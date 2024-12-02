@@ -1,7 +1,7 @@
 # NVIDIA Modulus-UW
 <!-- markdownlint-disable -->
 <p align="center">
-  <img src=/pscratch/sd/z/zespinos/modulus-uw/docs/img/UW/FlowChart.png alt="Modulus"/>
+  <img src=docs/img/UW/FlowChart.png alt="Modulus"/>
 </p>
 
 
