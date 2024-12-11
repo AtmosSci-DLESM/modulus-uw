@@ -14,9 +14,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .datapipes.datapipe import Datapipe
-from .datapipes.meta import DatapipeMetaData
-from .models.meta import ModelMetaData
-from .models.module import Module
+defaults:
+  - modules/encoder@encoder: unet_enc
+  - modules/decoder@decoder: unet_dec
 
-__version__ = "0.10.0a0"
+_target_: modulus.models.dlwp_healpix.HEALPixUNet
+_recursive_: false
+presteps: 0
+input_time_dim: ${data.input_time_dim}
+output_time_dim: ${data.output_time_dim}
+couplings: ${..data.module.couplings}
+
+# Parameters automatically overridden in train code
+input_channels: 1
+output_channels: 1
+n_constants: 1
+decoder_input_channels: 1
+
+# some perf parameters
+enable_nhwc: false
+enable_healpixpad: false
