@@ -157,10 +157,75 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         scaling_df.loc["zeros"] = {"mean": 0.0, "std": 1.0}
         scaling_da = scaling_df.to_xarray().astype("float32")
 
-        # only thing we do different here is get the scaling for the coupled values
         for c in self.couplings:
             c.set_scaling(scaling_da)
-        super()._get_scaling_da()
+        # REMARK: we remove the xarray overhead from these
+        try:
+            self.input_scaling = scaling_da.sel(index=self.input_variables).rename(
+                {"index": "channel_in"}
+            )
+            self.input_scaling = {
+                "mean": np.expand_dims(
+                    self.input_scaling["mean"].to_numpy(), (0, 2, 3, 4)
+                ),
+                "std": np.expand_dims(
+                    self.input_scaling["std"].to_numpy(), (0, 2, 3, 4)
+                ),
+            }
+        except (ValueError, KeyError):
+            missing = [
+                m
+                for m in self.input_variables
+                if m not in list(self.scaling.keys())
+            ]
+            raise KeyError(
+                f"Input channels {missing} not found in the scaling config dict data.scaling ({list(self.scaling.keys())})"
+            )
+        try:
+            self.target_scaling = scaling_da.sel(
+                index=self.output_variables
+            ).rename({"index": "channel_out"})
+            self.target_scaling = {
+                "mean": np.expand_dims(
+                    self.target_scaling["mean"].to_numpy(), (0, 2, 3, 4)
+                ),
+                "std": np.expand_dims(
+                    self.target_scaling["std"].to_numpy(), (0, 2, 3, 4)
+                ),
+            }
+        except (ValueError, KeyError):
+            missing = [
+                m
+                for m in self.output_variables
+                if m not in list(self.scaling.keys())
+            ]
+            raise KeyError(
+                f"Target channels {missing} not found in the scaling config dict data.scaling ({list(self.scaling.keys())})"
+            )
+
+        try:
+            # not all datasets will have constants
+            if "constants" in self.ds.data_vars:
+                self.constant_scaling = scaling_da.sel(
+                    index=self.ds.channel_c.values
+                ).rename({"index": "channel_out"})
+                self.constant_scaling = {
+                    "mean": np.expand_dims(
+                        self.constant_scaling["mean"].to_numpy(), (1, 2, 3)
+                    ),
+                    "std": np.expand_dims(
+                        self.constant_scaling["std"].to_numpy(), (1, 2, 3)
+                    ),
+                }
+        except (ValueError, KeyError):
+            missing = [
+                m
+                for m in self.ds.channel_c.values
+                if m not in list(self.scaling.keys())
+            ]
+            raise KeyError(
+                f"Constant channels {missing} not found in the scaling config dict data.scaling ({list(self.scaling.keys())})"
+            )
 
     def __getitem__(self, item):
         # start range
