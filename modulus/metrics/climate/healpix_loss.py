@@ -311,9 +311,9 @@ class WeightedDistributionOceanMSE( th.nn.MSELoss ):
             self.lsm_sum_calculated = True
 
         # Calculate weights based on target distribution
-        # Two hyperparameters (0.15 and 4) are used to determine the weights
+        # Two hyperparameters (0.05 and 10) are used to determine the weights
         sic = target[:,:,1,:,:,:]
-        weights_for_cice = th.ones_like(sic) * 10
+        weights_for_cice = th.ones_like(sic) * 15
         weights_for_ocn = th.ones_like(sic)
         dist_weights = th.where(sic >= .15, weights_for_cice, weights_for_ocn)
 
