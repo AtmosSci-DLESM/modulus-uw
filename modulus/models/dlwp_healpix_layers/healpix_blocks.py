@@ -618,6 +618,11 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 enable_healpixpad=enable_healpixpad,
             )
         )
+        # Apply BatchNorm or LayerNorm here
+        convblock.append(
+            th.nn.BatchNorm2d(int(latent_channels), track_running_stats=False, affine=False)
+        )
+        
         if activation is not None:
             convblock.append(activation)
         # 1x1 convolution establishing increased channels

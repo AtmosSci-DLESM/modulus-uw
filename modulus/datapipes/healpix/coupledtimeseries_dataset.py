@@ -132,7 +132,8 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         self.add_train_noise=add_train_noise
         self.train_noise_params=train_noise_params
         if self.add_train_noise:
-            self.rng = np.random.default_rng(train_noise_seed)
+            # self.rng = np.random.default_rng(train_noise_seed)
+            pass
 
         if couplings is not None:
             self.couplings = [
