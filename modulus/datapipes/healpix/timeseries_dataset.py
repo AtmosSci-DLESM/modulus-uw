@@ -477,9 +477,9 @@ class TimeSeriesDataset(Dataset, Datapipe):
         if self.reflect_across_equator:
             if reflect_batch_across_equator:
                 reflected_face_order = [8,9,10,11,4,5,6,7,0,1,2,3]
-                inputs_results[0] = np.flip(np.transpose(inputs_results[0], axes=[0,1,2,3,5,4]), axis=[4,5])[:,reflected_face_order]
-                inputs_results[1] = np.flip(np.transpose(inputs_results[1], axes=[0,1,2,3,5,4]), axis=[4,5])[:,reflected_face_order]
-                inputs_results[2] = np.flip(np.transpose(inputs_results[2], axes=[0,1,3,2]), axis=[2,3])[reflected_face_order]
+                inputs_result[0] = np.flip(np.transpose(inputs_result[0], axes=[0,1,2,3,5,4]), axis=[4,5])[:,reflected_face_order]
+                inputs_result[1] = np.flip(np.transpose(inputs_result[1], axes=[0,1,2,3,5,4]), axis=[4,5])[:,reflected_face_order]
+                inputs_result[2] = np.flip(np.transpose(inputs_result[2], axes=[0,1,3,2]), axis=[2,3])[reflected_face_order]
 
         logger.log(5, "computed batch in %0.2f s", time.time() - compute_time)
         torch.cuda.nvtx.range_pop()
