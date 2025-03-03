@@ -16,6 +16,7 @@
 
 import logging
 import time
+import gc
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 
@@ -197,7 +198,7 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             self.ds["inputs"]
             .sel(channel_in=self.input_variables)
             .isel(**batch)
-            .to_numpy()
+            .values.copy()
         )
         # retrieve coupled inputs
         if len(self.couplings) > 0:
@@ -220,7 +221,7 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
                 self.ds["targets"]
                 .sel(channel_out=self.output_variables)
                 .isel(**batch)
-                .to_numpy()
+                .values.copy()
             )
             target_array = (
                 target_array - self.target_scaling["mean"]
@@ -290,6 +291,12 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
                         scale=self.train_noise_params["couplings"][v]["std"],
                         size=integrated_couplings[i, :, :].shape
                     )
+
+        # Explicitly delete large temporary arrays so they can be garbage-collected
+        del input_array
+        if not self.forecast_mode:
+            del target_array
+        gc.collect()
 
         inputs_result = [inputs]
         if self.add_insolation:
