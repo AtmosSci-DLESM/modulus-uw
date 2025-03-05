@@ -172,10 +172,43 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         scaling_df.loc["zeros"] = {"mean": 0.0, "std": 1.0}
         scaling_da = scaling_df.to_xarray().astype("float32")
 
-        # only thing we do different here is get the scaling for the coupled values
         for c in self.couplings:
             c.set_scaling(scaling_da)
-        super()._get_scaling_da()
+        # REMARK: we remove the xarray overhead from these
+        try:
+            self.input_scaling = scaling_da.sel(index=self.input_variables).rename(
+                {"index": "channel_in"}
+            )
+            self.input_scaling = {
+                "mean": np.expand_dims(
+                    self.input_scaling["mean"].to_numpy(), (0, 2, 3, 4)
+                ),
+                "std": np.expand_dims(
+                    self.input_scaling["std"].to_numpy(), (0, 2, 3, 4)
+                ),
+            }
+        except (ValueError, KeyError):
+            raise KeyError(
+                f"one or more of the input data variables f{list(self.ds.channel_in)} not found in the "
+                f"scaling config dict data.scaling ({list(self.scaling.keys())})"
+            )
+        try:
+            self.target_scaling = scaling_da.sel(index=self.input_variables).rename(
+                {"index": "channel_out"}
+            )
+            self.target_scaling = {
+                "mean": np.expand_dims(
+                    self.target_scaling["mean"].to_numpy(), (0, 2, 3, 4)
+                ),
+                "std": np.expand_dims(
+                    self.target_scaling["std"].to_numpy(), (0, 2, 3, 4)
+                ),
+            }
+        except (ValueError, KeyError):
+            raise KeyError(
+                f"one or more of the target data variables f{list(self.ds.channel_out)} not found in the "
+                f"scaling config dict data.scaling ({list(self.scaling.keys())})"
+            )
 
     def __getitem__(self, item):
         # start range
