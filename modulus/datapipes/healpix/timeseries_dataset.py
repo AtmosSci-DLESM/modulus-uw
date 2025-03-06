@@ -19,6 +19,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
+from warnings import warn
 
 import numpy as np
 import pandas as pd
@@ -54,6 +55,9 @@ class TimeSeriesDataset(Dataset, Datapipe):
     def __init__(
         self,
         dataset: xr.Dataset,
+        input_variables: Sequence,
+        output_variables: Sequence = None,
+        constant_variables: Sequence = None,
         scaling: DictConfig = None,
         input_time_dim: int = 1,
         output_time_dim: int = 1,
@@ -73,6 +77,12 @@ class TimeSeriesDataset(Dataset, Datapipe):
             xarray Dataset produced by one of the `open_*` methods herein
         scaling: DictConfig
             Dictionary containing scaling parameters for data variables
+        input_variables: Sequence
+            a sequence of variables that will be ingested in to model
+        output_variables: Sequence, optional
+            a sequence of variables that are outputs of the model, default None
+        constant_variables: Sequence, optional
+            a sequence of variables that are the constant inputs, default None
         input_time_dim: int, optional
             Number of time steps in the input array, default 1
         output_time_dim: int, optional
@@ -118,6 +128,19 @@ class TimeSeriesDataset(Dataset, Datapipe):
         self.add_insolation = add_insolation
         self.forecast_init_times = forecast_init_times
         self.forecast_mode = self.forecast_init_times is not None
+        self.input_variables = input_variables
+        self.output_variables = (
+            input_variables if output_variables is None else output_variables
+        )
+        self.constant_variables = constant_variables
+
+        # verify that the time step we're getting matches whats in the data
+        ds_dt = pd.Timedelta( (self.ds.time[1]-self.ds.time[0]).values)
+        if not (ds_dt == self.data_time_step):
+            warn(
+                f"Dataset dt {ds_dt} doesn't match configuration dt {self.data_time_step}. "
+                "This could be a configuration error or a dataset mismatch."
+            )
 
         # Time stepping
         if (self.time_step % self.data_time_step).total_seconds() != 0:
@@ -193,6 +216,8 @@ class TimeSeriesDataset(Dataset, Datapipe):
         self.constants = None
         if self.scaling:
             self._get_scaling_da()
+        if self.constant_variables:
+            self.constants = self.get_constants()
 
     def get_constants(self):
         """Returns the constants used in this dataset
@@ -237,20 +262,20 @@ class TimeSeriesDataset(Dataset, Datapipe):
         # REMARK: we remove the xarray overhead from these
         try:
             self.input_scaling = scaling_da.sel(
-                index=self.ds.channel_out.values
+                index=self.input_variables
             ).rename({"index": "channel_in"})
             self.input_scaling = {
                 "mean": np.expand_dims(
-                    self.input_scaling["mean"].to_numpy(), (0, 2, 3, 4)
+                    self.input_scaling["mean"].values.copy(), (0, 2, 3, 4)
                 ),
                 "std": np.expand_dims(
-                    self.input_scaling["std"].to_numpy(), (0, 2, 3, 4)
+                    self.input_scaling["std"].values.copy(), (0, 2, 3, 4)
                 ),
             }
         except (ValueError, KeyError):
             missing = [
                 m
-                for m in self.ds.channel_in.values
+                for m in self.input_variables
                 if m not in list(self.scaling.keys())
             ]
             raise KeyError(
@@ -258,20 +283,20 @@ class TimeSeriesDataset(Dataset, Datapipe):
             )
         try:
             self.target_scaling = scaling_da.sel(
-                index=self.ds.channel_out.values
+                index=self.output_variables
             ).rename({"index": "channel_out"})
             self.target_scaling = {
                 "mean": np.expand_dims(
-                    self.target_scaling["mean"].to_numpy(), (0, 2, 3, 4)
+                    self.target_scaling["mean"].values.copy(), (0, 2, 3, 4)
                 ),
                 "std": np.expand_dims(
-                    self.target_scaling["std"].to_numpy(), (0, 2, 3, 4)
+                    self.target_scaling["std"].values.copy(), (0, 2, 3, 4)
                 ),
             }
         except (ValueError, KeyError):
             missing = [
                 m
-                for m in self.ds.channel_out.values
+                for m in self.output_variables
                 if m not in list(self.scaling.keys())
             ]
             raise KeyError(
@@ -282,20 +307,20 @@ class TimeSeriesDataset(Dataset, Datapipe):
             # not all datasets will have constants
             if "constants" in self.ds.data_vars:
                 self.constant_scaling = scaling_da.sel(
-                    index=self.ds.channel_c.values
+                    index=self.constant_variables
                 ).rename({"index": "channel_out"})
                 self.constant_scaling = {
                     "mean": np.expand_dims(
-                        self.constant_scaling["mean"].to_numpy(), (1, 2, 3)
+                        self.constant_scaling["mean"].values.copy(), (1, 2, 3)
                     ),
                     "std": np.expand_dims(
-                        self.constant_scaling["std"].to_numpy(), (1, 2, 3)
+                        self.constant_scaling["std"].values.copy(), (1, 2, 3)
                     ),
                 }
         except (ValueError, KeyError):
             missing = [
                 m
-                for m in self.ds.channel_c.values
+                for m in self.constant_variables
                 if m not in list(self.scaling.keys())
             ]
             raise KeyError(
@@ -400,13 +425,13 @@ class TimeSeriesDataset(Dataset, Datapipe):
         batch = {"time": slice(*time_index)}
         load_time = time.time()
 
-        input_array = self.ds["inputs"].isel(**batch).to_numpy()
+        input_array = self.ds["inputs"].sel(channel_in=self.input_variables).isel(**batch).values.copy()
         input_array = (input_array - self.input_scaling["mean"]) / self.input_scaling[
             "std"
         ]
 
         if not self.forecast_mode:
-            target_array = self.ds["targets"].isel(**batch).to_numpy()
+            target_array = self.ds["inputs"].sel(channel_in=self.output_variables).isel(**batch).values.copy()
             target_array = (
                 target_array - self.target_scaling["mean"]
             ) / self.target_scaling["std"]
@@ -431,13 +456,13 @@ class TimeSeriesDataset(Dataset, Datapipe):
 
         # Get buffers for the batches, which we'll fill in iteratively.
         inputs = np.empty(
-            (this_batch, self.input_time_dim, self.ds.sizes["channel_in"])
+            (this_batch, self.input_time_dim, len(self.input_variables))
             + self.spatial_dims,
             dtype="float32",
         )
         if not self.forecast_mode:
             targets = np.empty(
-                (this_batch, self.output_time_dim, self.ds.sizes["channel_out"])
+                (this_batch, self.output_time_dim, len(self.output_variables))
                 + self.spatial_dims,
                 dtype="float32",
             )
@@ -464,9 +489,9 @@ class TimeSeriesDataset(Dataset, Datapipe):
             np.transpose(x, axes=(0, 3, 1, 2, 4, 5)) for x in inputs_result
         ]
 
-        if "constants" in self.ds.data_vars:
+        if self.constant_variables:
             # Add the constants as [F, C, H, W]
-            inputs_result.append(self.get_constants())
+            inputs_result.append(self.constants)
 
         logger.log(5, "computed batch in %0.2f s", time.time() - compute_time)
         torch.cuda.nvtx.range_pop()

@@ -58,6 +58,7 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         scaling: DictConfig,
         input_variables: Sequence,
         output_variables: Sequence = None,
+        constant_variables: Sequence = None,
         input_time_dim: int = 1,
         presteps: int = 0,
         output_time_dim: int = 1,
@@ -85,6 +86,8 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             a sequence of variables that will be ingested in to model
         output_variables: Sequence, optional
             a sequence of variables that are outputs of the model, default None
+        constant_variables: Sequence, optional
+            a sequence of variables that are the constant inputs, default None
         input_time_dim: int, optional
             Number of time steps in the input array, default 1
         presteps: int, optional
@@ -147,6 +150,9 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         super().__init__(
             dataset=dataset,
             scaling=scaling,
+            input_variables=input_variables,
+            output_variables=output_variables,
+            constant_variables=constant_variables,
             input_time_dim=input_time_dim,
             output_time_dim=output_time_dim,
             data_time_step=data_time_step,
@@ -218,8 +224,8 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             #     leaving this in here as a warning
             # target_array = self.ds['targets'].isel(**batch).to_numpy()
             target_array = (
-                self.ds["targets"]
-                .sel(channel_out=self.output_variables)
+                self.ds["inputs"]
+                .sel(channel_in=self.output_variables)
                 .isel(**batch)
                 .values.copy()
             )
@@ -309,9 +315,9 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             np.transpose(x, axes=(0, 3, 1, 2, 4, 5)) for x in inputs_result
         ]
 
-        if "constants" in self.ds.data_vars:
+        if self.constant_variables:
             # Add the constants as [F, C, H, W]
-            inputs_result.append(self.get_constants())
+            inputs_result.append(self.constants)
 
         # append integrated couplings
         inputs_result.append(integrated_couplings)

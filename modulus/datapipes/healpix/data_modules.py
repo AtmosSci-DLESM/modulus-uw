@@ -151,19 +151,13 @@ def open_time_series_dataset_classic_on_the_fly(
 
     # Convert to input/target array by merging along the variables
     input_da = (
-        data[list(input_variables)]
+        data[list(all_variables)]
         .to_array("channel_in", name="inputs")
         .transpose("time", "channel_in", "face", "height", "width")
-    )
-    target_da = (
-        data[list(output_variables)]
-        .to_array("channel_out", name="targets")
-        .transpose("time", "channel_out", "face", "height", "width")
     )
 
     result = xr.Dataset()
     result["inputs"] = input_da
-    result["targets"] = target_da
 
     # Get constants
     if constants is not None:
@@ -320,19 +314,13 @@ def create_time_series_dataset_classic(
 
     # Convert to input/target array by merging along the variables
     input_da = (
-        data[list(input_variables)]
+        data[list(all_variables)]
         .to_array("channel_in", name="inputs")
         .transpose("time", "channel_in", "face", "height", "width")
-    )
-    target_da = (
-        data[list(output_variables)]
-        .to_array("channel_out", name="targets")
-        .transpose("time", "channel_out", "face", "height", "width")
     )
 
     result = xr.Dataset()
     result["inputs"] = input_da
-    result["targets"] = target_da
 
     # Get constants
     if constants is not None:
@@ -534,6 +522,8 @@ class TimeSeriesDataModule:
         else:
             raise ValueError("'data_format' must be one of ['classic']")
 
+        constant_names = list(self.constants.values()) if self.constants else None
+
         # make sure distributed manager is initalized
         if not DistributedManager.is_initialized():
             DistributedManager.initialize()
@@ -606,12 +596,19 @@ class TimeSeriesDataModule:
                     batch_size=self.batch_size,
                 )
 
-        dataset = dataset.sel(
-            channel_in=self.input_variables,
-            channel_out=self.output_variables,
+        # use a union to prevent duplication of channels and verify all channels exist
+        # to prevent an opaque xarray error
+        channels = set(self.input_variables).union(self.output_variables)
+        missing_channels = channels - set(dataset.channel_in.values)
+        if len(missing_channels) > 0:
+            raise KeyError(
+                f"Input or output variables not found in dataset: {missing_channels}"
+            )
+        dataser = dataset.sel(
+            channel_in=list(channels),
         )
         if self.constants is not None:
-            dataset = dataset.sel(channel_c=list(self.constants.values()))
+            dataset = dataset.sel(channel_c=constant_names)
 
         if self.splits is not None and self.forecast_init_times is None:
             self.train_dataset = TimeSeriesDataset(
@@ -621,6 +618,9 @@ class TimeSeriesDataModule:
                     )
                 ),
                 scaling=self.scaling,
+                input_variables=self.input_variables,
+                output_variables=self.output_variables,
+                constant_variables=constant_names,
                 input_time_dim=self.input_time_dim,
                 output_time_dim=self.output_time_dim,
                 data_time_step=self.data_time_step,
@@ -637,6 +637,9 @@ class TimeSeriesDataModule:
                     )
                 ),
                 scaling=self.scaling,
+                input_variables=self.input_variables,
+                output_variables=self.output_variables,
+                constant_variables=constant_names,
                 input_time_dim=self.input_time_dim,
                 output_time_dim=self.output_time_dim,
                 data_time_step=self.data_time_step,
@@ -654,6 +657,9 @@ class TimeSeriesDataModule:
                     )
                 ),
                 scaling=self.scaling,
+                input_variables=self.input_variables,
+                output_variables=self.output_variables,
+                constant_variables=constant_names,
                 input_time_dim=self.input_time_dim,
                 output_time_dim=self.output_time_dim,
                 data_time_step=self.data_time_step,
@@ -667,6 +673,9 @@ class TimeSeriesDataModule:
             self.test_dataset = TimeSeriesDataset(
                 dataset,
                 scaling=self.scaling,
+                input_variables=self.input_variables,
+                output_variables=self.output_variables,
+                constant_variables=constant_names,
                 input_time_dim=self.input_time_dim,
                 output_time_dim=self.output_time_dim,
                 data_time_step=self.data_time_step,
@@ -969,6 +978,8 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
             raise ValueError("'data_format' must be one of ['classic', 'zarr']")
 
         coupled_variables = self._get_coupled_vars()
+        constant_names = list(self.constants.values()) if self.constants else None
+
         # make sure distributed manager is initalized
         if not DistributedManager.is_initialized():
             DistributedManager.initialize()
@@ -1041,12 +1052,19 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
                     batch_size=self.batch_size,
                 )
 
-        dataset = dataset.sel(
-            channel_in=self.input_variables + coupled_variables,
-            channel_out=self.output_variables,
+        # use a union to prevent duplication of channels and verify all channels exist
+        # to prevent an opaque xarray error
+        channels = set(self.input_variables).union(coupled_variables).union(self.output_variables)
+        missing_channels = channels - set(dataset.channel_in.values)
+        if len(missing_channels) > 0:
+            raise KeyError(
+                f"Input, coupled, or output variables not found in dataset: {missing_channels}"
+            )
+        dataser = dataset.sel(
+            channel_in=list(channels),
         )
         if self.constants is not None:
-            dataset = dataset.sel(channel_c=list(self.constants.values()))
+            dataset = dataset.sel(channel_c=constant_names)
 
         if self.splits is not None and self.forecast_init_times is None:
             self.train_dataset = CoupledTimeSeriesDataset(
@@ -1055,9 +1073,10 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
                         self.splits["train_date_start"], self.splits["train_date_end"]
                     )
                 ),
-                scaling=self.scaling,
                 input_variables=self.input_variables,
                 output_variables=self.output_variables,
+                constant_variables=list(self.constants.values()),
+                scaling=self.scaling,
                 input_time_dim=self.input_time_dim,
                 output_time_dim=self.output_time_dim,
                 data_time_step=self.data_time_step,
@@ -1077,9 +1096,10 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
                         self.splits["val_date_start"], self.splits["val_date_end"]
                     )
                 ),
-                scaling=self.scaling,
                 input_variables=self.input_variables,
                 output_variables=self.output_variables,
+                constant_variables=list(self.constants.values()),
+                scaling=self.scaling,
                 input_time_dim=self.input_time_dim,
                 output_time_dim=self.output_time_dim,
                 data_time_step=self.data_time_step,
@@ -1097,9 +1117,10 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
                         self.splits["test_date_start"], self.splits["test_date_end"]
                     )
                 ),
-                scaling=self.scaling,
                 input_variables=self.input_variables,
                 output_variables=self.output_variables,
+                constant_variables=list(self.constants.values()),
+                scaling=self.scaling,
                 input_time_dim=self.input_time_dim,
                 output_time_dim=self.output_time_dim,
                 data_time_step=self.data_time_step,
@@ -1113,9 +1134,10 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
         else:
             self.test_dataset = CoupledTimeSeriesDataset(
                 dataset,
-                scaling=self.scaling,
                 input_variables=self.input_variables,
                 output_variables=self.output_variables,
+                constant_variables=list(self.constants.values()),
+                scaling=self.scaling,
                 input_time_dim=self.input_time_dim,
                 output_time_dim=self.output_time_dim,
                 data_time_step=self.data_time_step,
