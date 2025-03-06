@@ -132,21 +132,18 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         self.output_variables = (
             input_variables if output_variables is None else output_variables
         )
-        self.add_train_noise=add_train_noise
-        self.train_noise_params=train_noise_params
+        self.add_train_noise = add_train_noise
+        self.train_noise_params = train_noise_params
         if self.add_train_noise:
             self.rng = np.random.default_rng(train_noise_seed)
 
-        if couplings is not None:
-            self.couplings = [
-                getattr(couplers, c["coupler"])(
-                    dataset,
-                    **OmegaConf.to_object(DictConfig(c))["params"],
-                )
-                for c in couplings
-            ]
-        else:
-            self.couplings = None
+        self.couplings = [
+            getattr(couplers, c["coupler"])(
+                dataset,
+                **OmegaConf.to_object(DictConfig(c))["params"],
+            )
+            for c in couplings
+        ]
         super().__init__(
             dataset=dataset,
             scaling=scaling,
@@ -287,15 +284,17 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             for i in range(inputs.shape[2]):
                 inputs[:, :, i] += self.rng.normal(
                     loc=0,
-                    scale=self.train_noise_params["inputs"][self.input_variables[i]]["std"],
-                    size=inputs[:, :, i].shape
+                    scale=self.train_noise_params["inputs"][self.input_variables[i]][
+                        "std"
+                    ],
+                    size=inputs[:, :, i].shape,
                 )
             for c in self.couplings:
                 for i, v in enumerate(c.variables):
                     integrated_couplings[i, :, :] += self.rng.normal(
                         loc=0,
                         scale=self.train_noise_params["couplings"][v]["std"],
-                        size=integrated_couplings[i, :, :].shape
+                        size=integrated_couplings[i, :, :].shape,
                     )
 
         # Explicitly delete large temporary arrays so they can be garbage-collected
@@ -320,7 +319,8 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             inputs_result.append(self.constants)
 
         # append integrated couplings
-        inputs_result.append(integrated_couplings)
+        if len(self.couplings) > 0:
+            inputs_result.append(integrated_couplings)
 
         torch.cuda.nvtx.range_pop()
 

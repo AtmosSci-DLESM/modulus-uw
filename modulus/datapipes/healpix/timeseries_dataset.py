@@ -219,6 +219,7 @@ class TimeSeriesDataset(Dataset, Datapipe):
         if self.constant_variables:
             self.constants = self.get_constants()
 
+
     def get_constants(self):
         """Returns the constants used in this dataset
 
@@ -226,16 +227,22 @@ class TimeSeriesDataset(Dataset, Datapipe):
         -------
         np.ndarray: The list of constants, None if there are no constants
         """
+        # return constants if they've already been computed
+        if self.constants is not None:
+            return self.constants
+
         # extract from ds:
         const = self.ds.constants.values
+
         if self.constant_scaling:
             const = (const - self.constant_scaling["mean"]) / self.constant_scaling[
                 "std"
             ]
+
         # transpose to match new format:
         # [C, F, H, W] -> [F, C, H, W]
-        const = np.transpose(const, axes=(1, 0, 2, 3))
-        return const
+        self.constants = np.transpose(const, axes=(1, 0, 2, 3))
+        return self.constants
 
     @staticmethod
     def _convert_time_step(dt):  # pylint: disable=invalid-name
