@@ -604,7 +604,7 @@ class TimeSeriesDataModule:
             raise KeyError(
                 f"Input or output variables not found in dataset: {missing_channels}"
             )
-        dataser = dataset.sel(
+        dataset = dataset.sel(
             channel_in=list(channels),
         )
         if self.constants is not None:
@@ -1060,7 +1060,7 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
             raise KeyError(
                 f"Input, coupled, or output variables not found in dataset: {missing_channels}"
             )
-        dataser = dataset.sel(
+        dataset = dataset.sel(
             channel_in=list(channels),
         )
         if self.constants is not None:
