@@ -93,34 +93,6 @@ def scaling_double_dict():
 
 
 @import_or_fail("omegaconf")
-@import_or_fail("netCDF4")
-@nfsdata_or_fail
-def test_open_time_series_on_the_fly(create_path, pytestconfig):
-    from modulus.datapipes.healpix.data_modules import (
-        open_time_series_dataset_classic_on_the_fly,
-    )
-
-    variables = ["z500", "z1000"]
-    constants = {"lsm": "lsm"}
-
-    ds = open_time_series_dataset_classic_on_the_fly(
-        directory=create_path,
-        input_variables=variables,
-        output_variables=variables,
-        constants=constants,
-    )
-    assert isinstance(ds, xr.Dataset)
-
-    test_var = variables[0]
-    base = xr.open_dataset(create_path + "/" + test_var + ".nc")
-    ds_var = ds.inputs.sel(channel_in=test_var)
-
-    assert ds_var.equals(base[test_var])
-    ds.close()
-    base.close()
-
-
-@import_or_fail("omegaconf")
 @nfsdata_or_fail
 def test_open_time_series(data_dir, dataset_name, pytestconfig):
     # check for failure of non-existant dataset
@@ -138,72 +110,6 @@ def test_open_time_series(data_dir, dataset_name, pytestconfig):
 
 @import_or_fail("omegaconf")
 @import_or_fail("netCDF4")
-@import_or_fail("numpy")
-@nfsdata_or_fail
-def test_create_time_series(data_dir, dataset_name, create_path, pytestconfig):
-
-    from modulus.datapipes.healpix.data_modules import (
-        create_time_series_dataset_classic,
-    )
-
-    variables = ["z500", "z1000"]
-    constants = {"lsm": "lsm"}
-    scaling = {"z500": {"log_epsilon": 2}}
-    # check existing dataset
-    ds = create_time_series_dataset_classic(
-        src_directory="/null",
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
-        input_variables=["null", "null"],
-    )
-    assert isinstance(ds, xr.Dataset)
-    ds.close()
-
-    # create new dataset
-    # open a base dataset to compare against
-    test_var = list(scaling.keys())[0]
-    base = xr.open_dataset(create_path + "/" + test_var + ".nc")
-    # scale our test variable
-    base[test_var] = np.log(base[test_var] + scaling[test_var]["log_epsilon"]) - np.log(
-        scaling[test_var]["log_epsilon"]
-    )
-    ds = create_time_series_dataset_classic(
-        src_directory=create_path,
-        dst_directory=create_path,
-        dataset_name=dataset_name,
-        input_variables=variables,
-        scaling=scaling,
-    )
-    ds_var = ds.inputs.sel(channel_in=test_var)
-
-    assert ds_var.equals(base[test_var])
-    ds.close()
-    base.close()
-
-    # delete the created file so we have a clean test for next time
-    delete_dataset(create_path, dataset_name)
-
-    # and with constants
-    const = list(constants.keys())[0]
-    const_ds = xr.open_dataset(create_path + "/" + const + ".nc")
-    ds = create_time_series_dataset_classic(
-        src_directory=create_path,
-        dst_directory=create_path,
-        dataset_name=dataset_name,
-        input_variables=variables,
-        scaling=scaling,
-        constants=constants,
-    )
-    assert (const_ds[const] == ds.constants[0]).any()
-    ds.close()
-    const_ds.close()
-
-    # delete the created file so we have a clean test for next time
-    delete_dataset(create_path, dataset_name)
-
-
-@import_or_fail("omegaconf")
-@import_or_fail("netCDF4")
 @nfsdata_or_fail
 def test_TimeSeriesDataset_initialization(
     data_dir, dataset_name, scaling_dict, pytestconfig
@@ -214,6 +120,7 @@ def test_TimeSeriesDataset_initialization(
     # open our test dataset
     ds_path = Path(data_dir, dataset_name + ".zarr")
     zarr_ds = xr.open_zarr(ds_path)
+    input_variables = list(zarr_ds.channel_in.values)
 
     # check for failure of timestep not being a multiple of datatime step
     with pytest.raises(
@@ -221,9 +128,10 @@ def test_TimeSeriesDataset_initialization(
     ):
         timeseries_ds = TimeSeriesDataset(
             dataset=zarr_ds,
-            data_time_step="2h",
+            data_time_step="3h",
             time_step="5h",
             scaling=scaling_dict,
+            input_variables=input_variables,
         )
 
     # check for failure of gap not being a multiple of datatime step
@@ -232,10 +140,28 @@ def test_TimeSeriesDataset_initialization(
     ):
         timeseries_ds = TimeSeriesDataset(
             dataset=zarr_ds,
-            data_time_step="2h",
+            data_time_step="3h",
+            time_step="6h",
+            gap="5h",
+            scaling=scaling_dict,
+            input_variables=input_variables,
+        )
+
+    # check for warning of config dt being different from dataset dt
+    warnings.filterwarnings("error")
+    with pytest.raises(
+        UserWarning,
+        match=(
+            "Dataset dt 0 days 03:00:00 doesn't match configuration dt 0 days 01:00:00"
+        ),
+    ):
+        timeseries_ds = TimeSeriesDataset(
+            dataset=zarr_ds,
+            data_time_step="1h",
             time_step="6h",
             gap="3h",
             scaling=scaling_dict,
+            input_variables=input_variables,
         )
 
     # check for failure of invalid scaling variable on input
@@ -250,6 +176,29 @@ def test_TimeSeriesDataset_initialization(
             data_time_step="3h",
             time_step="6h",
             scaling=invalid_scaling,
+            input_variables=input_variables,
+        )
+
+    # check for failure of invalid scaling variable on target
+    with pytest.raises(KeyError, match=("Target channels ")):
+        timeseries_ds = TimeSeriesDataset(
+            dataset=zarr_ds,
+            data_time_step="3h",
+            time_step="6h",
+            scaling=scaling_dict,
+            input_variables=input_variables,
+            output_variables=input_variables + ["non_existant"],
+        )
+
+    # check for failure of invalid scaling variable on constants
+    with pytest.raises(KeyError, match=("Constant channels ")):
+        timeseries_ds = TimeSeriesDataset(
+            dataset=zarr_ds,
+            data_time_step="3h",
+            time_step="6h",
+            scaling=scaling_dict,
+            input_variables=input_variables,
+            constant_variables=["non_existant"],
         )
 
     # check for warning on batch size > 1 and forecast mode
@@ -263,6 +212,7 @@ def test_TimeSeriesDataset_initialization(
         timeseries_ds = TimeSeriesDataset(
             dataset=zarr_ds,
             scaling=scaling_dict,
+            input_variables=input_variables,
             batch_size=2,
             forecast_init_times=zarr_ds.time[:2],
         )
@@ -270,18 +220,21 @@ def test_TimeSeriesDataset_initialization(
     # test no scaling
     timeseries_ds = TimeSeriesDataset(
         dataset=zarr_ds,
+        input_variables=input_variables,
     )
     assert isinstance(timeseries_ds, TimeSeriesDataset)
 
     timeseries_ds = TimeSeriesDataset(
         dataset=zarr_ds,
         scaling=scaling_dict,
+        input_variables=input_variables,
     )
     assert isinstance(timeseries_ds, TimeSeriesDataset)
 
     timeseries_ds = TimeSeriesDataset(
         dataset=zarr_ds,
         scaling=scaling_dict,
+        input_variables=input_variables,
         batch_size=1,
         forecast_init_times=zarr_ds.time[:2],
     )
@@ -290,6 +243,7 @@ def test_TimeSeriesDataset_initialization(
     timeseries_ds = TimeSeriesDataset(
         dataset=zarr_ds,
         scaling=scaling_dict,
+        input_variables=input_variables,
         batch_size=1,
         forecast_init_times=zarr_ds.time[:2],
         data_time_step="3h",
@@ -311,10 +265,12 @@ def test_TimeSeriesDataset_get_constants(
     # open our test dataset
     ds_path = Path(data_dir, dataset_name + ".zarr")
     zarr_ds = xr.open_zarr(ds_path)
+    input_variables = list(zarr_ds.channel_in.values)
 
     timeseries_ds = TimeSeriesDataset(
         dataset=zarr_ds,
         scaling=scaling_dict,
+        input_variables=input_variables,
     )
 
     # constants are reshaped
@@ -336,12 +292,14 @@ def test_TimeSeriesDataset_len(data_dir, dataset_name, scaling_dict, pytestconfi
     # open our test dataset
     ds_path = Path(data_dir, dataset_name + ".zarr")
     zarr_ds = xr.open_zarr(ds_path)
+    input_variables = list(zarr_ds.channel_in.values)
 
     # check forecast mode
     init_times = random.randint(1, len(zarr_ds.time.values))
     timeseries_ds = TimeSeriesDataset(
         dataset=zarr_ds,
         scaling=scaling_dict,
+        input_variables=input_variables,
         batch_size=1,
         forecast_init_times=zarr_ds.time[:init_times],
     )
@@ -353,6 +311,7 @@ def test_TimeSeriesDataset_len(data_dir, dataset_name, scaling_dict, pytestconfi
         data_time_step="3h",
         time_step="9h",
         scaling=scaling_dict,
+        input_variables=input_variables,
         batch_size=2,
     )
     # Window length of 3 for one sample size
@@ -364,6 +323,7 @@ def test_TimeSeriesDataset_len(data_dir, dataset_name, scaling_dict, pytestconfi
         data_time_step="3h",
         time_step="9h",
         scaling=scaling_dict,
+        input_variables=input_variables,
         batch_size=2,
         drop_last=True,
     )
@@ -383,11 +343,15 @@ def test_TimeSeriesDataset_get(
     # open our test dataset
     ds_path = Path(data_dir, dataset_name + ".zarr")
     zarr_ds = xr.open_zarr(ds_path)
+    input_variables = list(zarr_ds.channel_in.values)
+    constant_variables = list(zarr_ds.channel_c.values)
 
     batch_size = 2
     timeseries_ds = TimeSeriesDataset(
         dataset=zarr_ds,
         scaling=scaling_double_dict,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         batch_size=batch_size,
     )
 
@@ -421,10 +385,12 @@ def test_TimeSeriesDataset_get(
     # we're not dropping incomplete elements by default
     assert len(targets) == 0
 
-    # this time dropping incomplete so that we get a full sample sample
+    # this time dropping incomplete so that we get a full sample
     timeseries_ds = TimeSeriesDataset(
         dataset=zarr_ds,
         scaling=scaling_double_dict,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         batch_size=batch_size,
         drop_last=True,
     )
@@ -440,6 +406,8 @@ def test_TimeSeriesDataset_get(
     timeseries_ds = TimeSeriesDataset(
         dataset=zarr_ds,
         scaling=scaling_double_dict,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         batch_size=batch_size,
         drop_last=True,
         add_insolation=True,
@@ -451,6 +419,8 @@ def test_TimeSeriesDataset_get(
     timeseries_ds = TimeSeriesDataset(
         dataset=zarr_ds,
         scaling=scaling_double_dict,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         batch_size=1,
         forecast_init_times=zarr_ds.time[:init_times],
     )
@@ -463,6 +433,8 @@ def test_TimeSeriesDataset_get(
     timeseries_ds = TimeSeriesDataset(
         dataset=zarr_ds,
         scaling=scaling_double_dict,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         batch_size=1,
         add_insolation=True,
         forecast_init_times=zarr_ds.time[:init_times],
@@ -471,10 +443,10 @@ def test_TimeSeriesDataset_get(
 
     # No constants in input data
     init_times = random.randint(1, len(zarr_ds.time.values))
-    zarr_ds_no_const = zarr_ds.drop_vars("constants")
     timeseries_ds = TimeSeriesDataset(
-        dataset=zarr_ds_no_const,
+        dataset=zarr_ds,
         scaling=scaling_double_dict,
+        input_variables=input_variables,
         batch_size=1,
         forecast_init_times=zarr_ds.time[:init_times],
     )
@@ -493,13 +465,14 @@ def test_TimeSeriesDataModule_initialization(
     )
 
     variables = ["z500", "z1000"]
+    # these have to be in the dataset otherwise the tests will fail
     splits = {
-        "train_date_start": "1959-01-01",
-        "train_date_end": "1998-12-31T18:00",
-        "val_date_start": "1999-01-01",
-        "val_date_end": "2000-12-31T18:00",
-        "test_date_start": "2017-01-01",
-        "test_date_end": "2018-12-31T18:00",
+        "train_date_start": "1979-01-01",
+        "train_date_end": "1979-01-01T21:00",
+        "val_date_start": "1979-01-02",
+        "val_date_end": "1979-01-02T09:00",
+        "test_date_start": "1979-01-02T12:00",
+        "test_date_end": "1979-01-02T18:00",
     }
 
     # open our test dataset
@@ -516,6 +489,32 @@ def test_TimeSeriesDataModule_initialization(
             data_format="null",
         )
 
+    # test with an invalid dataset name
+    with pytest.raises(FileNotFoundError, match=("Dataset doesn't appear to exist at")):
+        timeseries_dm = TimeSeriesDataModule(
+            src_directory=create_path,
+            dst_directory=data_dir,
+            dataset_name="non_existant",
+            input_variables=variables,
+            batch_size=1,
+            prebuilt_dataset=True,
+            scaling=scaling_double_dict,
+        )
+
+    # test with channels not in dataset
+    with pytest.raises(
+        KeyError, match=("Input, coupled, or output variables not found")
+    ):
+        timeseries_dm = TimeSeriesDataModule(
+            src_directory=create_path,
+            dst_directory=data_dir,
+            dataset_name=dataset_name,
+            input_variables=["non_existant"],
+            batch_size=1,
+            prebuilt_dataset=True,
+            scaling=scaling_double_dict,
+        )
+
     # use the prebuilt dataset
     # Internally initializes DistributedManager
     timeseries_dm = TimeSeriesDataModule(
@@ -529,17 +528,17 @@ def test_TimeSeriesDataModule_initialization(
     )
     assert isinstance(timeseries_dm, TimeSeriesDataModule)
 
-    # without the prebuilt dataset
-    timeseries_dm = TimeSeriesDataModule(
-        src_directory=create_path,
-        dst_directory=create_path,
-        dataset_name=dataset_name,
-        input_variables=variables,
-        batch_size=1,
-        prebuilt_dataset=False,
-        scaling=scaling_double_dict,
-    )
-    assert isinstance(timeseries_dm, TimeSeriesDataModule)
+    # test for fail without the prebuilt dataset
+    with pytest.raises(ValueError, match=("Only prebuilt datasets are supported")):
+        timeseries_dm = TimeSeriesDataModule(
+            src_directory=create_path,
+            dst_directory=create_path,
+            dataset_name=dataset_name,
+            input_variables=variables,
+            batch_size=1,
+            prebuilt_dataset=False,
+            scaling=scaling_double_dict,
+        )
 
     # with init times
     timeseries_dm = TimeSeriesDataModule(

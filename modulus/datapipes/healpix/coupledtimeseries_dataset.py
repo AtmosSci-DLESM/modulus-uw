@@ -14,9 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import logging
 import time
-import gc
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 

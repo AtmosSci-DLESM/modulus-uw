@@ -19,7 +19,6 @@ import time
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
-from warnings import warn
 
 import numpy as np
 import pandas as pd
@@ -134,14 +133,6 @@ class TimeSeriesDataset(Dataset, Datapipe):
         )
         self.constant_variables = constant_variables
 
-        # verify that the time step we're getting matches whats in the data
-        ds_dt = pd.Timedelta( (self.ds.time[1]-self.ds.time[0]).values)
-        if not (ds_dt == self.data_time_step):
-            warn(
-                f"Dataset dt {ds_dt} doesn't match configuration dt {self.data_time_step}. "
-                "This could be a configuration error or a dataset mismatch."
-            )
-
         # Time stepping
         if (self.time_step % self.data_time_step).total_seconds() != 0:
             raise ValueError(
@@ -154,6 +145,14 @@ class TimeSeriesDataset(Dataset, Datapipe):
                 f"(got {self.gap} and {self.data_time_step}"
             )
         self.interval = self.time_step // self.data_time_step
+
+        # verify that the time step we're getting matches whats in the data
+        ds_dt = pd.Timedelta((self.ds.time[1] - self.ds.time[0]).values)
+        if not (ds_dt == self.data_time_step):
+            warnings.warn(
+                f"Dataset dt {ds_dt} doesn't match configuration dt {self.data_time_step}. "
+                "This could be a configuration error or a dataset mismatch."
+            )
 
         # Find indices of init times for forecast mode
         if self.forecast_mode:
@@ -219,7 +218,6 @@ class TimeSeriesDataset(Dataset, Datapipe):
         if self.constant_variables:
             self.constants = self.get_constants()
 
-
     def get_constants(self):
         """Returns the constants used in this dataset
 
@@ -268,9 +266,9 @@ class TimeSeriesDataset(Dataset, Datapipe):
 
         # REMARK: we remove the xarray overhead from these
         try:
-            self.input_scaling = scaling_da.sel(
-                index=self.input_variables
-            ).rename({"index": "channel_in"})
+            self.input_scaling = scaling_da.sel(index=self.input_variables).rename(
+                {"index": "channel_in"}
+            )
             self.input_scaling = {
                 "mean": np.expand_dims(
                     self.input_scaling["mean"].values.copy(), (0, 2, 3, 4)
@@ -281,17 +279,15 @@ class TimeSeriesDataset(Dataset, Datapipe):
             }
         except (ValueError, KeyError):
             missing = [
-                m
-                for m in self.input_variables
-                if m not in list(self.scaling.keys())
+                m for m in self.input_variables if m not in list(self.scaling.keys())
             ]
             raise KeyError(
                 f"Input channels {missing} not found in the scaling config dict data.scaling ({list(self.scaling.keys())})"
             )
         try:
-            self.target_scaling = scaling_da.sel(
-                index=self.output_variables
-            ).rename({"index": "channel_out"})
+            self.target_scaling = scaling_da.sel(index=self.output_variables).rename(
+                {"index": "channel_out"}
+            )
             self.target_scaling = {
                 "mean": np.expand_dims(
                     self.target_scaling["mean"].values.copy(), (0, 2, 3, 4)
@@ -302,9 +298,7 @@ class TimeSeriesDataset(Dataset, Datapipe):
             }
         except (ValueError, KeyError):
             missing = [
-                m
-                for m in self.output_variables
-                if m not in list(self.scaling.keys())
+                m for m in self.output_variables if m not in list(self.scaling.keys())
             ]
             raise KeyError(
                 f"Target channels {missing} not found in the scaling config dict data.scaling ({list(self.scaling.keys())})"
@@ -312,7 +306,7 @@ class TimeSeriesDataset(Dataset, Datapipe):
 
         try:
             # not all datasets will have constants
-            if "constants" in self.ds.data_vars:
+            if self.constant_variables:
                 self.constant_scaling = scaling_da.sel(
                     index=self.constant_variables
                 ).rename({"index": "channel_out"})
@@ -326,9 +320,7 @@ class TimeSeriesDataset(Dataset, Datapipe):
                 }
         except (ValueError, KeyError):
             missing = [
-                m
-                for m in self.constant_variables
-                if m not in list(self.scaling.keys())
+                m for m in self.constant_variables if m not in list(self.scaling.keys())
             ]
             raise KeyError(
                 f"Constant channels {missing} not found in the scaling config dict data.scaling ({list(self.scaling.keys())})"
@@ -432,13 +424,23 @@ class TimeSeriesDataset(Dataset, Datapipe):
         batch = {"time": slice(*time_index)}
         load_time = time.time()
 
-        input_array = self.ds["inputs"].sel(channel_in=self.input_variables).isel(**batch).values.copy()
+        input_array = (
+            self.ds["inputs"]
+            .sel(channel_in=self.input_variables)
+            .isel(**batch)
+            .values.copy()
+        )
         input_array = (input_array - self.input_scaling["mean"]) / self.input_scaling[
             "std"
         ]
 
         if not self.forecast_mode:
-            target_array = self.ds["inputs"].sel(channel_in=self.output_variables).isel(**batch).values.copy()
+            target_array = (
+                self.ds["inputs"]
+                .sel(channel_in=self.output_variables)
+                .isel(**batch)
+                .values.copy()
+            )
             target_array = (
                 target_array - self.target_scaling["mean"]
             ) / self.target_scaling["std"]

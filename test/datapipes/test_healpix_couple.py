@@ -671,8 +671,8 @@ def test_CoupledTimeSeriesDataset_get(
     # open our test dataset
     ds_path = Path(data_dir, dataset_name + ".zarr")
     zarr_ds = xr.open_zarr(ds_path)
-
-    variables = list(zarr_ds.channel_out.to_numpy())
+    input_variables = list(zarr_ds.channel_in.values)
+    constant_variables = list(zarr_ds.channel_c.values)
 
     batch_size = 2
     constant_coupler = [
@@ -691,7 +691,8 @@ def test_CoupledTimeSeriesDataset_get(
     ]
     timeseries_ds = CoupledTimeSeriesDataset(
         dataset=zarr_ds,
-        input_variables=variables,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         scaling=scaling_double_dict,
         batch_size=batch_size,
         couplings=constant_coupler,
@@ -730,7 +731,8 @@ def test_CoupledTimeSeriesDataset_get(
     # this time dropping incomplete so that we get a full sample sample
     timeseries_ds = CoupledTimeSeriesDataset(
         dataset=zarr_ds,
-        input_variables=variables,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         scaling=scaling_double_dict,
         batch_size=batch_size,
         drop_last=True,
@@ -747,7 +749,8 @@ def test_CoupledTimeSeriesDataset_get(
     # without couplings
     timeseries_ds = CoupledTimeSeriesDataset(
         dataset=zarr_ds,
-        input_variables=variables,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         scaling=scaling_double_dict,
         batch_size=batch_size,
         drop_last=True,
@@ -763,7 +766,8 @@ def test_CoupledTimeSeriesDataset_get(
     }
     timeseries_ds = CoupledTimeSeriesDataset(
         dataset=zarr_ds,
-        input_variables=variables,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         scaling=scaling_double_dict,
         batch_size=batch_size,
         drop_last=True,
@@ -777,10 +781,33 @@ def test_CoupledTimeSeriesDataset_get(
     assert non_perturbed_inputs[0][0][0].shape == perturbed_inputs[0][0][0].shape
     assert not np.array_equal(non_perturbed_inputs[0][0][0], perturbed_inputs[0][0][0])
 
+    # with coupling and with noise
+    noise_params = {
+        "inputs": scaling_double_dict,
+        "couplings": scaling_double_dict,
+    }
+    timeseries_ds = CoupledTimeSeriesDataset(
+        dataset=zarr_ds,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
+        scaling=scaling_double_dict,
+        batch_size=batch_size,
+        drop_last=True,
+        add_train_noise=True,
+        train_noise_params=noise_params,
+        couplings=constant_coupler,
+    )
+    perturbed_inputs = timeseries_ds
+    # The first input will be the same sample, with perturbation it should have
+    # different values
+    assert non_perturbed_inputs[0][0][0].shape == perturbed_inputs[0][0][0].shape
+    assert not np.array_equal(non_perturbed_inputs[0][0][0], perturbed_inputs[0][0][0])
+
     # With insolation we get 1 extra channel
     timeseries_ds = CoupledTimeSeriesDataset(
         dataset=zarr_ds,
-        input_variables=variables,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         scaling=scaling_double_dict,
         batch_size=batch_size,
         drop_last=True,
@@ -793,7 +820,8 @@ def test_CoupledTimeSeriesDataset_get(
     init_times = random.randint(1, len(zarr_ds.time.values))
     timeseries_ds = CoupledTimeSeriesDataset(
         dataset=zarr_ds,
-        input_variables=variables,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         scaling=scaling_double_dict,
         batch_size=1,
         forecast_init_times=zarr_ds.time[:init_times],
@@ -803,11 +831,12 @@ def test_CoupledTimeSeriesDataset_get(
 
     assert np.array_equal(targets[0][:, 0, :, :], targets_expected)
 
-    # insolation adds 1 extra channel
+    # insolation adds 1 extra channel for forecast
     init_times = random.randint(1, len(zarr_ds.time.values))
     timeseries_ds = CoupledTimeSeriesDataset(
         dataset=zarr_ds,
-        input_variables=variables,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         scaling=scaling_double_dict,
         batch_size=1,
         add_insolation=True,
@@ -821,7 +850,7 @@ def test_CoupledTimeSeriesDataset_get(
     zarr_ds_no_const = zarr_ds.drop_vars("constants")
     timeseries_ds = CoupledTimeSeriesDataset(
         dataset=zarr_ds_no_const,
-        input_variables=variables,
+        input_variables=input_variables,
         scaling=scaling_double_dict,
         batch_size=1,
         forecast_init_times=zarr_ds.time[:init_times],
@@ -846,13 +875,14 @@ def test_CoupledTimeSeriesDataModule_initialization(
     )
 
     variables = ["z500", "z1000"]
+    # these have to be in the dataset otherwise the tests will fail
     splits = {
-        "train_date_start": "1959-01-01",
-        "train_date_end": "1998-12-31T18:00",
-        "val_date_start": "1999-01-01",
-        "val_date_end": "2000-12-31T18:00",
-        "test_date_start": "2017-01-01",
-        "test_date_end": "2018-12-31T18:00",
+        "train_date_start": "1979-01-01",
+        "train_date_end": "1979-01-01T21:00",
+        "val_date_start": "1979-01-02",
+        "val_date_end": "1979-01-02T09:00",
+        "test_date_start": "1979-01-02T12:00",
+        "test_date_end": "1979-01-02T18:00",
     }
 
     constant_coupler = [
@@ -885,6 +915,21 @@ def test_CoupledTimeSeriesDataModule_initialization(
             couplings=constant_coupler,
         )
 
+    # test with channels not in dataset
+    with pytest.raises(
+        KeyError, match=("Input, coupled, or output variables not found")
+    ):
+        timeseries_dm = CoupledTimeSeriesDataModule(
+            src_directory=data_dir,
+            dst_directory=data_dir,
+            dataset_name=dataset_name,
+            input_variables=["non_existant"],
+            batch_size=1,
+            prebuilt_dataset=True,
+            scaling=scaling_double_dict,
+            couplings=constant_coupler,
+        )
+
     # use the prebuilt dataset
     # Internally initializes DistributedManager
     timeseries_dm = CoupledTimeSeriesDataModule(
@@ -899,18 +944,18 @@ def test_CoupledTimeSeriesDataModule_initialization(
     )
     assert isinstance(timeseries_dm, CoupledTimeSeriesDataModule)
 
-    # without the prebuilt dataset
-    timeseries_dm = CoupledTimeSeriesDataModule(
-        src_directory=create_path,
-        dst_directory=create_path,
-        dataset_name=dataset_name,
-        input_variables=variables,
-        batch_size=1,
-        prebuilt_dataset=False,
-        scaling=scaling_double_dict,
-        couplings=constant_coupler,
-    )
-    assert isinstance(timeseries_dm, CoupledTimeSeriesDataModule)
+    # test fail without the prebuilt dataset
+    with pytest.raises(ValueError, match=("Only prebuilt datasets are supported")):
+        timeseries_dm = CoupledTimeSeriesDataModule(
+            src_directory=create_path,
+            dst_directory=create_path,
+            dataset_name=dataset_name,
+            input_variables=variables,
+            batch_size=1,
+            prebuilt_dataset=False,
+            scaling=scaling_double_dict,
+            couplings=constant_coupler,
+        )
 
     # with init times
     timeseries_dm = CoupledTimeSeriesDataModule(
@@ -1251,7 +1296,7 @@ def test_CoupledTimeSeriesDataset_next_integration(
         scaling=scaling_dict,
         batch_size=batch_size,
         couplings=constant_coupler,
-        data_time_step="6h",
+        data_time_step="3h",
         time_step="6h",
         drop_last=True,
         add_insolation=True,
@@ -1304,7 +1349,7 @@ def test_CoupledTimeSeriesDataset_next_integration(
         scaling=scaling_dict,
         batch_size=batch_size,
         couplings=[],
-        data_time_step="6h",
+        data_time_step="3h",
         time_step="6h",
         drop_last=True,
         add_insolation=True,
