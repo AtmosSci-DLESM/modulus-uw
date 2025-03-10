@@ -424,10 +424,14 @@ class TimeSeriesDataset(Dataset, Datapipe):
         batch = {"time": slice(*time_index)}
         load_time = time.time()
 
+        # data from the input and target arrays overlap, to avoid 2 seperate loads
+        # we load both and then slice it later
+        channels = list(set(self.input_variables).union(self.output_variables))
+        staging_ds = self.ds["inputs"].sel(channel_in=channels).isel(**batch).compute()
+
         input_array = (
-            self.ds["inputs"]
+            staging_ds
             .sel(channel_in=self.input_variables)
-            .isel(**batch)
             .values.copy()
         )
         input_array = (input_array - self.input_scaling["mean"]) / self.input_scaling[
@@ -436,9 +440,8 @@ class TimeSeriesDataset(Dataset, Datapipe):
 
         if not self.forecast_mode:
             target_array = (
-                self.ds["inputs"]
+                staging_ds
                 .sel(channel_in=self.output_variables)
-                .isel(**batch)
                 .values.copy()
             )
             target_array = (
@@ -487,6 +490,13 @@ class TimeSeriesDataset(Dataset, Datapipe):
                     if self.forecast_mode
                     else sol[self._input_indices[sample] + self._output_indices[sample]]
                 )
+
+        # Explicitly delete large temporary arrays so they can be garbage-collected
+        del staging_ds
+        del input_array
+        if not self.forecast_mode:
+            del target_array
+        gc.collect()
 
         inputs_result = [inputs]
         if self.add_insolation:

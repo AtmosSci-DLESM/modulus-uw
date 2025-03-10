@@ -197,10 +197,14 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         batch = {"time": slice(*time_index)}
         load_time = time.time()
 
+        # data from the input and target arrays overlap, to avoid 2 seperate loads
+        # we load both and then slice it later
+        channels = list(set(self.input_variables).union(self.output_variables))
+        staging_ds = self.ds["inputs"].sel(channel_in=channels).isel(**batch).compute()
+
         input_array = (
-            self.ds["inputs"]
+            staging_ds
             .sel(channel_in=self.input_variables)
-            .isel(**batch)
             .values.copy()
         )
         # retrieve coupled inputs
@@ -221,9 +225,8 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             #     leaving this in here as a warning
             # target_array = self.ds['targets'].isel(**batch).to_numpy()
             target_array = (
-                self.ds["inputs"]
+                staging_ds
                 .sel(channel_in=self.output_variables)
-                .isel(**batch)
                 .values.copy()
             )
             target_array = (
@@ -298,6 +301,7 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
                     )
 
         # Explicitly delete large temporary arrays so they can be garbage-collected
+        del staging_ds
         del input_array
         if not self.forecast_mode:
             del target_array
