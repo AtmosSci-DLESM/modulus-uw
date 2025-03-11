@@ -74,6 +74,7 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         add_train_noise: bool = False,
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
+        gc_interval: int = 10,
     ):
         """
         Parameters
@@ -127,6 +128,8 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             Dictionary containing parameters for adding noise to the training data
         train_noise_seed: int, optional
             Seed for the random number generator for adding noise to the training data, default 42
+        gc_interval: int, optional
+            Interval for garbage collection using -1 disables gc collection, default 10
         """
         self.input_variables = input_variables
         self.output_variables = (
@@ -160,6 +163,7 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             add_insolation=add_insolation,
             forecast_init_times=forecast_init_times,
             meta=meta,
+            gc_interval=gc_interval,
         )
         # calculate static indices for coupling
         for c in self.couplings:
@@ -310,7 +314,11 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         del input_array
         if not self.forecast_mode:
             del target_array
-        gc.collect()
+
+        if self.current_gc_cycle == self.gc_interval:
+            gc.collect()
+            self.current_gc_cycle = -1
+        self.current_gc_cycle += 1
 
         inputs_result = [inputs]
         if self.add_insolation:

@@ -67,6 +67,7 @@ class TimeSeriesDataset(Dataset, Datapipe):
         drop_last: bool = False,
         add_insolation: bool = False,
         forecast_init_times: Optional[Sequence] = None,
+        gc_interval: int = 10,
         meta: DatapipeMetaData = MetaData(),
     ):
         """
@@ -108,6 +109,8 @@ class TimeSeriesDataset(Dataset, Datapipe):
             Note that:
                 - providing this parameter configures the data loader to only produce this number of samples, and
                     NOT produce any target array.
+        gc_interval: int, optional
+            Number of batches to process before garbage collection, -1 disables gc, default 10
         meta: DatapipeMetaData, optional
             Data class for storing essential meta data
         """
@@ -132,6 +135,8 @@ class TimeSeriesDataset(Dataset, Datapipe):
             input_variables if output_variables is None else output_variables
         )
         self.constant_variables = constant_variables
+        self.gc_interval = gc_interval
+        self.current_gc_cycle = 0
 
         # Time stepping
         if (self.time_step % self.data_time_step).total_seconds() != 0:
@@ -502,7 +507,11 @@ class TimeSeriesDataset(Dataset, Datapipe):
         del input_array
         if not self.forecast_mode:
             del target_array
-        gc.collect()
+
+        if self.current_gc_cycle == self.gc_interval:
+            gc.collect()
+            self.current_gc_cycle = -1
+        self.current_gc_cycle += 1
 
         inputs_result = [inputs]
         if self.add_insolation:
