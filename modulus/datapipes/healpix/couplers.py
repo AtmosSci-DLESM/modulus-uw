@@ -155,8 +155,8 @@ class ConstantCoupler:
             {"index": "channel_in"}
         )
         self.coupled_scaling = {
-            "mean": np.expand_dims(coupled_scaling["mean"].values.copy(), (0, 2, 3, 4)),
-            "std": np.expand_dims(coupled_scaling["std"].values.copy(), (0, 2, 3, 4)),
+            "mean": np.expand_dims(coupled_scaling["mean"].to_numpy(), (0, 2, 3, 4)),
+            "std": np.expand_dims(coupled_scaling["std"].to_numpy(), (0, 2, 3, 4)),
         }
 
     def setup_coupling(self, coupled_module):
@@ -249,12 +249,10 @@ class ConstantCoupler:
             )
 
             # extract coupled variables and scale lazily
-            input_array = self.ds.inputs.sel(channel_in=self.variables)
-            ds = (input_array - self.coupled_scaling["mean"]) / self.coupled_scaling[
-                "std"
-            ]
-            # load before entering loop for efficiency
-            ds_index_range = ds.isel(time=index_range).load()
+            # do inplace scaling to avoid allocating temporary arrays
+            ds_index_range = self.ds.inputs.sel(channel_in=self.variables).isel(time=index_range).compute()
+            ds_index_range -= self.coupled_scaling["mean"]
+            ds_index_range /= self.coupled_scaling["std"]
 
             # use static offsets to create integrated coupling array
             for b in range(bsize):
@@ -264,7 +262,7 @@ class ConstantCoupler:
                     )
                     self.integrated_couplings[
                         b, i, :, :, :
-                    ] = coupling_temp.values.copy().reshape(
+                    ] = coupling_temp.to_numpy().reshape(
                         (self.timevar_dim,) + coupling_temp.shape[2:]
                     )
 
@@ -392,8 +390,8 @@ class TrailingAverageCoupler:
             {"index": "channel_in"}
         )
         self.coupled_scaling = {
-            "mean": np.expand_dims(coupled_scaling["mean"].values.copy(), (0, 2, 3, 4)),
-            "std": np.expand_dims(coupled_scaling["std"].values.copy(), (0, 2, 3, 4)),
+            "mean": np.expand_dims(coupled_scaling["mean"].to_numpy(), (0, 2, 3, 4)),
+            "std": np.expand_dims(coupled_scaling["std"].to_numpy(), (0, 2, 3, 4)),
         }
 
     def _set_time_increments(self):
@@ -544,7 +542,7 @@ class TrailingAverageCoupler:
                     )
                     self.integrated_couplings[
                         b, i, :, :, :
-                    ] = coupling_temp.values.copy().reshape(
+                    ] = coupling_temp.to_numpy().reshape(
                         (self.timevar_dim,) + coupling_temp.shape[2:]
                     )
 

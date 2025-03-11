@@ -195,13 +195,13 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:load_batch")
         time_index, this_batch = self._get_time_index(item)
         batch = {"time": slice(*time_index)}
-        load_time = time.time()
 
         # data from the input and target arrays overlap, to avoid 2 seperate loads
         # we load both and then slice it later
         channels = list(set(self.input_variables).union(self.output_variables))
         staging_ds = self.ds["inputs"].sel(channel_in=channels).isel(**batch).compute()
 
+        torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:load_input")
         input_array = (
             staging_ds
             .sel(channel_in=self.input_variables)
@@ -217,10 +217,15 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
                 axis=2,
             )
 
-        input_array = (input_array - self.input_scaling["mean"]) / self.input_scaling[
-            "std"
-        ]
+        # we do the scaling as in place operations to avoid creating temp arrays
+        # that result in a lot of data movement. This is around 4x faster than using
+        # standard operations
+        input_array -= self.input_scaling["mean"]
+        input_array /= self.input_scaling["std"]
+        torch.cuda.nvtx.range_pop() # CoupledTimeSeriesDataset:__getitem__:load_input
+
         if not self.forecast_mode:
+            torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:load_target")
             # BAD NEWS: Indexing the array as commented out below causes unexpected behavior in target creation.
             #     leaving this in here as a warning
             # target_array = self.ds['targets'].isel(**batch).to_numpy()
@@ -229,14 +234,15 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
                 .sel(channel_in=self.output_variables)
                 .values.copy()
             )
-            target_array = (
-                target_array - self.target_scaling["mean"]
-            ) / self.target_scaling["std"]
+            # we do the scaling as in place operations to avoid creating temp arrays
+            # that result in a lot of data movement. This is around 4x faster than using
+            # standard operations
+            target_array -= self.target_scaling["mean"]
+            target_array /= self.target_scaling["std"]
             # target_array = ((self.ds['targets'].isel(**batch) - self.target_scaling['mean']) /
             #                self.target_scaling['std']).compute()
-
-        logger.log(5, "loaded batch data in %0.2f s", time.time() - load_time)
-        torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_pop() # CoupledTimeSeriesDataset:__getitem__:load_target
+        torch.cuda.nvtx.range_pop() # CoupledTimeSeriesDataset:__getitem__:load_batch
 
         torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:process_batch")
         # Insolation
@@ -282,7 +288,6 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
                 )
 
         if not self.forecast_mode and self.add_train_noise:
-            logger.log(5, "Adding gaussian noise to inputs and integrated_couplings")
             # Iterate over C: inputs.shape = [B, T, C, F, H, W]
             for i in range(inputs.shape[2]):
                 inputs[:, :, i] += self.rng.normal(
@@ -326,17 +331,16 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         if len(self.couplings) > 0:
             inputs_result.append(integrated_couplings)
 
-        torch.cuda.nvtx.range_pop()
-
-        # finish range
-        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop() # CoupledTimeSeriesDataset:__getitem__:process_batch
 
         if self.forecast_mode:
+            torch.cuda.nvtx.range_pop() # CoupledTimeSeriesDataset:__getitem__
             return inputs_result
 
         # we also need to transpose targets
         targets = np.transpose(targets, axes=(0, 3, 1, 2, 4, 5))
 
+        torch.cuda.nvtx.range_pop() # CoupledTimeSeriesDataset:__getitem__
         return inputs_result, targets
 
     def next_integration(self, model_outputs, constants):

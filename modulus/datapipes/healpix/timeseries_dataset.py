@@ -422,37 +422,43 @@ class TimeSeriesDataset(Dataset, Datapipe):
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_batch")
         time_index, this_batch = self._get_time_index(item)
         batch = {"time": slice(*time_index)}
-        load_time = time.time()
 
         # data from the input and target arrays overlap, to avoid 2 seperate loads
         # we load both and then slice it later
         channels = list(set(self.input_variables).union(self.output_variables))
         staging_ds = self.ds["inputs"].sel(channel_in=channels).isel(**batch).compute()
 
+        torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_input")
         input_array = (
             staging_ds
             .sel(channel_in=self.input_variables)
             .values.copy()
         )
-        input_array = (input_array - self.input_scaling["mean"]) / self.input_scaling[
-            "std"
-        ]
+        # we do the scaling as in place operations to avoid creating temp arrays
+        # that result in a lot of data movement. This is around 4x faster than using
+        # standard operations
+        input_array -= self.input_scaling["mean"]
+        input_array /= self.input_scaling["std"]
+        torch.cuda.nvtx.range_pop() # TimeSeriesDataset:__getitem__:load_input
 
         if not self.forecast_mode:
+            torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_target")
             target_array = (
                 staging_ds
                 .sel(channel_in=self.output_variables)
                 .values.copy()
             )
-            target_array = (
-                target_array - self.target_scaling["mean"]
-            ) / self.target_scaling["std"]
+            # we do the scaling as in place operations to avoid creating temp arrays
+            # that result in a lot of data movement. This is around 4x faster than using
+            # standard operations
+            target_array -= self.target_scaling["mean"]
+            target_array /= self.target_scaling["std"]
+            torch.cuda.nvtx.range_pop() # TimeSeriesDataset:__getitem__:load_target
 
-        logger.log(5, "loaded batch data in %0.2f s", time.time() - load_time)
-        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop() # TimeSeriesDataset:__getitem__:load_batch
 
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:process_batch")
-        compute_time = time.time()
+
         # Insolation
         if self.add_insolation:
             sol = insolation(
@@ -511,17 +517,14 @@ class TimeSeriesDataset(Dataset, Datapipe):
         if self.constant_variables:
             # Add the constants as [F, C, H, W]
             inputs_result.append(self.constants)
-
-        logger.log(5, "computed batch in %0.2f s", time.time() - compute_time)
-        torch.cuda.nvtx.range_pop()
-
-        # finish range
-        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop() # TimeSeriesDataset:__getitem__:process_batch
 
         if self.forecast_mode:
+            torch.cuda.nvtx.range_pop() # TimeSeriesDataset:__getitem__
             return inputs_result
 
         # we also need to transpose targets
         targets = np.transpose(targets, axes=(0, 3, 1, 2, 4, 5))
-
+        
+        torch.cuda.nvtx.range_pop() # TimeSeriesDataset:__getitem__
         return inputs_result, targets
