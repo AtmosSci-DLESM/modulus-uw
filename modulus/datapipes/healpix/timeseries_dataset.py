@@ -132,6 +132,7 @@ class TimeSeriesDataset(Dataset, Datapipe):
             input_variables if output_variables is None else output_variables
         )
         self.constant_variables = constant_variables
+        self.all_variables = list(set(self.input_variables).union(self.output_variables))
 
         # Time stepping
         if (self.time_step % self.data_time_step).total_seconds() != 0:
@@ -304,6 +305,20 @@ class TimeSeriesDataset(Dataset, Datapipe):
                 f"Target channels {missing} not found in the scaling config dict data.scaling ({list(self.scaling.keys())})"
             )
 
+        # create a scaling that includes all input and target variables, all variables have to be in the dataset otherwise
+        # one of the earlier checks would have caught a problem
+        self.all_scaling = scaling_da.sel(index=self.all_variables).rename(
+            {"index": "channel_in"}
+        )
+        self.all_scaling = {
+            "mean": np.expand_dims(
+                self.all_scaling["mean"].values.copy(), (0, 2, 3, 4)
+            ),
+            "std": np.expand_dims(
+                self.all_scaling["std"].values.copy(), (0, 2, 3, 4)
+            ),
+        }
+
         try:
             # not all datasets will have constants
             if self.constant_variables:
@@ -425,8 +440,16 @@ class TimeSeriesDataset(Dataset, Datapipe):
 
         # data from the input and target arrays overlap, to avoid 2 seperate loads
         # we load both and then slice it later
-        channels = list(set(self.input_variables).union(self.output_variables))
-        staging_ds = self.ds["inputs"].sel(channel_in=channels).isel(**batch).compute()
+        staging_ds = self.ds["inputs"].sel(channel_in=self.all_channels).isel(**batch).compute()
+
+        # we scale this dataset to avoid doing twice the work when we scale as both
+        # input and output
+        # data is scaled using in place operations to avoid the overhead of creating
+        # temporary arrays
+        torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:scale_batch")
+        staging_ds -= self.input_scaling["mean"]
+        staging_ds /= self.input_scaling["std"]
+        torch.cuda.nvtx.range_pop() # TimeSeriesDataset:__getitem__:scale_batch
 
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_input")
         input_array = (
@@ -434,11 +457,6 @@ class TimeSeriesDataset(Dataset, Datapipe):
             .sel(channel_in=self.input_variables)
             .values.copy()
         )
-        # we do the scaling as in place operations to avoid creating temp arrays
-        # that result in a lot of data movement. This is around 4x faster than using
-        # standard operations
-        input_array -= self.input_scaling["mean"]
-        input_array /= self.input_scaling["std"]
         torch.cuda.nvtx.range_pop() # TimeSeriesDataset:__getitem__:load_input
 
         if not self.forecast_mode:
@@ -448,13 +466,7 @@ class TimeSeriesDataset(Dataset, Datapipe):
                 .sel(channel_in=self.output_variables)
                 .values.copy()
             )
-            # we do the scaling as in place operations to avoid creating temp arrays
-            # that result in a lot of data movement. This is around 4x faster than using
-            # standard operations
-            target_array -= self.target_scaling["mean"]
-            target_array /= self.target_scaling["std"]
             torch.cuda.nvtx.range_pop() # TimeSeriesDataset:__getitem__:load_target
-
         torch.cuda.nvtx.range_pop() # TimeSeriesDataset:__getitem__:load_batch
 
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:process_batch")

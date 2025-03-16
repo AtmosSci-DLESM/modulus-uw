@@ -198,15 +198,29 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
 
         # data from the input and target arrays overlap, to avoid 2 seperate loads
         # we load both and then slice it later
-        channels = list(set(self.input_variables).union(self.output_variables))
-        staging_ds = self.ds["inputs"].sel(channel_in=channels).isel(**batch).compute()
+        torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:load_staging_data")
+        staging_ds = self.ds["inputs"].sel(channel_in=self.all_variables).isel(**batch).compute()
+        torch.cuda.nvtx.range_pop() # CoupledTimeSeriesDataset:__getitem__:load_staging_data
+
+        # we scale this dataset to avoid doing twice the work when we scale as both
+        # input and outpu      
+        # we do the scaling as in place operations to avoid creating temp arrays
+        # that result in a lot of data movement. This is around 4x faster than using
+        # standard operations
+        torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:scale_staging_data")
+        staging_ds -= self.input_scaling["mean"]
+        staging_ds /= self.input_scaling["std"]
+        torch.cuda.nvtx.range_pop() # CoupledTimeSeriesDataset:__getitem__:scale_staging_data
 
         torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:load_input")
         input_array = (
             staging_ds
             .sel(channel_in=self.input_variables)
-            .values.copy()
+            .values
         )
+        torch.cuda.nvtx.range_pop() # CoupledTimeSeriesDataset:__getitem__:load_input
+
+        torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:retrieve_coupled")
         # retrieve coupled inputs
         if len(self.couplings) > 0:
             integrated_couplings = np.concatenate(
@@ -216,13 +230,7 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
                 ],
                 axis=2,
             )
-
-        # we do the scaling as in place operations to avoid creating temp arrays
-        # that result in a lot of data movement. This is around 4x faster than using
-        # standard operations
-        input_array -= self.input_scaling["mean"]
-        input_array /= self.input_scaling["std"]
-        torch.cuda.nvtx.range_pop() # CoupledTimeSeriesDataset:__getitem__:load_input
+        torch.cuda.nvtx.range_pop() # CoupledTimeSeriesDataset:__getitem__:retrieve_coupled
 
         if not self.forecast_mode:
             torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:load_target")
@@ -232,15 +240,8 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             target_array = (
                 staging_ds
                 .sel(channel_in=self.output_variables)
-                .values.copy()
+                .values
             )
-            # we do the scaling as in place operations to avoid creating temp arrays
-            # that result in a lot of data movement. This is around 4x faster than using
-            # standard operations
-            target_array -= self.target_scaling["mean"]
-            target_array /= self.target_scaling["std"]
-            # target_array = ((self.ds['targets'].isel(**batch) - self.target_scaling['mean']) /
-            #                self.target_scaling['std']).compute()
             torch.cuda.nvtx.range_pop() # CoupledTimeSeriesDataset:__getitem__:load_target
         torch.cuda.nvtx.range_pop() # CoupledTimeSeriesDataset:__getitem__:load_batch
 
