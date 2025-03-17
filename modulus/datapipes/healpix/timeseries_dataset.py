@@ -447,8 +447,8 @@ class TimeSeriesDataset(Dataset, Datapipe):
         # data is scaled using in place operations to avoid the overhead of creating
         # temporary arrays
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:scale_batch")
-        staging_ds -= self.input_scaling["mean"]
-        staging_ds /= self.input_scaling["std"]
+        staging_ds.values -= self.input_scaling["mean"]
+        staging_ds.values /= self.input_scaling["std"]
         torch.cuda.nvtx.range_pop() # TimeSeriesDataset:__getitem__:scale_batch
 
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_input")

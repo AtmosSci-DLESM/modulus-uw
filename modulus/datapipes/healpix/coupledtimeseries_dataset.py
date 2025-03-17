@@ -208,8 +208,8 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         # that result in a lot of data movement. This is around 4x faster than using
         # standard operations
         torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:scale_staging_data")
-        staging_ds -= self.input_scaling["mean"]
-        staging_ds /= self.input_scaling["std"]
+        staging_ds.values -= self.input_scaling["mean"]
+        staging_ds.values /= self.input_scaling["std"]
         torch.cuda.nvtx.range_pop() # CoupledTimeSeriesDataset:__getitem__:scale_staging_data
 
         torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:load_input")
