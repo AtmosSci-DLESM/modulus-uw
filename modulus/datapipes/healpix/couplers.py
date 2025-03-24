@@ -87,16 +87,16 @@ class ConstantCoupler:
         self.integrated_couplings = None
 
         if not prepared_coupled_data:
-            print(
-                "Assuming coupled data is not preprocessed, averaging fields in as designed in\
- TrailingAverageCoupler. See docs for specifics."
-            )
+#             print(
+#                 "Assuming coupled data is not preprocessed, averaging fields in as designed in\
+#  TrailingAverageCoupler. See docs for specifics."
+#             )
             self._prepare_coupled_data()
-        else:
-            print(
-                '**Assuming coupled data has been prepared properly, using coupled field[s] from\
- dataset "as-is"**'
-            )
+        # else:
+#             print(
+#                 '**Assuming coupled data has been prepared properly, using coupled field[s] from\
+#  dataset "as-is"**'
+#             )
 
     def _compute_coupled_integration_dim(self):
 
@@ -149,7 +149,8 @@ class ConstantCoupler:
 
         # To expediate the coupling process the coupled_forecast
         # get proper channels from coupled component output
-        output_channels = coupled_module.output_variables
+        self.output_variables = coupled_module.output_variables
+        channel_indices = []
         # A bit convoluted. Prepared coupled variables
         # are given a suffix for training associated with their
         # trailing average increment e.g. 'z1000-48H'. To extract
@@ -157,16 +158,37 @@ class ConstantCoupler:
         # we check if the coupled model output var is in self.variables.
         #
         # for example 'z1000' is in 'z1000-48H'
-        channel_indices = [
-            i for i, oc in enumerate(output_channels) for v in self.variables if oc in v
-        ]
+        for v in self.variables: 
+            for i, oc in enumerate(self.output_variables):
+                if '-' not in v:
+                    if oc in v and len(oc) == len(v):
+                        channel_indices.append(i)
+                else:
+                    if oc in v and oc == v.split('-')[0]:
+                        channel_indices.append(i)
         self.coupled_channel_indices = channel_indices
+
+    def setup_st_coupling(self, coupled_module):
+        # To expediate the coupling process the coupled_forecast
+        # get proper channels from coupled component output 
+        self.output_st_variables = coupled_module.output_variables
+        channel_indices = []
+        for v in self.variables: 
+            for i, oc in enumerate(self.output_st_variables):
+                if '-' not in v:
+                    if oc in v and len(oc) == len(v):
+                        channel_indices.append(i)
+                else:
+                    if oc in v and oc == v.split('-')[0]:
+                        channel_indices.append(i)
+        self.coupled_st_channel_indices = channel_indices
 
     def reset_coupler(self):
 
         self.coupled_mode = False
         self.integrated_couplings = None
         self.preset_coupled_fields = None
+        self.preset_st_coupled_fields = None
 
     def set_coupled_fields(self, coupled_fields):
 
@@ -175,13 +197,22 @@ class ConstantCoupler:
             :, :, :, self.coupled_channel_indices, :, :
         ].permute(0, 2, 3, 1, 4, 5)
         self.preset_coupled_fields = th.empty(
-            [self.coupled_integration_dim, coupled_fields.shape[0], self.timevar_dim]
+            [self.coupled_integration_dim, self.batch_size, self.timevar_dim]
             + list(self.spatial_dims)
         )
         for i in range(len(self.preset_coupled_fields)):
             self.preset_coupled_fields[i, :, :, :, :, :] = coupled_fields[
-                :, -1, :, :, :, :
+                0, -1, :, :, :, :
             ]
+        # flag for construct integrated coupling method to use this array
+        self.coupled_mode = True
+
+    def set_st_coupled_fields(self, coupled_fields):
+        # create buffer for coupling 
+        coupled_fields = coupled_fields[:,:,:,self.coupled_st_channel_indices,:,:].permute(0,2,3,1,4,5)
+        self.preset_st_coupled_fields = th.empty([self.coupled_integration_dim, self.batch_size, self.timevar_dim]+list(self.spatial_dims))
+        for i in range(len(self.preset_st_coupled_fields)):
+            self.preset_st_coupled_fields[i,:,:,:,:,:] = coupled_fields[0,-1,:,:,:,:]
         # flag for construct integrated coupling method to use this array
         self.coupled_mode = True
 
@@ -189,6 +220,7 @@ class ConstantCoupler:
         self,
         batch=None,
         bsize=None,
+        if_st=False,
     ):
 
         """
@@ -200,7 +232,10 @@ class ConstantCoupler:
         :param bsize: int batch size
         """
         if self.coupled_mode:
-            return self.preset_coupled_fields
+            if if_st:
+                return self.preset_st_coupled_fields
+            else:
+                return self.preset_coupled_fields
         else:
             # reset integrated couplings
             self.integrated_couplings = np.empty(
@@ -214,10 +249,12 @@ class ConstantCoupler:
             )
 
             # extract coupled variables and scale lazily
+            # print(f"variables: {self.variables}")
+            # print(f"ds.inputs.channel_in: {self.ds.inputs.channel_in}")
+            # print(f"ds.inputs: {self.ds.inputs}")
             input_array = self.ds.inputs.sel(channel_in=self.variables)
-            ds = (input_array - self.coupled_scaling["mean"]) / self.coupled_scaling[
-                "std"
-            ]
+            ds = (input_array - self.coupled_scaling["mean"]) \
+                / self.coupled_scaling["std"]
             # load before entering loop for efficiency
             ds_index_range = ds.isel(time=index_range).load()
 
@@ -308,16 +345,16 @@ class TrailingAverageCoupler:
         self.coupled_mode = False  # if forecasting with another coupled model
 
         if not prepared_coupled_data:
-            print(
-                "Assuming coupled data is not preprocessed, averaging fields in as designed in\
- TrailingAverageCoupler. See docs for specifics."
-            )
+#             print(
+#                 "Assuming coupled data is not preprocessed, averaging fields in as designed in\
+#  TrailingAverageCoupler. See docs for specifics."
+#             )
             self._prepare_coupled_data()
-        else:
-            print(
-                '**Assuming coupled data has been prepared properly, using coupled field[s] from\
- dataset "as-is"**'
-            )
+        # else:
+#             print(
+#                 '**Assuming coupled data has been prepared properly, using coupled field[s] from\
+#  dataset "as-is"**'
+#             )
 
     def compute_coupled_indices(self, interval, data_time_step):
 
@@ -385,7 +422,8 @@ class TrailingAverageCoupler:
 
         # To expediate the coupling process the coupled_forecast
         # get proper channels from coupled component output
-        output_channels = coupled_module.output_variables
+        self.output_variables = coupled_module.output_variables
+        channel_indices = []
         # A bit convoluted. Prepared coupled variables
         # are given a suffix for training associated with their
         # trailing average increment e.g. 'z1000-48H'. To extract
@@ -393,28 +431,25 @@ class TrailingAverageCoupler:
         # we check if the coupled model output var is in self.variables.
         #
         # for example 'z1000' is in 'z1000-48H'
-        channel_indices = [
-            i for i, oc in enumerate(output_channels) for v in self.variables if oc in v
-        ]
+        for v in self.variables: 
+            for i, oc in enumerate(self.output_variables):
+                if '-' not in v:
+                    if oc in v and len(oc) == len(v):
+                        channel_indices.append(i)
+                else:
+                    if oc in v and oc == v.split('-')[0]:
+                        channel_indices.append(i)
+                    elif oc in v and oc == v[:-4]: # as for 'tau300-700-48H', there are 2 '-'
+                        channel_indices.append(i)
         self.coupled_channel_indices = channel_indices
 
-        # find averaging periods from componenet output
-        averaging_window_max_indices = [
-            i // pd.Timedelta(coupled_module.time_step) for i in self.input_times
-        ]
+        averaging_window_max_indices = [i //pd.Timedelta(coupled_module.time_step) for i in self.input_times]
         di = averaging_window_max_indices[0]
-        # TODO: Now support output_time_dim =/= input_time_dim, but presteps need to be 0, will add support for presteps>0
         averaging_slices = []
-        for j in range(self.coupled_integration_dim):
-            averaging_slices.append([])
-            for i, r in enumerate(averaging_window_max_indices):
-                averaging_slices[j].append(
-                    slice(
-                        self.input_time_dim * j * di + i * di,
-                        self.input_time_dim * j * di + r,
-                    )
-                )
-        self.averaging_slices = averaging_slices
+        for i,r in enumerate(averaging_window_max_indices):
+             averaging_slices.append(slice(i*di,r))
+        self.averaging_slices=averaging_slices
+
 
     def reset_coupler(self):
 
@@ -423,21 +458,53 @@ class TrailingAverageCoupler:
         self.preset_coupled_fields = None
 
     def set_coupled_fields(self, coupled_fields):
-
-        coupled_fields = coupled_fields[:, :, :, self.coupled_channel_indices, :, :]
-        # TODO: Now support output_time_dim =/= input_time_dim, but presteps need to be 0, will add support for presteps>0
-        coupled_averaging_periods = []
-        for j in range(self.coupled_integration_dim):
-            averaging_periods = [
-                coupled_fields[:, :, s, :, :, :].mean(dim=2, keepdim=True)
-                for s in self.averaging_slices[j]
-            ]
-            coupled_averaging_periods.append(th.concat(averaging_periods, dim=3))
-        self.preset_coupled_fields = th.concat(
-            coupled_averaging_periods, dim=2
-        ).permute(2, 0, 3, 1, 4, 5)
+        '''
+        only used for forecasting
+        coupled_fields is atmos_output [B, F, T, C, H, W],   [1, 12, 16, 8, 32, 32] 
+        '''
+        coupled_fields = coupled_fields[:,:,:,self.coupled_channel_indices,:,:]
+        averaging_periods = [] 
+        for s in self.averaging_slices:
+            averaging_periods.append(coupled_fields[:,:,s,:,:,:].mean(dim=2,keepdim=True))
+        self.preset_coupled_fields = th.concat(averaging_periods, dim=3).permute(2,0,3,1,4,5)
+        # preset_coupled_fields is [T, B, C, F, H, W], torch.Size([1, 1, 4, 12, 32, 32])
         # flag for construct integrated coupling method to use this array
         self.coupled_mode = True
+
+
+
+    def update_scaling(self, integrated_couplings, scaling_da):
+
+        # for i in self.coupled_channel_indices:
+        #     print(f'output_variables: {self.output_variables[i]}')
+
+        # print(f"integrated_couplings: {integrated_couplings.shape}")
+
+        old_scaling = scaling_da.sel(index=[self.output_variables[i] for i in self.coupled_channel_indices]).rename({'index':'channel_in'})
+
+        # print(f"old_scaling: {old_scaling}")
+
+        n_avergaing_periods = len(self.averaging_slices)
+        old_scaling_mean = np.expand_dims( np.tile(old_scaling['mean'].to_numpy(), n_avergaing_periods),
+                                                        (0,1,3,4,5))
+        old_scaling_std = np.expand_dims( np.tile(old_scaling['std'].to_numpy(), n_avergaing_periods),
+                                                        (0,1,3,4,5))
+        new_scaling_mean = np.expand_dims( np.tile(self.coupled_scaling['mean'].squeeze(), n_avergaing_periods),
+                                                        (0,1,3,4,5))
+        new_scaling_std = np.expand_dims( np.tile(self.coupled_scaling['std'].squeeze(), n_avergaing_periods),
+                                                        (0,1,3,4,5))
+        
+        # print(f"old_scaling_mean: {old_scaling['mean'].to_numpy()}")
+        # print(f"old_scaling_std: {old_scaling['std'].to_numpy()}")
+        # print(f"new_scaling_mean: {self.coupled_scaling['mean'].squeeze()}")
+        # print(f"new_scaling_std: {self.coupled_scaling['std'].squeeze()}")
+
+        # update scaling
+        update_integrated_couplings = integrated_couplings * old_scaling_std + old_scaling_mean
+        update_integrated_couplings = (update_integrated_couplings - new_scaling_mean) / new_scaling_std
+        return update_integrated_couplings
+
+
 
     def construct_integrated_couplings(
         self,

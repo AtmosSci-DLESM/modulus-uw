@@ -471,3 +471,158 @@ class HEALPixRecUNet(Module):
         """Resets the state of the network"""
         self.encoder.reset()
         self.decoder.reset()
+
+
+
+class HEALPixRecUNet_STCoupler(HEALPixRecUNet):
+    def __init__(
+            self,
+            encoder: DictConfig,
+            decoder: DictConfig,
+            input_channels: int,
+            output_channels: int,
+            n_constants: int,
+            decoder_input_channels: int,
+            input_time_dim: int,
+            output_time_dim: int,
+            delta_time: str = "6h",
+            reset_cycle: str = "24h",
+            presteps: int = 1,
+            enable_nhwc: bool = False,
+            enable_healpixpad: bool = False,
+            couplings: list = [],
+            st_couplings: list = [],
+    ):
+        # Store st_couplings before calling parent constructor
+        self.st_couplings = st_couplings
+        self.st_coupled_channels = self._compute_coupled_channels(st_couplings)
+
+        super().__init__(
+            encoder, decoder, input_channels, output_channels, n_constants,
+            decoder_input_channels, input_time_dim, output_time_dim, delta_time,
+            reset_cycle, presteps, enable_nhwc, enable_healpixpad
+        )
+
+        self.couplings = couplings
+        self.coupled_channels = self._compute_coupled_channels(couplings)
+    
+        self.encoder = instantiate(
+            config=encoder,
+            input_channels=self._compute_input_channels(),
+            enable_nhwc=self.enable_nhwc,
+            enable_healpixpad=self.enable_healpixpad,
+        )
+        self.encoder_depth = len(self.encoder.n_channels)
+        self.decoder = instantiate(
+            config=decoder,
+            output_channels=self._compute_output_channels(),
+            enable_nhwc=self.enable_nhwc,
+            enable_healpixpad=self.enable_healpixpad,
+        )
+        
+    def _compute_input_channels(self) -> int:
+        # Override parent method to include st_coupled_channels
+        return self.input_time_dim * (self.input_channels + self.decoder_input_channels) \
+               + self.n_constants + self.coupled_channels + self.st_coupled_channels
+
+    def _reshape_inputs(self, inputs: Sequence, step: int = 0) -> th.Tensor:
+        """
+        Modified version of reshape_inputs that handles both regular couplings and st_couplings
+        """
+        if len(self.couplings) > 0 or len(self.st_couplings) > 0:
+            if not (self.n_constants > 0 or self.decoder_input_channels > 0):
+                raise NotImplementedError('Support for coupled models with no constant fields '
+                                       'or decoder inputs (TOA insolation) is not available at this time.')
+
+            result = [
+                inputs[0].flatten(start_dim=self.channel_dim, end_dim=self.channel_dim+1),
+                inputs[1][:, :, slice(step*self.input_time_dim, (step+1)*self.input_time_dim), ...].flatten(
+                    start_dim=self.channel_dim, end_dim=self.channel_dim+1),  # DI
+                inputs[2].expand(*tuple([inputs[0].shape[0]] + len(inputs[2].shape) * [-1])),  # constants
+            ]
+            
+            # Add regular couplings if present
+            if len(self.couplings) > 0:
+                result.append(inputs[3].permute(0, 2, 1, 3, 4))  # coupled inputs
+                
+            # Add st_couplings if present
+            if len(self.st_couplings) > 0:
+                result.append(inputs[4].permute(0, 2, 1, 3, 4))  # st_coupled inputs
+                
+            res = th.cat(result, dim=self.channel_dim)
+            
+        else:
+            # Use parent implementation for non-coupled case
+            return super()._reshape_inputs(inputs, step)
+
+        # fold faces into batch dim
+        res = self.fold(res)
+        return res
+
+    def _initialize_hidden(self, inputs: Sequence, outputs: Sequence, step: int) -> None:
+        self.reset()
+        for prestep in range(self.presteps):
+            if step < self.presteps:
+                s = step + prestep
+                input_list = [inputs[0][:, :, s*self.input_time_dim:(s+1)*self.input_time_dim]] + list(inputs[1:3])
+                
+                if len(self.couplings) > 0:
+                    input_list.append(inputs[3][prestep])
+                if len(self.st_couplings) > 0:
+                    input_list.append(inputs[4][prestep])
+                    
+                input_tensor = self._reshape_inputs(inputs=input_list, step=step+prestep)
+            else:
+                s = step - self.presteps + prestep
+                input_list = [outputs[s-1]] + list(inputs[1:3])
+                
+                if len(self.couplings) > 0:
+                    input_list.append(inputs[3][step-(prestep-self.presteps)])
+                if len(self.st_couplings) > 0:
+                    input_list.append(inputs[4][step-(prestep-self.presteps)])
+                    
+                input_tensor = self._reshape_inputs(inputs=input_list, step=s+1)
+                
+            # Forward the data through the model to initialize hidden states
+            self.decoder(self.encoder(input_tensor))
+
+    def forward(self, inputs: Sequence, output_only_last=False) -> th.Tensor:
+        self.reset()
+        outputs = []
+        for step in range(self.integration_steps):
+            # (Re-)initialize recurrent hidden states
+            if (step*(self.delta_t*self.input_time_dim)) % self.reset_cycle == 0:
+                self._initialize_hidden(inputs=inputs, outputs=outputs, step=step)
+            
+            # Construct concatenated input
+            if step == 0:
+                s = self.presteps
+                input_list = [inputs[0][:, :, s*self.input_time_dim:(s+1)*self.input_time_dim]] + list(inputs[1:3])
+                
+                if len(self.couplings) > 0:
+                    input_list.append(inputs[3][s])
+                if len(self.st_couplings) > 0:
+                    input_list.append(inputs[4][s])
+                    
+                input_tensor = self._reshape_inputs(inputs=input_list, step=s)
+            else:
+                input_list = [outputs[-1]] + list(inputs[1:3])
+                
+                if len(self.couplings) > 0:
+                    input_list.append(inputs[3][self.presteps+step])
+                if len(self.st_couplings) > 0:
+                    input_list.append(inputs[4][self.presteps+step])
+                    
+                input_tensor = self._reshape_inputs(inputs=input_list, step=step+self.presteps)
+
+            # Forward through model
+            encodings = self.encoder(input_tensor)
+            decodings = self.decoder(encodings)
+            # Residual prediction
+            reshaped = self._reshape_outputs(input_tensor[:, :self.input_channels*self.input_time_dim] + decodings)
+            outputs.append(reshaped)
+
+        if output_only_last:
+            return outputs[-1]
+        
+        return th.cat(outputs, dim=self.channel_dim)
