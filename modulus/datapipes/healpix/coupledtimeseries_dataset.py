@@ -243,12 +243,12 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
                     ],
                     axis=2,
                 )
-                # update scaling for coupled forecasts
-                for c in self.couplings:
-                    if c.coupled_mode:
-                        scaling_df = pd.DataFrame.from_dict(self.scaling).T
-                        scaling_da = scaling_df.to_xarray().astype('float32')
-                        integrated_couplings = c.update_scaling(integrated_couplings, scaling_da)
+                # # update scaling for coupled forecasts
+                # for c in self.couplings:
+                #     if c.coupled_mode:
+                #         scaling_df = pd.DataFrame.from_dict(self.scaling).T
+                #         scaling_da = scaling_df.to_xarray().astype('float32')
+                #         integrated_couplings = c.update_scaling(integrated_couplings, scaling_da)
 
 
             input_array = (input_array - self.input_scaling["mean"]) / self.input_scaling[
@@ -412,12 +412,12 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             integrated_couplings = np.concatenate(
                 [c.construct_integrated_couplings() for c in self.couplings], axis=2
             )
-            # update scaling for coupled forecasts
-            for c in self.couplings:
-                if c.coupled_mode:
-                    scaling_df = pd.DataFrame.from_dict(self.scaling).T
-                    scaling_da = scaling_df.to_xarray().astype('float32')
-                    integrated_couplings = c.update_scaling(integrated_couplings, scaling_da)
+            # # update scaling for coupled forecasts
+            # for c in self.couplings:
+            #     if c.coupled_mode:
+            #         scaling_df = pd.DataFrame.from_dict(self.scaling).T
+            #         scaling_da = scaling_df.to_xarray().astype('float32')
+            #         integrated_couplings = c.update_scaling(integrated_couplings, scaling_da)
 
             inputs_result.append(torch.tensor(integrated_couplings))
 
