@@ -534,9 +534,9 @@ class HEALPixPadding(th.nn.Module):
         if n+1 > top.shape[-1]:
             raise Exception(f"Padding {self.p} must not exceed half the face height/width {top.shape[-1]}")
 
-        fill_lens = np.arange(1, self.p+1)
-        fill_lens = np.concatenate((fill_lens, fill_lens[-2::-1]))
-        diag_nums = np.arange(self.p-1, -(self.p-1)-1, -1)
+        fill_lens = th.arange(1, p+1)
+        fill_lens = th.cat((fill_lens, th.flip(fill_lens[:-1], dims=(0,))))
+        diag_nums = th.arange(p-1, -(p-1)-1, -1)
         assert(len(fill_lens) == len(diag_nums))
 
         for i in range(n):
@@ -582,15 +582,15 @@ class HEALPixPadding(th.nn.Module):
 
     def br_isolat(self, b: th.Tensor, r: th.Tensor) -> th.Tensor:
         print("USING BR ISOLAT FILLING")
-        ret = th.zeros_like(top)[..., :self.p, :self.p]
+        ret = th.zeros_like(b)[..., :self.p, :self.p]
         n = 2*self.p-1
 
         if n+1 > b.shape[-1]:
             raise Exception(f"Padding {self.p} must not exceed half the face height/width {b.shape[-1]}")
 
-        fill_lens = np.arange(1, self.p+1)
-        fill_lens = np.concatenate((fill_lens, fill_lens[-2::-1]))
-        diag_nums = np.arange(self.p-1, -(self.p-1)-1, -1)
+        fill_lens = th.arange(1, p+1)
+        fill_lens = th.cat((fill_lens, th.flip(fill_lens[:-1], dims=(0,))))
+        diag_nums = th.arange(p-1, -(p-1)-1, -1)
         assert(len(fill_lens) == len(diag_nums))
 
         for i in range(n):
