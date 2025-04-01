@@ -542,7 +542,7 @@ class HEALPixPadding(th.nn.Module):
         for i in range(n):
 
             fill_val = 0.5*(top[..., -i-2, 0] + lft[..., 0, -i-2])
-            diag_indices = kth_diag_indices(self.p, diag_nums[i])
+            diag_indices = self.kth_diag_indices(self.p, diag_nums[i])
             ret[...,diag_indices[0],diag_indices[1]] = th.repeat_interleave(fill_val[...,None], fill_lens[i], axis=-1)
 
         ret = th.rot90(ret, k=-1, dims=(-2,-1))
@@ -596,12 +596,21 @@ class HEALPixPadding(th.nn.Module):
         for i in range(n):
 
             fill_val = 0.5*(b[..., -i-2, -1] + r[..., -1, -i-2])
-            diag_indices = kth_diag_indices(self.p, diag_nums[i])
+            diag_indices = self.kth_diag_indices(self.p, diag_nums[i])
             ret[...,diag_indices[0],diag_indices[1]] = th.repeat_interleave(fill_val[...,None], fill_lens[i], axis=-1)
 
         ret = th.rot90(ret, k=-1, dims=(-2,-1))
         assert(type(ret) == th.Tensor)
         return ret
+
+    def kth_diag_indices(self, n, k):
+        rows, cols = th.arange(n), th.arange(n)
+        if k < 0:
+            return rows[-k:], cols[:k]
+        elif k > 0:
+            return rows[:-k], cols[k:]
+        else:
+            return rows, cols
 
 
 class HEALPixLayer(th.nn.Module):
