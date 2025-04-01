@@ -255,44 +255,44 @@ class HEALPixPadding(th.nn.Module):
         p04 = self.pe(
             c=f04,
             t=f00,
-            tl=self.tl(f00, f03),
+            tl=self.tl_isolat(f00, f03),
             lft=f03,
             bl=f07,
             b=f11,
-            br=self.br(f11, f08),
+            br=self.br_isolat(f11, f08),
             rgt=f08,
             tr=f05,
         )
         p05 = self.pe(
             c=f05,
             t=f01,
-            tl=self.tl(f01, f00),
+            tl=self.tl_isolat(f01, f00),
             lft=f00,
             bl=f04,
             b=f08,
-            br=self.br(f08, f09),
+            br=self.br_isolat(f08, f09),
             rgt=f09,
             tr=f06,
         )
         p06 = self.pe(
             c=f06,
             t=f02,
-            tl=self.tl(f02, f01),
+            tl=self.tl_isolat(f02, f01),
             lft=f01,
             bl=f05,
             b=f09,
-            br=self.br(f09, f10),
+            br=self.br_isolat(f09, f10),
             rgt=f10,
             tr=f07,
         )
         p07 = self.pe(
             c=f07,
             t=f03,
-            tl=self.tl(f03, f02),
+            tl=self.tl_isolat(f03, f02),
             lft=f02,
             bl=f06,
             b=f10,
-            br=self.br(f10, f11),
+            br=self.br_isolat(f10, f11),
             rgt=f11,
             tr=f04,
         )
@@ -506,6 +506,7 @@ class HEALPixPadding(th.nn.Module):
         -------
             The assembled top left corner (only the sub-part that is required for padding)
         """
+        print("USING TL K24 FILLING")
         ret = th.zeros_like(top)[..., : self.p, : self.p]  # super ugly but super fast
 
         # Bottom left point
@@ -525,6 +526,29 @@ class HEALPixPadding(th.nn.Module):
 
         return ret
 
+    def tl_isolat(self, top: th.Tensor, lft: th.Tensor) -> th.Tensor:
+        print("USING TL ISOLAT FILLING")
+        ret = th.zeros_like(top)[..., : self.p, : self.p]
+        n = 2*self.p-1
+
+        if n+1 > top.shape[-1]:
+            raise Exception(f"Padding {self.p} must not exceed half the face height/width {top.shape[-1]}")
+
+        fill_lens = np.arange(1, self.p+1)
+        fill_lens = np.concatenate((fill_lens, fill_lens[-2::-1]))
+        diag_nums = np.arange(self.p-1, -(self.p-1)-1, -1)
+        assert(len(fill_lens) == len(diag_nums))
+
+        for i in range(n):
+
+            fill_val = 0.5*(top[..., -i-2, 0] + lft[..., 0, -i-2])
+            diag_indices = kth_diag_indices(self.p, diag_nums[i])
+            ret[...,diag_indices[0],diag_indices[1]] = th.repeat_interleave(fill_val[...,None], fill_lens[i], axis=-1)
+
+        ret = th.rot90(ret, k=-1, dims=(-2,-1))
+        assert(type(ret) == th.Tensor)
+        return ret
+
     def br(self, b: th.Tensor, r: th.Tensor) -> th.Tensor:
         """
         Assembles the bottom right corner of a center face in the cases where no according bottom right face is defined
@@ -542,6 +566,7 @@ class HEALPixPadding(th.nn.Module):
         torch.Tensor
             The assembled bottom right corner (only the sub-part that is required for padding)
         """
+        print("USING BR K24 FILLING")
         ret = th.zeros_like(b)[..., : self.p, : self.p]
 
         # Top left point
@@ -553,6 +578,29 @@ class HEALPixPadding(th.nn.Module):
             ret[..., i, :i] = b[..., i, -i:]  # Filling bottom left below main diagonal
             ret[..., i, i] = 0.5 * b[..., i, -1] + 0.5 * r[..., -1, i]  # Diagonal
 
+        return ret
+
+    def br_isolat(self, b: th.Tensor, r: th.Tensor) -> th.Tensor:
+        print("USING BR ISOLAT FILLING")
+        ret = th.zeros_like(top)[..., :self.p, :self.p]
+        n = 2*self.p-1
+
+        if n+1 > b.shape[-1]:
+            raise Exception(f"Padding {self.p} must not exceed half the face height/width {b.shape[-1]}")
+
+        fill_lens = np.arange(1, self.p+1)
+        fill_lens = np.concatenate((fill_lens, fill_lens[-2::-1]))
+        diag_nums = np.arange(self.p-1, -(self.p-1)-1, -1)
+        assert(len(fill_lens) == len(diag_nums))
+
+        for i in range(n):
+
+            fill_val = 0.5*(b[..., -i-2, -1] + r[..., -1, -i-2])
+            diag_indices = kth_diag_indices(self.p, diag_nums[i])
+            ret[...,diag_indices[0],diag_indices[1]] = th.repeat_interleave(fill_val[...,None], fill_lens[i], axis=-1)
+
+        ret = th.rot90(ret, k=-1, dims=(-2,-1))
+        assert(type(ret) == th.Tensor)
         return ret
 
 
