@@ -534,9 +534,9 @@ class HEALPixPadding(th.nn.Module):
         if n+1 > top.shape[-1]:
             raise Exception(f"Padding {self.p} must not exceed half the face height/width {top.shape[-1]}")
 
-        fill_lens = th.arange(1, p+1)
+        fill_lens = th.arange(1, self.p+1)
         fill_lens = th.cat((fill_lens, th.flip(fill_lens[:-1], dims=(0,))))
-        diag_nums = th.arange(p-1, -(p-1)-1, -1)
+        diag_nums = th.arange(self.p-1, -(self.p-1)-1, -1)
         assert(len(fill_lens) == len(diag_nums))
 
         for i in range(n):
@@ -588,9 +588,9 @@ class HEALPixPadding(th.nn.Module):
         if n+1 > b.shape[-1]:
             raise Exception(f"Padding {self.p} must not exceed half the face height/width {b.shape[-1]}")
 
-        fill_lens = th.arange(1, p+1)
+        fill_lens = th.arange(1, self.p+1)
         fill_lens = th.cat((fill_lens, th.flip(fill_lens[:-1], dims=(0,))))
-        diag_nums = th.arange(p-1, -(p-1)-1, -1)
+        diag_nums = th.arange(self.p-1, -(self.p-1)-1, -1)
         assert(len(fill_lens) == len(diag_nums))
 
         for i in range(n):
