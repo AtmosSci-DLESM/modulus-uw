@@ -317,7 +317,7 @@ class Module(torch.nn.Module):
             self.load_state_dict(model_dict, strict=strict)
 
     @classmethod
-    def from_checkpoint(cls, file_name: str) -> "Module":
+    def from_checkpoint(cls, file_name: str, strict=True) -> "Module":
         """Simple utility for constructing a model from a checkpoint
 
         Parameters
@@ -360,7 +360,7 @@ class Module(torch.nn.Module):
             model_dict = torch.load(
                 local_path.joinpath("model.pt"), map_location=model.device
             )
-            model.load_state_dict(model_dict)
+            model.load_state_dict(model_dict, strict=strict)
 
         return model
 
