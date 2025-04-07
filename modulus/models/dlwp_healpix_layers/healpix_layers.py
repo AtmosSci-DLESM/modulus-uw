@@ -527,7 +527,7 @@ class HEALPixPadding(th.nn.Module):
         return ret
 
     def tl_isolat(self, top: th.Tensor, lft: th.Tensor) -> th.Tensor:
-        print("USING TL ISOLAT FILLING")
+        # print("USING TL ISOLAT FILLING")
         ret = th.zeros_like(top)[..., : self.p, : self.p]
         n = 2*self.p-1
 
@@ -584,7 +584,7 @@ class HEALPixPadding(th.nn.Module):
         return ret
 
     def br_isolat(self, b: th.Tensor, r: th.Tensor) -> th.Tensor:
-        print("USING BR ISOLAT FILLING")
+        # print("USING BR ISOLAT FILLING")
         ret = th.zeros_like(b)[..., :self.p, :self.p]
         n = 2*self.p-1
 
