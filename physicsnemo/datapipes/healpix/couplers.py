@@ -171,7 +171,7 @@ class ConstantCoupler:
         #
         # for example 'z1000' is in 'z1000-48H'
         channel_indices = [
-            i for i, oc in enumerate(output_channels) for v in self.variables if oc in v
+            i for i, oc in enumerate(output_channels) for v in self.variables if oc == v.split('-')[0]
         ]
         self.coupled_channel_indices = channel_indices
 
@@ -209,7 +209,7 @@ class ConstantCoupler:
         # we use a constant set of values so we just copy time 0
         for i in range(len(self.preset_coupled_fields)):
             self.preset_coupled_fields[i, :, :, :, :, :] = coupled_fields[
-                :, -1, :, :, :, :
+                0, :, -1, :, :, :
             ]
         # flag for construct integrated coupling method to use this array
         self.coupled_mode = True
@@ -431,7 +431,7 @@ class TrailingAverageCoupler:
         #
         # for example 'z1000' is in 'z1000-48H'
         channel_indices = [
-            i for i, oc in enumerate(output_channels) for v in self.variables if oc in v
+            i for i, oc in enumerate(output_channels) for v in self.variables if oc == v.split('-')[0]
         ]
         self.coupled_channel_indices = channel_indices
 
