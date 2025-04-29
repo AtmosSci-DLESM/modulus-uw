@@ -312,16 +312,17 @@ class WeightedDistributionOceanMSE( th.nn.MSELoss ):
 
         # Calculate weights based on target distribution
         # Two hyperparameters (0.05 and 10) are used to determine the weights
-        sic = target[:,:,1,:,:,:]
-        weights_for_cice = th.ones_like(sic) * 15
-        weights_for_ocn = th.ones_like(sic)
-        dist_weights = th.where(sic >= .15, weights_for_cice, weights_for_ocn)
+
+        # sic = target[:,:,1,:,:,:]
+        # weights_for_cice = th.ones_like(sic) * 15
+        # weights_for_ocn = th.ones_like(sic)
+        # dist_weights = th.where(sic >= .15, weights_for_cice, weights_for_ocn)
 
         # average weighted
         ocean_err = (((target-prediction)**2)*self.lsm_tensor)
         # apply sic/sit weights based on target distribution (hard-coded for now):
-        ocean_err[:,:,1,:,:,:] = ocean_err[:,:,1,:,:,:]*dist_weights
-        ocean_err[:,:,2,:,:,:] = ocean_err[:,:,2,:,:,:]*dist_weights
+        # ocean_err[:,:,1,:,:,:] = ocean_err[:,:,1,:,:,:]*dist_weights
+        # ocean_err[:,:,2,:,:,:] = ocean_err[:,:,2,:,:,:]*dist_weights
         ocean_mean_err = ocean_err.sum(dim=(0, 1, 2, 4, 5))
         ocean_mean_err = ocean_mean_err*self.loss_weights
 

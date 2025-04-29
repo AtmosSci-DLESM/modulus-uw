@@ -20,7 +20,7 @@ import torch
 import torch as th
 
 from .healpix_layers import HEALPixLayer
-
+from torch.utils.checkpoint import checkpoint_sequential
 #
 # RECURRENT BLOCKS
 #
@@ -509,7 +509,10 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
             n_layers: int = 1,
             activation: th.nn.Module = None,
             enable_nhwc: bool = False,
-            enable_healpixpad: bool = False
+            enable_healpixpad: bool = False,
+            batch_norm: bool = True,
+            dropout: float = 0.0,
+            activation_ckpt: bool = False,
             ):
         """
         Parameters
@@ -536,7 +539,10 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                 upscale_factor=upscale_factor,
                 activation=activation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad
+                enable_healpixpad=enable_healpixpad,
+                batch_norm=batch_norm,
+                dropout=dropout,
+                activation_ckpt=activation_ckpt
             ))
 
     def forward(self, x):
@@ -565,6 +571,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        batch_norm: bool = False,
+        dropout: float = 0.0,
+        activation_ckpt: bool = False,
     ):
         """
         Parameters
@@ -590,6 +599,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         enable_healpixpad: bool, optional
             If HEALPixPadding should be enabled, passed to wrapper
         """
+        self.activation_ckpt = activation_ckpt
         super().__init__()
 
         if in_channels == int(latent_channels):
@@ -619,12 +629,19 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             )
         )
         # Apply BatchNorm or LayerNorm here
-        convblock.append(
-            th.nn.BatchNorm2d(int(latent_channels), track_running_stats=False, affine=False)
-        )
+        if batch_norm:
+            convblock.append(
+                th.nn.BatchNorm2d(int(latent_channels), track_running_stats=False, affine=False)
+            )
         
         if activation is not None:
             convblock.append(activation)
+
+        # Apply Dropout 
+        if dropout: 
+            print("Adding dropout")
+            convblock.append(th.nn.Dropout2d(p=dropout))
+
         # 1x1 convolution establishing increased channels
         convblock.append(
             geometry_layer(
@@ -682,8 +699,14 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         torch.Tensor
             result of the forward pass
         """
-        # residual connection with reshaped inpute and output of conv block
-        return self.skip_module(x) + self.convblock(x)
+        if self.activation_ckpt:
+            # Assuming self.convblock contains a list of layers in the block
+            num_segments = len(self.convblock) // 4 # hyperparameter
+            # Use checkpoint_sequential for the layers in blocks
+            return self.skip_module(x) + checkpoint_sequential(self.convblock, num_segments, x, use_reentrant=False, preserve_rng_state=False)
+        else:  
+            # residual connection with reshaped inpute and output of conv block
+            return self.skip_module(x) + self.convblock(x)
 
 
 #

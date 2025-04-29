@@ -35,6 +35,7 @@ class UNetEncoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        dropout: float = 0.0,
     ):
         """
         Parameters
@@ -58,6 +59,8 @@ class UNetEncoder(th.nn.Module):
             If channel last format should be used
         enable_healpixpad, bool, optional
             If the healpixpad library should be used (if installed)
+        dropout, float, optional
+            Probability to use in dropout (if 0, don't use dropout)
         """
         super().__init__()
         self.n_channels = n_channels
@@ -90,6 +93,8 @@ class UNetEncoder(th.nn.Module):
                     n_layers=n_layers[n],
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    dropout=dropout,
+                    activation_ckpt=False,
                 )
             )
             old_channels = curr_channel

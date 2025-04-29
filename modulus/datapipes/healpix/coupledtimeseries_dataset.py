@@ -132,8 +132,7 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         self.add_train_noise=add_train_noise
         self.train_noise_params=train_noise_params
         if self.add_train_noise:
-            # self.rng = np.random.default_rng(train_noise_seed)
-            pass
+            self.rng = np.random.default_rng(train_noise_seed)
 
         if couplings is not None:
             self.couplings = [
@@ -364,6 +363,11 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
 
             return inputs_result, targets
 
+        except Exception as e:
+            import traceback
+            print(f"An error occurred: {e}")
+            traceback.print_exc()  # Print the full stack trace
+
         finally:
             if not self.forecast_mode:
                 del input_array
@@ -372,6 +376,8 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
                     del target_array
                 if 'targets' in locals():
                     del targets
+                if 'inputs_result' in locals():
+                    del inputs_result
                 gc.collect()
         
 

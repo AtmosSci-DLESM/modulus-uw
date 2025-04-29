@@ -372,6 +372,7 @@ is not available at this time."
             decodings = self.decoder(encodings)
 
             reshaped = self._reshape_outputs(decodings)  # Absolute prediction
+            # Add interpolation code here....(add flag)
             outputs.append(reshaped)
 
         if output_only_last:

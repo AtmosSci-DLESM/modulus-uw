@@ -98,6 +98,7 @@ class UNetDecoder(th.nn.Module):
                 n_layers=n_layers[n],
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                activation_ckpt=False,
             )
 
             # Recurrent module
