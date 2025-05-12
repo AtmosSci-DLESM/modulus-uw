@@ -19,7 +19,7 @@ from typing import Sequence, Tuple, Union
 import torch
 import torch as th
 
-from .healpix_layers import HEALPixLayer
+from .healpix_layers import HEALPixLayer, HEALPixResizeConv
 
 #
 # RECURRENT BLOCKS
@@ -854,6 +854,83 @@ class TransposedConvUpsample(th.nn.Module):
         """
         return self.upsampler(x)
 
+class ResizeConv(th.nn.Module):
+    """
+    Class for sequentially interpolating then applying a simple Conv2d on
+    HEALPix (or other) tensor data
+    """
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixResizeConv,
+        resize_kwargs = {
+            'scale_factor': 2,
+            'mode': 'nearest',
+        },
+        in_channels: int = 3,
+        out_channels: int = 1,
+        kernel_size: int = 3,
+        activation: th.nn.Module = None,
+        enable_nhwc: bool = False,
+        enable_healpixpad: bool = False,
+    ):
+        """
+        Parameters
+        ----------
+        scale_factor: int, optional
+            Multiplier for spatial size, passed to torch.nn.functional.interpolate
+        mode: str, optional
+            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
+        geometry_layer: torch.nn.Module, optional
+            The wrapper for the geometry of the tensor
+        in_channels: int, optional
+            The number of input channels
+        out_channels: int, optional
+            The number of output channels
+        kernel_size: int, optional
+            Size of the convolutional kernel
+        activation: torch.nn.Module, optional
+            Activation function used in upsampling
+        enable_nhwc: bool, optional
+            Enable nhwc format, passed to wrapper
+        enable_healpixpad: bool, optional
+            If HEALPixPadding should be enabled, passed to wrapper
+        """
+        super().__init__()
+
+        block = []
+        block.append(
+            geometry_layer(
+                resize_layer=Interpolate,
+                resize_kwargs=resize_kwargs,
+                conv_layer=torch.nn.Conv2d,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
+        )
+        if activation is not None:
+            block.append(activation)
+        self.block = th.nn.Sequential(*block)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """
+        Forward pass of the ResizeConv layer
+
+        Parameters
+        ----------
+        x: torch.Tensor
+            inputs to the forward pass
+
+        Returns
+        -------
+        torch.Tensor
+            result of the forward pass
+        """
+        out = self.block(x)
+        return out
 
 #
 # Helper classes
@@ -865,7 +942,16 @@ class Interpolate(th.nn.Module):
     This is done as a class so that scale and mode can be stored
     """
 
-    def __init__(self, scale_factor: Union[int, Tuple], mode: str = "nearest"):
+    def __init__(
+        self,
+        scale_factor: Union[int, Tuple],
+        mode: str = "nearest",
+        # Options below are not used but needed for hydra instantiation to work
+        in_channels = 3,
+        out_channels = 3,
+        enable_nhwc = False,
+        enable_healpixpad = True,
+    ):
         """
         Parameters:
         ----------

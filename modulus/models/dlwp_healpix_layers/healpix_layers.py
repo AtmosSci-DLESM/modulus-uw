@@ -238,16 +238,16 @@ class HEALPixPadding(th.nn.Module):
         ]
 
         # Assemble the four padded faces on the northern hemisphere
-        p00 = self.pn(
+        p00 = self.pn_isolat(
             c=f00, t=f01, tl=f02, lft=f03, bl=f03, b=f04, br=f08, rgt=f05, tr=f01
         )
-        p01 = self.pn(
+        p01 = self.pn_isolat(
             c=f01, t=f02, tl=f03, lft=f00, bl=f00, b=f05, br=f09, rgt=f06, tr=f02
         )
-        p02 = self.pn(
+        p02 = self.pn_isolat(
             c=f02, t=f03, tl=f00, lft=f01, bl=f01, b=f06, br=f10, rgt=f07, tr=f03
         )
-        p03 = self.pn(
+        p03 = self.pn_isolat(
             c=f03, t=f00, tl=f01, lft=f02, bl=f02, b=f07, br=f11, rgt=f04, tr=f00
         )
 
@@ -298,16 +298,16 @@ class HEALPixPadding(th.nn.Module):
         )
 
         # Assemble the four padded faces on the southern hemisphere
-        p08 = self.ps(
+        p08 = self.ps_isolat(
             c=f08, t=f05, tl=f00, lft=f04, bl=f11, b=f11, br=f10, rgt=f09, tr=f09
         )
-        p09 = self.ps(
+        p09 = self.ps_isolat(
             c=f09, t=f06, tl=f01, lft=f05, bl=f08, b=f08, br=f11, rgt=f10, tr=f10
         )
-        p10 = self.ps(
+        p10 = self.ps_isolat(
             c=f10, t=f07, tl=f02, lft=f06, bl=f09, b=f09, br=f08, rgt=f11, tr=f11
         )
-        p11 = self.ps(
+        p11 = self.ps_isolat(
             c=f11, t=f04, tl=f03, lft=f07, bl=f10, b=f10, br=f09, rgt=f08, tr=f08
         )
 
@@ -378,6 +378,43 @@ class HEALPixPadding(th.nn.Module):
             ),
             dim=-2,
         )
+        right = th.cat((tr[..., -p:, :p], rgt[..., :p], br[..., :p, :p]), dim=-2)
+
+        return th.cat((left, c, right), dim=-1)
+
+    def pn_isolat(
+        self,
+        c: th.Tensor,
+        t: th.Tensor,
+        tl: th.Tensor,
+        lft: th.Tensor,
+        bl: th.Tensor,
+        b: th.Tensor,
+        br: th.Tensor,
+        rgt: th.Tensor,
+        tr: th.Tensor,
+    ) -> th.Tensor:
+        
+        # print('USING PN_ISOLAT')
+        p = self.p  # Padding size
+        d = self.d  # Dimensions for rotations
+
+        # Start with top and bottom to extend the height of the c tensor
+        t = t.rot90(1, dims=(-2,-1))[..., -p:, :]
+        for i in range(p):
+            t[..., -i-1, :] = torch.roll(t[..., -i-1, :], 2*i+1, dims=-1)
+            t[..., -i-1, :2*i+1] = t[..., -i-1, 2*i+1].unsqueeze(-1)
+
+        c = th.cat((t, c, b[..., :p, :]), dim=-2)
+
+        # Construct the left and right pads including the corner faces
+        lft = lft.rot90(-1, dims=(-2,-1))[..., -p:]
+        for i in range(p):
+            lft[..., -i-1] = torch.roll(lft[..., -i-1], 2*i+1, dims=-1)
+            lft[..., :2*i+1, -i-1] = lft[..., 2*i+1, -i-1].unsqueeze(-1)
+
+        left = th.cat((tl.rot90(2, d)[..., -p:, -p:], lft, bl[..., :p, -p:]), dim=-2)
+        
         right = th.cat((tr[..., -p:, :p], rgt[..., :p], br[..., :p, :p]), dim=-2)
 
         return th.cat((left, c, right), dim=-1)
@@ -490,6 +527,46 @@ class HEALPixPadding(th.nn.Module):
 
         return th.cat((left, c, right), dim=-1)
 
+    def ps_isolat(
+        self,
+        c: th.Tensor,
+        t: th.Tensor,
+        tl: th.Tensor,
+        lft: th.Tensor,
+        bl: th.Tensor,
+        b: th.Tensor,
+        br: th.Tensor,
+        rgt: th.Tensor,
+        tr: th.Tensor,
+    ) -> th.Tensor:
+        
+        # print('USING PS_ISOLAT')
+        p = self.p  # Padding size
+        d = self.d  # Dimensions for rotations
+
+        # Start with top and bottom to extend the height of the c tensor
+        b = b.rot90(1, d)[..., :p, :]
+        for i in range(p):
+            b[..., i, :] = torch.roll(b[..., i, :], -(2*i+1), dims=-1)
+            b[..., i, -(2*i+1):] = b[..., i, -(2*i+1)-1].unsqueeze(-1)
+
+        c = th.cat((t[..., -p:, :], c, b), dim=-2)
+
+        # Construct the left and right pads including the corner faces
+        left = th.cat((tl[..., -p:, -p:], lft[..., -p:], bl[..., :p, -p:]), dim=-2)
+
+        rgt = rgt.rot90(-1, d)[..., :p]
+        for i in range(p):
+            rgt[..., i] = torch.roll(rgt[..., i], -(2*i+1), dims=-1)
+            rgt[..., -(2*i+1):, i] = rgt[..., -(2*i+1)-1, i].unsqueeze(-1)
+            
+        right = th.cat(
+            (tr[..., -p:, :p], rgt, br.rot90(2, d)[..., :p, :p]),
+            dim=-2,
+        )
+
+        return th.cat((left, c, right), dim=-1)
+
     def tl(self, top: th.Tensor, lft: th.Tensor) -> th.Tensor:
         """
         Assembles the top left corner of a center face in the cases where no according top left face is defined on the
@@ -548,7 +625,7 @@ class HEALPixPadding(th.nn.Module):
             for i in range(len(diag_indices[0])):
                 ret[...,diag_indices[0][i],diag_indices[1][i]] = fill_val
 
-        ret = th.rot90(ret, k=-1, dims=(-2,-1))
+        ret = th.rot90(ret, k=-1, dims=self.d)
         assert(type(ret) == th.Tensor)
         return ret
 
@@ -598,14 +675,14 @@ class HEALPixPadding(th.nn.Module):
 
         for i in range(n):
 
-            fill_val = 0.5*(b[..., -i-2, -1] + r[..., -1, -i-2])
+            fill_val = 0.5*(b[..., i+1, -1] + r[..., -1, i+1])
             diag_indices = self.kth_diag_indices(self.p, diag_nums[i])
             # ret[...,diag_indices[0],diag_indices[1]] = th.repeat_interleave(fill_val[...,None], fill_lens[i], axis=-1)
             # ret[...,diag_indices[0],diag_indices[1]] = fill_val.unsqueeze(-1).expand(*([-1]*fill_val.ndim), fill_lens[i])
             for i in range(len(diag_indices[0])):
                 ret[...,diag_indices[0][i],diag_indices[1][i]] = fill_val
 
-        ret = th.rot90(ret, k=-1, dims=(-2,-1))
+        ret = th.rot90(ret, k=1, dims=self.d)
         assert(type(ret) == th.Tensor)
         return ret
 
@@ -683,4 +760,83 @@ class HEALPixLayer(th.nn.Module):
         :return: The output tensor of this HEALPix layer
         """
         res = self.layers(x)
+        return res
+
+class HEALPixResizeConv(th.nn.Module):
+    """Pytorch module for applying any base torch Module on a HEALPix tensor. Expects all input/output tensors to have a
+    shape [..., 12, H, W], where 12 is the dimension of the faces.
+    """
+
+    def __init__(
+        self,
+        resize_layer,
+        resize_kwargs,
+        conv_layer,
+        **kwargs,
+    ):
+        """
+        Parameters
+        ----------
+        layer: torch.nn.Module
+            Any torch layer function, e.g., th.nn.Conv2d
+        kwargs:
+            The arguments that are passed to the torch layer function, e.g., kernel_size
+        """
+        super().__init__()
+        hpx_resize = []
+        hpx_conv = []
+
+        if "enable_nhwc" in kwargs:
+            enable_nhwc = kwargs["enable_nhwc"]
+            del kwargs["enable_nhwc"]
+        else:
+            enable_nhwc = False
+
+        if "enable_healpixpad" in kwargs:
+            enable_healpixpad = kwargs["enable_healpixpad"]
+            del kwargs["enable_healpixpad"]
+        else:
+            enable_healpixpad = False
+
+        kwargs["padding"] = 0  # Disable native padding
+        kernel_size = 3 if "kernel_size" not in kwargs else kwargs["kernel_size"]
+        dilation = 1 if "dilation" not in kwargs else kwargs["dilation"]
+        padding = ((kernel_size - 1) // 2) * dilation
+
+        scale_factor = 2 if "scale_factor" not in resize_kwargs else resize_kwargs["scale_factor"]
+        self.strip = padding * (scale_factor - 1)
+
+        if (
+            enable_healpixpad
+            and have_healpixpad
+            and th.cuda.is_available()
+            and not enable_nhwc
+        ):
+            hpx_resize.append(HEALPixPaddingv2(padding=padding))
+        else:
+            hpx_resize.append(HEALPixPadding(padding=padding, enable_nhwc=enable_nhwc))
+
+        hpx_resize.append(resize_layer(**resize_kwargs))
+        self.hpx_resize = th.nn.Sequential(*hpx_resize)
+
+        hpx_conv.append(conv_layer(**kwargs))
+        self.hpx_conv = th.nn.Sequential(*hpx_conv)
+
+        if enable_nhwc:
+            self.hpx_resize = self.hpx_resize.to(memory_format=torch.channels_last)
+            self.hpx_conv = self.hpx_conv.to(memory_format=torch.channels_last)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """
+        Performs the forward pass using the defined layer function and the given data.
+
+        :param x: The input tensor of shape [..., F=12, H, W]
+        :return: The output tensor of this HEALPix layer
+        """
+        # Upsample and pad
+        x = self.hpx_resize(x)
+        # Strip unnecessary padding
+        x = x[..., self.strip:-self.strip, self.strip:-self.strip]
+        # Conv
+        res = self.hpx_conv(x)
         return res
