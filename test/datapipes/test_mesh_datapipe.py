@@ -21,7 +21,6 @@ import pytest
 from pytest_utils import import_or_fail
 
 # from pytest_utils import nfsdata_or_fail
-from modulus.datapipes.cae import MeshDatapipe
 
 
 @pytest.fixture
@@ -30,12 +29,14 @@ def cgns_data_dir():
     return path
 
 
-@import_or_fail(["vtk"])
+@import_or_fail(["vtk", "warp"])
 @pytest.mark.parametrize("device", ["cuda", "cpu"])
 def test_mesh_datapipe(device, tmp_path, pytestconfig):
     """Tests the MeshDatapipe class with VTP and VTU files."""
 
     import vtk
+
+    from physicsnemo.datapipes.cae import MeshDatapipe
 
     def _create_random_vtp_vtu_mesh(
         num_points: int, num_triangles: int, dir: str
@@ -117,7 +118,7 @@ def test_mesh_datapipe(device, tmp_path, pytestconfig):
 
     tmp_dir = tmp_path / "temp_data"
     tmp_dir.mkdir()
-    _create_random_vtp_vtu_mesh(num_points=20, num_triangles=40, dir=tmp_dir)
+    _create_random_vtp_vtu_mesh(num_points=10, num_triangles=20, dir=tmp_dir)
     datapipe_vtp = MeshDatapipe(
         data_dir=tmp_dir,
         variables=["RandomFeatures"],
@@ -133,8 +134,8 @@ def test_mesh_datapipe(device, tmp_path, pytestconfig):
 
     assert len(datapipe_vtp) == 1
     for data in datapipe_vtp:
-        assert data[0]["vertices"].shape == (1, 20, 3)
-        assert data[0]["x"].shape == (1, 20, 1)
+        assert data[0]["vertices"].shape == (1, 10, 3)
+        assert data[0]["x"].shape == (1, 10, 1)
 
     datapipe_vtu = MeshDatapipe(
         data_dir=tmp_dir,
@@ -151,8 +152,8 @@ def test_mesh_datapipe(device, tmp_path, pytestconfig):
 
     assert len(datapipe_vtu) == 1
     for data in datapipe_vtu:
-        assert data[0]["vertices"].shape == (1, 20, 3)
-        assert data[0]["x"].shape == (1, 20, 1)
+        assert data[0]["vertices"].shape == (1, 10, 3)
+        assert data[0]["x"].shape == (1, 10, 1)
 
 
 # @nfsdata_or_fail
