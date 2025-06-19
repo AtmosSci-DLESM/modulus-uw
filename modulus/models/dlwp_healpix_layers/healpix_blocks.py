@@ -529,7 +529,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
             curr_in = in_channels if i == 0 else out_channels
             
             # Create a single block as a separate Module
-            self.blocks.append(SymmetricConvNeXtBlock(
+            self.blocks.append(SymmetricConvNeXtBlock( # BottleneckConvNeXtBlock
                 geometry_layer=geometry_layer,
                 in_channels=curr_in,
                 latent_channels=latent_channels,
@@ -542,7 +542,8 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                 enable_healpixpad=enable_healpixpad,
                 batch_norm=batch_norm,
                 dropout=dropout,
-                activation_ckpt=activation_ckpt
+                activation_ckpt=activation_ckpt,
+                skip_out=True
             ))
 
     def forward(self, x):
@@ -552,7 +553,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         return out
 
 
-class SymmetricConvNeXtBlock(th.nn.Module):
+class BottleneckConvNeXtBlock(th.nn.Module):
     """Another modification of ConvNeXtBlock block this time using 4 layers and adding
     a layer that instead of going from in_channels to latent*upscale channesl goes to
     latent channels first
@@ -574,6 +575,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         batch_norm: bool = False,
         dropout: float = 0.0,
         activation_ckpt: bool = False,
+        skip_out: bool = True,
     ):
         """
         Parameters
@@ -602,7 +604,176 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         self.activation_ckpt = activation_ckpt
         super().__init__()
 
-        if in_channels == int(latent_channels):
+        if in_channels == int(out_channels): #int(latent_channels):
+            self.skip_module = lambda x: x  # Identity-function required in forward pass
+        else:
+            self.skip_module = geometry_layer(
+                layer=torch.nn.Conv2d,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=1,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
+
+        # 1st ConvNeXt block, the output of this one remains internal
+        convblock = []
+
+        # Helper to determine number of groups for GroupNorm
+        def get_num_groups(channels, max_groups=32, min_channels_per_group=8):
+            num_groups = min(max_groups, channels // min_channels_per_group)
+            # Ensure num_groups is a divisor of channels
+            while channels % num_groups != 0:
+                num_groups -= 1
+            return num_groups
+
+        num_groups = get_num_groups(int(in_channels))
+        convblock.append(
+            th.nn.GroupNorm(num_groups, int(in_channels), affine=False)
+        )
+        if activation is not None:
+            convblock.append(activation)
+        # 3x3 convolution establishing latent channels channels
+        convblock.append(
+            geometry_layer(
+                layer=torch.nn.Conv2d,
+                in_channels=in_channels,
+                out_channels=int(latent_channels),
+                kernel_size=kernel_size,
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
+        )
+        num_groups = get_num_groups(int(latent_channels))
+
+        convblock.append(
+            th.nn.GroupNorm(num_groups, int(latent_channels), affine=False)
+        )
+        if activation is not None:
+            convblock.append(activation)
+        # 1x1 convolution establishing increased channels
+        convblock.append(
+            geometry_layer(
+                layer=torch.nn.Conv2d,
+                in_channels=int(latent_channels),
+                out_channels=int(latent_channels * upscale_factor),
+                kernel_size=1,
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
+        )
+
+        convblock.append(
+            th.nn.GroupNorm(num_groups, int(latent_channels), affine=False)
+        )
+        if activation is not None:
+            convblock.append(activation)
+        # 1x1 convolution returning to latent channels
+        convblock.append(
+            geometry_layer(
+                layer=torch.nn.Conv2d,
+                in_channels=int(latent_channels * upscale_factor),
+                out_channels=int(latent_channels),
+                kernel_size=1,
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
+        )
+
+        convblock.append(
+            th.nn.GroupNorm(num_groups, int(latent_channels), affine=False)
+        )
+        if activation is not None:
+            convblock.append(activation)
+        # 3x3 convolution from latent channels to latent channels
+        convblock.append(
+            geometry_layer(
+                layer=torch.nn.Conv2d,
+                in_channels=int(latent_channels),
+                out_channels=out_channels,  # int(latent_channels),
+                kernel_size=kernel_size,
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
+        )
+
+        self.convblock = th.nn.Sequential(*convblock)
+
+    def forward(self, x):
+        """Forward pass of the SymmetricConvNextBlock
+
+        Parameters
+        ----------
+        x: torch.Tensor
+            inputs to the forward pass
+
+        Returns
+        -------
+        torch.Tensor
+            result of the forward pass
+        """
+        # residual connection with reshaped inpute and output of conv block
+        return self.skip_module(x) + self.convblock(x)
+
+
+
+class SymmetricConvNeXtBlock(th.nn.Module):
+    """Another modification of ConvNeXtBlock block this time using 4 layers and adding
+    a layer that instead of going from in_channels to latent*upscale channesl goes to
+    latent channels first
+    """
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels: int = 3,
+        latent_channels: int = 1,
+        out_channels: int = 1,
+        kernel_size: int = 3,
+        dilation: int = 1,
+        n_layers: int = 1,  # not used, but required for hydra instantiation
+        upscale_factor: int = 4,
+        activation: th.nn.Module = None,
+        enable_nhwc: bool = False,
+        enable_healpixpad: bool = False,
+        batch_norm: bool = False,
+        dropout: float = 0.0,
+        activation_ckpt: bool = False,
+        skip_out: bool = False,
+    ):
+        """
+        Parameters
+        ----------
+        geometry_layer: torch.nn.Module, optional
+            The wrapper for the geometry layer
+        in_channels: int, optional
+            The number of input channels
+        latent_channels: int, optional
+            Number of latent channels
+        out_channels: int, optional
+            The number of output channels
+        kernel_size: int, optional
+            Size of the convolutioonal kernels
+        dilation: int, optional
+            Spacing between kernel points, passed to torch.nn.Conv2d
+        upscale_factor: int, optional
+            Upscale factor to apply on the number of latent channels
+        activation: torch.nn.Module, optional
+            Activation function to use between layers
+        enable_nhwc: bool, optional
+            Enable nhwc format, passed to wrapper
+        enable_healpixpad: bool, optional
+            If HEALPixPadding should be enabled, passed to wrapper
+        """
+        self.activation_ckpt = activation_ckpt
+        super().__init__()
+
+        check_channels = out_channels if skip_out else latent_channels
+        if in_channels == int(check_channels):
             self.skip_module = lambda x: x  # Identity-function required in forward pass
         else:
             self.skip_module = geometry_layer(

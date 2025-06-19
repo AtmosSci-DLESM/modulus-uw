@@ -64,6 +64,9 @@ class HEALPixUNet(Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         couplings: list = [],
+        var_indices: dict = {},
+        apply_clamping: bool = False,
+        apply_lsm_mask: bool = False,
     ):
         """
         Parameters
@@ -95,6 +98,8 @@ class HEALPixUNet(Module):
             Enable CUDA HEALPixPadding if installed. default: False
         couplings: list, optional
             sequence of dictionaries that describe coupling mechanisms
+        var_indices: dict, optional
+            dictionary of variable names and their indices
         """
         super().__init__()
 
@@ -125,7 +130,9 @@ class HEALPixUNet(Module):
         self.channel_dim = 2  # Now 2 with [B, F, C*T, H, W]. Was 1 in old data format with [B, T*C, F, H, W]
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
-
+        self.var_indices = var_indices
+        self.apply_clamping = apply_clamping
+        self.apply_lsm_mask = apply_lsm_mask
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
         if not self.is_diagnostic and (self.output_time_dim % self.input_time_dim != 0):
@@ -332,6 +339,65 @@ is not available at this time."
 
         return res
 
+    def _clamp_variables(self, tensor: th.Tensor, var_indices: dict) -> th.Tensor:
+        """Apply variable-specific clamping to the output tensor.
+
+        Parameters
+        ----------
+        tensor: th.Tensor
+            The output tensor to clamp
+        var_indices: dict
+            Dictionary mapping variable names to their channel indices
+
+        Returns
+        -------
+        th.Tensor
+            The clamped tensor
+        """
+        # Define clamping ranges for each variable
+        clamp_ranges = {
+            'sst': ((270.000 - 291.428) / 10.649, (312.594 - 291.428) / 10.649),
+            'sic': (0.0, 1.0),
+            'sit': (0.0, 8.0),
+            'ssh': (-3.5729057788848877, 2.942920446395874),
+            't0m': (-1.8705846071243286, 1.835655689239502),
+            't10m': (-1.8642222881317139, 1.8440333604812622),
+            't50m': (-1.8229796886444092, 1.5968620777130127),
+            't200m': (-2.115108013153076, 2.6492390632629395),
+            's0m': (-10.585844039916992, 2.1577463150024414),
+            's10m': (-10.822975158691406, 2.1814584732055664),
+            's50m': (-13.978135108947754, 2.6098599433898926),
+            's200m': (-10.763301849365234, 4.24226713180542)
+        }
+
+        # Apply clamping for each variable
+        for var_name, idx in var_indices.items():
+            if var_name in clamp_ranges:
+                min_val, max_val = clamp_ranges[var_name]
+                tensor[..., idx, :, :] = th.clamp(tensor[..., idx, :, :], min_val, max_val)
+
+        return tensor
+
+    def _apply_lsm_mask(self, tensor: th.Tensor, lsm: th.Tensor) -> th.Tensor:
+        """Apply land-sea mask to the tensor.
+
+        Parameters
+        ----------
+        tensor: th.Tensor
+            The tensor to mask
+        lsm: th.Tensor
+            The land-sea mask (1 for ocean, 0 for land)
+
+        Returns
+        -------
+        th.Tensor
+            The masked tensor
+        """
+        # Expand LSM to match tensor dimensions
+        lsm = lsm.expand_as(tensor[..., 0:1, :, :])
+        # Apply mask by multiplication (differentiable)
+        return tensor * lsm
+
     def forward(self, inputs: Sequence, output_only_last=False) -> th.Tensor:
         """
         Forward pass of the HEALPixUnet
@@ -349,6 +415,19 @@ is not available at this time."
         -------
         th.Tensor: Predicted outputs
         """
+        # Get LSM from constants if available
+        lsm = None
+        if len(inputs) > 2 and inputs[2] is not None:
+            lsm = inputs[2][:, 0:1, :, :].unsqueeze(2)  # Add time dimension
+            lsm = 1 - lsm  # Convert to 1 for ocean, 0 for land
+
+        if self.apply_clamping:
+            if hasattr(self, 'var_indices'): # Apply variable-specific clamping
+                inputs[0] = self._clamp_variables(inputs[0], self.var_indices)
+        if self.apply_lsm_mask:
+            if lsm is not None: # Apply LSM masking
+                inputs[0] = self._apply_lsm_mask(inputs[0], lsm)
+
         outputs = []
         for step in range(self.integration_steps):
             if step == 0:
@@ -370,9 +449,15 @@ is not available at this time."
 
             encodings = self.encoder(input_tensor)
             decodings = self.decoder(encodings)
+            reshaped = self._reshape_outputs(decodings)
 
-            reshaped = self._reshape_outputs(decodings)  # Absolute prediction
-            # Add interpolation code here....(add flag)
+            if self.apply_clamping:
+                if hasattr(self, 'var_indices'): # Apply variable-specific clamping
+                    reshaped = self._clamp_variables(reshaped, self.var_indices)
+            if self.apply_lsm_mask:
+                if lsm is not None: # Apply LSM masking
+                    reshaped = self._apply_lsm_mask(reshaped, lsm)
+
             outputs.append(reshaped)
 
         if output_only_last:

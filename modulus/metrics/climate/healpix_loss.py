@@ -294,6 +294,8 @@ class WeightedDistributionOceanMSE( th.nn.MSELoss ):
         self.lsm_ds = xr.open_dataset(self.lsm_file,**self.open_dict).constants.sel(self.selection_dict)
         # 1-lsm gives the percentage of pixel that has ocean
         self.lsm_tensor = 1 - th.tensor(np.expand_dims(self.lsm_ds.values,(0,2,3))).to(trainer.device)
+        # If lsm is greater than .15 then set to 1, otherwise set to 0
+        # self.lsm_tensor = th.where(self.lsm_tensor > .15, th.ones_like(self.lsm_tensor), th.zeros_like(self.lsm_tensor))
 
         ### 2. WEIGHTS PREP ###
         try:
@@ -317,14 +319,26 @@ class WeightedDistributionOceanMSE( th.nn.MSELoss ):
         # weights_for_cice = th.ones_like(sic) * 15
         # weights_for_ocn = th.ones_like(sic)
         # dist_weights = th.where(sic >= .15, weights_for_cice, weights_for_ocn)
-
-        # average weighted
-        ocean_err = (((target-prediction)**2)*self.lsm_tensor)
         # apply sic/sit weights based on target distribution (hard-coded for now):
         # ocean_err[:,:,1,:,:,:] = ocean_err[:,:,1,:,:,:]*dist_weights
         # ocean_err[:,:,2,:,:,:] = ocean_err[:,:,2,:,:,:]*dist_weights
+
+        # average weighted
+        ocean_err = (((target-prediction)**2)*self.lsm_tensor)
         ocean_mean_err = ocean_err.sum(dim=(0, 1, 2, 4, 5))
         ocean_mean_err = ocean_mean_err*self.loss_weights
+
+        # Calculate penalty for sst and ice difference
+        # penalty = [ torch.relu(SST - T_freeze) * (SIC > SIC_thres) + torch.relu(T_freeze - SST) * (SIC < SIC_thres) ]
+        # 271.46017 - freeze temp in K
+        alpha = .01 # Penalty multiplier
+        sst_mu, sst_std = 291.4281005859375, 10.649566650390625
+        T_freeze = (271.5 - sst_mu) / sst_std
+        SIC_thres = 0.15
+        SIC_idx, SST_idx = 1, 2 # Need to check these indices
+        penalty = th.relu(target[:,:,SST_idx,:,:,:] - T_freeze) * (target[:,:,SIC_idx,:,:,:] > SIC_thres) + th.relu(T_freeze - target[:,:,SST_idx,:,:,:]) * (target[:,:,SIC_idx,:,:,:] < SIC_thres)
+        penalty = penalty.sum(dim=(0, 1, 2, 4, 5))
+        # ocean_mean_err = ocean_mean_err + alpha*penalty
 
         if average_channels:
             return th.sum(ocean_mean_err)/self.lsm_sum
