@@ -112,6 +112,67 @@ class ConvGRUBlock(th.nn.Module):
         """Reset the update gates"""
         self.h = th.zeros_like(self.h)
 
+class ConvGRFBlock(th.nn.Module):
+    """
+    Class that implements a Convolutional GRF from https://arxiv.org/pdf/2506.09733
+    """
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels: int = 3,
+        kernel_size: int = 1,
+        enable_nhwc: bool = False,
+        enable_healpixpad: bool = False,
+    ):
+        """
+        Parameters
+        ----------
+        geometry_layer: torch.nn.Module, optional
+            The wrapper for the geometry layer
+        in_channels: int, optional
+            The number of input channels
+        kernel_size: int, optional
+            Size of the convolutioonal kernel
+        enable_nhwc: bool, optional
+            Enable nhwc format, passed to wrapper
+        enable_healpixpad: bool, optional
+            If HEALPixPadding should be enabled, passed to wrapper
+        """
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.conv = geometry_layer(
+            layer=torch.nn.Conv2d,
+            in_channels=in_channels,
+            out_channels=2*in_channels,
+            kernel_size=kernel_size,
+            enable_nhwc=enable_nhwc,
+            enable_healpixpad=enable_healpixpad,
+        )
+
+    def forward(self, inputs: Sequence) -> Sequence:
+        """Forward pass of the ConvGRUBlock
+
+        Parameters
+        ----------
+        inputs: Sequence
+            Input to the forward pass
+
+        Returns
+        -------
+        Sequence
+            Result of the forward pass
+        """
+        h = self.conv(inputs)
+        z, h_hat = th.split(h, self.in_channels, dim=1)
+        z = th.sigmoid(z)
+        h_hat = th.tanh(h_hat)
+        y = z*h_hat + (1-z)*inputs
+        return y
+
+    def reset(self):
+        pass
 
 #
 # CONV BLOCKS
