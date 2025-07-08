@@ -569,6 +569,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        use_block_skip_connection: bool = True,
     ):
         """
         Parameters
@@ -593,20 +594,26 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             Enable nhwc format, passed to wrapper
         enable_healpixpad: bool, optional
             If HEALPixPadding should be enabled, passed to wrapper
+        use_block_skip_connection: bool, optional
+            If training a diagnostic model, set to False
         """
         super().__init__()
 
-        if in_channels == int(latent_channels):
-            self.skip_module = lambda x: x  # Identity-function required in forward pass
-        else:
-            self.skip_module = geometry_layer(
-                layer=torch.nn.Conv2d,
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=1,
-                enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
-            )
+        self.use_block_skip_connection = use_block_skip_connection
+
+        if use_block_skip_connection:
+
+            if in_channels == int(latent_channels):
+                self.skip_module = lambda x: x  # Identity-function required in forward pass
+            else:
+                self.skip_module = geometry_layer(
+                    layer=torch.nn.Conv2d,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=1,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
 
         # 1st ConvNeXt block, the output of this one remains internal
         convblock = []
@@ -682,7 +689,10 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             result of the forward pass
         """
         # residual connection with reshaped inpute and output of conv block
-        return self.skip_module(x) + self.convblock(x)
+        if self.use_block_skip_connection:
+            return self.skip_module(x) + self.convblock(x)
+        else:
+            return self.convblock(x)
 
 
 #
