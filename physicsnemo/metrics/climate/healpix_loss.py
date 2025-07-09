@@ -141,16 +141,40 @@ class ConditionalWeightLoss( th.nn.MSELoss ):
         b=None,
         w=1,
         ):
+        """
+        Parameters
+        -----------
+        weight: tuple of floats
+            weight[0] is used when the target precipitation value is zero
+            weight[1] is used for all non-zero precipitation
+        b: float
+            Exponential scaling factor used to define weighting curve for non-zero precip. weights
+        w: float
+            Final scaling factor applied to loss.
+        """
+
         super().__init__()
         self.weight_zero = weight[0]
         self.weight_nonzero = weight[1]
         self.b = b
         self.device = None
         self.w = w
+
     def setup(self, trainer):
         self.b = th.tensor(self.b, device=trainer.device)
         self.w = th.tensor(self.w, device=trainer.device)
-    def forward(self, prediction, target, average_channels=True ):
+
+    def forward(self, prediction, target):
+        """
+        Computes the MSE of model prediction and applies weights for zero and non-zero precipitation cases.
+
+        Parameters
+        -----------
+        prediction: torch.tensor
+            The prediction tensor
+        target: torch.Tensor
+            The target tensor
+        """
         weights_for_zero = th.ones_like(target) * self.weight_zero
         weights_for_nonzero = (th.ones_like(target) * self.weight_nonzero) * th.exp(self.b*target)
         weights = th.where(target > 0, weights_for_nonzero, weights_for_zero)

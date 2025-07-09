@@ -595,7 +595,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         enable_healpixpad: bool, optional
             If HEALPixPadding should be enabled, passed to wrapper
         use_block_skip_connection: bool, optional
-            If training a diagnostic model, set to False
+            Whether or not to use block-level skip connection
         """
         super().__init__()
 
