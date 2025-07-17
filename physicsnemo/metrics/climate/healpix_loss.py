@@ -307,3 +307,89 @@ class WeightedOceanMSE(th.nn.MSELoss):
             return th.sum(ocean_mean_err) / self.lsm_sum
         else:
             return ocean_mean_err / self.lsm_var_sum
+        
+class WeightedCRPSLoss(th.nn.MSELoss):
+
+    """
+    Probabilistic loss function that allows for user defined weighting of variables when calculating CRPS.
+    """
+
+    def __init__(
+        self,
+        weights: Sequence = [],
+        n_members: int = 2,
+        alpha: float = 0.95
+    ):
+        """
+        Parameters
+        ----------
+        weights: Sequence
+            list of floats that determine weighting of variable loss, assumed to be
+            in order consistent with order of model output channels
+        n_members: int
+            number of ensemble members in the model output
+        alpha: float
+            hyperparamter for approximating fair CRPS loss. between 0 and 1, 1 corresponds to a fair CRPS loss.
+        """
+        super().__init__()
+        self.loss_weights = th.tensor(weights)
+        if n_members < 2:
+            raise ValueError("n_members must be at least 2 for CRPS loss to be defined")
+        else:    
+            self.n_members = n_members
+        self.device = None
+
+        # parameter for almost fair CRPS loss. See https://arxiv.org/html/2412.15832v1
+        self.coeff_eps = 1 - ((1-alpha) / (n_members))
+
+    def setup(self, trainer):
+        """
+        pushes constants to cuda device
+        """
+
+        if len(trainer.output_variables) != len(self.loss_weights):
+            raise ValueError("Length of outputs and loss_weights is not the same!")
+
+        self.loss_weights = self.loss_weights.to(device=trainer.device)
+        self.n_members = th.tensor(self.n_members, device=trainer.device)
+        self.coeff_eps = th.tensor(self.coeff_eps, device=trainer.device)
+        
+
+    def forward(self, prediction, target, average_channels=True):
+        """
+        Forward pass of the WeightedCRPSLoss 
+        Prediction tensor is expected to be in the shape [N, B, F, C, H, W, M] where M is the number of ensemble members.
+        Target tensor is expected to be in the shape [N, B, F, C, H, W]. No ensemble dimension is expected.
+
+        Parameters
+        ----------
+        prediction: torch.Tensor
+            The prediction tensor
+        target: torch.Tensor
+            The target tensor
+        average_channels: bool, optional
+            whether the mean of the channels should be taken
+        """
+        if not (prediction.ndim == 7 and target.ndim == 7):
+            raise AssertionError("Probabilistic loss expects predictions to have 7 dimensions (last corresponds to ensemble members)")
+
+        # initialize crps field with zeros
+        crps = th.zeros_like(prediction[..., 0])
+        # loop over all ensemble members
+        for j in range(self.n_members):
+            xj = prediction[..., j]
+            for k in range(self.n_members):
+                xk = prediction[..., k]
+                if j != k:
+                    # this is the crps as defined in https://arxiv.org/html/2412.15832v1 equation 4
+                    crps += th.abs(xj - prediction) + th.abs(xk - prediction) - self.coeff_eps * th.abs(xj - xk)
+        
+
+
+        crps = crps.mean(dim=(0, 1, 2, 4, 5)) * self.loss_weights
+        if average_channels:
+            return th.mean(crps)
+        else:
+            return crps
+
+
