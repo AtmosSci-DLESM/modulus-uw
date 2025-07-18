@@ -117,6 +117,9 @@ RUN if [ "$TARGETPLATFORM" = "linux/amd64" ] && [ "$ONNX_AMD64_WHEEL" != "unknow
         pip install --no-cache-dir onnxruntime-gpu --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ ; \
     fi
 
+# Install earth2grid
+RUN pip install --no-build-isolation https://github.com/NVlabs/earth2grid/archive/f1d534bf16870bf12ef1a2d9b13ee5de65d869b7.tar.gz
+
 # cleanup of stage
 RUN rm -rf /modulus/
 
