@@ -36,6 +36,7 @@ class UNetDecoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
     ):
         """
         Parameters
@@ -81,6 +82,7 @@ class UNetDecoder(th.nn.Module):
                     out_channels=curr_channel,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    enable_torch_compile=enable_torch_compile,
                 )
 
             next_channel = (
@@ -98,6 +100,7 @@ class UNetDecoder(th.nn.Module):
                 n_layers=n_layers[n],
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
 
             # Recurrent module
@@ -106,6 +109,7 @@ class UNetDecoder(th.nn.Module):
                     config=recurrent_block,
                     in_channels=next_channel,
                     enable_healpixpad=enable_healpixpad,
+                    enable_torch_compile=enable_torch_compile,
                 )
             else:
                 rec_module = None
@@ -130,6 +134,7 @@ class UNetDecoder(th.nn.Module):
             dilation=dilations[-1],
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            enable_torch_compile=enable_torch_compile,
         )
 
     def forward(self, inputs: Sequence) -> th.Tensor:

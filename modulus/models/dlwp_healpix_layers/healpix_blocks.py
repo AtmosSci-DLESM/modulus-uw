@@ -39,6 +39,7 @@ class ConvGRUBlock(th.nn.Module):
         kernel_size: int = 1,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
     ):
         """
         Parameters
@@ -65,6 +66,7 @@ class ConvGRUBlock(th.nn.Module):
             padding="same",
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            enable_torch_compile=enable_torch_compile,
         )
         self.conv_can = geometry_layer(
             layer=torch.nn.Conv2d,
@@ -74,6 +76,7 @@ class ConvGRUBlock(th.nn.Module):
             padding="same",
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            enable_torch_compile=enable_torch_compile,
         )
         self.h = th.zeros(1, 1, 1, 1)
 
@@ -133,6 +136,7 @@ class BasicConvBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
     ):
         """
         Parameters
@@ -172,6 +176,7 @@ class BasicConvBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    enable_torch_compile=enable_torch_compile,
                 )
             )
             if activation is not None:
@@ -212,6 +217,7 @@ class ConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile:bool = False,
     ):
         """
         Parameters
@@ -250,6 +256,7 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         # Convolution block
         convblock = []
@@ -263,6 +270,7 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         )
         if activation is not None:
@@ -277,6 +285,7 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         )
         if activation is not None:
@@ -290,6 +299,7 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         )
         self.convblock = th.nn.Sequential(*convblock)
@@ -329,6 +339,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
     ):
         """
         Parameters:
@@ -368,6 +379,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         if out_channels == int(latent_channels):
             self.skip_module2 = (
@@ -381,6 +393,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
 
         # 1st ConvNeXt block, the output of this one remains internal
@@ -395,6 +408,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         )
         if activation is not None:
@@ -409,6 +423,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         )
         if activation is not None:
@@ -423,6 +438,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         )
         if activation is not None:
@@ -441,6 +457,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         )
         if activation is not None:
@@ -455,6 +472,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         )
         if activation is not None:
@@ -469,6 +487,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         )
         if activation is not None:
@@ -513,6 +532,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
     ):
         """
         Parameters
@@ -550,6 +570,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
 
         # 1st ConvNeXt block, the output of this one remains internal
@@ -564,6 +585,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         )
         if activation is not None:
@@ -578,6 +600,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         )
         if activation is not None:
@@ -592,6 +615,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         )
         if activation is not None:
@@ -606,6 +630,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         )
         if activation is not None:
@@ -645,6 +670,7 @@ class MaxPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile:bool = False,
     ):
         """
         Parameters
@@ -664,6 +690,7 @@ class MaxPool(th.nn.Module):
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            enable_torch_compile=enable_torch_compile,
         )
 
     def forward(self, x):
@@ -693,6 +720,7 @@ class AvgPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
     ):
         """
         Parameters
@@ -712,6 +740,7 @@ class AvgPool(th.nn.Module):
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            enable_torch_compile=enable_torch_compile,
         )
 
     def forward(self, x):
@@ -749,6 +778,7 @@ class TransposedConvUpsample(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
     ):
         """
         Parameters
@@ -781,6 +811,7 @@ class TransposedConvUpsample(th.nn.Module):
                 padding=0,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
             )
         )
         if activation is not None:

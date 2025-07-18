@@ -45,10 +45,19 @@ import torch as th
 sys.path.append("/home/disk/quicksilver/nacc/dlesm/HealPixPad")
 have_healpixpad = True
 try:
-    from healpixpad import HEALPixPad
+    from earth2grid.healpix import pad as healpix_pad
 except ImportError:
     print("Warning, cannot find healpixpad module")
     have_healpixpad = False
+
+
+class HEALPixPad(th.nn.Module):
+    def __init__(self, padding: int):
+        super().__init__()
+        self.padding = padding
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        return healpix_pad(tensor, self.padding)
 
 
 class HEALPixFoldFaces(th.nn.Module):
@@ -168,13 +177,13 @@ class HEALPixPaddingv2(th.nn.Module):
         torch.Tensor
             The padded tensor where each face's height and width are increased by 2*p
         """
-        torch.cuda.nvtx.range_push("HEALPixPaddingv2:forward")
+        #torch.cuda.nvtx.range_push("HEALPixPaddingv2:forward")
 
         x = self.unfold(x)
         xp = self.padding(x)
         xp = self.fold(xp)
 
-        torch.cuda.nvtx.range_pop()
+        #torch.cuda.nvtx.range_pop()
 
         return xp
 
@@ -226,7 +235,7 @@ class HEALPixPadding(th.nn.Module):
         torch.Tensor
             The padded tensor where each face's height and width are increased by 2*p
         """
-        torch.cuda.nvtx.range_push("HEALPixPadding:forward")
+        #torch.cuda.nvtx.range_push("HEALPixPadding:forward")
 
         # unfold faces from batch dim
         data = self.unfold(data)
@@ -318,7 +327,7 @@ class HEALPixPadding(th.nn.Module):
         # fold faces into batch dim
         res = self.fold(res)
 
-        torch.cuda.nvtx.range_pop()
+        #torch.cuda.nvtx.range_pop()
 
         return res
 
@@ -584,6 +593,11 @@ class HEALPixLayer(th.nn.Module):
             del kwargs["enable_healpixpad"]
         else:
             enable_healpixpad = False
+        if "enable_torch_compile" in kwargs:
+            enable_torch_compile = kwargs["enable_torch_compile"]
+            del kwargs["enable_torch_compile"]
+        else:
+            enable_torch_compile = False
 
         # Define a HEALPixPadding layer if the given layer is a convolution layer
         if (
@@ -598,15 +612,16 @@ class HEALPixLayer(th.nn.Module):
                 enable_healpixpad
                 and have_healpixpad
                 and th.cuda.is_available()
-                and not enable_nhwc
             ):  # pragma: no cover
-                # TODO: missing library, need to decide if we can get library
-                # or if this needs to be removed
                 layers.append(HEALPixPaddingv2(padding=padding))
             else:
                 layers.append(HEALPixPadding(padding=padding, enable_nhwc=enable_nhwc))
 
-        layers.append(layer(**kwargs))
+        if enable_torch_compile:
+            print(f"compiling layer {layer}")
+            layers.append(torch.compile(layer(**kwargs)))
+        else:
+            layers.append(layer(**kwargs))
         self.layers = th.nn.Sequential(*layers)
 
         if enable_nhwc:

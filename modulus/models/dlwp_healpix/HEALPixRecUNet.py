@@ -66,6 +66,7 @@ class HEALPixRecUNet(Module):
         presteps: int = 1,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
         couplings: list = [],
     ):
         """
@@ -137,6 +138,7 @@ class HEALPixRecUNet(Module):
         self.presteps = presteps
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
+        self.enable_torch_compile = enable_torch_compile
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -154,6 +156,7 @@ class HEALPixRecUNet(Module):
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
+            enable_torch_compile=self.enable_torch_compile,
         )
         self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
@@ -161,7 +164,12 @@ class HEALPixRecUNet(Module):
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
+            enable_torch_compile=self.enable_torch_compile,
         )
+        #self.compile = True
+        #if self.compile:
+        #    self.encoder = th.compile(self.encoder)
+        #    self.decoder = th.compile(self.decoder)
 
     @property
     def integration_steps(self):
@@ -290,8 +298,10 @@ class HEALPixRecUNet(Module):
             ]
             res = th.cat(result, dim=self.channel_dim)
 
-        # fold faces into batch dim
+        # fold faces into batch dim (BF, C, H, W)
         res = self.fold(res)
+        if self.enable_nhwc:
+            res = res.to(memory_format=th.channels_last)
         return res
 
     def _reshape_outputs(self, outputs: th.Tensor) -> th.Tensor:
@@ -406,6 +416,7 @@ class HEALPixRecUNet(Module):
         self.reset()
         outputs = []
         for step in range(self.integration_steps):
+            th.cuda.nvtx.range_push(f"Integration step: {step}")
             # (Re-)initialize recurrent hidden states
             if (step * (self.delta_t * self.input_time_dim)) % self.reset_cycle == 0:
                 self._initialize_hidden(inputs=inputs, outputs=outputs, step=step)
@@ -451,16 +462,23 @@ class HEALPixRecUNet(Module):
                         inputs=[outputs[-1]] + list(inputs[1:]),
                         step=step + self.presteps,
                     )
+            th.cuda.nvtx.range_pop()
 
             # Forward through model
+            th.cuda.nvtx.range_push("Encoder")
             encodings = self.encoder(input_tensor)
+            th.cuda.nvtx.range_pop()
+            th.cuda.nvtx.range_push("Decoder")
             decodings = self.decoder(encodings)
+            th.cuda.nvtx.range_pop()
 
+            th.cuda.nvtx.range_push("Reshape outputs")
             # Residual prediction
             reshaped = self._reshape_outputs(
                 input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
             )
             outputs.append(reshaped)
+            th.cuda.nvtx.range_pop()
 
         if output_only_last:
             return outputs[-1]
