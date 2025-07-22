@@ -67,6 +67,7 @@ class HEALPixRecUNet(Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         couplings: list = [],
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -133,10 +134,14 @@ class HEALPixRecUNet(Module):
         self.input_time_dim = input_time_dim
         self.output_time_dim = output_time_dim
         self.delta_t = int(pd.Timedelta(delta_time).total_seconds() // 3600)
-        self.reset_cycle = int(pd.Timedelta(reset_cycle).total_seconds() // 3600)
+        if reset_cycle == float('inf'):
+            self.reset_cycle = reset_cycle
+        else:
+            self.reset_cycle = int(pd.Timedelta(reset_cycle).total_seconds() // 3600)
         self.presteps = presteps
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
+        self.hpx_padding_mode = hpx_padding_mode
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -154,6 +159,7 @@ class HEALPixRecUNet(Module):
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
+            hpx_padding_mode=self.hpx_padding_mode,
         )
         self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
@@ -161,6 +167,7 @@ class HEALPixRecUNet(Module):
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
+            hpx_padding_mode=self.hpx_padding_mode,
         )
 
     @property
@@ -456,10 +463,20 @@ class HEALPixRecUNet(Module):
             encodings = self.encoder(input_tensor)
             decodings = self.decoder(encodings)
 
+            # steady_state_tendency = th.load('/pscratch/sd/y/yikwill/datasets/29ch_model_steady_state_tendency_retrain.pt')
+            # decodings -= steady_state_tendency
+
             # Residual prediction
             reshaped = self._reshape_outputs(
                 input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
             )
+            # if step == 0:
+            #     print(f'input_tensor.shape={input_tensor.shape}')
+            #     print(f'decodings.shape={decodings.shape}')
+            #     print(f'test shape={(decodings-input_tensor[:, : self.input_channels * self.input_time_dim]).shape}')
+            #     steady_state_tendency = decodings-input_tensor[:, : self.input_channels * self.input_time_dim]
+            #     th.save(decodings, '/pscratch/sd/y/yikwill/datasets/29ch_model_steady_state_tendency_retrain.pt')
+            #     print(f'SAVED')
             outputs.append(reshaped)
 
         if output_only_last:

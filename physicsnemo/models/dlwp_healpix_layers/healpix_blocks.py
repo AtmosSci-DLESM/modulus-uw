@@ -19,7 +19,9 @@ from typing import Sequence, Tuple, Union
 import torch
 import torch as th
 
-from .healpix_layers import HEALPixLayer, HEALPixResizeConv
+from .healpix_layers import HEALPixLayer
+
+from hydra.utils import get_class
 
 #
 # RECURRENT BLOCKS
@@ -39,6 +41,8 @@ class ConvGRUBlock(th.nn.Module):
         kernel_size: int = 1,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
+        conv_layer = torch.nn.Conv2d,
     ):
         """
         Parameters
@@ -56,24 +60,29 @@ class ConvGRUBlock(th.nn.Module):
         """
         super().__init__()
 
+        if isinstance(conv_layer, str):
+            conv_layer = get_class(conv_layer)
+
         self.channels = in_channels
         self.conv_gates = geometry_layer(
-            layer=torch.nn.Conv2d,
+            layer=conv_layer,
             in_channels=in_channels + self.channels,
             out_channels=2 * self.channels,  # for update_gate,reset_gate respectively
             kernel_size=kernel_size,
             padding="same",
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
         self.conv_can = geometry_layer(
-            layer=torch.nn.Conv2d,
+            layer=conv_layer,
             in_channels=in_channels + self.channels,
             out_channels=self.channels,  # for candidate neural memory
             kernel_size=kernel_size,
             padding="same",
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
         self.h = th.zeros(1, 1, 1, 1)
 
@@ -112,6 +121,69 @@ class ConvGRUBlock(th.nn.Module):
         """Reset the update gates"""
         self.h = th.zeros_like(self.h)
 
+class ConvGRFBlock(th.nn.Module):
+    """
+    Class that implements a Convolutional GRF from https://arxiv.org/pdf/2506.09733
+    """
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels: int = 3,
+        kernel_size: int = 1,
+        enable_nhwc: bool = False,
+        enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
+    ):
+        """
+        Parameters
+        ----------
+        geometry_layer: torch.nn.Module, optional
+            The wrapper for the geometry layer
+        in_channels: int, optional
+            The number of input channels
+        kernel_size: int, optional
+            Size of the convolutioonal kernel
+        enable_nhwc: bool, optional
+            Enable nhwc format, passed to wrapper
+        enable_healpixpad: bool, optional
+            If HEALPixPadding should be enabled, passed to wrapper
+        """
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.conv = geometry_layer(
+            layer=torch.nn.Conv2d,
+            in_channels=in_channels,
+            out_channels=2*in_channels,
+            kernel_size=kernel_size,
+            enable_nhwc=enable_nhwc,
+            enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
+        )
+
+    def forward(self, inputs: Sequence) -> Sequence:
+        """Forward pass of the ConvGRUBlock
+
+        Parameters
+        ----------
+        inputs: Sequence
+            Input to the forward pass
+
+        Returns
+        -------
+        Sequence
+            Result of the forward pass
+        """
+        h = self.conv(inputs)
+        z, h_hat = th.split(h, self.in_channels, dim=1)
+        z = th.sigmoid(z)
+        h_hat = th.tanh(h_hat)
+        y = z*h_hat + (1-z)*inputs
+        return y
+
+    def reset(self):
+        pass
 
 #
 # CONV BLOCKS
@@ -133,6 +205,8 @@ class BasicConvBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
+        conv_layer = torch.nn.Conv2d,
     ):
         """
         Parameters
@@ -159,19 +233,22 @@ class BasicConvBlock(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         """
         super().__init__()
+        if isinstance(conv_layer, str):
+            conv_layer = get_class(conv_layer)
         if latent_channels is None:
             latent_channels = max(in_channels, out_channels)
         convblock = []
         for n in range(n_layers):
             convblock.append(
                 geometry_layer(
-                    layer=torch.nn.Conv2d,
+                    layer=conv_layer,
                     in_channels=in_channels if n == 0 else latent_channels,
                     out_channels=out_channels if n == n_layers - 1 else latent_channels,
                     kernel_size=kernel_size,
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if activation is not None:
@@ -193,6 +270,51 @@ class BasicConvBlock(th.nn.Module):
         """
         return self.convblock(x)
 
+class ReflectionSymmetricConv2d(th.nn.Module):
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=1,
+        kernel_size=3,
+        stride=1,
+        padding=0,
+        dilation=1,
+        bias=True,
+    ):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+        k = torch.Tensor([1/(in_channels*kernel_size**2)])
+
+        self.weight = th.nn.Parameter(
+            2 * torch.sqrt(k) * torch.rand(out_channels, in_channels, kernel_size, kernel_size) - torch.sqrt(k)
+        )
+        
+        if bias:
+            self.bias = th.nn.Parameter(
+                2 * torch.sqrt(k) * torch.rand(out_channels) - torch.sqrt(k)
+            )
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, x):
+
+        weight = 0.5 * (self.weight + torch.rot90(torch.flip(self.weight, dims=[3]), dims=(-1,-2)))
+        
+        return th.nn.functional.conv2d(
+            x,
+            weight=weight,
+            bias=self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation
+        )
 
 class ConvNeXtBlock(th.nn.Module):
     """Class implementing a modified ConvNeXt network as described in https://arxiv.org/pdf/2201.03545.pdf
@@ -212,6 +334,7 @@ class ConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -250,6 +373,7 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         # Convolution block
         convblock = []
@@ -263,6 +387,7 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -277,6 +402,7 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -290,6 +416,7 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         self.convblock = th.nn.Sequential(*convblock)
@@ -329,6 +456,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters:
@@ -368,6 +496,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         if out_channels == int(latent_channels):
             self.skip_module2 = (
@@ -381,6 +510,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
 
         # 1st ConvNeXt block, the output of this one remains internal
@@ -395,6 +525,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -409,6 +540,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -423,6 +555,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -441,6 +574,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -455,6 +589,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -469,6 +604,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -512,6 +648,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -540,6 +677,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                     activation=activation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
 
@@ -569,6 +707,8 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
+        conv_layer = torch.nn.Conv2d,
     ):
         """
         Parameters
@@ -596,16 +736,20 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         """
         super().__init__()
 
+        if isinstance(conv_layer, str):
+            conv_layer = get_class(conv_layer)
+
         if in_channels == int(latent_channels):
             self.skip_module = lambda x: x  # Identity-function required in forward pass
         else:
             self.skip_module = geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=in_channels,
                 out_channels=out_channels,
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
 
         # 1st ConvNeXt block, the output of this one remains internal
@@ -613,13 +757,14 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 3x3 convolution establishing latent channels channels
         convblock.append(
             geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=in_channels,
                 out_channels=int(latent_channels),
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -627,13 +772,14 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 1x1 convolution establishing increased channels
         convblock.append(
             geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=int(latent_channels),
                 out_channels=int(latent_channels * upscale_factor),
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -641,13 +787,14 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 1x1 convolution returning to latent channels
         convblock.append(
             geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=int(latent_channels * upscale_factor),
                 out_channels=int(latent_channels),
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -655,13 +802,14 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 3x3 convolution from latent channels to latent channels
         convblock.append(
             geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=int(latent_channels),
                 out_channels=out_channels,  # int(latent_channels),
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -701,6 +849,7 @@ class MaxPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -720,6 +869,7 @@ class MaxPool(th.nn.Module):
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
 
     def forward(self, x):
@@ -749,6 +899,7 @@ class AvgPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -768,6 +919,7 @@ class AvgPool(th.nn.Module):
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
 
     def forward(self, x):
@@ -805,6 +957,7 @@ class TransposedConvUpsample(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -837,6 +990,7 @@ class TransposedConvUpsample(th.nn.Module):
                 padding=0,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -861,22 +1015,23 @@ class TransposedConvUpsample(th.nn.Module):
 class ResizeConv(th.nn.Module):
     """
     Class for sequentially interpolating then applying a simple Conv2d on
-    HEALPix (or other) tensor data
+    HEALPix tensor data
     """
 
     def __init__(
         self,
-        geometry_layer: th.nn.Module = HEALPixResizeConv,
-        resize_kwargs = {
-            'scale_factor': 2,
-            'mode': 'nearest',
-        },
-        in_channels: int = 3,
-        out_channels: int = 1,
-        kernel_size: int = 3,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels = 3,
+        out_channels = 3,
+        kernel_size = 3,
+        dilation = 1,
+        scale_factor = 2,
+        mode = 'bilinear',
+        enable_nhwc = False,
+        enable_healpixpad = True,
         activation: th.nn.Module = None,
-        enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',     
+        conv_layer = torch.nn.Conv2d,   
     ):
         """
         Parameters
@@ -902,19 +1057,43 @@ class ResizeConv(th.nn.Module):
         """
         super().__init__()
 
+        if isinstance(conv_layer, str):
+            conv_layer = get_class(conv_layer)
+
+        if dilation > 1:
+            raise Exception(
+                f"dilation > 1 is not currently supported for hpx resize \
+                convolutions, received dilation = {dilation}"
+            )
+
+        # Precompute the amount of extra padding to trim between interpolation
+        # and conv
+        padding = ((kernel_size - 1) // 2) * dilation
+        trim_size = padding * (scale_factor - 1)
+
         block = []
-        block.append(
+        block += [
             geometry_layer(
-                resize_layer=Interpolate,
-                resize_kwargs=resize_kwargs,
-                conv_layer=torch.nn.Conv2d,
+                layer=Interpolate,
+                scale_factor=scale_factor,
+                mode=mode,
+                trim_size=trim_size,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+            ),
+            geometry_layer(
+                layer=conv_layer,
+                disable_pad=True, # Padding is handled by the interpolation layer
                 in_channels=in_channels,
                 out_channels=out_channels,
                 kernel_size=kernel_size,
+                dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-            )
-        )
+                hpx_padding_mode=hpx_padding_mode,
+            ),
+        ]
         if activation is not None:
             block.append(activation)
         self.block = th.nn.Sequential(*block)
@@ -950,6 +1129,7 @@ class Interpolate(th.nn.Module):
         self,
         scale_factor: Union[int, Tuple],
         mode: str = "nearest",
+        trim_size: int = 0,
         # Options below are not used but needed for hydra instantiation to work
         in_channels = 3,
         out_channels = 3,
@@ -963,11 +1143,15 @@ class Interpolate(th.nn.Module):
             Multiplier for spatial size, passed to torch.nn.functional.interpolate
         mode: str, optional
             Interpolation mode used for upsampling, passed to torch.nn.functional.interpolate
+        trim_size: int, optional
+            Number of rows/columns to trim after interpolation, useful if interpolation
+            immediately follows a HPX padding layer to avoid edge artifacts
         """
         super().__init__()
         self.interp = th.nn.functional.interpolate
         self.scale_factor = scale_factor
         self.mode = mode
+        self.trim_size = trim_size
 
     def forward(self, inputs):
         """Forward pass of the Interpolate layer
@@ -982,4 +1166,7 @@ class Interpolate(th.nn.Module):
         torch.Tensor
             the interpolated values
         """
-        return self.interp(inputs, scale_factor=self.scale_factor, mode=self.mode)
+        x = self.interp(inputs, scale_factor=self.scale_factor, mode=self.mode)
+        if self.trim_size > 0:
+            x = x[..., self.trim_size:-self.trim_size, self.trim_size:-self.trim_size]
+        return x
