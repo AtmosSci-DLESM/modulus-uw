@@ -107,19 +107,17 @@ class ConditionalLayerNorm(th.nn.Module):
         x_norm = (x - mean) / th.sqrt(var + self.eps)
     
         # dynamically build gamma and beta, don't store in self
-        gammas = []
-        betas = []
+        gamma = self.gamma_mlp(conditions)[:, None, None, :]
+        beta = self.beta_mlp(conditions)[:, None, None, :]
 
-        for i in range(self.batch_size):
-            gamma = self.gamma_mlp(conditions[i])
-            beta = self.beta_mlp(conditions[i])
-            gammas.append(gamma)
-            betas.append(beta)
+        # Repeat for the number of faces(which has been folded into the batch dimension)
+        gamma = gamma.repeat_interleave(self.n_faces, dim=0)
+        beta = beta.repeat_interleave(self.n_faces, dim=0)
 
-        # add singleton dimensions for H, W, repeat batch dimesnsion n_faces times: these two
-        # dimensions are folded together
-        gamma = th.stack(gammas, dim=0)[:,None,None,:].repeat_interleave(self.n_faces, dim=0)
-        beta = th.stack(betas, dim=0)[:,None,None,:].repeat_interleave(self.n_faces, dim=0)
+        # # add singleton dimensions for H, W, repeat batch dimesnsion n_faces times: these two
+        # # dimensions are folded together
+        # gamma = th.stack(gammas, dim=0)[:,None,None,:].repeat_interleave(self.n_faces, dim=0)
+        # beta = th.stack(betas, dim=0)[:,None,None,:].repeat_interleave(self.n_faces, dim=0)
 
         # now gamma and beta are clean tensors that participate in autograd safely
         return gamma * x_norm + beta

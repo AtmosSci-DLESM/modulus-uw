@@ -352,7 +352,6 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             raise ValueError("Length of outputs and loss_weights is not the same!")
 
         self.loss_weights = self.loss_weights.to(device=trainer.device)
-        self.n_members = th.tensor(self.n_members, device=trainer.device)
         self.coeff_eps = th.tensor(self.coeff_eps, device=trainer.device)
         self.averaging_coeff = th.tensor(self.averaging_coeff, device=trainer.device)
 
@@ -371,25 +370,18 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         average_channels: bool, optional
             whether the mean of the channels should be taken
         """
+        
+        # Unfold ensemble dimension from batch dimension to have shape [N, B, F, T, C, H, W]
+        b = target.shape[0]
+        prediction = prediction.view(self.n_members, b, *prediction.shape[1:])
 
         # checks for dimensions 
         if not prediction.shape[1:] == target.shape:
             raise ValueError(f"Shape of prediction should match shape of target along non-ensemble dimensions, got {prediction.shape} and {target.shape}")
-        if not prediction.shape[0] == self.n_members:
+    
+        if not prediction.shape[0] % self.n_members == 0:
             raise ValueError(f"Shape of prediction should have ensemble dimension of size {self.n_members}, got {prediction.shape[0]}")
         
-        # # initialize crps field with zeros
-        # crps = th.zeros_like(prediction[0,...])
-        # # loop over all ensemble members
-        # for j in range(self.n_members):
-        #     xj = prediction[j,...]
-        #     for k in range(self.n_members):
-        #         xk = prediction[k,...]
-        #         if j != k:
-        #             # this is the crps as defined in https://arxiv.org/html/2412.15832v1 equation 4
-        #             crps += th.abs(xj - target) + th.abs(xk - target) - self.coeff_eps * th.abs(xj - xk)
-        # "fair" averaging using triangle inequality
-        # crps = crps * self.averaging_coeff
         crps_terms = []
         for j in range(self.n_members):
             xj = prediction[j,...]
