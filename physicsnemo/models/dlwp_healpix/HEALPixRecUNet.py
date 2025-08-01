@@ -328,7 +328,7 @@ class HEALPixRecUNet(Module):
         return res
 
     def _initialize_hidden(
-        self, inputs: Sequence, outputs: Sequence, step: int
+        self, inputs: Sequence, outputs: Sequence, step: int, conditions_cln: Sequence = None
     ) -> None:
         """Initialize the hidden layers
 
@@ -340,6 +340,8 @@ class HEALPixRecUNet(Module):
             Outputs to use to initialize the hideen layers
         step: int
             Current step number of the initialization
+        conditions_cln: Sequence, optional
+            Conditional inputs for the normalization layers.
         """
         self.reset()
         for prestep in range(self.presteps):
@@ -384,9 +386,9 @@ class HEALPixRecUNet(Module):
                         inputs=[outputs[s - 1]] + list(inputs[1:]), step=s + 1
                     )
             # Forward the data through the model to initialize hidden states
-            self.decoder(self.encoder(input_tensor))
+            self.decoder(self.encoder(input_tensor, conditions_cln=conditions_cln), conditions_cln=conditions_cln)
 
-    def forward(self, inputs: Sequence, output_only_last=False) -> th.Tensor:
+    def forward(self, inputs: Sequence, output_only_last=False, conditions_cln=None) -> th.Tensor:
         """
         Forward pass of the HEALPixUnet
 
@@ -398,17 +400,22 @@ class HEALPixRecUNet(Module):
             [F, C, H, W] is the format for constants
         output_only_last: bool, optional
             If only the last dimension of the outputs should be returned
+        conditions_cln: Sequence, optional
+            If the model is using conditional normalization, this is a sequence of tensors
+            that will be used to condition the normalization layers. The shape of the tensors
+            should be [N], where N is the size of the condition.
 
         Returns
         -------
         th.Tensor: Predicted outputs
         """
+
         self.reset()
         outputs = []
         for step in range(self.integration_steps):
             # (Re-)initialize recurrent hidden states
             if (step * (self.delta_t * self.input_time_dim)) % self.reset_cycle == 0:
-                self._initialize_hidden(inputs=inputs, outputs=outputs, step=step)
+                self._initialize_hidden(inputs=inputs, outputs=outputs, step=step, conditions_cln=conditions_cln)
 
             # Construct concatenated input: [prognostics|TISR|constants]
             if step == 0:
@@ -452,9 +459,19 @@ class HEALPixRecUNet(Module):
                         step=step + self.presteps,
                     )
 
-            # Forward through model
-            encodings = self.encoder(input_tensor)
-            decodings = self.decoder(encodings)
+            # Forward through model, with or without conditions
+            # print('=========================================================================================')
+            # print('Inside HPXRecUnet forward pass')
+            # print(f'conditions_cln: {conditions_cln}')
+            # print(f'conditions_cln shape: {conditions_cln.shape if conditions_cln is not None else "None"}')
+            # print('=========================================================================================')
+            # exit()
+            if conditions_cln is not None:
+                encodings = self.encoder(input_tensor, conditions_cln=conditions_cln)
+                decodings = self.decoder(encodings, conditions_cln=conditions_cln)
+            else:
+                encodings = self.encoder(input_tensor)
+                decodings = self.decoder(encodings)
 
             # Residual prediction
             reshaped = self._reshape_outputs(

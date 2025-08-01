@@ -341,6 +341,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
 
         # parameter for almost fair CRPS loss. See https://arxiv.org/html/2412.15832v1
         self.coeff_eps = 1 - ((1-alpha) / (n_members))
+        self.averaging_coeff = 1 / (n_members * (n_members - 1))
 
     def setup(self, trainer):
         """
@@ -353,7 +354,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         self.loss_weights = self.loss_weights.to(device=trainer.device)
         self.n_members = th.tensor(self.n_members, device=trainer.device)
         self.coeff_eps = th.tensor(self.coeff_eps, device=trainer.device)
-        
+        self.averaging_coeff = th.tensor(self.averaging_coeff, device=trainer.device)
 
     def forward(self, prediction, target, average_channels=True):
         """
@@ -370,22 +371,38 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         average_channels: bool, optional
             whether the mean of the channels should be taken
         """
-        if not (prediction.ndim == 7 and target.ndim == 7):
-            raise AssertionError("Probabilistic loss expects predictions to have 7 dimensions (last corresponds to ensemble members)")
 
-        # initialize crps field with zeros
-        crps = th.zeros_like(prediction[..., 0])
-        # loop over all ensemble members
-        for j in range(self.n_members):
-            xj = prediction[..., j]
-            for k in range(self.n_members):
-                xk = prediction[..., k]
-                if j != k:
-                    # this is the crps as defined in https://arxiv.org/html/2412.15832v1 equation 4
-                    crps += th.abs(xj - prediction) + th.abs(xk - prediction) - self.coeff_eps * th.abs(xj - xk)
+        # checks for dimensions 
+        if not prediction.shape[1:] == target.shape:
+            raise ValueError(f"Shape of prediction should match shape of target along non-ensemble dimensions, got {prediction.shape} and {target.shape}")
+        if not prediction.shape[0] == self.n_members:
+            raise ValueError(f"Shape of prediction should have ensemble dimension of size {self.n_members}, got {prediction.shape[0]}")
         
+        # # initialize crps field with zeros
+        # crps = th.zeros_like(prediction[0,...])
+        # # loop over all ensemble members
+        # for j in range(self.n_members):
+        #     xj = prediction[j,...]
+        #     for k in range(self.n_members):
+        #         xk = prediction[k,...]
+        #         if j != k:
+        #             # this is the crps as defined in https://arxiv.org/html/2412.15832v1 equation 4
+        #             crps += th.abs(xj - target) + th.abs(xk - target) - self.coeff_eps * th.abs(xj - xk)
+        # "fair" averaging using triangle inequality
+        # crps = crps * self.averaging_coeff
+        crps_terms = []
+        for j in range(self.n_members):
+            xj = prediction[j,...]
+            for k in range(self.n_members):
+                xk = prediction[k,...]
+                if j != k:
+                    term = th.abs(xj - target) + th.abs(xk - target) - self.coeff_eps * th.abs(xj - xk)
+                    crps_terms.append(term)
 
-
+        crps = th.stack(crps_terms).sum(dim=0) * self.averaging_coeff
+        # ToDo: speed up CRPS calculation?
+        # I could permute array to apply operations exclusively on tensors
+        # This would involve reshaping the tensors and using indexing to avoid the double loop
         crps = crps.mean(dim=(0, 1, 2, 4, 5)) * self.loss_weights
         if average_channels:
             return th.mean(crps)

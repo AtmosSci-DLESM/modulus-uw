@@ -19,6 +19,7 @@ from typing import Sequence
 import torch as th
 from hydra.utils import instantiate
 from omegaconf import DictConfig
+from omegaconf import OmegaConf
 
 
 class UNetEncoder(th.nn.Module):
@@ -82,7 +83,11 @@ class UNetEncoder(th.nn.Module):
                         enable_healpixpad=enable_healpixpad,
                     )
                 )
-
+            # print(f'======================================================================')
+            # print(f'Initializing ConvNeXtBlock with parameters:')
+            # print(f'Using config: {conv_block}')
+            # print(f'======================================================================')
+            # exit()
             modules.append(
                 instantiate(
                     config=conv_block,
@@ -102,7 +107,7 @@ class UNetEncoder(th.nn.Module):
 
         self.encoder = th.nn.ModuleList(self.encoder)
 
-    def forward(self, inputs: Sequence) -> Sequence:
+    def forward(self, inputs: Sequence, conditions_cln: th.Tensor=None) -> Sequence:
         """
         Forward pass of the HEALPix Unet encoder
 
@@ -110,15 +115,41 @@ class UNetEncoder(th.nn.Module):
         ----------
         inputs: Sequence
             The inputs to enccode
+        conditions_cln: th.Tensor: optional
+            The conditional inputs for the normalization layers.
 
         Returns
         -------
         Sequence: The encoded values
         """
+       
         outputs = []
-        for layer in self.encoder:
-            outputs.append(layer(inputs))
+        # for layer in self.encoder:
+        #     outputs.append(layer(inputs,))
+        #     inputs = outputs[-1]
+        for layer_group in self.encoder:
+            interim_output = inputs
+            for layer in layer_group:
+                # check if class accepts cln inputs
+                if getattr(layer, 'cln_enabled', False):
+                    if conditions_cln is None:
+                        raise ValueError("Conditional inputs are required for layers with cln_enabled=True")
+                    interim_output = layer(interim_output, conditions_cln=conditions_cln)
+                else:
+                    interim_output = layer(interim_output)
+            outputs.append(interim_output)
             inputs = outputs[-1]
+        # print(f"=======================================================================")
+        # print(f'last layer: {layer}')
+        # print(f"Shape of output: {len(outputs)}")
+        # print(f'Shape of outputs[0]: {outputs[0].shape if outputs else "No outputs"}')
+        # print(f"Shape of outputs[1]: {outputs[1].shape if len(outputs) > 1 else 'No outputs'}")
+        # print(f"Shape of outputs[2]: {outputs[2].shape if len(outputs) > 2 else 'No outputs'}")
+        # # print(f"Shape of outputs[3]: {outputs[3].shape if len(outputs) > 3 else 'No outputs'}")
+        # # print(f"Shape of outputs[4]: {outputs[4].shape if len(outputs) > 4 else 'No outputs'}")
+        # print(f"=======================================================================")
+        # exit()
+        # Return the outputs of the last layer
         return outputs
 
     def reset(self):
