@@ -122,7 +122,6 @@ class UNetDecoder(th.nn.Module):
             )
 
         self.decoder = th.nn.ModuleList(self.decoder)
-
         # (Linear) Output layer
         self.output_layer = instantiate(
             config=output_layer,
@@ -148,25 +147,13 @@ class UNetDecoder(th.nn.Module):
         -------
         torch.Tensor: The decoded values
         """
-        # print(f"=======================================================================")
-        # print(f"Shape of inputs: {len(inputs)}")
-        # print(f'Shape of inputs[0]: {inputs[0].shape if inputs else "No inputs"}')
-        # print(f"Shape of inputs[1]: {inputs[1].shape if inputs else 'No inputs'}")
-        # print(f"Shape of inputs[2]: {inputs[2].shape if inputs else 'No inputs'}")
-        # print(f"Shape of inputs[3]: {inputs[3].shape if inputs else 'No inputs'}")
-        # print(f"Shape of inputs[4]: {inputs[4].shape if inputs else 'No inputs'}")
-        # print(f'conditions_cln: {conditions_cln.shape if conditions_cln is not None else "No conditions"}') 
         x = inputs[-1]
         for n, layer in enumerate(self.decoder):
-            # print(f'shape of x in layer {n}: {x.shape}')
-            # print(f'layer: {layer}')
             if layer["upsamp"] is not None:
                 up = layer["upsamp"](x)
                 x = th.cat([up, inputs[-1 - n]], dim=self.channel_dim)
             # apply the conv block, check if the layer accepts conditional inputs
             if conditions_cln is not None:
-                # print(f"Applying Conditional Layer Normalization with conditions shape: {conditions_cln.shape}")
-                # print(f"=======================================================================")
                 x = layer["conv"](x, conditions_cln=conditions_cln)
             else:
                 x = layer["conv"](x)

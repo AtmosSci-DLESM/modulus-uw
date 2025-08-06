@@ -36,7 +36,6 @@ class UNetEncoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        dropout: float = 0.0,
     ):
         """
         Parameters
@@ -60,8 +59,6 @@ class UNetEncoder(th.nn.Module):
             If channel last format should be used
         enable_healpixpad, bool, optional
             If the healpixpad library should be used (if installed)
-        dropout, float, optional
-            Probability to use in dropout (if 0, don't use dropout)
         """
         super().__init__()
         self.n_channels = n_channels
@@ -83,11 +80,6 @@ class UNetEncoder(th.nn.Module):
                         enable_healpixpad=enable_healpixpad,
                     )
                 )
-            # print(f'======================================================================')
-            # print(f'Initializing ConvNeXtBlock with parameters:')
-            # print(f'Using config: {conv_block}')
-            # print(f'======================================================================')
-            # exit()
             modules.append(
                 instantiate(
                     config=conv_block,
@@ -98,7 +90,6 @@ class UNetEncoder(th.nn.Module):
                     n_layers=n_layers[n],
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
-                    dropout=dropout,
                 )
             )
             old_channels = curr_channel
@@ -114,7 +105,7 @@ class UNetEncoder(th.nn.Module):
         Parameters
         ----------
         inputs: Sequence
-            The inputs to enccode
+            The inputs to encode
         conditions_cln: th.Tensor: optional
             The conditional inputs for the normalization layers.
 
@@ -122,11 +113,7 @@ class UNetEncoder(th.nn.Module):
         -------
         Sequence: The encoded values
         """
-       
         outputs = []
-        # for layer in self.encoder:
-        #     outputs.append(layer(inputs,))
-        #     inputs = outputs[-1]
         for layer_group in self.encoder:
             interim_output = inputs
             for layer in layer_group:
@@ -139,16 +126,6 @@ class UNetEncoder(th.nn.Module):
                     interim_output = layer(interim_output)
             outputs.append(interim_output)
             inputs = outputs[-1]
-        # print(f"=======================================================================")
-        # print(f'last layer: {layer}')
-        # print(f"Shape of output: {len(outputs)}")
-        # print(f'Shape of outputs[0]: {outputs[0].shape if outputs else "No outputs"}')
-        # print(f"Shape of outputs[1]: {outputs[1].shape if len(outputs) > 1 else 'No outputs'}")
-        # print(f"Shape of outputs[2]: {outputs[2].shape if len(outputs) > 2 else 'No outputs'}")
-        # # print(f"Shape of outputs[3]: {outputs[3].shape if len(outputs) > 3 else 'No outputs'}")
-        # # print(f"Shape of outputs[4]: {outputs[4].shape if len(outputs) > 4 else 'No outputs'}")
-        # print(f"=======================================================================")
-        # exit()
         # Return the outputs of the last layer
         return outputs
 

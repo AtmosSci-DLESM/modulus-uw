@@ -358,21 +358,20 @@ class WeightedCRPSLoss(th.nn.MSELoss):
     def forward(self, prediction, target, average_channels=True):
         """
         Forward pass of the WeightedCRPSLoss 
-        Prediction tensor is expected to be in the shape [N, B, F, C, H, W, M] where M is the number of ensemble members.
-        Target tensor is expected to be in the shape [N, B, F, C, H, W]. No ensemble dimension is expected.
+        Computes the CRPS loss for the model prediction and target.
 
         Parameters
         ----------
         prediction: torch.Tensor
-            The prediction tensor
+            The prediction tensor shape [Cond*B, F, T, C, H, W] where Cond is the number of ensemble members
         target: torch.Tensor
-            The target tensor
+            The target tensor shape [B, F, T, C, H, W]
         average_channels: bool, optional
             whether the mean of the channels should be taken
         """
         
-        # Unfold ensemble dimension from batch dimension to have shape [N, B, F, T, C, H, W]
-        b = target.shape[0]
+        # Unfold ensemble dimension from batch dimension to have shape [Cond, B, F, T, C, H, W]
+        b = target.shape[0] # get batch shape from target
         prediction = prediction.view(self.n_members, b, *prediction.shape[1:])
 
         # checks for dimensions 

@@ -114,10 +114,5 @@ class ConditionalLayerNorm(th.nn.Module):
         gamma = gamma.repeat_interleave(self.n_faces, dim=0)
         beta = beta.repeat_interleave(self.n_faces, dim=0)
 
-        # # add singleton dimensions for H, W, repeat batch dimesnsion n_faces times: these two
-        # # dimensions are folded together
-        # gamma = th.stack(gammas, dim=0)[:,None,None,:].repeat_interleave(self.n_faces, dim=0)
-        # beta = th.stack(betas, dim=0)[:,None,None,:].repeat_interleave(self.n_faces, dim=0)
-
         # now gamma and beta are clean tensors that participate in autograd safely
         return gamma * x_norm + beta

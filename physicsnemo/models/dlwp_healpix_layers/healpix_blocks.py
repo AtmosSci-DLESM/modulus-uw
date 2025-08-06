@@ -533,7 +533,6 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         self.blocks = th.nn.ModuleList()
         # flag for conditional layer normalization
         self.cln_enabled = conditional_layer_norm is not None
-
         for i in range(n_layers):
             curr_in = in_channels if i == 0 else out_channels
 
@@ -649,7 +648,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         self.cln_enabled = conditional_layer_norm is not None
 
         if use_block_skip_connection:
-            if in_channels == int(latent_channels):
+            if in_channels == int(out_channels):
                 self.skip_module = lambda x: x
             else:
                 self.skip_module = geometry_layer(
