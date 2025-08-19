@@ -297,8 +297,10 @@ class HEALPixRecUNet(Module):
             ]
             res = th.cat(result, dim=self.channel_dim)
 
-        # fold faces into batch dim
+        # fold faces into batch dim (BF, C, H, W)
         res = self.fold(res)
+        if self.enable_nhwc:
+            res = res.to(memory_format=th.channels_last)
         return res
 
     def _reshape_outputs(self, outputs: th.Tensor) -> th.Tensor:
