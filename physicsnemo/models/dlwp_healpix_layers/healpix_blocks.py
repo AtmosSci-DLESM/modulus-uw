@@ -22,10 +22,6 @@ import torch as th
 from .healpix_layers import HEALPixLayer
 
 from hydra.utils import get_class
-import xarray as xr
-import cuhpx
-from cuhpx import SHTCUDA, iSHTCUDA, SHT, iSHT
-import earth2grid
 
 #
 # RECURRENT BLOCKS
