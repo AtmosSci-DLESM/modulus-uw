@@ -64,7 +64,6 @@ class TimeSeriesDataset(Dataset, Datapipe):
         drop_last: bool = False,
         add_insolation: bool = False,
         forecast_init_times: Optional[Sequence] = None,
-        reflect_across_equator: bool = False,
         meta: DatapipeMetaData = MetaData(),
     ):
         """
@@ -119,7 +118,6 @@ class TimeSeriesDataset(Dataset, Datapipe):
         self.add_insolation = add_insolation
         self.forecast_init_times = forecast_init_times
         self.forecast_mode = self.forecast_init_times is not None
-        self.reflect_across_equator = reflect_across_equator
 
         # Time stepping
         if (self.time_step % self.data_time_step).total_seconds() != 0:
@@ -323,8 +321,8 @@ class TimeSeriesDataset(Dataset, Datapipe):
             return len(self._forecast_init_indices)
         length = (self.ds.sizes["time"] - self._window_length + 1) / self.batch_size
         if self.drop_last:
-            return int(np.floor(length))*2 if self.reflect_across_equator else int(np.floor(length))
-        return int(np.ceil(length))*2 if self.reflect_across_equator else int(np.ceil(length))
+            return int(np.floor(length))
+        return int(np.ceil(length))
 
     def _get_time_index(self, item):
         """Get the indices for the specified sample
@@ -396,10 +394,6 @@ class TimeSeriesDataset(Dataset, Datapipe):
         """
         # start range
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__")
-
-        if self.reflect_across_equator:
-            reflect_batch_across_equator = item % 2
-            item = item // 2
 
         if item < 0:
             item = len(self) + item
@@ -482,13 +476,6 @@ class TimeSeriesDataset(Dataset, Datapipe):
             # Add the constants as [F, C, H, W]
             inputs_result.append(self.constants)
 
-        if self.reflect_across_equator:
-            if reflect_batch_across_equator:
-                reflected_face_order = [8,9,10,11,4,5,6,7,0,1,2,3]
-                inputs_result[0] = np.flip(np.transpose(inputs_result[0], axes=[0,1,2,3,5,4]), axis=[4,5])[:,reflected_face_order]
-                inputs_result[1] = np.flip(np.transpose(inputs_result[1], axes=[0,1,2,3,5,4]), axis=[4,5])[:,reflected_face_order]
-                inputs_result[2] = np.flip(np.transpose(inputs_result[2], axes=[0,1,3,2]), axis=[2,3])[reflected_face_order]
-
         logger.log(5, "computed batch in %0.2f s", time.time() - compute_time)
         torch.cuda.nvtx.range_pop()
 
@@ -501,9 +488,4 @@ class TimeSeriesDataset(Dataset, Datapipe):
         # we also need to transpose targets
         targets = np.transpose(targets, axes=(0, 3, 1, 2, 4, 5))
 
-        if self.reflect_across_equator:
-            if reflect_batch_across_equator:
-                reflected_face_order = [8,9,10,11,4,5,6,7,0,1,2,3]
-                targets = np.flip(np.transpose(targets, axes=[0,1,2,3,5,4]), axis=[4,5])[:,reflected_face_order]
-        
         return inputs_result, targets

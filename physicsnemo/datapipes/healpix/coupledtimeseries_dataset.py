@@ -68,7 +68,6 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         drop_last: bool = False,
         add_insolation: bool = False,
         forecast_init_times: Optional[Sequence] = None,
-        reflect_across_equator: bool = False,
         couplings: Sequence = [],
         meta: DatapipeMetaData = MetaData(),
         add_train_noise: bool = False,
@@ -154,7 +153,6 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             drop_last=drop_last,
             add_insolation=add_insolation,
             forecast_init_times=forecast_init_times,
-            reflect_across_equator=reflect_across_equator,
             meta=meta,
         )
         # calculate static indices for coupling
@@ -179,10 +177,6 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
     def __getitem__(self, item):
         # start range
         torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__")
-
-        if self.reflect_across_equator:
-            reflect_batch_across_equator = item % 2
-            item = item // 2
 
         if item < 0:
             item = len(self) + item
@@ -322,14 +316,6 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         if len(self.couplings) > 0:
             inputs_result.append(integrated_couplings)
 
-        if self.reflect_across_equator:
-            if reflect_batch_across_equator:
-                reflected_face_order = [8,9,10,11,4,5,6,7,0,1,2,3]
-                inputs_result[0] = np.flip(np.transpose(inputs_result[0], axes=[0,1,2,3,5,4]), axis=[4,5])[:,reflected_face_order]
-                inputs_result[1] = np.flip(np.transpose(inputs_result[1], axes=[0,1,2,3,5,4]), axis=[4,5])[:,reflected_face_order]
-                inputs_result[2] = np.flip(np.transpose(inputs_result[2], axes=[0,1,3,2]), axis=[2,3])[reflected_face_order]
-                inputs_result[3] = np.flip(np.transpose(inputs_result[3], axes=[0,1,2,3,5,4]), axis=[4,5])[:,:,:,reflected_face_order]
-
         torch.cuda.nvtx.range_pop()
 
         # finish range
@@ -340,11 +326,6 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
 
         # we also need to transpose targets
         targets = np.transpose(targets, axes=(0, 3, 1, 2, 4, 5))
-
-        if self.reflect_across_equator:
-            if reflect_batch_across_equator:
-                reflected_face_order = [8,9,10,11,4,5,6,7,0,1,2,3]
-                targets = np.flip(np.transpose(targets, axes=[0,1,2,3,5,4]), axis=[4,5])[:,reflected_face_order]
 
         return inputs_result, targets
 

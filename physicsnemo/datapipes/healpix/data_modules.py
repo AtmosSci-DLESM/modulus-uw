@@ -398,7 +398,6 @@ class TimeSeriesDataModule:
         pin_memory: bool = True,
         prebuilt_dataset: bool = True,
         forecast_init_times: Optional[Sequence] = None,
-        reflect_across_equator: bool = False,
     ):
         """
         Parameters
@@ -496,7 +495,6 @@ class TimeSeriesDataModule:
         self.pin_memory = pin_memory
         self.prebuilt_dataset = prebuilt_dataset
         self.forecast_init_times = forecast_init_times
-        self.reflect_across_equator = reflect_across_equator
 
         self.train_dataset = None
         self.val_dataset = None
@@ -631,7 +629,6 @@ class TimeSeriesDataModule:
                 batch_size=self.dataset_batch_size,
                 drop_last=self.drop_last,
                 add_insolation=self.add_insolation,
-                reflect_across_equator=self.reflect_across_equator,
             )
             self.val_dataset = TimeSeriesDataset(
                 dataset.sel(
@@ -834,7 +831,6 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
         pin_memory: bool = True,
         prebuilt_dataset: bool = True,
         forecast_init_times: Optional[Sequence] = None,
-        reflect_across_equator: bool = False,
         couplings: Sequence = None,
         add_train_noise: Optional[bool] = False,
         train_noise_params: Optional[DictConfig] = None,
@@ -951,7 +947,6 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
             pin_memory,
             prebuilt_dataset,
             forecast_init_times,
-            reflect_across_equator,
         )
 
     def _get_coupled_vars(self):
@@ -1071,7 +1066,6 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
                 batch_size=self.dataset_batch_size,
                 drop_last=self.drop_last,
                 add_insolation=self.add_insolation,
-                reflect_across_equator=self.reflect_across_equator,
                 couplings=self.couplings,
                 add_train_noise=self.add_train_noise,
                 train_noise_params=self.train_noise_params,
