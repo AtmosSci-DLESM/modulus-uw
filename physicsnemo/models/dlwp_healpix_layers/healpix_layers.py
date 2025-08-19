@@ -1008,12 +1008,6 @@ class HEALPixLayer(th.nn.Module):
         super().__init__()
         layers = []
 
-        if "disable_pad" in kwargs:
-            disable_pad = kwargs["disable_pad"]
-            del kwargs["disable_pad"]
-        else:
-            disable_pad = False
-
         if "enable_nhwc" in kwargs:
             enable_nhwc = kwargs["enable_nhwc"]
             del kwargs["enable_nhwc"]
@@ -1039,7 +1033,7 @@ class HEALPixLayer(th.nn.Module):
             layer_type = "other"
 
         if (
-            (layer_type == "conv" and kwargs["kernel_size"] > 1 and (not disable_pad))
+            (layer_type == "conv" and kwargs["kernel_size"] > 1)
             or (layer_type == "interp")
         ):
             if layer_type == "conv":
