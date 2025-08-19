@@ -43,6 +43,8 @@ import torch
 import torch as th
 from typing import Union, Optional
 
+import xarray as xr
+
 sys.path.append("/home/disk/quicksilver/nacc/dlesm/HealPixPad")
 have_healpixpad = True
 try:
@@ -527,17 +529,17 @@ class HEALPixPadding(th.nn.Module):
         torch.Tensor:
             The padded tensor p
         """
-        print('USING PN_ISOLATV2')
+        # print('USING PN_ISOLATV2')
         d = self.d  # Dimensions for rotations
 
         # Roll top and left face padding towards equator
         t = t.rot90(1, dims=d)[..., -1:, :]
         t[..., -1, :] = torch.roll(t[..., -1, :], 1, dims=-1)
-        t[..., -1, 0] = tl.rot90(2, d)[..., -2, -1]
+        t[..., -1, 0] = tl.rot90(2, d)[..., -2, -1] # fill opened point
 
         lft = lft.rot90(-1, dims=d)[..., -1:]
         lft[..., -1] = torch.roll(lft[..., -1], 1, dims=-1)
-        lft[..., 0, -1] = tl.rot90(2, d)[..., -1, -2]
+        lft[..., 0, -1] = tl.rot90(2, d)[..., -1, -2] # fill opened point
 
         # Assemble the center pads including the center face
         c = th.cat((t, c, b[..., :1, :]), dim=-2)
@@ -768,17 +770,17 @@ class HEALPixPadding(th.nn.Module):
         torch.Tensor:
             The padded tensor p
         """
-        print('USING PS_ISOLATV2')
+        # print('USING PS_ISOLATV2')
         d = self.d  # Dimensions for rotations
 
         # Roll bottom and right padding towards equator
         b = b.rot90(1, d)[..., :1, :]
         b[..., 0, :] = torch.roll(b[..., 0, :], -1, dims=-1)
-        b[..., 0, -1] = br.rot90(2, d)[..., 1, 0]
+        b[..., 0, -1] = br.rot90(2, d)[..., 1, 0] # fill opened point
 
         rgt = rgt.rot90(-1, d)[..., :1]
         rgt[..., 0] = torch.roll(rgt[..., 0], -1, dims=-1)
-        rgt[..., -1, 0] = br.rot90(2, d)[..., 0, 1]
+        rgt[..., -1, 0] = br.rot90(2, d)[..., 0, 1] # fill opened point
             
         # Assemble the center pads including the center face
         c = th.cat((t[..., -1:, :], c, b), dim=-2)
@@ -1024,12 +1026,20 @@ class HEALPixLayer(th.nn.Module):
         else:
             enable_healpixpad = False
 
+        if "add_coriolis" in kwargs:
+            del kwargs["add_coriolis"]
+
         # Define a HEALPixPadding layer if the given layer is a convolution or
         # interpolation layer
         if (layer.__bases__[0] is th.nn.modules.conv._ConvNd) \
-        or (layer.__name__ == "ReflectionSymmetricConv2d"):
+        or (layer.__name__ == "ReflectionSymmetricConv2d") \
+        or (layer.__name__ == "Conv2dCoriolis"):
             layer_type = "conv"
-        elif layer.__name__ == "Interpolate":
+        elif layer.__name__ in [
+            "Interpolate",
+            "HPXSymmetricInterpolate",
+            "HPXSymmetricInterpolateSmooth",
+        ]:
             layer_type = "interp"
         else:
             layer_type = "other"
@@ -1075,4 +1085,268 @@ class HEALPixLayer(th.nn.Module):
         :return: The output tensor of this HEALPix layer
         """
         res = self.layers(x)
+        return res
+
+class HEALPixCoriolisLayer(th.nn.Module):
+    """Pytorch module for applying any base torch Module on a HEALPix tensor. Expects all input/output tensors to have a
+    shape [..., 12, H, W], where 12 is the dimension of the faces.
+    """
+
+    def __init__(self, layer, hpx_padding_mode="karlbauer", **kwargs):
+        """
+        Parameters
+        ----------
+        layer: torch.nn.Module
+            Any torch layer function, e.g., th.nn.Conv2d
+        kwargs:
+            The arguments that are passed to the torch layer function, e.g., kernel_size
+        """
+        super().__init__()
+        layers = []
+
+        if "in_channels" in kwargs:
+            kwargs["in_channels"] += 1 # for Coriolis parameter
+        self.f = None
+
+        if "disable_pad" in kwargs:
+            disable_pad = kwargs["disable_pad"]
+            del kwargs["disable_pad"]
+        else:
+            disable_pad = False
+
+        if "enable_nhwc" in kwargs:
+            enable_nhwc = kwargs["enable_nhwc"]
+            del kwargs["enable_nhwc"]
+        else:
+            enable_nhwc = False
+
+        if "enable_healpixpad" in kwargs:
+            enable_healpixpad = kwargs["enable_healpixpad"]
+            del kwargs["enable_healpixpad"]
+        else:
+            enable_healpixpad = False
+
+        # Define a HEALPixPadding layer if the given layer is a convolution or
+        # interpolation layer
+        if (layer.__bases__[0] is th.nn.modules.conv._ConvNd) \
+        or (layer.__name__ == "ReflectionSymmetricConv2d") \
+        or (layer.__name__ == "Conv2dCoriolis"):
+            layer_type = "conv"
+        elif layer.__name__ == "Interpolate":
+            layer_type = "interp"
+        else:
+            layer_type = "other"
+
+        if (
+            (layer_type == "conv" and kwargs["kernel_size"] > 1 and (not disable_pad))
+            or (layer_type == "interp")
+        ):
+            if layer_type == "conv":
+                kwargs["padding"] = 0  # Disable native padding
+            kernel_size = 3 if "kernel_size" not in kwargs else kwargs["kernel_size"]
+            dilation = 1 if "dilation" not in kwargs else kwargs["dilation"]
+            padding = ((kernel_size - 1) // 2) * dilation
+            if (
+                enable_healpixpad
+                and have_healpixpad
+                and th.cuda.is_available()
+                and not enable_nhwc
+            ):  # pragma: no cover
+                # TODO: missing library, need to decide if we can get library
+                # or if this needs to be removed
+                layers.append(HEALPixPaddingv2(padding=padding))
+            else:
+                layers.append(
+                    HEALPixPadding(
+                        padding=padding,
+                        hpx_padding_mode=hpx_padding_mode,
+                        enable_nhwc=enable_nhwc
+                    )
+                )
+
+        layers.append(layer(**kwargs))
+        self.n_layers = len(layers)
+        self.layers = th.nn.Sequential(*layers)
+
+        if enable_nhwc:
+            self.layers = self.layers.to(memory_format=torch.channels_last)
+
+        self.register_buffer("refl_face_order", torch.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=torch.int))
+
+    def hpx_reflect(self,x):
+        '''
+        Helper function to reflect a HPX tensor across its horizontal axis.
+        Assumes x has shape [B*F,C,H,W]
+        '''
+        x = torch.rot90(torch.flip(x, dims=[3]), dims=(-1,-2))
+        x = x.reshape(-1, 12, *x.shape[1:])
+        # refl_face_order = [8,9,10,11,4,5,6,7,0,1,2,3]
+        # x = x[:,refl_face_order]
+        x = torch.index_select(x, dim=1, index=self.refl_face_order.to(x.device))
+        x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
+        return x
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """
+        Performs the forward pass using the defined layer function and the given data.
+
+        :param x: The input tensor of shape [..., F=12, H, W]
+        :return: The output tensor of this HEALPix layer
+        """
+
+        if self.f is None:
+            nside = x.shape[-1]
+            self.f = xr.open_dataset(
+                f'/pscratch/sd/y/yikwill/datasets/healpix/HPX64/era5_0.25deg_3h_HPX{nside}_1979-2021_f.nc'
+            )['f'].data
+            self.f = torch.Tensor(self.f).unsqueeze(1).repeat(x.shape[0]//self.f.shape[0],1,1,1)
+
+        self.f = self.f.to(x.device)
+        x1 = torch.cat([x,self.f], dim=1)
+        x2 = torch.cat([self.hpx_reflect(x), -self.hpx_reflect(self.f)], dim=1,)
+
+        if self.n_layers > 1:
+            x1 = self.layers[-1](self.layers[0](x1))
+            x2 = self.layers[-1](self.layers[0](x2))
+        else:
+            x1 = self.layers[0](x1)
+            x2 = self.layers[0](x2)
+
+        res = 0.5 * x1 + 0.5 * self.hpx_reflect(x2)
+
+        return res
+
+class ReflectionEquivariantHEALPixLayer(th.nn.Module):
+    """Pytorch module for applying any base torch Module on a HEALPix tensor. Expects all input/output tensors to have a
+    shape [..., 12, H, W], where 12 is the dimension of the faces.
+    """
+
+    def __init__(
+        self,
+        layer,
+        hpx_padding_mode="karlbauer",
+        add_coriolis=False,
+        **kwargs
+    ):
+        """
+        Parameters
+        ----------
+        layer: torch.nn.Module
+            Any torch layer function, e.g., th.nn.Conv2d
+        kwargs:
+            The arguments that are passed to the torch layer function, e.g., kernel_size
+        """
+        super().__init__()
+        layers = []
+
+        if "in_channels" in kwargs and add_coriolis:
+            kwargs["in_channels"] += 1 # for Coriolis parameter
+        self.add_coriolis = add_coriolis
+        self.f = None
+
+        # if "disable_pad" in kwargs:
+        #     disable_pad = kwargs["disable_pad"]
+        #     del kwargs["disable_pad"]
+        # else:
+        #     disable_pad = False
+
+        if "enable_nhwc" in kwargs:
+            enable_nhwc = kwargs["enable_nhwc"]
+            del kwargs["enable_nhwc"]
+        else:
+            enable_nhwc = False
+
+        if "enable_healpixpad" in kwargs:
+            enable_healpixpad = kwargs["enable_healpixpad"]
+            del kwargs["enable_healpixpad"]
+        else:
+            enable_healpixpad = False
+
+        # Define a HEALPixPadding layer if the given layer is a convolution or
+        # interpolation layer
+        if layer.__bases__[0] is th.nn.modules.conv._ConvNd:
+            layer_type = "conv"
+        elif "Interpolate" in layer.__name__:
+            layer_type = "interp"
+        else:
+            layer_type = "other"
+
+        if (
+            (layer_type == "conv" and kwargs["kernel_size"] > 1)
+            or (layer_type == "interp")
+        ):
+            if layer_type == "conv":
+                kwargs["padding"] = 0  # Disable native padding
+            kernel_size = 3 if "kernel_size" not in kwargs else kwargs["kernel_size"]
+            dilation = 1 if "dilation" not in kwargs else kwargs["dilation"]
+            padding = ((kernel_size - 1) // 2) * dilation
+            if (
+                enable_healpixpad
+                and have_healpixpad
+                and th.cuda.is_available()
+                and not enable_nhwc
+            ):  # pragma: no cover
+                # TODO: missing library, need to decide if we can get library
+                # or if this needs to be removed
+                layers.append(HEALPixPaddingv2(padding=padding))
+            else:
+                layers.append(
+                    HEALPixPadding(
+                        padding=padding,
+                        hpx_padding_mode=hpx_padding_mode,
+                        enable_nhwc=enable_nhwc
+                    )
+                )
+
+        layers.append(layer(**kwargs))
+        self.n_layers = len(layers)
+        self.layers = th.nn.Sequential(*layers)
+
+        if enable_nhwc:
+            self.layers = self.layers.to(memory_format=torch.channels_last)
+
+        self.refl_face_order = torch.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=torch.int)
+        # self.register_buffer("refl_face_order", torch.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=torch.int))
+
+    def hpx_reflect(self,x):
+        '''
+        Helper function to reflect a HPX tensor across its horizontal axis.
+        Assumes x has shape [B*F,C,H,W]
+        '''
+        x = torch.rot90(torch.flip(x, dims=[3]), dims=(-1,-2))
+        x = x.reshape(-1, 12, *x.shape[1:])
+        # refl_face_order = [8,9,10,11,4,5,6,7,0,1,2,3]
+        # x = x[:,refl_face_order]
+        x = torch.index_select(x, dim=1, index=self.refl_face_order.to(x.device))
+        x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
+        return x
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """
+        Performs the forward pass using the defined layer function and the given data.
+
+        :param x: The input tensor of shape [..., F=12, H, W]
+        :return: The output tensor of this HEALPix layer
+        """
+
+        if self.f is None:
+            nside = x.shape[-1]
+            self.f = xr.open_dataset(
+                f'/pscratch/sd/y/yikwill/datasets/healpix/HPX64/era5_0.25deg_3h_HPX{nside}_1979-2021_f.nc'
+            )['f'].data
+            self.f = torch.Tensor(self.f).unsqueeze(1).repeat(x.shape[0]//self.f.shape[0],1,1,1)
+
+        if self.add_coriolis:
+            self.f = self.f.to(x.device)
+            x1 = torch.cat([x,self.f], dim=1)
+            x2 = torch.cat([self.hpx_reflect(x), -self.hpx_reflect(self.f)], dim=1)
+        else:
+            x1 = x
+            x2 = self.hpx_reflect(x)
+
+        x1 = self.layers(x1)
+        x2 = self.layers(x2)
+
+        res = 0.5 * x1 + 0.5 * self.hpx_reflect(x2)
+
         return res
