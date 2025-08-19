@@ -969,69 +969,6 @@ class AvgPool(th.nn.Module):
         """
         return self.avgpool(x)
 
-class HPXSymmetricAvgPool(th.nn.Module):
-    """This class provides a wrapper for a HEALPix (or other) tensor data
-    around the torch.nn.AvgPool2d class.
-    """
-
-    def __init__(
-        self,
-        geometry_layer: th.nn.Module = HEALPixLayer,
-        pooling: int = 2,
-        enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
-        hpx_padding_mode: str = 'karlbauer',
-    ):
-        """
-        Parameters
-        ----------
-        geometry_layer: torch.nn.Module, optional
-            The wrapper for the geometry of the tensor being bassed to MaxPool2d
-        pooling: int, optional
-            Pooling kernel size passed to geometry layer
-        enable_nhwc: bool, optional
-            Enable nhwc format, passed to wrapper
-        enable_healpixpad: bool, optional
-            If HEALPixPadding should be enabled, passed to wrapper
-        """
-        super().__init__()
-        self.avgpool = geometry_layer(
-            layer=torch.nn.AvgPool2d,
-            kernel_size=pooling,
-            enable_nhwc=enable_nhwc,
-            enable_healpixpad=enable_healpixpad,
-            hpx_padding_mode=hpx_padding_mode,
-        )
-
-        self.register_buffer("refl_face_order", torch.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=torch.int))
-
-    def hpx_reflect(self,x):
-        '''
-        Helper function to reflect a HPX tensor across its horizontal axis.
-        Assumes x has shape [B*F,C,H,W]
-        '''
-        x = torch.rot90(torch.flip(x, dims=[3]), dims=(-1,-2))
-        x = x.reshape(-1, 12, *x.shape[1:])
-        x = torch.index_select(x, dim=1, index=self.refl_face_order.to(x.device))
-        x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
-        return x
-
-    def forward(self, x):
-        """Forward pass of the AvgPool layer
-
-        Parameters
-        ----------
-        x: torch.Tensor
-            The values to average
-
-        Returns
-        -------
-        torch.Tensor
-            The averaged values
-        """
-        return 0.5 * self.avgpool(x) + 0.5 * self.hpx_reflect(self.avgpool(self.hpx_reflect(x)))
-
-
 #
 # UPSAMPLING BLOCKS
 #
@@ -1127,7 +1064,7 @@ class ResizeConv(th.nn.Module):
         activation: th.nn.Module = None,
         hpx_padding_mode: str = 'karlbauer',     
         conv_layer = torch.nn.Conv2d,
-        nside_in = None, # Not used, just for hydra instantiation 
+        add_coriolis = False,
     ):
         """
         Parameters
@@ -1172,7 +1109,7 @@ class ResizeConv(th.nn.Module):
 
         block = []
         block += [
-            HEALPixLayer(
+            geometry_layer(
                 layer=Interpolate,
                 scale_factor=scale_factor,
                 mode=mode,
@@ -1180,10 +1117,10 @@ class ResizeConv(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=False,
             ),
             geometry_layer(
                 layer=conv_layer,
-                # disable_pad=True, # Padding is handled by the interpolation layer
                 in_channels=in_channels,
                 out_channels=out_channels,
                 kernel_size=kernel_size,
@@ -1191,113 +1128,7 @@ class ResizeConv(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
-            ),
-        ]
-        if activation is not None:
-            block.append(activation)
-        self.block = th.nn.Sequential(*block)
-
-    def forward(self, x: th.Tensor) -> th.Tensor:
-        """
-        Forward pass of the ResizeConv layer
-
-        Parameters
-        ----------
-        x: torch.Tensor
-            inputs to the forward pass
-
-        Returns
-        -------
-        torch.Tensor
-            result of the forward pass
-        """
-        out = self.block(x)
-        return out
-
-class HPXSymmetricResizeConv(th.nn.Module):
-    """
-    Class for sequentially interpolating then applying a simple Conv2d on
-    HEALPix tensor data
-    """
-
-    def __init__(
-        self,
-        geometry_layer: th.nn.Module = HEALPixLayer,
-        in_channels = 3,
-        out_channels = 3,
-        kernel_size = 3,
-        dilation = 1,
-        scale_factor = 2,
-        mode = 'bilinear',
-        enable_nhwc = False,
-        enable_healpixpad = True,
-        activation: th.nn.Module = None,
-        hpx_padding_mode: str = 'karlbauer',     
-        conv_layer = torch.nn.Conv2d,
-        nside_in = None, # Not used, just for hydra instantiation 
-    ):
-        """
-        Parameters
-        ----------
-        scale_factor: int, optional
-            Multiplier for spatial size, passed to torch.nn.functional.interpolate
-        mode: str, optional
-            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
-        geometry_layer: torch.nn.Module, optional
-            The wrapper for the geometry of the tensor
-        in_channels: int, optional
-            The number of input channels
-        out_channels: int, optional
-            The number of output channels
-        kernel_size: int, optional
-            Size of the convolutional kernel
-        activation: torch.nn.Module, optional
-            Activation function used in upsampling
-        enable_nhwc: bool, optional
-            Enable nhwc format, passed to wrapper
-        enable_healpixpad: bool, optional
-            If HEALPixPadding should be enabled, passed to wrapper
-        """
-        super().__init__()
-
-        if isinstance(conv_layer, str):
-            conv_layer = get_class(conv_layer)
-        if isinstance(geometry_layer, str):
-            geometry_layer = get_class(geometry_layer)
-
-        if dilation > 1:
-            raise Exception(
-                f"dilation > 1 is not currently supported for hpx resize \
-                convolutions, received dilation = {dilation}"
-            )
-
-        # Precompute the amount of extra padding to trim between interpolation
-        # and conv
-        padding = ((kernel_size - 1) // 2) * dilation
-        # trim_size = padding * (scale_factor - 1)
-        trim_size = 2 * padding
-
-        block = []
-        block += [
-            HEALPixLayer(
-                layer=HPXSymmetricInterpolate,
-                scale_factor=scale_factor,
-                mode=mode,
-                trim_size=trim_size,
-                enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
-                hpx_padding_mode=hpx_padding_mode,
-            ),
-            geometry_layer(
-                layer=conv_layer,
-                # disable_pad=True, # Padding is handled by the interpolation layer
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=kernel_size,
-                dilation=dilation,
-                enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
-                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis
             ),
         ]
         if activation is not None:
@@ -1456,7 +1287,6 @@ class SmoothedInterpolate(th.nn.Module):
     def forward(self, x: th.Tensor) -> th.Tensor:
         self.smoother_kernel = self.smoother_kernel.to(x.device)
         
-        x = x
         x = self.interp(x, scale_factor=self.scale_factor, mode=self.mode)
         x = torch.nn.functional.conv2d(
             x,
@@ -1469,170 +1299,6 @@ class SmoothedInterpolate(th.nn.Module):
             x = x[..., self.trim_size:-self.trim_size, self.trim_size:-self.trim_size]
 
         return x
-
-class HPXSymmetricInterpolateSmooth(th.nn.Module):
-
-    def __init__(
-        self,
-        in_channels = 3,
-        scale_factor=2,
-        mode='bilinear',
-        trim_size: int = 0,
-    ):
-        super().__init__()
-
-        self.in_channels = in_channels
-        self.scale_factor = scale_factor
-        self.mode = mode
-        self.trim_size = trim_size
-        self.interp = th.nn.functional.interpolate
-
-        self.smoother_kernel = torch.tensor(
-            [[0.,1.,0.],
-             [1.,0.,1.],
-             [0.,1.,0.]]
-        )
-        self.smoother_kernel = self.smoother_kernel.unsqueeze(0).unsqueeze(0)  # shape (1,1,3,3)
-        self.smoother_kernel = self.smoother_kernel.repeat((in_channels,1,1,1))
-        # self.smoother = lambda x: torch.nn.functional.conv2d(
-        #     x,
-        #     kernel,
-        #     padding=0,
-        #     groups=in_channels
-        # ) / 4 # TODO: explain
-        self.register_buffer("refl_face_order", torch.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=torch.int))
-
-    def hpx_reflect(self,x):
-        '''
-        Helper function to reflect a HPX tensor across its horizontal axis.
-        Assumes x has shape [B*F,C,H,W]
-        '''
-        x = torch.rot90(torch.flip(x, dims=[3]), dims=(-1,-2))
-        x = x.reshape(-1, 12, *x.shape[1:])
-        x = torch.index_select(x, dim=1, index=self.refl_face_order.to(x.device))
-        x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
-        return x
-
-    def forward(self, x: th.Tensor) -> th.Tensor:
-        self.smoother_kernel = self.smoother_kernel.to(x.device)
-        
-        x1 = x
-        x1 = self.interp(x1, scale_factor=self.scale_factor, mode=self.mode)
-        x1 = torch.nn.functional.conv2d(
-            x1,
-            self.smoother_kernel,
-            padding=0,
-            groups=self.in_channels
-        ) / 4
-
-        x2 = self.hpx_reflect(x)
-        x2 = self.interp(x2, scale_factor=self.scale_factor, mode=self.mode)
-        x2 = torch.nn.functional.conv2d(
-            x2,
-            self.smoother_kernel,
-            padding=0,
-            groups=self.in_channels
-        ) / 4
-
-        x = 0.5 * x1 + 0.5 * self.hpx_reflect(x2)
-        if self.trim_size > 0:
-            x = x[..., self.trim_size:-self.trim_size, self.trim_size:-self.trim_size]
-        return x
-    
-
-class HPXResampleConv(th.nn.Module):
-    """
-    Class for sequentially interpolating then applying a simple Conv2d on
-    HEALPix tensor data
-    """
-
-    def __init__(
-        self,
-        geometry_layer: th.nn.Module = HEALPixLayer,
-        in_channels = 3,
-        out_channels = 3,
-        kernel_size = 3,
-        dilation = 1,
-        scale_factor = 2,
-        enable_nhwc = False,
-        enable_healpixpad = True,
-        activation: th.nn.Module = None,
-        hpx_padding_mode: str = 'karlbauer',     
-        conv_layer = torch.nn.Conv2d,
-        nside_in: int = 16,   
-    ):
-        """
-        Parameters
-        ----------
-        scale_factor: int, optional
-            Multiplier for spatial size, passed to torch.nn.functional.interpolate
-        mode: str, optional
-            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
-        geometry_layer: torch.nn.Module, optional
-            The wrapper for the geometry of the tensor
-        in_channels: int, optional
-            The number of input channels
-        out_channels: int, optional
-            The number of output channels
-        kernel_size: int, optional
-            Size of the convolutional kernel
-        activation: torch.nn.Module, optional
-            Activation function used in upsampling
-        enable_nhwc: bool, optional
-            Enable nhwc format, passed to wrapper
-        enable_healpixpad: bool, optional
-            If HEALPixPadding should be enabled, passed to wrapper
-        """
-        super().__init__()
-
-        if isinstance(conv_layer, str):
-            conv_layer = get_class(conv_layer)
-        if isinstance(geometry_layer, str):
-            geometry_layer = get_class(geometry_layer)
-
-        if dilation > 1:
-            raise Exception(
-                f"dilation > 1 is not currently supported for hpx resize \
-                convolutions, received dilation = {dilation}"
-            )
-
-        block = []
-        block += [
-            HPXResample(
-                scale_factor=scale_factor,
-                nside_in=nside_in
-            ),
-            geometry_layer(
-                layer=conv_layer,
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=kernel_size,
-                dilation=dilation,
-                enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
-                hpx_padding_mode=hpx_padding_mode,
-            ),
-        ]
-        if activation is not None:
-            block.append(activation)
-        self.block = th.nn.Sequential(*block)
-
-    def forward(self, x: th.Tensor) -> th.Tensor:
-        """
-        Forward pass of the ResizeConv layer
-
-        Parameters
-        ----------
-        x: torch.Tensor
-            inputs to the forward pass
-
-        Returns
-        -------
-        torch.Tensor
-            result of the forward pass
-        """
-        out = self.block(x)
-        return out
 
 #
 # Helper classes
@@ -1689,146 +1355,3 @@ class Interpolate(th.nn.Module):
         if self.trim_size > 0:
             x = x[..., self.trim_size:-self.trim_size, self.trim_size:-self.trim_size]
         return x
-
-class HPXSymmetricInterpolate(th.nn.Module):
-    """Helper class that handles interpolation
-    This is done as a class so that scale and mode can be stored
-    """
-
-    def __init__(
-        self,
-        scale_factor: Union[int, Tuple],
-        mode: str = "nearest",
-        trim_size: int = 0,
-        # Options below are not used but needed for hydra instantiation to work
-        in_channels = 3,
-        out_channels = 3,
-        kernel_size = 3,
-        dilation = 1,
-        enable_nhwc = False,
-        enable_healpixpad = True,
-    ):
-        """
-        Parameters:
-        ----------
-        scale_factor: Union[int , Tuple]
-            Multiplier for spatial size, passed to torch.nn.functional.interpolate
-        mode: str, optional
-            Interpolation mode used for upsampling, passed to torch.nn.functional.interpolate
-        trim_size: int, optional
-            Number of rows/columns to trim after interpolation, useful if interpolation
-            immediately follows a HPX padding layer to avoid edge artifacts
-        """
-        super().__init__()
-        self.interp = th.nn.functional.interpolate
-        self.scale_factor = scale_factor
-        self.mode = mode
-        self.trim_size = trim_size
-        self.register_buffer("refl_face_order", torch.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=torch.int))
-
-    def hpx_reflect(self,x):
-        '''
-        Helper function to reflect a HPX tensor across its horizontal axis.
-        Assumes x has shape [B*F,C,H,W]
-        '''
-        x = torch.rot90(torch.flip(x, dims=[3]), dims=(-1,-2))
-        x = x.reshape(-1, 12, *x.shape[1:])
-        x = torch.index_select(x, dim=1, index=self.refl_face_order.to(x.device))
-        x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
-        return x
-
-    def forward(self, inputs):
-        """Forward pass of the Interpolate layer
-
-        Parameters
-        ----------
-        x: torch.Tensor
-            inputs to interpolate
-
-        Returns
-        -------
-        torch.Tensor
-            the interpolated values
-        """
-        x1 = self.interp(inputs, scale_factor=self.scale_factor, mode=self.mode)
-        x2 = self.hpx_reflect(self.interp(self.hpx_reflect(inputs), scale_factor=self.scale_factor, mode=self.mode))
-        x = 0.5 * x1 + 0.5 * x2
-        if self.trim_size > 0:
-            x = x[..., self.trim_size:-self.trim_size, self.trim_size:-self.trim_size]
-        return x
-
-'''
-class HPXResample(th.nn.Module):
-    """
-    Helper class that handles interpolation
-    This is done as a class so that scale and mode can be stored
-    """
-
-    def __init__(
-        self,
-        scale_factor: int,
-        nside_in: int,
-    ):
-        """
-        Parameters:
-        ----------
-        scale_factor: Union[int , Tuple]
-            Multiplier for spatial size, passed to torch.nn.functional.interpolate
-        mode: str, optional
-            Interpolation mode used for upsampling, passed to torch.nn.functional.interpolate
-        trim_size: int, optional
-            Number of rows/columns to trim after interpolation, useful if interpolation
-            immediately follows a HPX padding layer to avoid edge artifacts
-        """
-        super().__init__()
-
-        self.scale_factor = scale_factor
-
-        self.quad_weights = 'ring'
-        self.nside_in = int(nside_in)
-        self.level_in = int(th.log2(th.Tensor([self.nside_in])))
-        self.nside_out = int(self.scale_factor*self.nside_in)
-        self.level_out = int(th.log2(th.Tensor([self.nside_out])))
-        self.lmax = 3*self.nside_in+1
-        self.mmax = self.lmax
-
-        self.sht = SHTCUDA(self.nside_in, lmax=self.lmax, mmax=self.mmax, quad_weights=self.quad_weights)
-        self.isht = iSHTCUDA(self.nside_out, lmax=self.lmax, mmax=self.mmax)
-
-        # self.hpx_xy_grid_in = earth2grid.healpix.Grid(level=self.level_in, pixel_order=earth2grid.healpix.HEALPIX_PAD_XY)
-        # self.hpx_ring_grid_out = earth2grid.healpix.Grid(level=self.level_out, pixel_order=earth2grid.healpix.PixelOrder.RING)
-
-    def forward(self, inputs):
-        """
-        Forward pass of the Interpolate layer
-
-        Parameters
-        ----------
-        x: torch.Tensor
-            inputs to interpolate
-
-        Returns
-        -------
-        torch.Tensor
-            the interpolated values
-        """
-        # Assumes inputs.shape=[B*F,C,H,W]
-        x = inputs
-        x = x.reshape(-1, 12, *x.shape[1:]) # [B,F,C,H,W]
-        B, F, C, H, W = x.shape
-        x = th.transpose(x, 1, 2) # [B,C,F,H,W]
-        x = x.reshape(B, C, -1) # [B,C,F*H*W]
-        # x = self.hpx_xy_grid_in.reorder(earth2grid.healpix.PixelOrder.RING, x)
-        # x = cuhpx.flat2ring(x, origin='N', clockwise=True, nside=self.nside_in)
-
-        x = self.sht(x)
-        x = self.isht(x)
-
-        # x = self.hpx_ring_grid_out.reorder(earth2grid.healpix.HEALPIX_PAD_XY, x)
-        # x = cuhpx.ring2flat(x, origin='N', clockwise=True, nside=self.nside_out)
-        x = x.reshape(B, C, F, int(self.scale_factor*H), int(self.scale_factor*W))
-        x = th.transpose(x, 1, 2)
-        x = x.reshape(B*F, *x.shape[2:])
-
-        return x
-'''
