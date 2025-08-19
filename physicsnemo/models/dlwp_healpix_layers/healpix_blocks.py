@@ -285,52 +285,6 @@ class BasicConvBlock(th.nn.Module):
         """
         return self.convblock(x)
 
-class ReflectionSymmetricConv2d(th.nn.Module):
-    def __init__(
-        self,
-        in_channels=3,
-        out_channels=1,
-        kernel_size=3,
-        stride=1,
-        padding=0,
-        dilation=1,
-        bias=True,
-    ):
-        super().__init__()
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-
-        k = torch.Tensor([1/(in_channels*kernel_size**2)])
-
-        self.weight = th.nn.Parameter(
-            2 * torch.sqrt(k) * torch.rand(out_channels, in_channels, kernel_size, kernel_size) - torch.sqrt(k)
-        )
-        
-        if bias:
-            self.bias = th.nn.Parameter(
-                2 * torch.sqrt(k) * torch.rand(out_channels) - torch.sqrt(k)
-            )
-        else:
-            self.register_parameter('bias', None)
-
-    def forward(self, x):
-
-        weight = 0.5 * (self.weight + torch.rot90(torch.flip(self.weight, dims=[3]), dims=(-1,-2)))
-        
-        return th.nn.functional.conv2d(
-            x,
-            weight=weight,
-            bias=self.bias,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation
-        )
-
 class ConvNeXtBlock(th.nn.Module):
     """Class implementing a modified ConvNeXt network as described in https://arxiv.org/pdf/2201.03545.pdf
     and shown in figure 4
