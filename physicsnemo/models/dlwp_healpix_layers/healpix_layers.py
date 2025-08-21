@@ -1158,8 +1158,7 @@ class ReflectionEquivariantHEALPixLayer(th.nn.Module):
         if enable_nhwc:
             self.layers = self.layers.to(memory_format=torch.channels_last)
 
-        self.refl_face_order = torch.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=torch.int)
-        # self.register_buffer("refl_face_order", torch.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=torch.int))
+        self.register_buffer("refl_face_order", torch.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=torch.int))
 
     def hpx_reflect(self,x):
         '''
@@ -1168,8 +1167,6 @@ class ReflectionEquivariantHEALPixLayer(th.nn.Module):
         '''
         x = torch.rot90(torch.flip(x, dims=[3]), dims=(-1,-2))
         x = x.reshape(-1, 12, *x.shape[1:])
-        # refl_face_order = [8,9,10,11,4,5,6,7,0,1,2,3]
-        # x = x[:,refl_face_order]
         x = torch.index_select(x, dim=1, index=self.refl_face_order.to(x.device))
         x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
         return x
