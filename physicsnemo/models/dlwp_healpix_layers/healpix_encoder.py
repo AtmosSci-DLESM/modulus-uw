@@ -19,7 +19,6 @@ from typing import Sequence
 import torch as th
 from hydra.utils import instantiate
 from omegaconf import DictConfig
-from omegaconf import OmegaConf
 
 
 class UNetEncoder(th.nn.Module):

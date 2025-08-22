@@ -343,6 +343,9 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         self.coeff_eps = 1 - ((1-alpha) / (n_members))
         self.averaging_coeff = 1 / (n_members * (n_members - 1))
 
+        # Static indices to idnex unique pairs of ensemble members (CUDA graph capture safe)
+        self.i, self.j = th.triu_indices(self.n_members, self.n_members, offset=1)
+
     def setup(self, trainer):
         """
         pushes constants to cuda device
@@ -354,6 +357,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         self.loss_weights = self.loss_weights.to(device=trainer.device)
         self.coeff_eps = th.tensor(self.coeff_eps, device=trainer.device)
         self.averaging_coeff = th.tensor(self.averaging_coeff, device=trainer.device)
+        self.i = self.i.to(device=trainer.device)
+        self.j = self.j.to(device=trainer.device)
 
     def forward(self, prediction, target, average_channels=True):
         """
@@ -371,8 +376,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         """
         
         # Unfold ensemble dimension from batch dimension to have shape [Cond, B, F, T, C, H, W]
-        b = target.shape[0] # get batch shape from target
-        prediction = prediction.view(self.n_members, b, *prediction.shape[1:])
+        b, f, t, c, h, w = target.shape # get batch shape from target
+        prediction = prediction.view(self.n_members, b, f, t, c, h, w)
 
         # checks for dimensions 
         if not prediction.shape[1:] == target.shape:
@@ -380,24 +385,24 @@ class WeightedCRPSLoss(th.nn.MSELoss):
     
         if not prediction.shape[0] % self.n_members == 0:
             raise ValueError(f"Shape of prediction should have ensemble dimension of size {self.n_members}, got {prediction.shape[0]}")
-        
-        crps_terms = []
-        for j in range(self.n_members):
-            xj = prediction[j,...]
-            for k in range(self.n_members):
-                xk = prediction[k,...]
-                if j != k:
-                    term = th.abs(xj - target) + th.abs(xk - target) - self.coeff_eps * th.abs(xj - xk)
-                    crps_terms.append(term)
 
-        crps = th.stack(crps_terms).sum(dim=0) * self.averaging_coeff
-        # ToDo: speed up CRPS calculation?
-        # I could permute array to apply operations exclusively on tensors
-        # This would involve reshaping the tensors and using indexing to avoid the double loop
-        crps = crps.mean(dim=(0, 1, 2, 4, 5)) * self.loss_weights
+        # Compute first term of the afCRPS formula
+        diff_target = th.abs(prediction - target.unsqueeze(0)).mean(dim=0) # [B, F, T, C, H, W]
+
+        # Compute the last term of the afCRPS formula (pairwise L1 distance matrix)
+        # Index only the upper triangular part of the matrix for unique pairs
+        dist_matrix = th.abs(prediction.unsqueeze(1) - prediction.unsqueeze(0)) # [Cond, Cond, B, F, T, C, H, W]
+        diff_ensemble = dist_matrix[self.i, self.j] # [num_unique_pairs, B, F, T, C, H, W]
+        diff_ensemble = diff_ensemble.sum(dim=0) # [B, F, T, C, H, W]
+
+        # afCRPS formula
+        crps = diff_target - self.coeff_eps * self.averaging_coeff * diff_ensemble # [B, F, T, C, H, W]
+
+        crps *= self.loss_weights[None, None, None, :, None, None] # [B, F, T, C, H, W]
+
         if average_channels:
-            return th.mean(crps)
+            return crps.mean()
         else:
-            return crps
+            return crps.mean(dim=(0, 1, 2, 4, 5))
 
 

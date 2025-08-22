@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence, Tuple, Union
+from typing import Sequence, Tuple, Union, Callable
 
 import torch
 import torch as th
@@ -23,7 +23,7 @@ from .normalization import ConditionalLayerNorm
 
 from hydra.utils import instantiate
 from omegaconf import DictConfig
-from omegaconf import OmegaConf
+
 #
 # RECURRENT BLOCKS
 #
@@ -516,16 +516,17 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         enable_healpixpad: bool = False,
         batch_norm: bool = False,
         dropout: float = 0.0,
-        conditional_layer_norm: DictConfig = None,
+        conditional_layer_norm: Callable = None,
     ):
         """
         Parameters
         ----------
         n_layers: int, optional
             The number of SymmetricConvNeXt Blocks
-        conditional_layer_norm: DictConfig, optional
-            Configuration for conditional layer normalization. If None, 
-            no conditional layer normalization is applied.
+        conditional_layer_norm: Callable, optional
+            Callable for physicsnemo.models.dlwp_healpix_layers.normalization.ConditionalLayerNorm. 
+            Callable can be passed in by setting _partial_ to True in hydra config. If None,
+            conditional layer normalization is not applied.
         """
         super().__init__()
 
@@ -533,47 +534,26 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         self.blocks = th.nn.ModuleList()
         # flag for conditional layer normalization
         self.cln_enabled = conditional_layer_norm is not None
+
         for i in range(n_layers):
             curr_in = in_channels if i == 0 else out_channels
-
-            # collect context dependent parameters into a config
-            conv_block = {
-                # we have to add target format to support recursive instantiation
-                '_target_': 'physicsnemo.models.dlwp_healpix_layers.healpix_blocks.SymmetricConvNeXtBlock',
-                "geometry_layer": geometry_layer,
-                "in_channels": curr_in,
-                "latent_channels": latent_channels,
-                "out_channels": out_channels,
-                "kernel_size": kernel_size,
-                "dilation": dilation,
-                "n_layers": n_layers,  # not used, but required for hydra instantiation
-                "upscale_factor": upscale_factor,
-                "activation": activation,
-                "enable_nhwc": enable_nhwc,
-                "enable_healpixpad": enable_healpixpad,
-                "batch_norm": batch_norm,
-                "dropout": dropout,
-                "conditional_layer_norm": conditional_layer_norm if conditional_layer_norm is not None else None,
-            }
-            # Create a single block as a separate Module
-            self.blocks.append(instantiate(conv_block))
-            # self.blocks.append(
-            #     SymmetricConvNeXtBlock(
-            #         geometry_layer=geometry_layer,
-            #         in_channels=curr_in,
-            #         latent_channels=latent_channels,
-            #         out_channels=out_channels,
-            #         kernel_size=kernel_size,
-            #         dilation=dilation,
-            #         upscale_factor=upscale_factor,
-            #         activation=activation,
-            #         enable_nhwc=enable_nhwc,
-            #         enable_healpixpad=enable_healpixpad,
-            #         batch_norm=batch_norm,
-            #         dropout=dropout,
-            #         conditional_layer_norm=conditional_layer_norm if conditional_layer_norm is not None else None,
-            #     ),
-            # )
+            self.blocks.append(
+                SymmetricConvNeXtBlock(
+                    geometry_layer=geometry_layer,
+                    in_channels=curr_in,
+                    latent_channels=latent_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    upscale_factor=upscale_factor,
+                    activation=activation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                    batch_norm=batch_norm,
+                    dropout=dropout,
+                    conditional_layer_norm=conditional_layer_norm if conditional_layer_norm is not None else None,
+                ),
+            )
 
     def forward(self, x, conditions_cln=None):
         out = x
@@ -660,67 +640,97 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     enable_healpixpad=enable_healpixpad,
                 )
 
-        # 3x3: in → latent
-        self.initial_conv = geometry_layer(
-            layer=th.nn.Conv2d,
-            in_channels=in_channels,
-            out_channels=int(latent_channels),
-            kernel_size=kernel_size,
-            dilation=dilation,
-            enable_nhwc=enable_nhwc,
-            enable_healpixpad=enable_healpixpad,
-        )
+        # Collect conv->norm->activation->dropout operations in list for sequential execution
+        convblock = []
 
-        self.batch_norm = (
-            th.nn.BatchNorm2d(int(latent_channels), track_running_stats=False, affine=False)
-            if batch_norm else None
+        # 3x3: in → latent
+        convblock.append(
+            geometry_layer(
+                layer=th.nn.Conv2d,
+                in_channels=in_channels,
+                out_channels=int(latent_channels),
+                kernel_size=kernel_size,
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
         )
+        if batch_norm:
+            convblock.append(th.nn.BatchNorm2d(int(latent_channels), track_running_stats=False, affine=False))
         # Conditional Layer Normalization
         if conditional_layer_norm is not None:
-            # resolve context-dependent parameters
-            self.cln = conditional_layer_norm
-            self.cln.setup_cln(channel_depth=int(latent_channels))
-        else:
-            self.cln = None
-        # self.cln = conditional_layer_norm if conditional_layer_norm is not None else None
-
-        self.dropout_layer = (
-            th.nn.Dropout2d(p=dropout)
-            if self.dropout else None
-        )
+            # resolve context-dependent parameters (channel depth)
+            cln = conditional_layer_norm(channel_depth=int(latent_channels))
+            convblock.append(cln)
+        if activation is not None:
+            convblock.append(activation)
+        if dropout > 0.0:
+            convblock.append(th.nn.Dropout2d(p=dropout))
 
         # 1x1: latent → latent * upscale
-        self.expand_conv = geometry_layer(
-            layer=th.nn.Conv2d,
-            in_channels=int(latent_channels),
-            out_channels=int(latent_channels * upscale_factor),
-            kernel_size=1,
-            dilation=dilation,
-            enable_nhwc=enable_nhwc,
-            enable_healpixpad=enable_healpixpad,
+        convblock.append(
+            geometry_layer(
+                layer=th.nn.Conv2d,
+                in_channels=int(latent_channels),
+                out_channels=int(latent_channels * upscale_factor),
+                kernel_size=1,
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
         )
+        if batch_norm:
+            convblock.append(th.nn.BatchNorm2d(int(latent_channels * upscale_factor), track_running_stats=False, affine=False))
+        if conditional_layer_norm is not None:
+            cln = conditional_layer_norm(channel_depth=int(latent_channels * upscale_factor))
+            convblock.append(cln)
+        if activation is not None:
+            convblock.append(activation)
+        if dropout > 0.0:
+            convblock.append(th.nn.Dropout2d(p=dropout))
 
+        
         # 1x1: upscale → latent
-        self.reduce_conv = geometry_layer(
-            layer=th.nn.Conv2d,
-            in_channels=int(latent_channels * upscale_factor),
-            out_channels=int(latent_channels),
-            kernel_size=1,
-            dilation=dilation,
-            enable_nhwc=enable_nhwc,
-            enable_healpixpad=enable_healpixpad,
+        convblock.append(
+            geometry_layer(
+                layer=th.nn.Conv2d,
+                in_channels=int(latent_channels * upscale_factor),
+                out_channels=int(latent_channels),
+                kernel_size=1,
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
         )
+        if batch_norm:
+            convblock.append(th.nn.BatchNorm2d(int(latent_channels), track_running_stats=False, affine=False))
+        if conditional_layer_norm is not None:
+            cln = conditional_layer_norm(channel_depth=int(latent_channels))
+            convblock.append(cln)
+        if activation is not None:
+            convblock.append(activation)
+        if dropout > 0.0:
+            convblock.append(th.nn.Dropout2d(p=dropout))
 
-        # 3x3: latent → out
-        self.output_conv = geometry_layer(
-            layer=th.nn.Conv2d,
-            in_channels=int(latent_channels),
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            dilation=dilation,
-            enable_nhwc=enable_nhwc,
-            enable_healpixpad=enable_healpixpad,
+        # 3x3: latent → out (no norm on this one, following convnext)
+        convblock.append(
+            geometry_layer(
+                layer=th.nn.Conv2d,
+                in_channels=int(latent_channels),
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
         )
+        if activation is not None:
+            convblock.append(activation)
+        if dropout > 0.0:
+            convblock.append(th.nn.Dropout2d(p=dropout))
+
+        self.convblock = th.nn.ModuleList(convblock)
+
 
     def forward(self, x, conditions_cln=None):
         """
@@ -740,44 +750,12 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # Save residual
         residual = self.skip_module(x) if self.use_block_skip_connection else 0
 
-        # Initial 3x3 convolution
-        x = self.initial_conv(x)
+        for layer in self.convblock:
+            if isinstance(layer, ConditionalLayerNorm):
+                x = layer(x, conditions=conditions_cln)
+            else:
+                x = layer(x)
 
-        # Optional BatchNorm
-        if self.batch_norm:
-            x = self.batch_norm(x)
-
-        # Optional activation
-        if self.activation:
-            x = self.activation(x)
-
-        # Optional Conditional LayerNorm
-        if self.cln:
-            # Expecting input format: (N, C, H, W) → permute to (N, H, W, C)
-            x = x.permute(0, 2, 3, 1) 
-            x = self.cln(x, conditions=conditions_cln)
-            x = x.permute(0, 3, 1, 2)
-
-        # Optional dropout
-        if self.dropout_layer:
-            x = self.dropout_layer(x)
-
-        # 1x1 conv to expand channels
-        x = self.expand_conv(x)
-        if self.activation:
-            x = self.activation(x)
-
-        # 1x1 conv to reduce channels
-        x = self.reduce_conv(x)
-        if self.activation:
-            x = self.activation(x)
-
-        # Final 3x3 convolution
-        x = self.output_conv(x)
-        if self.activation:
-            x = self.activation(x)
-
-        # Apply residual connection (if enabled)
         return x + residual
 
 

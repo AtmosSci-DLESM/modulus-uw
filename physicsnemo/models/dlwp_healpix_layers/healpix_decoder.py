@@ -19,7 +19,7 @@ from typing import Sequence
 import torch as th
 from hydra.utils import instantiate
 from omegaconf import DictConfig
-from omegaconf import OmegaConf
+
 
 
 class UNetDecoder(th.nn.Module):
@@ -154,7 +154,10 @@ class UNetDecoder(th.nn.Module):
                 x = th.cat([up, inputs[-1 - n]], dim=self.channel_dim)
             # apply the conv block, check if the layer accepts conditional inputs
             if conditions_cln is not None:
-                x = layer["conv"](x, conditions_cln=conditions_cln)
+                if hasattr(layer["conv"], "cln_enabled") and layer["conv"].cln_enabled:
+                    x = layer["conv"](x, conditions_cln=conditions_cln)
+                else:
+                    raise ValueError("Conditional input passed but conv block does not support conditional inputs.")
             else:
                 x = layer["conv"](x)
             # apply the recurrent block if it exists

@@ -19,15 +19,23 @@ from typing import Sequence, List
 import torch as th
 from omegaconf import DictConfig
 
+try:
+    from apex.normalization import FusedLayerNorm
+    _APEX_AVAILABLE = True
+except ImportError:
+    _APEX_AVAILABLE = False
+
+
 class ConditionalLayerNorm(th.nn.Module):
     def __init__(
         self,
         condition_shape: int,
-        batch_size: int,
+        channel_depth: int,
         mlp_hidden_dims: List[int] = [128, 128],
         activation: th.nn.Module = None,
         eps: float = 1e-5,
         n_faces: int = 12,
+        norm_op:str = "torch",
     ):
         """
         Conditional LayerNorm with MLP-based conditioning.
@@ -39,32 +47,25 @@ class ConditionalLayerNorm(th.nn.Module):
             activation (DictConfig): Activation function configuration for the MLPs.
             eps (float): Numerical stability constant.
             n_faces (int): Number of faces in the Healpix grid, used for reshaping.
+            norm_op (str): "torch" for torch.nn.LayerNorm, "apex" for apex FusedLayerNorm.
         """
         super().__init__()
         self.eps = eps
         self.condition_shape = condition_shape
+        self.channel_depth = channel_depth
         self.hidden_dims = mlp_hidden_dims
-        self.batch_size = batch_size
         self.activation = activation if activation is not None else th.nn.Identity()
-        self.gamma_mlp = None
-        self.beta_mlp = None
-        self.gamma = None
-        self.beta = None
+        self.gamma_mlp = self._make_mlp(self.condition_shape, self.hidden_dims, self.channel_depth, self.activation)
+        self.beta_mlp = self._make_mlp(self.condition_shape, self.hidden_dims, self.channel_depth, self.activation)
         self.n_faces = n_faces
-        # 
-        self.initialized = False
 
-    def setup_cln(self, channel_depth):
-        """
-        Set up the Conditional Layer Normalization with MLPs. Uses context dependent parameters.
+        if norm_op == "torch":
+            self.norm = th.nn.LayerNorm(channel_depth, elementwise_affine=False)
+        elif norm_op == "apex":
+            if not _APEX_AVAILABLE:
+                raise ImportError("Apex FusedLayerNorm requested but apex is not available, please install it from https://github.com/NVIDIA/apex")
+            self.norm = FusedLayerNorm(channel_depth, elementwise_affine=False)
 
-        Args:
-            normalized_shape (int): The number of channels (C) to normalize across.
-        """
-        # Create MLPs to produce gamma and beta from the cond input
-        self.gamma_mlp = self._make_mlp(self.condition_shape, self.hidden_dims, channel_depth, self.activation)
-        self.beta_mlp = self._make_mlp(self.condition_shape, self.hidden_dims, channel_depth, self.activation)
-    
     def _make_mlp(self, in_dim: int, hidden_dims: List[int], out_dim: int, activation: th.nn.Module) -> th.nn.Sequential:
 
         layers = []
@@ -76,43 +77,28 @@ class ConditionalLayerNorm(th.nn.Module):
         layers.append(th.nn.Linear(in_dim, out_dim))
         return th.nn.Sequential(*layers)
 
-    def _initialze(self, device):
-
-        """
-        Initialize the Conditional LayerNorm by moving MLPs to the specified device.
-
-        Args:
-            device (torch.device): The device to which the MLPs should be moved.
-        """
-        self.gamma_mlp.to(device)
-        self.beta_mlp.to(device)
-        self.initialized = True
 
     def forward(self, x: th.Tensor, conditions: th.Tensor) -> th.Tensor:
         """
         Args:
-            x: Input tensor of shape: 
-            conditions: Conditioning tensor of shape (B, N, cond_dim)
+            x: Input tensor of shape: (B, C, H, W)
+            conditions: Conditioning tensor of shape (B*n_cond, cond_dim)
         Returns:
-            Normalized and conditioned tensor of shape: 
+            Normalized and conditioned tensor of shape: (B, C, H, W)
         """
 
-        # check if the layer is initialized
-        if not self.initialized:
-            self._initialze(x.device)
-
-        # normal layer norm, assumes channel-last format
-        mean = x.mean(dim=-1, keepdim=True)
-        var = x.var(dim=-1, keepdim=True, unbiased=False)
-        x_norm = (x - mean) / th.sqrt(var + self.eps)
+        # normal layer norm without default scale, bias applied (permute to channels_last)
+        x = x.permute(0, 2, 3, 1)
+        x_norm = self.norm(x)
     
-        # dynamically build gamma and beta, don't store in self
-        gamma = self.gamma_mlp(conditions)[:, None, None, :]
-        beta = self.beta_mlp(conditions)[:, None, None, :]
+        # Compute gamma and beta from conditions
+        gamma = self.gamma_mlp(conditions)[:, None, None, :] # (B*n_cond, 1, 1, C)
+        beta = self.beta_mlp(conditions)[:, None, None, :] # (B*n_cond, 1, 1, C)
 
         # Repeat for the number of faces(which has been folded into the batch dimension)
         gamma = gamma.repeat_interleave(self.n_faces, dim=0)
         beta = beta.repeat_interleave(self.n_faces, dim=0)
 
-        # now gamma and beta are clean tensors that participate in autograd safely
-        return gamma * x_norm + beta
+        # Apply and reshape to channels first
+        x = gamma * x_norm + beta
+        return x.permute(0, 3, 1, 2)
