@@ -196,7 +196,6 @@ class ConstantCoupler:
             The data to use when the dataloader requests coupled fields. Expected
             format is [B, F, T, C, H, W]
         """
-
         # create buffer for coupling
         coupled_fields = coupled_fields[
             :, :, :, self.coupled_channel_indices, :, :
@@ -473,7 +472,6 @@ class TrailingAverageCoupler:
             The data to use when the dataloader requests coupled fields. Expected
             format is [B, F, T, C, H, W]
         """
-
         coupled_fields = coupled_fields[:, :, :, self.coupled_channel_indices, :, :]
         # TODO: Now support output_time_dim =/= input_time_dim, but presteps need to be 0, will add support for presteps>0
         coupled_averaging_periods = []
