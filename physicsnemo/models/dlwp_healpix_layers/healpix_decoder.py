@@ -36,6 +36,7 @@ class UNetDecoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
     ):
         """
@@ -82,6 +83,7 @@ class UNetDecoder(th.nn.Module):
                     out_channels=curr_channel,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    enable_torch_compile=enable_torch_compile,
                     hpx_padding_mode=hpx_padding_mode,
                 )
 
@@ -100,6 +102,7 @@ class UNetDecoder(th.nn.Module):
                 n_layers=n_layers[n],
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
             )
 
@@ -108,7 +111,9 @@ class UNetDecoder(th.nn.Module):
                 rec_module = instantiate(
                     config=recurrent_block,
                     in_channels=next_channel,
+                    enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    enable_torch_compile=enable_torch_compile,
                     hpx_padding_mode=hpx_padding_mode,
                 )
             else:
@@ -134,6 +139,7 @@ class UNetDecoder(th.nn.Module):
             dilation=dilations[-1],
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            enable_torch_compile=enable_torch_compile,
             hpx_padding_mode=hpx_padding_mode,
         )
 

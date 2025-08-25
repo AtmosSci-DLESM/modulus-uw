@@ -41,6 +41,7 @@ class ConvGRUBlock(th.nn.Module):
         kernel_size: int = 1,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
         conv_layer = torch.nn.Conv2d,
         add_coriolis = False,
@@ -76,6 +77,7 @@ class ConvGRUBlock(th.nn.Module):
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
             hpx_padding_mode=hpx_padding_mode,
+            enable_torch_compile=enable_torch_compile,
             add_coriolis=add_coriolis,
         )
         self.conv_can = geometry_layer(
@@ -87,6 +89,7 @@ class ConvGRUBlock(th.nn.Module):
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
             hpx_padding_mode=hpx_padding_mode,
+            enable_torch_compile=enable_torch_compile,
             add_coriolis=add_coriolis,
         )
         self.h = th.zeros(1, 1, 1, 1)
@@ -146,6 +149,7 @@ class BasicConvBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
         conv_layer = torch.nn.Conv2d,
         add_coriolis = False,
@@ -194,6 +198,7 @@ class BasicConvBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    enable_torch_compile=enable_torch_compile,
                     hpx_padding_mode=hpx_padding_mode,
                     add_coriolis=add_coriolis,
                 )
@@ -235,6 +240,7 @@ class ConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
     ):
         """
@@ -274,6 +280,7 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
             )
         # Convolution block
@@ -288,6 +295,7 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
             )
         )
@@ -303,6 +311,7 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
             )
         )
@@ -317,6 +326,7 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
             )
         )
@@ -357,6 +367,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
         conv_layer = torch.nn.Conv2d,
         add_coriolis = False,
@@ -404,6 +415,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
             )
@@ -419,6 +431,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
             )
@@ -435,6 +448,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
             )
@@ -451,6 +465,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
             )
@@ -467,6 +482,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
             )
@@ -487,6 +503,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
             )
@@ -503,6 +520,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
             )
@@ -519,6 +537,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
             )
@@ -564,6 +583,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
     ):
         """
@@ -593,6 +613,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                     activation=activation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    enable_torch_compile=enable_torch_compile,
                     hpx_padding_mode=hpx_padding_mode,
                 )
             )
@@ -623,8 +644,10 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
         conv_layer = torch.nn.Conv2d,
+        add_coriolis = False,
     ):
         """
         Parameters
@@ -654,6 +677,8 @@ class SymmetricConvNeXtBlock(th.nn.Module):
 
         if isinstance(conv_layer, str):
             conv_layer = get_class(conv_layer)
+        if isinstance(geometry_layer, str):
+            geometry_layer = get_class(geometry_layer)
 
         if in_channels == int(latent_channels):
             self.skip_module = lambda x: x  # Identity-function required in forward pass
@@ -665,7 +690,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
             )
 
         # 1st ConvNeXt block, the output of this one remains internal
@@ -680,7 +707,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
             )
         )
         if activation is not None:
@@ -695,7 +724,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
             )
         )
         if activation is not None:
@@ -710,7 +741,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
             )
         )
         if activation is not None:
@@ -725,7 +758,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
             )
         )
         if activation is not None:
@@ -765,6 +800,7 @@ class MaxPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
     ):
         """
@@ -785,6 +821,7 @@ class MaxPool(th.nn.Module):
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            enable_torch_compile=enable_torch_compile,
             hpx_padding_mode=hpx_padding_mode,
         )
 
@@ -815,6 +852,7 @@ class AvgPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
     ):
         """
@@ -837,6 +875,7 @@ class AvgPool(th.nn.Module):
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            enable_torch_compile=enable_torch_compile,
             hpx_padding_mode=hpx_padding_mode,
         )
 
@@ -874,6 +913,7 @@ class TransposedConvUpsample(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
         nside_in = None, # Not used, just for hydra instantiation
     ):
@@ -908,6 +948,7 @@ class TransposedConvUpsample(th.nn.Module):
                 padding=0,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
             )
         )
@@ -947,6 +988,7 @@ class ResizeConv(th.nn.Module):
         mode = 'bilinear',
         enable_nhwc = False,
         enable_healpixpad = True,
+        enable_torch_compile: bool = False,
         activation: th.nn.Module = None,
         hpx_padding_mode: str = 'karlbauer',     
         conv_layer = torch.nn.Conv2d,
@@ -1002,6 +1044,7 @@ class ResizeConv(th.nn.Module):
                 trim_size=trim_size,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=False,
             ),
@@ -1013,6 +1056,7 @@ class ResizeConv(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis
             ),
@@ -1055,6 +1099,7 @@ class SmoothedInterpolateConv(th.nn.Module):
         mode = 'nearest',
         enable_nhwc = False,
         enable_healpixpad = True,
+        enable_torch_compile: bool = False,
         activation: th.nn.Module = None,
         hpx_padding_mode: str = 'karlbauer',     
         conv_layer = torch.nn.Conv2d,
@@ -1108,6 +1153,7 @@ class SmoothedInterpolateConv(th.nn.Module):
                 trim_size=trim_size,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=False,
             ),
@@ -1119,6 +1165,7 @@ class SmoothedInterpolateConv(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
             )
