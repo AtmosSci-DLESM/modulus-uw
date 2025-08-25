@@ -307,7 +307,7 @@ class WeightedOceanMSE(th.nn.MSELoss):
             return th.sum(ocean_mean_err) / self.lsm_sum
         else:
             return ocean_mean_err / self.lsm_var_sum
-        
+
 class WeightedCRPSLoss(th.nn.MSELoss):
 
     """
@@ -339,12 +339,14 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             self.n_members = n_members
         self.device = None
 
-        # parameter for almost fair CRPS loss. See https://arxiv.org/html/2412.15832v1
+        # Parameters for "almost fair CRPS" loss. See https://arxiv.org/html/2412.15832v1
         self.coeff_eps = 1 - ((1-alpha) / (n_members))
-        self.averaging_coeff = 1 / (n_members * (n_members - 1))
+        self.averaging_coeff = 1 / (2* n_members * (n_members - 1))
 
-        # Static indices to idnex unique pairs of ensemble members (CUDA graph capture safe)
-        self.i, self.j = th.triu_indices(self.n_members, self.n_members, offset=1)
+        # For n>2, will use pairwise distance to copmute [NxN] distance matrix
+        # Diagonal elements of (prediciton - target) matrix are zeroed out to avoid double counting
+        self.pdist = th.nn.PairwiseDistance(p=1)
+        self.diag_mask = th.ones(self.n_members, self.n_members) - th.eye(self.n_members) # Mask to zero out diagonal elements
 
     def setup(self, trainer):
         """
@@ -355,10 +357,10 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             raise ValueError("Length of outputs and loss_weights is not the same!")
 
         self.loss_weights = self.loss_weights.to(device=trainer.device)
-        self.coeff_eps = th.tensor(self.coeff_eps, device=trainer.device)
         self.averaging_coeff = th.tensor(self.averaging_coeff, device=trainer.device)
-        self.i = self.i.to(device=trainer.device)
-        self.j = self.j.to(device=trainer.device)
+        self.coeff_eps = th.tensor(self.coeff_eps, device=trainer.device)
+        self.pdist = self.pdist.to(device=trainer.device)
+        self.diag_mask = self.diag_mask.to(device=trainer.device)
 
     def forward(self, prediction, target, average_channels=True):
         """
@@ -376,33 +378,54 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         """
         
         # Unfold ensemble dimension from batch dimension to have shape [Cond, B, F, T, C, H, W]
-        b, f, t, c, h, w = target.shape # get batch shape from target
+        b, f, t, c, h, w = target.shape
         prediction = prediction.view(self.n_members, b, f, t, c, h, w)
 
         # checks for dimensions 
         if not prediction.shape[1:] == target.shape:
             raise ValueError(f"Shape of prediction should match shape of target along non-ensemble dimensions, got {prediction.shape} and {target.shape}")
     
-        if not prediction.shape[0] % self.n_members == 0:
+        if not prediction.shape[0] == self.n_members:
             raise ValueError(f"Shape of prediction should have ensemble dimension of size {self.n_members}, got {prediction.shape[0]}")
 
-        # Compute first term of the afCRPS formula
-        diff_target = th.abs(prediction - target.unsqueeze(0)).mean(dim=0) # [B, F, T, C, H, W]
+        n = self.n_members
 
-        # Compute the last term of the afCRPS formula (pairwise L1 distance matrix)
-        # Index only the upper triangular part of the matrix for unique pairs
-        dist_matrix = th.abs(prediction.unsqueeze(1) - prediction.unsqueeze(0)) # [Cond, Cond, B, F, T, C, H, W]
-        diff_ensemble = dist_matrix[self.i, self.j] # [num_unique_pairs, B, F, T, C, H, W]
-        diff_ensemble = diff_ensemble.sum(dim=0) # [B, F, T, C, H, W]
+        # Apply channel weights across channel dims
+        prediction *= self.loss_weights[None, None, None, None, :, None, None]
+        target *= self.loss_weights[None, None, None, :, None, None]
 
-        # afCRPS formula
-        crps = diff_target - self.coeff_eps * self.averaging_coeff * diff_ensemble # [B, F, T, C, H, W]
+        if n == 2:
+            # Use faster explicit implementation
+            diff_target = th.abs(prediction - target.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
+            diff_ensemble = th.abs(prediction[0] - prediction[1]) # [B, F, T, C, H, W]
+            crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
 
-        crps *= self.loss_weights[None, None, None, :, None, None] # [B, F, T, C, H, W]
-
-        if average_channels:
-            return crps.mean()
+            if average_channels:
+                return crps.mean()
+            else:
+                return crps.mean(dim=(0, 1, 2, 4, 5))
         else:
-            return crps.mean(dim=(0, 1, 2, 4, 5))
+            # Use pairwise distance method
+            if not average_channels:
+                # Move channels to first dimension and exclude that dimension from the reductions           
+                prediction = prediction.permute(4, 0, 1, 2, 3, 5, 6) # [C, Cond, B, F, T, H, W]
+                target = target.permute(3, 0, 1, 2, 4, 5) # [C, B, F, T, H, W]
 
+                prediction = prediction.reshape(c, n, -1) # [C, Cond, ...]
+                target = target.unsqueeze(1).reshape(c, 1, -1) # [C, 1, ...] (second dim will broadcast across ensemble)
 
+                diff = self.pdist(prediction, target) # [C, Cond]
+                dist_matrix = self.pdist(prediction.unsqueeze(1), prediction.unsqueeze(2))  # [C, Cond, Cond]
+                
+                diff_terms = self.diag_mask[None, ...] * (diff.unsqueeze(1) + diff.unsqueeze(2)) # [C, Cond, Cond], diagonal elements zeroed out
+                crps = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum(dim=(1,2))/(b*f*t*h*w)
+            else:
+                prediction = prediction.reshape(n, -1)
+                target = target.unsqueeze(0).reshape(1, -1) # [1, ...] (first dim will broadcast across ensemble)
+                diff = self.pdist(prediction, target) # [Cond]
+                dist_matrix = self.pdist(prediction.unsqueeze(1), prediction.unsqueeze(0))  # [Cond, Cond] 
+
+                diff_terms = self.diag_mask * (diff.unsqueeze(0) + diff.unsqueeze(1)) # [Cond, Cond], diagonal elements zeroed out
+                crps = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum()/(b*f*c*t*h*w)
+
+            return crps
