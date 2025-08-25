@@ -644,6 +644,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        use_block_skip_connection: bool = True,
         enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
         conv_layer = torch.nn.Conv2d,
@@ -672,28 +673,33 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             Enable nhwc format, passed to wrapper
         enable_healpixpad: bool, optional
             If HEALPixPadding should be enabled, passed to wrapper
+        use_block_skip_connection: bool, optional
+            Whether or not to use block-level skip connection
         """
         super().__init__()
+
+        self.use_block_skip_connection = use_block_skip_connection
 
         if isinstance(conv_layer, str):
             conv_layer = get_class(conv_layer)
         if isinstance(geometry_layer, str):
             geometry_layer = get_class(geometry_layer)
 
-        if in_channels == int(latent_channels):
-            self.skip_module = lambda x: x  # Identity-function required in forward pass
-        else:
-            self.skip_module = geometry_layer(
-                layer=conv_layer,
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=1,
-                enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
-                hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=add_coriolis,
-            )
+        if use_block_skip_connection:
+            if in_channels == int(latent_channels):
+                self.skip_module = lambda x: x  # Identity-function required in forward pass
+            else:
+                self.skip_module = geometry_layer(
+                    layer=conv_layer,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=1,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                    enable_torch_compile=enable_torch_compile,
+                    hpx_padding_mode=hpx_padding_mode,
+                    add_coriolis=add_coriolis,
+                )
 
         # 1st ConvNeXt block, the output of this one remains internal
         convblock = []
@@ -781,7 +787,10 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             result of the forward pass
         """
         # residual connection with reshaped inpute and output of conv block
-        return self.skip_module(x) + self.convblock(x)
+        if self.use_block_skip_connection:
+            return self.skip_module(x) + self.convblock(x)
+        else:
+            return self.convblock(x)
 
 
 #
