@@ -36,18 +36,34 @@ class ConditionalLayerNorm(th.nn.Module):
         eps: float = 1e-5,
         n_faces: int = 12,
         norm_op:str = "torch",
+        init_cln_to_zero: bool = False,
+        scale_center: float = 0.0,
     ):
         """
         Conditional LayerNorm with MLP-based conditioning.
 
-        Args:
-            condition_shape (int): Shape of the conditioning input.
-            batch_size (int): Size of the batch.
-            mlp_hidden_dims (List[int]): Hidden layer sizes for MLPs predicting gamma and beta.
-            activation (DictConfig): Activation function configuration for the MLPs.
-            eps (float): Numerical stability constant.
-            n_faces (int): Number of faces in the Healpix grid, used for reshaping.
-            norm_op (str): "torch" for torch.nn.LayerNorm, "apex" for apex FusedLayerNorm.
+        Parameters
+        ----------
+        condition_shape : int
+            Shape of the conditioning input.
+        channel_depth : int
+            Number of channels in the input tensor.
+        mlp_hidden_dims : List[int]
+            Hidden layer sizes for MLPs predicting gamma and beta.
+        activation : DictConfig
+            Activation function configuration for the MLPs.
+        eps : float
+            Numerical stability constant.
+        n_faces : int
+            Number of faces in the Healpix grid, used for reshaping.
+        norm_op : str
+            "torch" for torch.nn.LayerNorm, "apex" for apex FusedLayerNorm.
+        init_cln_to_zero : bool = False
+            If True, initialize the last layer of the MLPs to zero.
+            At the start of training, the noise will be ignored
+        scale_center : float = 0.0
+            Center of the scale parameter. Set to 1.0 and use `init_cln_to_zero=True`
+            to make CLN behave like standard LayerNorm at initialization.
         """
         super().__init__()
         self.eps = eps
@@ -58,6 +74,13 @@ class ConditionalLayerNorm(th.nn.Module):
         self.gamma_mlp = self._make_mlp(self.condition_shape, self.hidden_dims, self.channel_depth, self.activation)
         self.beta_mlp = self._make_mlp(self.condition_shape, self.hidden_dims, self.channel_depth, self.activation)
         self.n_faces = n_faces
+        self.scale_center = scale_center
+
+        if init_cln_to_zero:
+            self.gamma_mlp[-1].weight.data.zero_()
+            self.beta_mlp[-1].weight.data.zero_()
+            self.gamma_mlp[-1].bias.data.zero_()
+            self.beta_mlp[-1].bias.data.zero_()
 
         if norm_op == "torch":
             self.norm = th.nn.LayerNorm(channel_depth, elementwise_affine=False)
@@ -80,10 +103,16 @@ class ConditionalLayerNorm(th.nn.Module):
 
     def forward(self, x: th.Tensor, conditions: th.Tensor) -> th.Tensor:
         """
-        Args:
-            x: Input tensor of shape: (B, C, H, W)
-            conditions: Conditioning tensor of shape (B*n_cond, cond_dim)
-        Returns:
+        Parameters
+        ----------
+        x : th.Tensor
+            Input tensor of shape: (B, C, H, W)
+        conditions : th.Tensor
+            Conditioning tensor of shape (B*n_cond, cond_dim)
+
+        Returns
+        -------
+        th.Tensor
             Normalized and conditioned tensor of shape: (B, C, H, W)
         """
 
@@ -92,7 +121,7 @@ class ConditionalLayerNorm(th.nn.Module):
         x_norm = self.norm(x)
     
         # Compute gamma and beta from conditions
-        gamma = self.gamma_mlp(conditions)[:, None, None, :] # (B*n_cond, 1, 1, C)
+        gamma = self.scale_center + self.gamma_mlp(conditions)[:, None, None, :] # (B*n_cond, 1, 1, C)
         beta = self.beta_mlp(conditions)[:, None, None, :] # (B*n_cond, 1, 1, C)
 
         # Repeat for the number of faces(which has been folded into the batch dimension)
