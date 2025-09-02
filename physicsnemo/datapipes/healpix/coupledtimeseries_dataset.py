@@ -191,12 +191,23 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         batch = {"time": slice(*time_index)}
         load_time = time.time()
 
-        input_array = (
-            self.ds["inputs"]
-            .sel(channel_in=self.input_variables)
-            .isel(**batch)
-            .values.copy()
-        )
+        # input_array = (
+        #     self.ds["inputs"]
+        #     .sel(channel_in=self.input_variables)
+        #     .isel(**batch)
+        #     .values.copy()
+        # )
+        a = self.ds["inputs"].sel(channel_in=self.input_variables).isel(**batch)
+        input_array = a.values.copy()
+        # test_time = time.time()
+        # t = self.ds["inputs"].sel(channel_in=self.input_variables).isel(**batch)
+        # print(f"loaded input data in {time.time() - test_time} s")
+        # test_time_2 = time.time()
+        # input_array = (
+        #     t.values.copy()
+        # )
+        # print(f"loaded input data (isel) in {time.time() - test_time_2} s")
+
         # retrieve coupled inputs
         if len(self.couplings) > 0:
             integrated_couplings = np.concatenate(
@@ -214,12 +225,14 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             # BAD NEWS: Indexing the array as commented out below causes unexpected behavior in target creation.
             #     leaving this in here as a warning
             # target_array = self.ds['targets'].isel(**batch).to_numpy()
-            target_array = (
-                self.ds["targets"]
-                .sel(channel_out=self.output_variables)
-                .isel(**batch)
-                .values.copy()
-            )
+            # target_array = (
+            #     self.ds["targets"]
+            #     .sel(channel_out=self.output_variables)
+            #     .isel(**batch)
+            #     .values.copy()
+            # )
+            b = self.ds["targets"].sel(channel_out=self.output_variables).isel(**batch)
+            target_array = b.values.copy()
             target_array = (
                 target_array - self.target_scaling["mean"]
             ) / self.target_scaling["std"]
@@ -227,9 +240,11 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             #                self.target_scaling['std']).compute()
 
         logger.log(5, "loaded batch data in %0.2f s", time.time() - load_time)
+        # print(f"loaded batch data in {time.time() - load_time} s")
         torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:process_batch")
+        # compute_time = time.time()
         # Insolation
         if self.add_insolation:
             sol = insolation(
@@ -316,6 +331,7 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         if len(self.couplings) > 0:
             inputs_result.append(integrated_couplings)
 
+        # print(f"computed batch in {time.time() - compute_time:.2f} s")
         torch.cuda.nvtx.range_pop()
 
         # finish range

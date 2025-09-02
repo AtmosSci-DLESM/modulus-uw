@@ -395,6 +395,8 @@ class TimeSeriesDataModule:
         add_insolation: bool = False,
         cube_dim: int = 64,
         num_workers: int = 4,
+        persistent_workers: bool = False,
+        prefetch_factor: int = 2,
         pin_memory: bool = True,
         prebuilt_dataset: bool = True,
         forecast_init_times: Optional[Sequence] = None,
@@ -492,6 +494,8 @@ class TimeSeriesDataModule:
         self.add_insolation = add_insolation
         self.cube_dim = cube_dim
         self.num_workers = num_workers
+        self.persistent_workers = persistent_workers
+        self.prefetch_factor = prefetch_factor
         self.pin_memory = pin_memory
         self.prebuilt_dataset = prebuilt_dataset
         self.forecast_init_times = forecast_init_times
@@ -711,6 +715,8 @@ class TimeSeriesDataModule:
             dataset=self.train_dataset,
             pin_memory=self.pin_memory,
             num_workers=self.num_workers,
+            persistent_workers=self.persistent_workers,
+            # prefetch_factor=self.prefetch_factor,
             shuffle=shuffle,
             drop_last=drop_last,
             sampler=sampler,
@@ -749,6 +755,8 @@ class TimeSeriesDataModule:
             dataset=self.val_dataset,
             pin_memory=self.pin_memory,
             num_workers=self.num_workers,
+            persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor,
             shuffle=False,
             drop_last=False,
             sampler=sampler,
@@ -787,6 +795,8 @@ class TimeSeriesDataModule:
             dataset=self.test_dataset,
             pin_memory=self.pin_memory,
             num_workers=self.num_workers,
+            persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor,
             shuffle=False,
             drop_last=False,
             sampler=sampler,
@@ -828,6 +838,8 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
         add_insolation: bool = False,
         cube_dim: int = 64,
         num_workers: int = 4,
+        persistent_workers: bool = False,
+        prefetch_factor: int = 2,
         pin_memory: bool = True,
         prebuilt_dataset: bool = True,
         forecast_init_times: Optional[Sequence] = None,
@@ -944,6 +956,8 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
             add_insolation,
             cube_dim,
             num_workers,
+            persistent_workers,
+            prefetch_factor,
             pin_memory,
             prebuilt_dataset,
             forecast_init_times,
