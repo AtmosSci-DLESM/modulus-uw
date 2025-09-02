@@ -45,6 +45,8 @@ class ConvGRUBlock(th.nn.Module):
         hpx_padding_mode: str = 'karlbauer',
         conv_layer = torch.nn.Conv2d,
         add_coriolis = False,
+        batch_size: int = 1,
+        nside_in = 64,
     ):
         """
         Parameters
@@ -79,6 +81,8 @@ class ConvGRUBlock(th.nn.Module):
             hpx_padding_mode=hpx_padding_mode,
             enable_torch_compile=enable_torch_compile,
             add_coriolis=add_coriolis,
+            nside_in=nside_in,
+            batch_size=batch_size,
         )
         self.conv_can = geometry_layer(
             layer=conv_layer,
@@ -91,9 +95,12 @@ class ConvGRUBlock(th.nn.Module):
             hpx_padding_mode=hpx_padding_mode,
             enable_torch_compile=enable_torch_compile,
             add_coriolis=add_coriolis,
+            nside_in=nside_in,
+            batch_size=batch_size,
         )
-        self.h = th.zeros(1, 1, 1, 1)
-
+        # self.h = th.zeros(1, 1, 1, 1)
+        self.h = None
+        
     def forward(self, inputs: Sequence) -> Sequence:
         """Forward pass of the ConvGRUBlock
 
@@ -107,7 +114,9 @@ class ConvGRUBlock(th.nn.Module):
         Sequence
             Result of the forward pass
         """
-        if inputs.shape != self.h.shape:
+        # if inputs.shape != self.h.shape:
+        #     self.h = th.zeros_like(inputs)
+        if self.h is None:
             self.h = th.zeros_like(inputs)
         combined = th.cat([inputs, self.h], dim=1)
         combined_conv = self.conv_gates(combined)
@@ -127,7 +136,8 @@ class ConvGRUBlock(th.nn.Module):
 
     def reset(self):
         """Reset the update gates"""
-        self.h = th.zeros_like(self.h)
+        if self.h is not None:
+            self.h = th.zeros_like(self.h)
 
 #
 # CONV BLOCKS
@@ -153,6 +163,8 @@ class BasicConvBlock(th.nn.Module):
         hpx_padding_mode: str = 'karlbauer',
         conv_layer = torch.nn.Conv2d,
         add_coriolis = False,
+        batch_size: int = 1,
+        nside_in: int = 64
     ):
         """
         Parameters
@@ -201,6 +213,8 @@ class BasicConvBlock(th.nn.Module):
                     enable_torch_compile=enable_torch_compile,
                     hpx_padding_mode=hpx_padding_mode,
                     add_coriolis=add_coriolis,
+                    batch_size=batch_size,
+                    nside_in=nside_in,
                 )
             )
             if activation is not None:
@@ -371,6 +385,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
         hpx_padding_mode: str = 'karlbauer',
         conv_layer = torch.nn.Conv2d,
         add_coriolis = False,
+        batch_size: int = 1,
+        nside_in: int = 64,
     ):
         """
         Parameters:
@@ -418,6 +434,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=nside_in,
             )
         if out_channels == int(latent_channels):
             self.skip_module2 = (
@@ -434,6 +452,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=nside_in,
             )
 
         # 1st ConvNeXt block, the output of this one remains internal
@@ -451,6 +471,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -468,6 +490,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -485,6 +509,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -506,6 +532,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -522,6 +550,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_healpixpad=enable_healpixpad,
                 enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
+                batch_size=batch_size,
+                nside_in=nside_in,
                 add_coriolis=add_coriolis,
             )
         )
@@ -540,6 +570,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -945,6 +977,10 @@ class TransposedConvUpsample(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         """
         super().__init__()
+
+        if isinstance(geometry_layer, str):
+            geometry_layer = get_class(geometry_layer)   
+                     
         upsampler = []
         # Upsample transpose conv
         upsampler.append(
@@ -1113,6 +1149,8 @@ class SmoothedInterpolateConv(th.nn.Module):
         hpx_padding_mode: str = 'karlbauer',     
         conv_layer = torch.nn.Conv2d,
         add_coriolis = False,
+        batch_size: int = 1,
+        nside_in: int = 64,
     ):
         """
         Parameters
@@ -1165,6 +1203,8 @@ class SmoothedInterpolateConv(th.nn.Module):
                 enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=False,
+                batch_size=batch_size,
+                nside_in=nside_in,
             ),
             geometry_layer(
                 layer=conv_layer,
@@ -1177,6 +1217,8 @@ class SmoothedInterpolateConv(th.nn.Module):
                 enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
                 add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=scale_factor*nside_in,
             )
         ]
 
@@ -1283,8 +1325,8 @@ class SmoothedInterpolate(th.nn.Module):
         self.smoother_kernel = self.smoother_kernel.repeat((in_channels,1,1,1))
 
     def forward(self, x: th.Tensor) -> th.Tensor:
-        self.smoother_kernel = self.smoother_kernel.to(x.device)
-        
+        self.smoother_kernel = self.smoother_kernel.to(device=x.device, dtype=x.dtype)
+
         x = self.interp(x, scale_factor=self.scale_factor, mode=self.mode)
         x = torch.nn.functional.conv2d(
             x,

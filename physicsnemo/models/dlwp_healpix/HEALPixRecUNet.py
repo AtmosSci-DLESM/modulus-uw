@@ -69,6 +69,7 @@ class HEALPixRecUNet(Module):
         enable_torch_compile: bool = False,
         couplings: list = [],
         hpx_padding_mode: str = 'karlbauer',
+        batch_size: int = 1,
     ):
         """
         Parameters
@@ -144,6 +145,7 @@ class HEALPixRecUNet(Module):
         self.enable_healpixpad = enable_healpixpad
         self.enable_torch_compile = enable_torch_compile
         self.hpx_padding_mode = hpx_padding_mode
+        self.batch_size = batch_size
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -163,6 +165,7 @@ class HEALPixRecUNet(Module):
             enable_healpixpad=self.enable_healpixpad,
             enable_torch_compile=self.enable_torch_compile,
             hpx_padding_mode=self.hpx_padding_mode,
+            batch_size=self.batch_size,
         )
         self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
@@ -172,6 +175,7 @@ class HEALPixRecUNet(Module):
             enable_healpixpad=self.enable_healpixpad,
             enable_torch_compile=self.enable_torch_compile,
             hpx_padding_mode=self.hpx_padding_mode,
+            batch_size=self.batch_size,
         )
 
     @property

@@ -38,6 +38,8 @@ class UNetDecoder(th.nn.Module):
         enable_healpixpad: bool = False,
         enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
+        batch_size: int = 1,
+        nside_in: Sequence = (16, 32, 64)
     ):
         """
         Parameters
@@ -85,6 +87,8 @@ class UNetDecoder(th.nn.Module):
                     enable_healpixpad=enable_healpixpad,
                     enable_torch_compile=enable_torch_compile,
                     hpx_padding_mode=hpx_padding_mode,
+                    batch_size=batch_size,
+                    nside_in=nside_in[n-1],
                 )
 
             next_channel = (
@@ -104,6 +108,8 @@ class UNetDecoder(th.nn.Module):
                 enable_healpixpad=enable_healpixpad,
                 enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
+                batch_size=batch_size,
+                nside_in=nside_in[n]
             )
 
             # Recurrent module
@@ -115,6 +121,8 @@ class UNetDecoder(th.nn.Module):
                     enable_healpixpad=enable_healpixpad,
                     enable_torch_compile=enable_torch_compile,
                     hpx_padding_mode=hpx_padding_mode,
+                    batch_size=batch_size,
+                    nside_in=nside_in[n],
                 )
             else:
                 rec_module = None
@@ -141,6 +149,8 @@ class UNetDecoder(th.nn.Module):
             enable_healpixpad=enable_healpixpad,
             enable_torch_compile=enable_torch_compile,
             hpx_padding_mode=hpx_padding_mode,
+            batch_size=batch_size,
+            nside_in=nside_in[n],
         )
 
     def forward(self, inputs: Sequence) -> th.Tensor:
