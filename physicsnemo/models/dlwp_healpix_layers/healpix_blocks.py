@@ -98,9 +98,8 @@ class ConvGRUBlock(th.nn.Module):
             nside_in=nside_in,
             batch_size=batch_size,
         )
-        # self.h = th.zeros(1, 1, 1, 1)
-        self.h = None
-        
+        self.h = th.zeros(1, 1, 1, 1)
+
     def forward(self, inputs: Sequence) -> Sequence:
         """Forward pass of the ConvGRUBlock
 
@@ -114,9 +113,7 @@ class ConvGRUBlock(th.nn.Module):
         Sequence
             Result of the forward pass
         """
-        # if inputs.shape != self.h.shape:
-        #     self.h = th.zeros_like(inputs)
-        if self.h is None:
+        if inputs.shape != self.h.shape:
             self.h = th.zeros_like(inputs)
         combined = th.cat([inputs, self.h], dim=1)
         combined_conv = self.conv_gates(combined)
@@ -136,8 +133,118 @@ class ConvGRUBlock(th.nn.Module):
 
     def reset(self):
         """Reset the update gates"""
-        if self.h is not None:
-            self.h = th.zeros_like(self.h)
+        self.h = th.zeros_like(self.h)
+
+# class ConvGRUBlock(th.nn.Module):
+#     """Class that implements a Convolutional GRU
+#     Code modified from
+#     https://github.com/happyjin/ConvGRU-pytorch/blob/master/convGRU.py
+#     """
+
+#     def __init__(
+#         self,
+#         geometry_layer: th.nn.Module = HEALPixLayer,
+#         in_channels: int = 3,
+#         kernel_size: int = 1,
+#         enable_nhwc: bool = False,
+#         enable_healpixpad: bool = False,
+#         enable_torch_compile: bool = False,
+#         hpx_padding_mode: str = 'karlbauer',
+#         conv_layer = torch.nn.Conv2d,
+#         add_coriolis = False,
+#         batch_size: int = 1,
+#         nside_in = 64,
+#     ):
+#         """
+#         Parameters
+#         ----------
+#         geometry_layer: torch.nn.Module, optional
+#             The wrapper for the geometry layer
+#         in_channels: int, optional
+#             The number of input channels
+#         kernel_size: int, optional
+#             Size of the convolutioonal kernel
+#         enable_nhwc: bool, optional
+#             Enable nhwc format, passed to wrapper
+#         enable_healpixpad: bool, optional
+#             If HEALPixPadding should be enabled, passed to wrapper
+#         """
+#         super().__init__()
+
+#         if isinstance(conv_layer, str):
+#             conv_layer = get_class(conv_layer)
+#         if isinstance(geometry_layer, str):
+#             geometry_layer = get_class(geometry_layer)
+
+#         self.channels = in_channels
+#         self.conv_gates = geometry_layer(
+#             layer=conv_layer,
+#             in_channels=in_channels + self.channels,
+#             out_channels=2 * self.channels,  # for update_gate,reset_gate respectively
+#             kernel_size=kernel_size,
+#             padding="same",
+#             enable_nhwc=enable_nhwc,
+#             enable_healpixpad=enable_healpixpad,
+#             hpx_padding_mode=hpx_padding_mode,
+#             enable_torch_compile=enable_torch_compile,
+#             add_coriolis=add_coriolis,
+#             nside_in=nside_in,
+#             batch_size=batch_size,
+#         )
+#         self.conv_can = geometry_layer(
+#             layer=conv_layer,
+#             in_channels=in_channels + self.channels,
+#             out_channels=self.channels,  # for candidate neural memory
+#             kernel_size=kernel_size,
+#             padding="same",
+#             enable_nhwc=enable_nhwc,
+#             enable_healpixpad=enable_healpixpad,
+#             hpx_padding_mode=hpx_padding_mode,
+#             enable_torch_compile=enable_torch_compile,
+#             add_coriolis=add_coriolis,
+#             nside_in=nside_in,
+#             batch_size=batch_size,
+#         )
+#         # self.h = th.zeros(1, 1, 1, 1)
+#         self.h = None
+        
+#     def forward(self, inputs: Sequence) -> Sequence:
+#         """Forward pass of the ConvGRUBlock
+
+#         Parameters
+#         ----------
+#         inputs: Sequence
+#             Input to the forward pass
+
+#         Returns
+#         -------
+#         Sequence
+#             Result of the forward pass
+#         """
+#         # if inputs.shape != self.h.shape:
+#         #     self.h = th.zeros_like(inputs)
+#         if self.h is None:
+#             self.h = th.zeros_like(inputs)
+#         combined = th.cat([inputs, self.h], dim=1)
+#         combined_conv = self.conv_gates(combined)
+
+#         gamma, beta = th.split(combined_conv, self.channels, dim=1)
+#         reset_gate = th.sigmoid(gamma)
+#         update_gate = th.sigmoid(beta)
+
+#         combined = th.cat([inputs, reset_gate * self.h], dim=1)
+#         cc_cnm = self.conv_can(combined)
+#         cnm = th.tanh(cc_cnm)
+
+#         h_next = (1 - update_gate) * self.h + update_gate * cnm
+#         self.h = h_next
+
+#         return inputs + h_next
+
+#     def reset(self):
+#         """Reset the update gates"""
+#         if self.h is not None:
+#             self.h = th.zeros_like(self.h)
 
 #
 # CONV BLOCKS
