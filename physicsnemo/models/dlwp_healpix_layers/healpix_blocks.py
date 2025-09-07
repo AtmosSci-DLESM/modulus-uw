@@ -1063,7 +1063,9 @@ class TransposedConvUpsample(th.nn.Module):
         enable_healpixpad: bool = False,
         enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
-        nside_in = None, # Not used, just for hydra instantiation
+        add_coriolis = False,
+        batch_size: int = 1,
+        nside_in = 64,
     ):
         """
         Parameters

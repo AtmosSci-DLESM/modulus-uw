@@ -237,6 +237,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         dst_directory: str,
         dataset_name: str,
         data_format: str,
+        surface_geopotential_name: str,
         surface_geopotential_mean: float = -597.7115478515625,
         surface_geopotential_std: float = 55658.21484375,
         R: float = 287,  # J K^{-1} kg^{-1}
@@ -350,9 +351,11 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         # Get topography information
         ds = xr.open_zarr(f"{src_directory}{dataset_name}.zarr")
         self.topography = (
-            surface_geopotential_std * ds.constants[1, :, :, :].values
+            surface_geopotential_std * ds.constants.sel(channel_c=surface_geopotential_name).values
             + surface_geopotential_mean
-        ) / self.g0
+        )
+        if surface_geopotential_name != "z_nonnorm":
+            self.topography /= self.g0
 
         self.topography = torch.tensor(
             self.topography[np.newaxis, :, np.newaxis, :, :], dtype=torch.float

@@ -191,14 +191,14 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         batch = {"time": slice(*time_index)}
         load_time = time.time()
 
-        # input_array = (
-        #     self.ds["inputs"]
-        #     .sel(channel_in=self.input_variables)
-        #     .isel(**batch)
-        #     .values.copy()
-        # )
-        a = self.ds["inputs"].sel(channel_in=self.input_variables).isel(**batch)
-        input_array = a.values.copy()
+        input_array = (
+            self.ds["inputs"]
+            .sel(channel_in=self.input_variables)
+            .isel(**batch)
+            .values.copy()
+        )
+        # a = self.ds["inputs"].sel(channel_in=self.input_variables).isel(**batch)
+        # input_array = a.values.copy()
         # test_time = time.time()
         # t = self.ds["inputs"].sel(channel_in=self.input_variables).isel(**batch)
         # print(f"loaded input data in {time.time() - test_time} s")
@@ -225,14 +225,14 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             # BAD NEWS: Indexing the array as commented out below causes unexpected behavior in target creation.
             #     leaving this in here as a warning
             # target_array = self.ds['targets'].isel(**batch).to_numpy()
-            # target_array = (
-            #     self.ds["targets"]
-            #     .sel(channel_out=self.output_variables)
-            #     .isel(**batch)
-            #     .values.copy()
-            # )
-            b = self.ds["targets"].sel(channel_out=self.output_variables).isel(**batch)
-            target_array = b.values.copy()
+            target_array = (
+                self.ds["targets"]
+                .sel(channel_out=self.output_variables)
+                .isel(**batch)
+                .values.copy()
+            )
+            # b = self.ds["targets"].sel(channel_out=self.output_variables).isel(**batch)
+            # target_array = b.values.copy()
             target_array = (
                 target_array - self.target_scaling["mean"]
             ) / self.target_scaling["std"]

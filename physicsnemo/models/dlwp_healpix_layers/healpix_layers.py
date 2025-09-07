@@ -1021,6 +1021,18 @@ class HEALPixLayer(th.nn.Module):
         super().__init__()
         layers = []
 
+        if "add_coriolis" in kwargs:
+            add_coriolis = kwargs["add_coriolis"]
+            del kwargs["add_coriolis"]
+
+        if "batch_size" in kwargs:
+            batch_size = kwargs["batch_size"]
+            del kwargs["batch_size"]
+
+        if "nside_in" in kwargs:
+            nside_in = kwargs["nside_in"]
+            del kwargs["nside_in"]
+       
         if "enable_nhwc" in kwargs:
             enable_nhwc = kwargs["enable_nhwc"]
             del kwargs["enable_nhwc"]
@@ -1038,9 +1050,6 @@ class HEALPixLayer(th.nn.Module):
             del kwargs["enable_torch_compile"]
         else:
             enable_torch_compile = False
-
-        if "add_coriolis" in kwargs:
-            del kwargs["add_coriolis"]
 
         # Define a HEALPixPadding layer if the given layer is a convolution or
         # interpolation layer
