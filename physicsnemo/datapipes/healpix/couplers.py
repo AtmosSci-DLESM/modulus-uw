@@ -84,7 +84,7 @@ class ConstantCoupler:
         self.output_channels = len(self.variables) * len(self.input_times)
         self.timevar_dim = self._compute_timevar_dim()
         self.coupled_inputs_shape = None
-        self.scaling_dict = None
+        self.coupled_scaling = None
         self._coupled_offsets = None
         self.coupled_mode = False
         self.integrated_couplings = None
@@ -247,10 +247,11 @@ class ConstantCoupler:
             )
 
             # extract coupled variables and scale lazily
-            input_array = self.ds.inputs.sel(channel_in=self.variables)
-            ds = (input_array - self.coupled_scaling["mean"]) / self.coupled_scaling[
-                "std"
-            ]
+            ds = self.ds.inputs.sel(channel_in=self.variables)
+            if self.coupled_scaling is not None:
+                ds -= self.coupled_scaling["mean"]
+                ds /= self.coupled_scaling["std"]
+
             # load before entering loop for efficiency
             ds_index_range = ds.isel(time=index_range).load()
 
@@ -335,7 +336,7 @@ class TrailingAverageCoupler:
         self.coupled_integration_dim = self._compute_coupled_integration_dim()
         self.timevar_dim = self._compute_timevar_dim()
         self.coupled_inputs_shape = None
-        self.scaling_dict = None
+        self.coupled_scaling = None
         self._coupled_offsets = None
         self.integrated_couplings = None
         self.coupled_mode = False  # if forecasting with another coupled model
@@ -521,10 +522,11 @@ class TrailingAverageCoupler:
             )
 
             # extract coupled variables and scale lazily
-            ds = (
-                self.ds.inputs.sel(channel_in=self.variables)
-                - self.coupled_scaling["mean"]
-            ) / self.coupled_scaling["std"]
+            ds = self.ds.inputs.sel(channel_in=self.variables)
+            if self.coupled_scaling is not None:
+                ds -= self.coupled_scaling["mean"]
+                ds /= self.coupled_scaling["std"]
+
             # load before entering loop for efficiency
             ds_index_range = ds.isel(time=index_range).load()
 
