@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import random
 import shutil
 import warnings
@@ -99,16 +100,17 @@ def test_TimeSeriesDataset_initialization(
     data_dir, dataset_name, scaling_dict, pytestconfig
 ):
 
-    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import TimeSeriesDatasetZarr
+    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
+        TimeSeriesDatasetZarr,
+    )
 
     # check for failure of invalid dataset path
-    try:
-        # Check if fsspec is available for object store paths
-        # optional dependency
-        import fsspec
-    except ImportError:
+    # Check if fsspec is available for object store paths, optional dependency
+    if importlib.util.find_spec("fsspec"):
         # If fsspec is not available, expect an ImportError
-        with pytest.raises(ImportError, match=("fsspec is required to access object store paths")):
+        with pytest.raises(
+            ImportError, match=("fsspec is required to access object store paths")
+        ):
             timeseries_ds = TimeSeriesDatasetZarr(
                 ds_path="s3://physicsnemo-data/datasets/healpix/healpix.zarr",
                 scaling=scaling_dict,
@@ -174,13 +176,13 @@ def test_TimeSeriesDataset_initialization(
     timeseries_ds = TimeSeriesDatasetZarr(
         dataset=zarr_ds,
     )
-    assert isinstance(timeseries_ds, TimeSeriesDataset)
+    assert isinstance(timeseries_ds, TimeSeriesDatasetZarr)
 
     timeseries_ds = TimeSeriesDatasetZarr(
         dataset=zarr_ds,
         scaling=scaling_dict,
     )
-    assert isinstance(timeseries_ds, TimeSeriesDataset)
+    assert isinstance(timeseries_ds, TimeSeriesDatasetZarr)
 
     timeseries_ds = TimeSeriesDatasetZarr(
         dataset=zarr_ds,
@@ -188,7 +190,7 @@ def test_TimeSeriesDataset_initialization(
         batch_size=1,
         forecast_init_times=zarr_ds.time[:2],
     )
-    assert isinstance(timeseries_ds, TimeSeriesDataset)
+    assert isinstance(timeseries_ds, TimeSeriesDatasetZarr)
 
     timeseries_ds = TimeSeriesDatasetZarr(
         dataset=zarr_ds,
@@ -198,7 +200,7 @@ def test_TimeSeriesDataset_initialization(
         data_time_step="3h",
         time_step="6h",
     )
-    assert isinstance(timeseries_ds, TimeSeriesDataset)
+    assert isinstance(timeseries_ds, TimeSeriesDatasetZarr)
     zarr_ds.close()
 
 
@@ -209,7 +211,9 @@ def test_TimeSeriesDataset_initialization(
 def test_TimeSeriesDataset_get_constants(
     data_dir, dataset_name, scaling_dict, pytestconfig
 ):
-    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import TimeSeriesDatasetZarr
+    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
+        TimeSeriesDatasetZarr,
+    )
 
     # open our test dataset
     ds_path = Path(data_dir, dataset_name + ".zarr")
@@ -234,7 +238,9 @@ def test_TimeSeriesDataset_get_constants(
 @import_or_fail("netCDF4")
 @nfsdata_or_fail
 def test_TimeSeriesDataset_len(data_dir, dataset_name, scaling_dict, pytestconfig):
-    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import TimeSeriesDatasetZarr 
+    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
+        TimeSeriesDatasetZarr,
+    )
 
     # open our test dataset
     ds_path = Path(data_dir, dataset_name + ".zarr")
@@ -281,7 +287,9 @@ def test_TimeSeriesDataset_len(data_dir, dataset_name, scaling_dict, pytestconfi
 def test_TimeSeriesDataset_get(
     data_dir, dataset_name, scaling_double_dict, pytestconfig
 ):
-    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import TimeSeriesDatasetZarr
+    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
+        TimeSeriesDatasetZarr,
+    )
 
     # open our test dataset
     ds_path = Path(data_dir, dataset_name + ".zarr")
@@ -392,7 +400,7 @@ def test_TimeSeriesDataModule_initialization(
     data_dir, create_path, dataset_name, scaling_double_dict, pytestconfig
 ):
     from physicsnemo.datapipes.healpix.data_modules_zarr import (
-        TimeSeriesDataModule,
+        TimeSeriesDataModuleZarr,
     )
 
     variables = ["z500", "z1000"]
@@ -411,7 +419,7 @@ def test_TimeSeriesDataModule_initialization(
 
     # test with an invalid mode
     with pytest.raises(ValueError, match=("'data_format' must be one of")):
-        timeseries_dm = TimeSeriesDataModule(
+        timeseries_dm = TimeSeriesDataModuleZarr(
             src_directory=data_dir,
             dst_directory=create_path,
             dataset_name=dataset_name,
@@ -430,7 +438,7 @@ def test_TimeSeriesDataModule_initialization(
         prebuilt_dataset=True,
         scaling=scaling_double_dict,
     )
-    assert isinstance(timeseries_dm, TimeSeriesDataModule)
+    assert isinstance(timeseries_dm, TimeSeriesDataModuleZarr)
 
     # without the prebuilt dataset
     timeseries_dm = TimeSeriesDataModuleZarr(
@@ -442,7 +450,7 @@ def test_TimeSeriesDataModule_initialization(
         prebuilt_dataset=False,
         scaling=scaling_double_dict,
     )
-    assert isinstance(timeseries_dm, TimeSeriesDataModule)
+    assert isinstance(timeseries_dm, TimeSeriesDataModuleZarr)
 
     # with init times
     timeseries_dm = TimeSeriesDataModuleZarr(
@@ -455,7 +463,7 @@ def test_TimeSeriesDataModule_initialization(
         scaling=scaling_double_dict,
         forecast_init_times=zarr_ds.time[:2],
     )
-    assert isinstance(timeseries_dm, TimeSeriesDataModule)
+    assert isinstance(timeseries_dm, TimeSeriesDataModuleZarr)
 
     # with splits
     timeseries_dm = TimeSeriesDataModuleZarr(
@@ -468,7 +476,7 @@ def test_TimeSeriesDataModule_initialization(
         scaling=scaling_double_dict,
         splits=omegaconf.DictConfig(splits),
     )
-    assert isinstance(timeseries_dm, TimeSeriesDataModule)
+    assert isinstance(timeseries_dm, TimeSeriesDataModuleZarr)
     zarr_ds.close()
     DistributedManager.cleanup()
 
@@ -481,7 +489,7 @@ def test_TimeSeriesDataModule_get_constants(
     data_dir, create_path, dataset_name, scaling_double_dict, pytestconfig
 ):
     from physicsnemo.datapipes.healpix.data_modules_zarr import (
-        TimeSeriesDataModule,
+        TimeSeriesDataModuleZarr,
     )
 
     variables = ["z500", "z1000"]
@@ -560,7 +568,7 @@ def test_TimeSeriesDataModule_get_dataloaders(
 ):
 
     from physicsnemo.datapipes.healpix.data_modules_zarr import (
-        TimeSeriesDataModule,
+        TimeSeriesDataModuleZarr,
     )
 
     variables = ["z500", "z1000"]

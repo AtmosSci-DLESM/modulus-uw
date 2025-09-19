@@ -16,20 +16,11 @@
 
 # System modules
 import logging
-import os
-import time
 from pathlib import Path
-from typing import DefaultDict, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
 # numpy
 import numpy as np
-
-# distributed stuff
-import torch
-import xarray as xr
-
-# Internal modules
-from dask.diagnostics import ProgressBar
 
 # External modules
 from omegaconf import DictConfig
@@ -43,9 +34,10 @@ from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
 
 logger = logging.getLogger(__name__)
 
+
 class TimeSeriesDataModuleZarr:
     """pytorch-lightning module for complete model train, validation, and test data loading. Uses
-    dlwp.data.data_loading.TimeSeriesDataset under-the-hood.    
+    dlwp.data.data_loading.TimeSeriesDataset under-the-hood.
     """
 
     def __init__(
@@ -157,7 +149,6 @@ class TimeSeriesDataModuleZarr:
         self.gap = gap
         self.shuffle = shuffle
         self.add_insolation = add_insolation
-        self.cube_dim = cube_dim
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.forecast_init_times = forecast_init_times
@@ -169,7 +160,9 @@ class TimeSeriesDataModuleZarr:
         self.test_dataset = None
 
         if self.batch_size % self.dataloader_batch_size != 0:
-            raise ValueError(f"Batch size must be divisible by dataloader batch size. Batch size: {self.batch_size}, Databale by dataloader batch size: {self.dataloader_batch_size}")
+            raise ValueError(
+                f"Batch size must be divisible by dataloader batch size. Batch size: {self.batch_size}, dataloader batch size: {self.dataloader_batch_size}"
+            )
 
         self.dataloader_batch_size = dataloader_batch_size
         self.dataset_batch_size = self.batch_size // self.dataloader_batch_size
@@ -264,13 +257,15 @@ class TimeSeriesDataModuleZarr:
         """Setup the datasets used for this DataModule"""
         self._validate_setup_requirements()
         dist = self._initialize_distributed_manager()
-        
+
         common_kwargs = self._get_common_dataset_kwargs()
         dataset_class = self._get_dataset_class()
-        
+
         self._create_datasets(common_kwargs, dataset_class, dist)
 
-    def _base_dataloader(self, dataset, num_shards=1, shard_id=0, shuffle=False, drop_last=False) -> DataLoader:
+    def _base_dataloader(
+        self, dataset, num_shards=1, shard_id=0, shuffle=False, drop_last=False
+    ) -> DataLoader:
         """Setup a dataloader with common functionality
 
         Parameters
@@ -334,7 +329,7 @@ class TimeSeriesDataModuleZarr:
             dataset=self.train_dataset,
             num_shards=num_shards,
             shard_id=shard_id,
-            shuffle=self.shuffle
+            shuffle=self.shuffle,
             drop_last=True,
         )
 
@@ -516,13 +511,13 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
     def _get_common_dataset_kwargs(self) -> dict:
         """Get common keyword arguments for dataset creation (includes coupling-specific params)"""
         base_kwargs = super()._get_common_dataset_kwargs()
-        base_kwargs.update({
-            "couplings": self.couplings,
-        })
+        base_kwargs.update(
+            {
+                "couplings": self.couplings,
+            }
+        )
         return base_kwargs
 
     def _get_dataset_class(self):
         """Get the dataset class to use for creating datasets"""
         return CoupledTimeSeriesDatasetZarr
-
-

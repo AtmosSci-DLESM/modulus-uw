@@ -16,20 +16,14 @@
 
 # System modules
 import logging
-import os
-import time
 from pathlib import Path
-from typing import DefaultDict, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
 # numpy
 import numpy as np
 
 # distributed stuff
-import torch
 import xarray as xr
-
-# Internal modules
-from dask.diagnostics import ProgressBar
 
 # External modules
 from omegaconf import DictConfig
@@ -56,7 +50,7 @@ def open_time_series_dataset_classic_prebuilt(
         The directory that contains the dataset
     dataset_name: str
         The name of the dataset to open
-    constants: DefaultDict, optional
+    constants: typing.DefaultDict, optional
         Not used for open_time_series_dataset_classic_prebuilt, default False
     batch_size: str, optional
         The chunk size to use for the input datasets, default 32
@@ -64,7 +58,7 @@ def open_time_series_dataset_classic_prebuilt(
     Returns
     -------
     xr.Dataset: The opened dataset
-    
+
     Raises
     ------
     FileNotFoundError: If the dataset doesn't exist at the specified path
@@ -79,9 +73,6 @@ def open_time_series_dataset_classic_prebuilt(
     return result
 
 
-
-
-
 class TimeSeriesDataModule:
     """pytorch-lightning module for complete model train, validation, and test data loading. Uses
     dlwp.data.data_loading.TimeSeriesDataset under-the-hood. Loaded data files follow the naming scheme
@@ -90,12 +81,12 @@ class TimeSeriesDataModule:
 
     def __init__(
         self,
-        src_directory: str = ".", # kept for backwards compatibility
+        src_directory: str = ".",  # kept for backwards compatibility
         dst_directory: str = ".",
         dataset_name: str = "dataset",
         prefix: Optional[str] = None,
         suffix: Optional[str] = None,
-        data_format: str = "classic", # kept for backwards compatibility
+        data_format: str = "classic",  # kept for backwards compatibility
         batch_size: int = 32,
         drop_last: bool = False,
         input_variables: Optional[Sequence] = ["t2m"],
@@ -111,10 +102,10 @@ class TimeSeriesDataModule:
         gap: Union[int, str, None] = None,
         shuffle: bool = True,
         add_insolation: bool = False,
-        cube_dim: int = 64,
+        cube_dim: int = 64,  # kept for backwards compatibility
         num_workers: int = 4,
         pin_memory: bool = True,
-        prebuilt_dataset: bool = True, # kept for backwards compatibility
+        prebuilt_dataset: bool = True,  # kept for backwards compatibility
         forecast_init_times: Optional[Sequence] = None,
     ):
         """
@@ -164,8 +155,6 @@ class TimeSeriesDataModule:
             Option to shuffle the training data, default True
         add_insolation: bool, optional
             Option to add prescribed insolation as a decoder input feature, default True
-        cube_dim: int, optional
-            Number of points on the side of a cube face. Not currently used.
         num_workers: int, optional
             Number of parallel data loading workers, default 4
         pin_memory: bool, optional
@@ -233,7 +222,6 @@ class TimeSeriesDataModule:
         # make sure distributed manager is initalized
         if not DistributedManager.is_initialized():
             DistributedManager.initialize()
-        dist = DistributedManager()
 
         dataset = open_time_series_dataset_classic_prebuilt(
             directory=self.dst_directory,
@@ -245,18 +233,26 @@ class TimeSeriesDataModule:
         # Verify that all input variables are available in the dataset
         missing_input_vars = set(self.input_variables) - set(dataset.channel_in.values)
         if missing_input_vars:
-            raise ValueError(f"Input variables not found in dataset: {missing_input_vars}")
-        
+            raise ValueError(
+                f"Input variables not found in dataset: {missing_input_vars}"
+            )
+
         # Verify that all output variables are available in the dataset
-        missing_output_vars = set(self.output_variables) - set(dataset.channel_out.values)
+        missing_output_vars = set(self.output_variables) - set(
+            dataset.channel_out.values
+        )
         if missing_output_vars:
-            raise ValueError(f"Output variables not found in dataset: {missing_output_vars}")
-        
+            raise ValueError(
+                f"Output variables not found in dataset: {missing_output_vars}"
+            )
+
         # Verify that all constants are available in the dataset
-        missing_constants = set(list(self.constants.values())) - set(dataset.channel_c.values)
+        missing_constants = set(list(self.constants.values())) - set(
+            dataset.channel_c.values
+        )
         if missing_constants:
             raise ValueError(f"Constants not found in dataset: {missing_constants}")
-        
+
         dataset = dataset.sel(
             channel_in=self.input_variables,
             channel_out=self.output_variables,
@@ -456,12 +452,12 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
 
     def __init__(
         self,
-        src_directory: str = ".", # kept for backwards compatibility
+        src_directory: str = ".",  # kept for backwards compatibility
         dst_directory: str = ".",
         dataset_name: str = "dataset",
         prefix: Optional[str] = None,
         suffix: Optional[str] = None,
-        data_format: str = "classic", # kept for backwards compatibility
+        data_format: str = "classic",  # kept for backwards compatibility
         batch_size: int = 32,
         drop_last: bool = False,
         input_variables: Optional[Sequence] = None,
@@ -477,10 +473,10 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
         gap: Union[int, str, None] = None,
         shuffle: bool = True,
         add_insolation: bool = False,
-        cube_dim: int = 64,
+        cube_dim: int = 64,  # kept for backwards compatibility
         num_workers: int = 4,
         pin_memory: bool = True,
-        prebuilt_dataset: bool = True, # kept for backwards compatibility
+        prebuilt_dataset: bool = True,  # kept for backwards compatibility
         forecast_init_times: Optional[Sequence] = None,
         couplings: Sequence = None,
         add_train_noise: Optional[bool] = False,
@@ -615,18 +611,25 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
         # Verify that all input variables are available in the dataset
         missing_input_vars = set(self.input_variables) - set(dataset.channel_in.values)
         if missing_input_vars:
-            raise ValueError(f"Input variables not found in dataset: {missing_input_vars}")
-        
+            raise ValueError(
+                f"Input variables not found in dataset: {missing_input_vars}"
+            )
+
         # Verify that all output variables are available in the dataset
-        missing_output_vars = set(self.output_variables) - set(dataset.channel_out.values)
+        missing_output_vars = set(self.output_variables) - set(
+            dataset.channel_out.values
+        )
         if missing_output_vars:
-            raise ValueError(f"Output variables not found in dataset: {missing_output_vars}")
-        
+            raise ValueError(
+                f"Output variables not found in dataset: {missing_output_vars}"
+            )
+
         # Verify that all constants are available in the dataset
-        missing_constants = set(list(self.constants.values())) - set(dataset.channel_c.values)
+        missing_constants = set(list(self.constants.values())) - set(
+            dataset.channel_c.values
+        )
         if missing_constants:
             raise ValueError(f"Constants not found in dataset: {missing_constants}")
-        
 
         dataset = dataset.sel(
             channel_in=self.input_variables + coupled_variables,

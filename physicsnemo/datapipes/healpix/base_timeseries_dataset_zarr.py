@@ -1,34 +1,30 @@
-from abc import ABC, abstractmethod
-import gc
+import importlib.util
 import logging
-import time
-from dataclasses import dataclass
-from typing import Optional, Sequence, Union, Tuple, List
+import warnings
+from abc import ABC, abstractmethod
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import numpy.ma as ma
 import pandas as pd
-import torch
 import xarray as xr
 import zarr
-from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import Dataset
-
 from modulus.datapipes.datapipe import Datapipe
 from modulus.datapipes.meta import DatapipeMetaData
-from modulus.utils.insolation import insolation
+from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
 
 def _is_object_store_path(path: str) -> bool:
     """Check if path is an object store path (contains :// or ::).
-    
+
     Parameters
     ----------
     path : str
         Path to check
-        
+
     Returns
     -------
     bool
@@ -37,36 +33,35 @@ def _is_object_store_path(path: str) -> bool:
     return "://" in path or "::" in path
 
 
-def _check_fsspec_availability(path: str) -> None: # pragma: no cover
+def _check_fsspec_availability(path: str) -> None:  # pragma: no cover
     """Check if fsspec is available for object store paths.
-    
+
     Parameters
     ----------
     path : str
         Path to check
-        
+
     Raises
     ------
     ImportError
         If path is an object store path but fsspec is not available
     """
     if _is_object_store_path(path):
-        try:
-            import fsspec
-        except ImportError:
+        if not importlib.util.find_spec("fsspec"):
             raise ImportError(
-                f"fsspec is required to access object store paths like '{path}'. "
+                f"fsspec is required to access dataset paths like '{path}'. "
                 "Please install fsspec with: pip install fsspec"
             )
 
+
 class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
     """Abstract base class for time series datasets using Zarr storage.
-    
+
     This class provides the core functionality for loading and processing time series data
     stored in Zarr format. It handles data loading, scaling, masking, and time management.
     Subclasses must implement the __getitem__ method to define specific data retrieval logic.
     """
-    
+
     def __init__(
         self,
         ds_path: str,
@@ -94,7 +89,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         meta: DatapipeMetaData = None,
     ):
         """Initialize base time series dataset.
-        
+
         Parameters
         ----------
         ds_path : str
@@ -149,7 +144,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             Metadata for the datapipe
         """
         Datapipe.__init__(self, meta=meta)
-        
+
         self.ds_path = ds_path
         self.scaling = OmegaConf.to_object(scaling) if scaling else None
         self.input_time_dim = input_time_dim
@@ -166,14 +161,18 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         self.land_masked_fields = land_masked_fields
         self.sea_masked_fields = sea_masked_fields
         self.mask_threshold = mask_threshold
-        self.output_variables = input_variables if output_variables is None else output_variables
+        self.output_variables = (
+            input_variables if output_variables is None else output_variables
+        )
         self.constant_variables = constant_variables
-        self.all_variables = list(set(self.input_variables).union(self.output_variables))
+        self.all_variables = list(
+            set(self.input_variables).union(self.output_variables)
+        )
         self.all_scaling = None
 
         # Check if fsspec is available for object store paths
         _check_fsspec_availability(ds_path)
-        
+
         self.ds = zarr.open(ds_path)
 
         # Validate channels exist
@@ -187,10 +186,12 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         self._get_time_da(self.ds_path, start_date, end_date)
 
         self.all_variable_indices = [
-            int(np.where(self.ds.channel_in[:] == ch)[0][0]) for ch in self.all_variables
+            int(np.where(self.ds.channel_in[:] == ch)[0][0])
+            for ch in self.all_variables
         ]
         self.constant_variable_indices = [
-            int(np.where(self.ds.channel_c[:] == ch)[0][0]) for ch in self.constant_variables
+            int(np.where(self.ds.channel_c[:] == ch)[0][0])
+            for ch in self.constant_variables
         ]
         self.input_variable_indices = [
             self.all_variables.index(inp_ch) for inp_ch in self.input_variables
@@ -209,12 +210,12 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                 + (self.gap // self.data_time_step)
                 + self.interval * (self.output_time_dim - 1)
             )
-            
+
         self._batch_window_length = self.batch_size + self._window_length - 1
         self._output_delay = self.interval * (self.input_time_dim - 1) + (
             self.gap // self.data_time_step
         )
-        
+
         # Indices within a batch
         self._input_indices = [
             list(range(n, n + self.interval * self.input_time_dim, self.interval))
@@ -276,7 +277,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         self,
         ds_path: str,
         start_date: Optional[Union[int, str]],
-        end_date: Optional[Union[int, str]]
+        end_date: Optional[Union[int, str]],
     ) -> None:
         """Load and decode time array from dataset.
 
@@ -294,7 +295,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         """
         # Check if fsspec is available for object store paths
         _check_fsspec_availability(ds_path)
-        
+
         ds = xr.open_zarr(ds_path)
 
         if "time" not in ds:
@@ -307,7 +308,9 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             if isinstance(start_date, int):
                 self.start_index = start_date
             else:
-                self.start_index = int(np.where(self.time_da == np.datetime64(start_date))[0][0])
+                self.start_index = int(
+                    np.where(self.time_da == np.datetime64(start_date))[0][0]
+                )
         else:
             self.start_index = 0
 
@@ -341,10 +344,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                     "setting it now"
                 )
             self._forecast_init_indices = np.array(
-                [
-                    int(np.where(self.time == s)[0][0])
-                    for s in self.forecast_init_times
-                ],
+                [int(np.where(self.time == s)[0][0]) for s in self.forecast_init_times],
                 dtype="int",
             ) - ((self.input_time_dim - 1) * self.interval)
         else:
@@ -352,7 +352,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
 
     def _get_masking(self) -> None:
         """Setup masking fields for land and sea regions.
-        
+
         Creates masks and indices for masking specific fields over land/sea regions
         based on land-sea mask in dataset. Sets the following attributes:
         - sea_mask: Binary mask for sea points
@@ -362,21 +362,27 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         """
         if "lsm" in self.ds.channel_c:
             lsm_index = np.where(self.ds.channel_c[:] == "lsm")[0][0]
-            land_vals = ma.masked_less_equal(self.ds.constants[lsm_index], self.mask_threshold).mask
-            sea_vals = ma.masked_greater(self.ds.constants[lsm_index], self.mask_threshold).mask
-            self.sea_mask = (
-                sea_vals * np.ones_like(sea_vals) +
-                land_vals * np.zeros_like(land_vals)
-            )
+            land_vals = ma.masked_less_equal(
+                self.ds.constants[lsm_index], self.mask_threshold
+            ).mask
+            sea_vals = ma.masked_greater(
+                self.ds.constants[lsm_index], self.mask_threshold
+            ).mask
+            self.sea_mask = sea_vals * np.ones_like(
+                sea_vals
+            ) + land_vals * np.zeros_like(land_vals)
             self.land_mask = 1 - self.sea_mask
         elif "land_sea_mask" in self.ds.channel_c:
             lsm_index = np.where(self.ds.channel_c[:] == "land_sea_mask")[0][0]
-            land_vals = ma.masked_less_equal(self.ds.constants[lsm_index], self.mask_threshold).mask
-            sea_vals = ma.masked_greater(self.ds.constants[lsm_index], self.mask_threshold).mask
-            self.sea_mask = (
-                sea_vals * np.ones_like(sea_vals) +
-                land_vals * np.zeros_like(land_vals)
-            )
+            land_vals = ma.masked_less_equal(
+                self.ds.constants[lsm_index], self.mask_threshold
+            ).mask
+            sea_vals = ma.masked_greater(
+                self.ds.constants[lsm_index], self.mask_threshold
+            ).mask
+            self.sea_mask = sea_vals * np.ones_like(
+                sea_vals
+            ) + land_vals * np.zeros_like(land_vals)
             self.land_mask = 1 - self.sea_mask
         else:
             self.sea_mask = None
@@ -385,7 +391,8 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         if self.land_masked_fields and len(self.land_masked_fields) > 0:
             self.land_mask_indices = [
                 self.all_variables.index(field)
-                for field in self.land_masked_fields if field in self.all_variables
+                for field in self.land_masked_fields
+                if field in self.all_variables
             ]
         else:
             self.land_mask_indices = None
@@ -393,20 +400,21 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         if self.sea_masked_fields and len(self.sea_masked_fields) > 0:
             self.sea_mask_indices = [
                 self.all_variables.index(field)
-                for field in self.sea_masked_fields if field in self.all_variables
+                for field in self.sea_masked_fields
+                if field in self.all_variables
             ]
         else:
             self.sea_mask_indices = None
 
     def _get_scaling_da(self) -> None:
         """Setup data scaling parameters.
-        
+
         Processes scaling configuration and sets up scaling parameters for:
         - Input variables
         - Target/output variables
         - All variables combined
         - Constant fields
-        
+
         Raises
         ------
         KeyError
@@ -463,15 +471,14 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             "mean": np.expand_dims(
                 self.all_scaling["mean"].values.copy(), (0, 2, 3, 4)
             ),
-            "std": np.expand_dims(
-                self.all_scaling["std"].values.copy(), (0, 2, 3, 4)
-            ),
+            "std": np.expand_dims(self.all_scaling["std"].values.copy(), (0, 2, 3, 4)),
         }
 
         if self.constant_variables:
             # Check that all constant variables are present in scaling data
             missing_constants = [
-                var for var in self.constant_variables 
+                var
+                for var in self.constant_variables
                 if var not in list(self.scaling.keys())
             ]
             if missing_constants:
@@ -480,7 +487,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                 )
 
             try:
-                
+
                 self.constant_scaling = scaling_da.sel(
                     index=self.constant_variables
                 ).rename({"index": "channel_out"})
@@ -494,7 +501,9 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                 }
             except (ValueError, KeyError):
                 missing = [
-                    m for m in self.constant_variables if m not in list(self.scaling.keys())
+                    m
+                    for m in self.constant_variables
+                    if m not in list(self.scaling.keys())
                 ]
                 raise KeyError(
                     f"Constant channels {missing} not found in the scaling config dict data.scaling ({list(self.scaling.keys())})"
@@ -511,11 +520,13 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         """
         if self.constants is not None:
             return self.constants
-        
+
         const = np.asarray(self.ds.constants[self.constant_variable_indices])
 
         if self.constant_scaling:
-            const = (const - self.constant_scaling["mean"]) / self.constant_scaling["std"]
+            const = (const - self.constant_scaling["mean"]) / self.constant_scaling[
+                "std"
+            ]
 
         self.constants = np.transpose(const, axes=(1, 0, 2, 3))
         return self.constants
@@ -588,7 +599,9 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         return int(np.ceil(length))
 
     @abstractmethod
-    def __getitem__(self, item: int) -> Union[List[np.ndarray], Tuple[List[np.ndarray], np.ndarray]]:
+    def __getitem__(
+        self, item: int
+    ) -> Union[List[np.ndarray], Tuple[List[np.ndarray], np.ndarray]]:
         """Get requested sample - must be implemented by subclasses.
 
         Parameters
@@ -601,13 +614,13 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         Union[List[np.ndarray], Tuple[List[np.ndarray], np.ndarray]]
             In forecast mode: List of input arrays
             In training mode: Tuple of (input arrays, target array)
-            
+
             Input arrays are in order:
             - Model inputs [B, F, T, C, H, W]
             - Insolation (if enabled)
             - Constants (if provided)
             - Additional data (in subclasses)
-            
+
             Target array has shape [B, F, T, C, H, W]
             where:
             B = batch size
@@ -617,4 +630,4 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             H = height
             W = width
         """
-        pass 
+        pass

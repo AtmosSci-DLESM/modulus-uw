@@ -15,21 +15,13 @@
 # limitations under the License.
 
 import logging
-import time
-import warnings
 from dataclasses import dataclass
-from typing import Optional, Sequence, Union, List, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-import numpy.ma as ma
-import pandas as pd
 import torch
-import xarray as xr
-import zarr
-from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import Dataset
+from omegaconf import DictConfig
 
-from physicsnemo.datapipes.datapipe import Datapipe
 from physicsnemo.datapipes.meta import DatapipeMetaData
 from physicsnemo.utils.insolation import insolation
 
@@ -52,7 +44,7 @@ class MetaData(DatapipeMetaData):
 
 class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
     """Dataset for sampling from continuous time-series data stored in Zarr format.
-    
+
     This class implements the basic time series dataset functionality without coupling
     to external data sources. It provides data loading, scaling, masking and batching
     capabilities for training and inference.
@@ -85,7 +77,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         meta: DatapipeMetaData = MetaData(),
     ):
         """Initialize time series dataset.
-        
+
         Parameters are same as BaseTimeSeriesDatasetZarr.
         See base class for detailed parameter descriptions.
         """
@@ -115,7 +107,9 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             meta=meta,
         )
 
-    def __getitem__(self, item: int) -> Union[List[np.ndarray], Tuple[List[np.ndarray], np.ndarray]]:
+    def __getitem__(
+        self, item: int
+    ) -> Union[List[np.ndarray], Tuple[List[np.ndarray], np.ndarray]]:
         """Get a batch of time series data.
 
         This implementation provides the basic time series data loading functionality:
@@ -135,12 +129,12 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         Union[List[np.ndarray], Tuple[List[np.ndarray], np.ndarray]]
             In forecast mode: List of input arrays
             In training mode: Tuple of (input arrays, target array)
-            
+
             Input arrays are in order:
             - Model inputs [B, F, T, C, H, W]
             - Insolation (if enabled) [B, F, T, 1, H, W]
             - Constants (if provided) [F, C, H, W]
-            
+
             Target array has shape [B, F, T, C, H, W]
             where:
             B = batch size
@@ -187,13 +181,13 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
 
         if self.land_mask_indices:
             for idx in self.land_mask_indices:
-                masked_input_field = staging_ds[:,idx] * self.land_mask
-                staging_ds[:,idx] = masked_input_field
+                masked_input_field = staging_ds[:, idx] * self.land_mask
+                staging_ds[:, idx] = masked_input_field
 
         if self.sea_mask_indices:
             for idx in self.sea_mask_indices:
-                masked_input_field = staging_ds[:,idx] * self.sea_mask
-                staging_ds[:,idx] = masked_input_field
+                masked_input_field = staging_ds[:, idx] * self.sea_mask
+                staging_ds[:, idx] = masked_input_field
         torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_input")
@@ -235,7 +229,9 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             )
 
         # Iterate over valid sample windows
-        torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:copy_inputs_targets_insolation")
+        torch.cuda.nvtx.range_push(
+            "TimeSeriesDataset:__getitem__:copy_inputs_targets_insolation"
+        )
         for sample in range(this_batch):
             inputs[sample] = input_array[self._input_indices[sample]]
             if not self.forecast_mode:
@@ -262,7 +258,9 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             torch.cuda.nvtx.range_pop()
 
         inputs_result = [inputs]
-        torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:add_insolation")
+        torch.cuda.nvtx.range_push(
+            "CoupledTimeSeriesDataset:__getitem__:add_insolation"
+        )
         if self.add_insolation:
             inputs_result.append(decoder_inputs)
         torch.cuda.nvtx.range_pop()
@@ -283,6 +281,6 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
 
         # Transpose targets to match input format
         targets = np.transpose(targets, axes=(0, 3, 1, 2, 4, 5))
-        
+
         torch.cuda.nvtx.range_pop()
         return inputs_result, targets
