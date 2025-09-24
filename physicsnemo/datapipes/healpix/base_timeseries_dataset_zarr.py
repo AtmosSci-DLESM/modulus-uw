@@ -1,5 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import importlib.util
 import logging
+import os
 import warnings
 from abc import ABC, abstractmethod
 from typing import List, Optional, Sequence, Tuple, Union
@@ -30,11 +47,12 @@ def _is_object_store_path(path: str) -> bool:
     bool
         True if path appears to be an object store path
     """
-    return "://" in path or "::" in path
+    return "://" in str(path) or "::" in str(path)
 
 
-def _check_fsspec_availability(path: str) -> None:  # pragma: no cover
-    """Check if fsspec is available for object store paths.
+def _check_availability(path: str) -> None:  # pragma: no cover
+    """
+    Check if path exists or fsspec is available for object store paths
 
     Parameters
     ----------
@@ -45,6 +63,8 @@ def _check_fsspec_availability(path: str) -> None:  # pragma: no cover
     ------
     ImportError
         If path is an object store path but fsspec is not available
+    FileNotFoundError
+        If the path is file and doesn't exist
     """
     if _is_object_store_path(path):
         if not importlib.util.find_spec("fsspec"):
@@ -52,6 +72,10 @@ def _check_fsspec_availability(path: str) -> None:  # pragma: no cover
                 f"fsspec is required to access dataset paths like '{path}'. "
                 "Please install fsspec with: pip install fsspec"
             )
+    elif not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Dataset not found at specified location: {path}"
+        )
 
 
 class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
@@ -64,7 +88,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
 
     def __init__(
         self,
-        ds_path: str,
+        dataset_path: str,
         input_variables: Sequence,
         output_variables: Sequence = None,
         constant_variables: Sequence = None,
@@ -92,7 +116,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
 
         Parameters
         ----------
-        ds_path : str
+        dataset_path : str
             Path to the Zarr dataset
         input_variables : Sequence
             Variables to use as model inputs
@@ -145,7 +169,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         """
         Datapipe.__init__(self, meta=meta)
 
-        self.ds_path = ds_path
+        self.dataset_path = dataset_path
         self.scaling = OmegaConf.to_object(scaling) if scaling else None
         self.input_time_dim = input_time_dim
         self.output_time_dim = output_time_dim
@@ -170,29 +194,42 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         )
         self.all_scaling = None
 
-        # Check if fsspec is available for object store paths
-        _check_fsspec_availability(ds_path)
+        # Check if for fsspec if necessary and make sure path exist
+        _check_availability(dataset_path)
 
-        self.ds = zarr.open(ds_path)
+        self.ds = zarr.open(dataset_path)
+
+
+        if (start_date is None or end_date is None) and self.forecast_init_times is None:
+            raise ValueError("Either start and end date or forecast_init_times must be provided")
 
         # Validate channels exist
         channels = set(self.input_variables).union(self.output_variables)
         missing_channels = channels - set(self.ds.channel_in[:])
         if len(missing_channels) > 0:
             raise KeyError(
-                f"Input, coupled, or output variables not found in dataset: {missing_channels}"
+                f"Requested Input, coupled, or output variables not found in dataset: {missing_channels}"
             )
 
-        self._get_time_da(self.ds_path, start_date, end_date)
+        self._get_time_da(self.dataset_path, start_date, end_date)
 
         self.all_variable_indices = [
             int(np.where(self.ds.channel_in[:] == ch)[0][0])
             for ch in self.all_variables
         ]
+
+        # Validate constants exist
+        if constant_variables:
+            missing_constants = set(constant_variables) - set(self.ds.channel_c[:])
+            if len(missing_constants) > 0:
+                raise KeyError(
+                    f"Requested constants not found in dataset: {missing_constants}"
+                )
+
         self.constant_variable_indices = [
             int(np.where(self.ds.channel_c[:] == ch)[0][0])
             for ch in self.constant_variables
-        ]
+        ] if self.constant_variables else None
         self.input_variable_indices = [
             self.all_variables.index(inp_ch) for inp_ch in self.input_variables
         ]
@@ -275,7 +312,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
 
     def _get_time_da(
         self,
-        ds_path: str,
+        dataset_path: str,
         start_date: Optional[Union[int, str]],
         end_date: Optional[Union[int, str]],
     ) -> None:
@@ -286,7 +323,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
 
         Parameters
         ----------
-        ds_path : str
+        dataset_path : str
             Path to Zarr dataset
         start_date : Optional[Union[int, str]]
             Start date/index for data slice
@@ -294,12 +331,17 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             End date/index for data slice
         """
         # Check if fsspec is available for object store paths
-        _check_fsspec_availability(ds_path)
+        _check_availability(dataset_path)
 
-        ds = xr.open_zarr(ds_path)
+        ds = xr.open_zarr(dataset_path)
 
         if "time" not in ds:
-            raise KeyError(f"Dataset missing time. Dataset provided {ds_path}")
+            raise KeyError(f"Dataset missing time. Dataset provided {dataset_path}")
+
+        if np.datetime64(start_date) < ds.time[0]:
+            warnings.warn(f"Start date {start_date} is before first available date {ds.time[0].values}")            
+        if ds.time[-1] < np.datetime64(end_date):
+            warnings.warn(f"End date {end_date} is after last available date {ds.time[-1].values}")            
 
         self.time_da = ds.time.copy(deep=True)
         self.total_samples = self.time_da.sel(time=slice(start_date, end_date)).shape[0]
@@ -344,7 +386,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                     "setting it now"
                 )
             self._forecast_init_indices = np.array(
-                [int(np.where(self.time == s)[0][0]) for s in self.forecast_init_times],
+                [int(np.where(self.time_da == s)[0][0]) for s in self.forecast_init_times],
                 dtype="int",
             ) - ((self.input_time_dim - 1) * self.interval)
         else:
@@ -521,6 +563,9 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         if self.constants is not None:
             return self.constants
 
+        if self.constant_variables is None:
+            return None
+
         const = np.asarray(self.ds.constants[self.constant_variable_indices])
 
         if self.constant_scaling:
@@ -577,7 +622,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         time_index, _ = self._get_time_index(item)
         if self.forecast_mode:
             timedeltas = (
-                self._input_indices[0] + self._output_indices[0]
+                np.array(self._input_indices[0] + self._output_indices[0])
             ) * self.data_time_step
             return self.time_da[self.start_index].values + timedeltas
         return self.time_da[slice(*time_index)].values

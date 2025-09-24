@@ -30,31 +30,28 @@ from physicsnemo.distributed import DistributedManager
 omegaconf = pytest.importorskip("omegaconf")
 np = pytest.importorskip("numpy")
 xr = pytest.importorskip("xarray")
-
+zarr = pytest.importorskip("zarr")
 
 @pytest.fixture
-def data_dir():
-    path = "/data/nfs/modulus-data/datasets/healpix/"
+def dataset_path():
+    data_dir = "/data/nfs/modulus-data/datasets/healpix/"
+    dataset_name = "healpix.zarr"
+    path = Path(data_dir, dataset_name)
     return path
 
 
 @pytest.fixture
-def dataset_name():
-    name = "healpix"
-    return name
+def splits():
+    split_dict = {
+        "train_date_start": "1979-01-01",
+        "train_date_end": "1979-01-01T21:00",
+        "val_date_start": "1979-01-02",
+        "val_date_end": "1979-01-02T09:00",
+        "test_date_start": "1979-01-02T12:00",
+        "test_date_end": "1979-01-02T18:00",
+    }
 
-
-@pytest.fixture
-def create_path():
-    path = "/data/nfs/modulus-data/datasets/healpix/merge"
-    return path
-
-
-def delete_dataset(create_path, dataset_name):
-    """Helper that deletes a requested dataset at the specified location"""
-    dataset_path = f"{create_path}/{dataset_name}.zarr"
-    if Path(dataset_path).exists():
-        shutil.rmtree(dataset_path)
+    return split_dict
 
 
 @pytest.fixture
@@ -97,38 +94,57 @@ def scaling_double_dict():
 @import_or_fail("netCDF4")
 @nfsdata_or_fail
 def test_TimeSeriesDataset_initialization(
-    data_dir, dataset_name, scaling_dict, pytestconfig
+    dataset_path, scaling_dict, pytestconfig,
 ):
-
     from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
         TimeSeriesDatasetZarr,
     )
 
+    input_variables = ["t2m0", "t850", "z500"]
+    
+    bad_start_date = "1900-01-01"
+    valid_start_date = "1979-01-01"
+    bad_end_date = "2000-12-31"
+    valid_end_date = "1979-01-02"
+
+    zarr_ds = zarr.open(dataset_path)
+    time_da = xr.open_zarr(dataset_path).time
+
     # check for failure of invalid dataset path
     # Check if fsspec is available for object store paths, optional dependency
-    if importlib.util.find_spec("fsspec"):
+    if not importlib.util.find_spec("fsspec"):
         # If fsspec is not available, expect an ImportError
         with pytest.raises(
             ImportError, match=("fsspec is required to access object store paths")
         ):
             timeseries_ds = TimeSeriesDatasetZarr(
-                ds_path="s3://physicsnemo-data/datasets/healpix/healpix.zarr",
+                dataset_path="s3://physicsnemo-data/datasets/healpix/healpix.zarr",
                 scaling=scaling_dict,
+                input_variables = input_variables,
             )
 
-    # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    zarr_ds = xr.open_zarr(ds_path)
+    # If path doesn't exist, expect a FileNotFoundError
+    with pytest.raises(
+        FileNotFoundError, match=("Dataset not found at")
+    ):
+        timeseries_ds = TimeSeriesDatasetZarr(
+            dataset_path="/boguspath.zarr",
+            scaling=scaling_dict,
+            input_variables = input_variables,
+        )
+
 
     # check for failure of timestep not being a multiple of datatime step
     with pytest.raises(
         ValueError, match=("'time_step' must be a multiple of 'data_time_step' ")
     ):
         timeseries_ds = TimeSeriesDatasetZarr(
-            dataset=zarr_ds,
+            dataset_path=dataset_path,
             data_time_step="2h",
             time_step="5h",
             scaling=scaling_dict,
+            input_variables = input_variables,
+            forecast_init_times=zarr_ds.time[:2],
         )
 
     # check for failure of gap not being a multiple of datatime step
@@ -136,11 +152,14 @@ def test_TimeSeriesDataset_initialization(
         ValueError, match=("'gap' must be a multiple of 'data_time_step' ")
     ):
         timeseries_ds = TimeSeriesDatasetZarr(
-            dataset=zarr_ds,
+            dataset_path=dataset_path,
             data_time_step="2h",
             time_step="6h",
             gap="3h",
             scaling=scaling_dict,
+            start_date=valid_start_date,
+            end_date=valid_end_date,
+            input_variables = input_variables,
         )
 
     # check for failure of invalid scaling variable on input
@@ -151,10 +170,12 @@ def test_TimeSeriesDataset_initialization(
     )
     with pytest.raises(KeyError, match=("Input channels ")):
         timeseries_ds = TimeSeriesDatasetZarr(
-            dataset=zarr_ds,
+            dataset_path=dataset_path,
             data_time_step="3h",
             time_step="6h",
             scaling=invalid_scaling,
+            forecast_init_times=time_da[:10],
+            input_variables = input_variables,
         )
 
     # check for warning on batch size > 1 and forecast mode
@@ -166,66 +187,149 @@ def test_TimeSeriesDataset_initialization(
         ),
     ):
         timeseries_ds = TimeSeriesDatasetZarr(
-            dataset=zarr_ds,
+            dataset_path=dataset_path,
             scaling=scaling_dict,
             batch_size=2,
             forecast_init_times=zarr_ds.time[:2],
+            input_variables = input_variables,
         )
+    warnings.resetwarnings()
+
+    # check for no dates provided
+    with pytest.raises(
+        ValueError, match=("Either start and end date or forecast_init_times must be provided")
+    ):
+        timeseries_ds = TimeSeriesDatasetZarr(
+            dataset_path=dataset_path,
+            scaling=scaling_dict,
+            batch_size=2,
+            input_variables = input_variables,
+        )
+
+    # check for out of range dates
+    warnings.filterwarnings("error")
+    with pytest.raises(
+        UserWarning,
+        match=(f"Start date {bad_start_date} is before first available date")
+    ):
+        timeseries_ds = TimeSeriesDatasetZarr(
+            dataset_path=dataset_path,
+            scaling=scaling_dict,
+            batch_size=2,
+            start_date=bad_start_date,
+            end_date=valid_end_date,
+            input_variables = input_variables,
+        )
+
+    with pytest.raises(
+        UserWarning,
+        match=(f"End date {bad_end_date} is after last available date")
+    ):
+        timeseries_ds = TimeSeriesDatasetZarr(
+            dataset_path=dataset_path,
+            scaling=scaling_dict,
+            batch_size=2,
+            start_date=valid_start_date,
+            end_date=bad_end_date,
+            input_variables = input_variables,
+        )
+    warnings.resetwarnings()
 
     # test no scaling
     timeseries_ds = TimeSeriesDatasetZarr(
-        dataset=zarr_ds,
+        dataset_path=dataset_path,
+        start_date=valid_start_date,
+        end_date=valid_end_date,
+        input_variables = input_variables,   
     )
     assert isinstance(timeseries_ds, TimeSeriesDatasetZarr)
 
     timeseries_ds = TimeSeriesDatasetZarr(
-        dataset=zarr_ds,
+        dataset_path=dataset_path,
         scaling=scaling_dict,
+        start_date=valid_start_date,
+        end_date=valid_end_date,
+        input_variables = input_variables,
     )
     assert isinstance(timeseries_ds, TimeSeriesDatasetZarr)
 
     timeseries_ds = TimeSeriesDatasetZarr(
-        dataset=zarr_ds,
-        scaling=scaling_dict,
-        batch_size=1,
-        forecast_init_times=zarr_ds.time[:2],
-    )
-    assert isinstance(timeseries_ds, TimeSeriesDatasetZarr)
-
-    timeseries_ds = TimeSeriesDatasetZarr(
-        dataset=zarr_ds,
+        dataset_path=dataset_path,
         scaling=scaling_dict,
         batch_size=1,
-        forecast_init_times=zarr_ds.time[:2],
+        start_date=valid_start_date,
+        end_date=valid_end_date,
+        input_variables = input_variables,
+    )
+    assert isinstance(timeseries_ds, TimeSeriesDatasetZarr)
+
+    timeseries_ds = TimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        scaling=scaling_dict,
+        batch_size=1,
+        start_date=valid_start_date,
+        end_date=valid_end_date,
         data_time_step="3h",
         time_step="6h",
+        input_variables = input_variables,
     )
     assert isinstance(timeseries_ds, TimeSeriesDatasetZarr)
-    zarr_ds.close()
 
 
 @import_or_fail("omegaconf")
 @import_or_fail("netCDF4")
 @import_or_fail("numpy")
+@import_or_fail("zarr")
 @nfsdata_or_fail
 def test_TimeSeriesDataset_get_constants(
-    data_dir, dataset_name, scaling_dict, pytestconfig
+    dataset_path, scaling_dict, pytestconfig
 ):
     from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
         TimeSeriesDatasetZarr,
     )
 
+    input_variables = ["z500", "z1000"]
+    constant_variables = ["lsm"]
+
     # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    zarr_ds = xr.open_zarr(ds_path)
+    zarr_ds = xr.open_zarr(dataset_path)
+    constant_indices = [
+        int(np.where(zarr_ds.channel_c[:] == ch)[0][0]) for ch in constant_variables
+    ]
+
+    # Constant that isn't in dataset
+    with pytest.raises(
+        KeyError, match=("Requested constants not found in dataset")
+    ):
+        timeseries_dm = TimeSeriesDatasetZarr(
+            dataset_path=dataset_path,
+            input_variables=input_variables,
+            batch_size=1,
+            scaling=scaling_dict,
+            constant_variables=["DoesntExist"],
+            forecast_init_times=zarr_ds.time[:2],
+        )
 
     timeseries_ds = TimeSeriesDatasetZarr(
-        dataset=zarr_ds,
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         scaling=scaling_dict,
+        constant_variables=None,
+        forecast_init_times=zarr_ds.time[:2],
+    )
+
+    assert timeseries_ds.get_constants() == None
+
+    timeseries_ds = TimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
+        scaling=scaling_dict,
+        constant_variables=constant_variables,
+        forecast_init_times=zarr_ds.time[:2],
     )
 
     # constants are reshaped
-    expected = np.transpose(zarr_ds.constants.values, axes=(1, 0, 2, 3))
+    expected = np.transpose(zarr_ds.constants.values[constant_indices], axes=(1, 0, 2, 3))
     outvar = timeseries_ds.get_constants()
     assert np.array_equal(
         expected,
@@ -237,19 +341,21 @@ def test_TimeSeriesDataset_get_constants(
 @import_or_fail("omegaconf")
 @import_or_fail("netCDF4")
 @nfsdata_or_fail
-def test_TimeSeriesDataset_len(data_dir, dataset_name, scaling_dict, pytestconfig):
+def test_TimeSeriesDataset_len(dataset_path, scaling_dict, pytestconfig):
     from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
         TimeSeriesDatasetZarr,
     )
 
+    input_variables = ["z500", "z1000"]
+
     # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    zarr_ds = xr.open_zarr(ds_path)
+    zarr_ds = xr.open_zarr(dataset_path)
 
     # check forecast mode
-    init_times = random.randint(1, len(zarr_ds.time.values))
+    init_times = random.randint(1, zarr_ds.time.shape[0])
     timeseries_ds = TimeSeriesDatasetZarr(
-        dataset=zarr_ds,
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         scaling=scaling_dict,
         batch_size=1,
         forecast_init_times=zarr_ds.time[:init_times],
@@ -258,48 +364,58 @@ def test_TimeSeriesDataset_len(data_dir, dataset_name, scaling_dict, pytestconfi
 
     # check train mode
     timeseries_ds = TimeSeriesDatasetZarr(
-        dataset=zarr_ds,
+        dataset_path=dataset_path,
         data_time_step="3h",
         time_step="9h",
+        input_variables=input_variables,
         scaling=scaling_dict,
         batch_size=2,
+        start_date = zarr_ds.time[0].values,
+        end_date = zarr_ds.time[-1].values,
     )
     # Window length of 3 for one sample size
-    assert len(timeseries_ds) == (len(zarr_ds.time.values) - 2) // 2
+    assert len(timeseries_ds) == (zarr_ds.time.shape[0] - 2) // 2
 
     # check train mode
     timeseries_ds = TimeSeriesDatasetZarr(
-        dataset=zarr_ds,
+        dataset_path=dataset_path,
         data_time_step="3h",
         time_step="9h",
+        input_variables=input_variables,
         scaling=scaling_dict,
         batch_size=2,
         drop_last=True,
+        start_date = zarr_ds.time[0].values,
+        end_date = zarr_ds.time[-1].values,
     )
-    assert len(timeseries_ds) == (len(zarr_ds.time.values) - 2) // 2
-    zarr_ds.close()
-
+    assert len(timeseries_ds) == (zarr_ds.time.shape[0] - 2) // 2
 
 @import_or_fail("omegaconf")
 @import_or_fail("netCDF4")
 @import_or_fail("numpy")
 @nfsdata_or_fail
 def test_TimeSeriesDataset_get(
-    data_dir, dataset_name, scaling_double_dict, pytestconfig
+    dataset_path, scaling_double_dict, splits, pytestconfig
 ):
     from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
         TimeSeriesDatasetZarr,
     )
 
+    input_variables = ["z500", "z1000"]
+    constant_variables = ["lsm"]
+
     # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    zarr_ds = xr.open_zarr(ds_path)
+    zarr_ds = xr.open_zarr(dataset_path)
+    time_da = zarr_ds.time.values
 
     batch_size = 2
     timeseries_ds = TimeSeriesDatasetZarr(
-        dataset=zarr_ds,
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         scaling=scaling_double_dict,
         batch_size=batch_size,
+        start_date=splits["train_date_start"],
+        end_date=splits["test_date_start"],
     )
 
     # check for invalid index
@@ -318,7 +434,9 @@ def test_TimeSeriesDataset_get(
     # need to transpose
     targets_expected = zarr_ds.targets[batch_size].transpose(
         "face", "channel_out", "height", "width"
-    )
+    ).sel(channel_out=input_variables)
+
+    #scale target data
     targets_expected = targets_expected.to_numpy() / 2
     assert np.array_equal(targets[0][:, 0, :, :], targets_expected)
 
@@ -334,132 +452,175 @@ def test_TimeSeriesDataset_get(
 
     # this time dropping incomplete so that we get a full sample sample
     timeseries_ds = TimeSeriesDatasetZarr(
-        dataset=zarr_ds,
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         scaling=scaling_double_dict,
         batch_size=batch_size,
         drop_last=True,
+        start_date=time_da[0],
+        end_date=time_da[-1],
     )
 
     inputs, targets = timeseries_ds[-1]
     targets_expected = zarr_ds.targets[-1 - batch_size].transpose(
         "face", "channel_out", "height", "width"
-    )
+    ).sel(channel_out=input_variables)
     targets_expected = targets_expected.to_numpy() / 2
     assert np.array_equal(targets[0][:, 0, :, :], targets_expected)
 
-    # With insolation we get 1 extra channel
+    # With insolation we get 1 extra tensor
     timeseries_ds = TimeSeriesDatasetZarr(
-        dataset=zarr_ds,
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         scaling=scaling_double_dict,
         batch_size=batch_size,
         drop_last=True,
         add_insolation=True,
+        start_date=time_da[0],
+        end_date=time_da[-1],
     )
-    assert (len(inputs)) + 1 == len(timeseries_ds[0][0])
+
+    # verify underlying data doesn't change
+    targets_expected = zarr_ds.targets[2].transpose(
+        "face", "channel_out", "height", "width"
+    ).sel(channel_out=input_variables)
+    targets_expected = targets_expected.to_numpy() / 2
+    result = timeseries_ds[0]
+    assert (len(inputs)) + 1 == len(result[0])
+    assert np.array_equal(result[1][0][:, 0, :, :], targets_expected)
+
+    # With insolation and constants we get 2 extra tensors
+    timeseries_ds = TimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
+        scaling=scaling_double_dict,
+        batch_size=batch_size,
+        drop_last=True,
+        add_insolation=True,
+        start_date=time_da[0],
+        end_date=time_da[-1],
+    )
+    assert (len(inputs)) + 2 == len(timeseries_ds[0][0])
 
     # nothing should change with forecast mode other than getting just inputs
     init_times = random.randint(1, len(zarr_ds.time.values))
     timeseries_ds = TimeSeriesDatasetZarr(
-        dataset=zarr_ds,
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         scaling=scaling_double_dict,
         batch_size=1,
-        forecast_init_times=zarr_ds.time[:init_times],
+        forecast_init_times=zarr_ds.time[:init_times].values,
     )
     inputs = timeseries_ds[0]
 
-    assert np.array_equal(targets[0][:, 0, :, :], targets_expected)
+    assert len(inputs) == 1
 
-    # insolation adds 1 extra channel
+    # insolation adds 1 extra tensor, same as above but using forecast mode
     init_times = random.randint(1, len(zarr_ds.time.values))
     timeseries_ds = TimeSeriesDatasetZarr(
-        dataset=zarr_ds,
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         scaling=scaling_double_dict,
         batch_size=1,
         add_insolation=True,
-        forecast_init_times=zarr_ds.time[:init_times],
+        forecast_init_times=zarr_ds.time[:init_times].values,
     )
-    assert (len(inputs)) + 1 == len(timeseries_ds[0])
-
-    # No constants in input data
-    init_times = random.randint(1, len(zarr_ds.time.values))
-    zarr_ds_no_const = zarr_ds.drop_vars("constants")
-    timeseries_ds = TimeSeriesDatasetZarr(
-        dataset=zarr_ds_no_const,
-        scaling=scaling_double_dict,
-        batch_size=1,
-        forecast_init_times=zarr_ds.time[:init_times],
-    )
-    assert len(inputs) == (len(timeseries_ds[0]) + 1)
-    zarr_ds.close()
+    assert (len(inputs) + 1) == len(timeseries_ds[0])
 
 
 @import_or_fail("omegaconf")
 @import_or_fail("netCDF4")
+@import_or_fail("zarr")
 @nfsdata_or_fail
 def test_TimeSeriesDataModule_initialization(
-    data_dir, create_path, dataset_name, scaling_double_dict, pytestconfig
+    dataset_path, splits, scaling_double_dict, pytestconfig
 ):
     from physicsnemo.datapipes.healpix.data_modules_zarr import (
         TimeSeriesDataModuleZarr,
     )
 
     variables = ["z500", "z1000"]
-    splits = {
-        "train_date_start": "1959-01-01",
-        "train_date_end": "1998-12-31T18:00",
-        "val_date_start": "1999-01-01",
-        "val_date_end": "2000-12-31T18:00",
-        "test_date_start": "2017-01-01",
-        "test_date_end": "2018-12-31T18:00",
-    }
 
     # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    zarr_ds = xr.open_zarr(ds_path)
+    zarr_ds = xr.open_zarr(dataset_path)
 
-    # test with an invalid mode
-    with pytest.raises(ValueError, match=("'data_format' must be one of")):
+    # test for invalid path
+    with pytest.raises(
+        FileNotFoundError, match=("Dataset path not found")
+    ):
         timeseries_dm = TimeSeriesDataModuleZarr(
-            src_directory=data_dir,
-            dst_directory=create_path,
-            dataset_name=dataset_name,
+            dataset_path="DoesntExist",
+            input_variables=variables,
             batch_size=1,
-            data_format="null",
+            scaling=scaling_double_dict,
         )
 
-    # use the prebuilt dataset
-    # Internally initializes DistributedManager
-    timeseries_dm = TimeSeriesDataModuleZarr(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
-        input_variables=variables,
-        batch_size=1,
-        prebuilt_dataset=True,
-        scaling=scaling_double_dict,
-    )
-    assert isinstance(timeseries_dm, TimeSeriesDataModuleZarr)
+    # test for missing times
+    with pytest.raises(
+        ValueError, match=("Either splits or forecast_init_times must be provided")
+    ):
+        timeseries_dm = TimeSeriesDataModuleZarr(
+            dataset_path=dataset_path,
+            input_variables=variables,
+            batch_size=1,
+            scaling=scaling_double_dict,
+        )
 
-    # without the prebuilt dataset
-    timeseries_dm = TimeSeriesDataModuleZarr(
-        src_directory=create_path,
-        dst_directory=create_path,
-        dataset_name=dataset_name,
-        input_variables=variables,
-        batch_size=1,
-        prebuilt_dataset=False,
-        scaling=scaling_double_dict,
-    )
-    assert isinstance(timeseries_dm, TimeSeriesDataModuleZarr)
+    # test for overlapping dates
+    warnings.filterwarnings("error")
+    with pytest.raises(
+        UserWarning,
+        match=(f"Training and validation date ranges overlap")
+    ):
+        bad_splits = splits.copy()
+        bad_splits["val_date_start"] = splits["train_date_start"]
+        timeseries_dm = TimeSeriesDataModuleZarr(
+            dataset_path=dataset_path,
+            input_variables=variables,
+            batch_size=1,
+            splits=bad_splits,
+            scaling=scaling_double_dict,
+        )
+    warnings.resetwarnings()
+
+    warnings.filterwarnings("error")
+    with pytest.raises(
+        UserWarning,
+        match=(f"Training and test date ranges overlap")
+    ):
+        bad_splits = splits.copy()
+        bad_splits["test_date_start"] = splits["train_date_start"]
+        timeseries_dm = TimeSeriesDataModuleZarr(
+            dataset_path=dataset_path,
+            input_variables=variables,
+            batch_size=1,
+            splits=bad_splits,
+            scaling=scaling_double_dict,
+        )
+    warnings.resetwarnings()
+
+    warnings.filterwarnings("error")
+    with pytest.raises(
+        UserWarning,
+        match=(f"Test and validation date ranges overlap")
+    ):
+        bad_splits = splits.copy()
+        bad_splits["val_date_end"] = splits["test_date_start"]
+        timeseries_dm = TimeSeriesDataModuleZarr(
+            dataset_path=dataset_path,
+            input_variables=variables,
+            batch_size=1,
+            splits=bad_splits,
+            scaling=scaling_double_dict,
+        )
+    warnings.resetwarnings()
 
     # with init times
     timeseries_dm = TimeSeriesDataModuleZarr(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
+        dataset_path=dataset_path,
         input_variables=variables,
         batch_size=1,
-        prebuilt_dataset=True,
         scaling=scaling_double_dict,
         forecast_init_times=zarr_ds.time[:2],
     )
@@ -467,12 +628,9 @@ def test_TimeSeriesDataModule_initialization(
 
     # with splits
     timeseries_dm = TimeSeriesDataModuleZarr(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
+        dataset_path=dataset_path,
         input_variables=variables,
         batch_size=1,
-        prebuilt_dataset=True,
         scaling=scaling_double_dict,
         splits=omegaconf.DictConfig(splits),
     )
@@ -484,9 +642,10 @@ def test_TimeSeriesDataModule_initialization(
 @import_or_fail("omegaconf")
 @import_or_fail("netCDF4")
 @import_or_fail("numpy")
+@import_or_fail("zarr")
 @nfsdata_or_fail
 def test_TimeSeriesDataModule_get_constants(
-    data_dir, create_path, dataset_name, scaling_double_dict, pytestconfig
+    dataset_path, scaling_double_dict, splits, pytestconfig
 ):
     from physicsnemo.datapipes.healpix.data_modules_zarr import (
         TimeSeriesDataModuleZarr,
@@ -495,36 +654,48 @@ def test_TimeSeriesDataModule_get_constants(
     variables = ["z500", "z1000"]
     constants = {"lsm": "lsm"}
 
+    # open our test dataset
+    zarr_ds = xr.open_zarr(dataset_path)
+    forecast_times = zarr_ds.time[:2]
+
     # No constants
     # Internally initializes DistributedManager
     timeseries_dm = TimeSeriesDataModuleZarr(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
+        dataset_path=dataset_path,
         input_variables=variables,
         batch_size=1,
-        prebuilt_dataset=True,
         scaling=scaling_double_dict,
         constants=None,
+        forecast_init_times=forecast_times,
     )
 
     assert timeseries_dm.get_constants() is None
 
+    # Constant that isn't in dataset
+    with pytest.raises(
+        KeyError, match=("Requested constants not found in dataset")
+    ):
+        timeseries_dm = TimeSeriesDataModuleZarr(
+            dataset_path=dataset_path,
+            input_variables=variables,
+            batch_size=1,
+            scaling=scaling_double_dict,
+            constants={"missing": "missing"},
+            forecast_init_times=forecast_times,
+        )
+
     # just lsm as constant
     timeseries_dm = TimeSeriesDataModuleZarr(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
+        dataset_path=dataset_path,
         input_variables=variables,
         batch_size=1,
-        prebuilt_dataset=True,
         scaling=scaling_double_dict,
         constants=constants,
+        forecast_init_times=forecast_times,
     )
 
     # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    zarr_ds = xr.open_zarr(ds_path)
+    zarr_ds = xr.open_zarr(dataset_path)
 
     # dividing by 2 due to scaling
     expected = (
@@ -543,14 +714,12 @@ def test_TimeSeriesDataModule_get_constants(
     # with splits we're doing forecasting and get
     # constants from train instead of test dataset
     timeseries_dm = TimeSeriesDataModuleZarr(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
+        dataset_path=dataset_path,
         input_variables=variables,
         batch_size=1,
-        prebuilt_dataset=True,
         scaling=scaling_double_dict,
         constants=constants,
+        splits=splits,
     )
 
     assert np.array_equal(
@@ -562,34 +731,23 @@ def test_TimeSeriesDataModule_get_constants(
 
 
 @import_or_fail("omegaconf")
+@import_or_fail("zarr")
 @nfsdata_or_fail
 def test_TimeSeriesDataModule_get_dataloaders(
-    data_dir, create_path, dataset_name, scaling_double_dict, pytestconfig
+    dataset_path, scaling_double_dict, splits, pytestconfig
 ):
-
     from physicsnemo.datapipes.healpix.data_modules_zarr import (
         TimeSeriesDataModuleZarr,
     )
 
-    variables = ["z500", "z1000"]
-    splits = {
-        "train_date_start": "1979-01-01",
-        "train_date_end": "1979-01-01T21:00",
-        "val_date_start": "1979-01-02",
-        "val_date_end": "1979-01-02T09:00",
-        "test_date_start": "1979-01-02T12:00",
-        "test_date_end": "1979-01-02T18:00",
-    }
+    input_variables = ["z500", "z1000"]
 
     # use the prebuilt dataset
     # Internally initializes DistributedManager
     timeseries_dm = TimeSeriesDataModuleZarr(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
-        input_variables=variables,
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         batch_size=1,
-        prebuilt_dataset=True,
         scaling=scaling_double_dict,
         splits=splits,
         shuffle=False,

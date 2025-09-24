@@ -58,7 +58,7 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
 
     def __init__(
         self,
-        ds_path: str,
+        dataset_path: str,
         scaling: DictConfig,
         input_variables: Sequence,
         output_variables: Sequence = None,
@@ -120,7 +120,7 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         ]
 
         super().__init__(
-            ds_path=ds_path,
+            dataset_path=dataset_path,
             scaling=scaling,
             input_variables=input_variables,
             output_variables=output_variables,

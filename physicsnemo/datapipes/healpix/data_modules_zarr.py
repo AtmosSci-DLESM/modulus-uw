@@ -17,6 +17,7 @@
 # System modules
 import logging
 from pathlib import Path
+import warnings
 from typing import Optional, Sequence, Union
 
 # numpy
@@ -135,6 +136,7 @@ class TimeSeriesDataModuleZarr:
         super().__init__()
         self.dataset_path = Path(dataset_path)
         self.batch_size = batch_size
+        self.dataloader_batch_size = dataloader_batch_size
         self.drop_last = drop_last
         self.input_variables = input_variables
         self.output_variables = output_variables or input_variables
@@ -164,7 +166,6 @@ class TimeSeriesDataModuleZarr:
                 f"Batch size must be divisible by dataloader batch size. Batch size: {self.batch_size}, dataloader batch size: {self.dataloader_batch_size}"
             )
 
-        self.dataloader_batch_size = dataloader_batch_size
         self.dataset_batch_size = self.batch_size // self.dataloader_batch_size
         self.collate_fn = None
 
@@ -210,6 +211,29 @@ class TimeSeriesDataModuleZarr:
 
         if self.splits is None and self.forecast_init_times is None:
             raise ValueError("Either splits or forecast_init_times must be provided")
+
+        # sanity check if dates overlap
+        if self.splits:
+            train_test_overlap = (
+                (np.datetime64(self.splits["train_date_end"]) >= np.datetime64(self.splits["test_date_start"]))
+                and (np.datetime64(self.splits["train_date_start"]) <= np.datetime64(self.splits["test_date_end"]))
+            )
+            if train_test_overlap:
+                warnings.warn("Training and test date ranges overlap")
+            
+            train_val_overlap = (
+                (np.datetime64(self.splits["train_date_end"]) >= np.datetime64(self.splits["val_date_start"]))
+                and (np.datetime64(self.splits["train_date_start"]) <= np.datetime64(self.splits["val_date_end"]))
+            )
+            if train_val_overlap:
+                warnings.warn("Training and validation date ranges overlap")
+
+            test_val_overlap = (
+                (np.datetime64(self.splits["test_date_end"]) >= np.datetime64(self.splits["val_date_start"]))
+                and (np.datetime64(self.splits["test_date_start"]) <= np.datetime64(self.splits["val_date_end"]))
+            )
+            if test_val_overlap:
+                warnings.warn("Test and validation date ranges overlap")
 
     def _initialize_distributed_manager(self):
         """Initialize distributed manager if not already initialized"""

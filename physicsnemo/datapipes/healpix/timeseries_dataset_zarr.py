@@ -52,7 +52,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
 
     def __init__(
         self,
-        ds_path: str,
+        dataset_path: str,
         input_variables: Sequence,
         output_variables: Sequence = None,
         constant_variables: Sequence = None,
@@ -82,7 +82,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         See base class for detailed parameter descriptions.
         """
         super().__init__(
-            ds_path=ds_path,
+            dataset_path=dataset_path,
             input_variables=input_variables,
             output_variables=output_variables,
             constant_variables=constant_variables,
