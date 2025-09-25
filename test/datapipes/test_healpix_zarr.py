@@ -50,7 +50,6 @@ def splits():
         "test_date_start": "1979-01-02T12:00",
         "test_date_end": "1979-01-02T18:00",
     }
-
     return split_dict
 
 
@@ -362,19 +361,8 @@ def test_TimeSeriesDataset_len(dataset_path, scaling_dict, pytestconfig):
     )
     assert len(timeseries_ds) == init_times
 
-    # check train mode
-    timeseries_ds = TimeSeriesDatasetZarr(
-        dataset_path=dataset_path,
-        data_time_step="3h",
-        time_step="9h",
-        input_variables=input_variables,
-        scaling=scaling_dict,
-        batch_size=2,
-        start_date = zarr_ds.time[0].values,
-        end_date = zarr_ds.time[-1].values,
-    )
-    # Window length of 3 for one sample size
-    assert len(timeseries_ds) == (zarr_ds.time.shape[0] - 2) // 2
+    # get the last index that's evenly divisible by 3 (9h / 3h)
+    last_index = (zarr_ds.time.shape[0] // 3) * 3 - 1
 
     # check train mode
     timeseries_ds = TimeSeriesDatasetZarr(
@@ -384,11 +372,28 @@ def test_TimeSeriesDataset_len(dataset_path, scaling_dict, pytestconfig):
         input_variables=input_variables,
         scaling=scaling_dict,
         batch_size=2,
+        start_date=zarr_ds.time[0].values,
+        end_date=zarr_ds.time[last_index - 1].values,
+    )
+    # Window length of 3 for one sample size
+    assert len(timeseries_ds) == (zarr_ds.time.shape[0] - 3) // batch_size
+
+    # drop incomplete last window
+    timeseries_ds = TimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        data_time_step="3h",
+        time_step="9h",
+        input_variables=input_variables,
+        scaling=scaling_dict,
+        batch_size=2,
         drop_last=True,
         start_date = zarr_ds.time[0].values,
-        end_date = zarr_ds.time[-1].values,
+        end_date = zarr_ds.time[last_index - 1].values,
     )
-    assert len(timeseries_ds) == (zarr_ds.time.shape[0] - 2) // 2
+    assert len(timeseries_ds) == (zarr_ds.time.shape[0] - 4) // batch_size
+
+    zarr_ds.close()
+    DistributedManager.cleanup()
 
 @import_or_fail("omegaconf")
 @import_or_fail("netCDF4")

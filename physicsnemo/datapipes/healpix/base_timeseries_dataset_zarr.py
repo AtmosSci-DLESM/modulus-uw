@@ -82,7 +82,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
     """Abstract base class for time series datasets using Zarr storage.
 
     This class provides the core functionality for loading and processing time series data
-    stored in Zarr format. It handles data loading, scaling, masking, and time management.
+    stored in Zarr format. It handles data loading, scaling, and time management.
     Subclasses must implement the __getitem__ method to define specific data retrieval logic.
     """
 
@@ -104,9 +104,6 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         forecast_init_times: Optional[Sequence] = None,
         start_date: Optional[Union[int, str]] = None,
         end_date: Optional[Union[int, str]] = None,
-        land_masked_fields: Optional[Sequence] = None,
-        sea_masked_fields: Optional[Sequence] = None,
-        mask_threshold: float = 0.5,
         add_train_noise: bool = False,
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
@@ -152,12 +149,6 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             Start date/index from which to load data
         end_date : Union[int, str], optional
             End date/index to which to load data
-        land_masked_fields : Sequence, optional
-            Fields to mask over land
-        sea_masked_fields : Sequence, optional
-            Fields to mask over sea
-        mask_threshold : float, default=0.5
-            Threshold for land-sea mask
         add_train_noise : bool, default=False
             Whether to add train noise
         train_noise_params : DictConfig, optional
@@ -182,9 +173,6 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         self.forecast_init_times = forecast_init_times
         self.forecast_mode = self.forecast_init_times is not None
         self.input_variables = input_variables
-        self.land_masked_fields = land_masked_fields
-        self.sea_masked_fields = sea_masked_fields
-        self.mask_threshold = mask_threshold
         self.output_variables = (
             input_variables if output_variables is None else output_variables
         )
@@ -283,7 +271,6 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         self.constant_scaling = None
         self.constants = None
 
-        self._get_masking()
         if self.scaling:
             self._get_scaling_da()
         if self.constant_variables:
@@ -392,61 +379,6 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         else:
             self._forecast_init_indices = None
 
-    def _get_masking(self) -> None:
-        """Setup masking fields for land and sea regions.
-
-        Creates masks and indices for masking specific fields over land/sea regions
-        based on land-sea mask in dataset. Sets the following attributes:
-        - sea_mask: Binary mask for sea points
-        - land_mask: Binary mask for land points
-        - land_mask_indices: Indices of fields to mask over land
-        - sea_mask_indices: Indices of fields to mask over sea
-        """
-        if "lsm" in self.ds.channel_c:
-            lsm_index = np.where(self.ds.channel_c[:] == "lsm")[0][0]
-            land_vals = ma.masked_less_equal(
-                self.ds.constants[lsm_index], self.mask_threshold
-            ).mask
-            sea_vals = ma.masked_greater(
-                self.ds.constants[lsm_index], self.mask_threshold
-            ).mask
-            self.sea_mask = sea_vals * np.ones_like(
-                sea_vals
-            ) + land_vals * np.zeros_like(land_vals)
-            self.land_mask = 1 - self.sea_mask
-        elif "land_sea_mask" in self.ds.channel_c:
-            lsm_index = np.where(self.ds.channel_c[:] == "land_sea_mask")[0][0]
-            land_vals = ma.masked_less_equal(
-                self.ds.constants[lsm_index], self.mask_threshold
-            ).mask
-            sea_vals = ma.masked_greater(
-                self.ds.constants[lsm_index], self.mask_threshold
-            ).mask
-            self.sea_mask = sea_vals * np.ones_like(
-                sea_vals
-            ) + land_vals * np.zeros_like(land_vals)
-            self.land_mask = 1 - self.sea_mask
-        else:
-            self.sea_mask = None
-            self.land_mask = None
-
-        if self.land_masked_fields and len(self.land_masked_fields) > 0:
-            self.land_mask_indices = [
-                self.all_variables.index(field)
-                for field in self.land_masked_fields
-                if field in self.all_variables
-            ]
-        else:
-            self.land_mask_indices = None
-
-        if self.sea_masked_fields and len(self.sea_masked_fields) > 0:
-            self.sea_mask_indices = [
-                self.all_variables.index(field)
-                for field in self.sea_masked_fields
-                if field in self.all_variables
-            ]
-        else:
-            self.sea_mask_indices = None
 
     def _get_scaling_da(self) -> None:
         """Setup data scaling parameters.

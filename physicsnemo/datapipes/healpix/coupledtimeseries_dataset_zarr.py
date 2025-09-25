@@ -51,7 +51,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
     This class extends the base time series functionality to include coupling with
     external data sources like ocean models, land models, etc. It supports:
     - Integration of coupled data during training/inference
-    - Masking of coupled fields
     - Addition of training noise to improve generalization
     - Step-by-step integration for forecasting
     """
@@ -79,9 +78,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         add_train_noise: bool = False,
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
-        land_masked_fields: Optional[Sequence] = None,
-        sea_masked_fields: Optional[Sequence] = None,
-        mask_threshold: float = 0.5,
     ):
         """Initialize coupled time series dataset.
 
@@ -109,8 +105,7 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
 
         # We setup couplers first so superclass can properly initialize
         # and set the scaling
-        self.ds_path = ds_path
-        self.ds = zarr.open(ds_path)
+        self.ds = zarr.open(dataset_path)
         self.couplings = [
             getattr(couplers, c["coupler"])(
                 self.ds,
@@ -136,9 +131,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
             forecast_init_times=forecast_init_times,
             start_date=start_date,
             end_date=end_date,
-            land_masked_fields=land_masked_fields,
-            sea_masked_fields=sea_masked_fields,
-            mask_threshold=mask_threshold,
             meta=meta,
         )
 
@@ -152,46 +144,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         self.last_batch = None  # keeps track of batch info for coupler
         self.curr_item = None  # keeps track of current initialization
 
-    def _get_masking(self) -> None:
-        """Setup masking fields for land and sea with coupling-specific additions.
-
-        Extends base masking setup to handle coupled fields:
-        - Identifies coupled fields that need masking
-        - Creates PyTorch tensor versions of masks for GPU usage
-        - Sets up separate indices for land/sea masking of coupled fields
-        """
-        super()._get_masking()
-
-        self.masked_coupled_idx = -1
-        if (
-            self.land_masked_fields
-            and self.land_masked_fields[0] in self.coupled_variables
-        ):
-            self.masked_coupled_idx = self.coupled_variables.index(
-                self.land_masked_fields[0]
-            )
-        # use dicts here so we can check individual instances
-        self.coupled_land_masked_fields = {}
-        self.coupled_sea_masked_fields = {}
-        for index, coupled_variables in enumerate(self.coupled_variables):
-            if self.land_masked_fields and len(self.land_masked_fields) > 0:
-                land_indices = [
-                    coupled_variables.index(field)
-                    for field in self.land_masked_fields
-                    if field in coupled_variables
-                ]
-                self.coupled_land_masked_fields[index] = land_indices
-            if self.sea_masked_fields and len(self.sea_masked_fields) > 0:
-                sea_indices = [
-                    coupled_variables.index(field)
-                    for field in self.sea_masked_fields
-                    if field in coupled_variables
-                ]
-                self.coupled_sea_masked_fields[index] = sea_indices
-
-        # for use with the couplers
-        self.land_mask_tensor = torch.tensor(self.land_mask)
-        self.sea_mask_tensor = torch.tensor(self.sea_mask)
 
     def _get_scaling_da(self) -> None:
         """extend scaling to include coupling-specific additions.
@@ -215,9 +167,8 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
 
         This implementation extends the base time series data loading to include:
         1. Integration of coupled data sources
-        2. Application of masking to coupled fields
-        3. Addition of training noise if enabled
-        4. Tracking of batch info for step-by-step integration
+        2. Addition of training noise if enabled
+        3. Tracking of batch info for step-by-step integration
 
         Parameters
         ----------
@@ -251,6 +202,14 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
             If item is out of range
         """
 
+        # check for valid item and adjust for negative indices
+        if item < 0:
+            item = len(self) + item
+        if item < 0 or item > len(self):
+            raise IndexError(
+                f"index {item} out of range for dataset with length {len(self)}"
+            )
+
         if self.forecast_mode:
             inputs_result = super().__getitem__(item)
         else:
@@ -277,14 +236,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
                 ],
                 axis=2,
             )
-
-            if self.masked_coupled_idx > -1:
-                integrated_couplings_masked = (
-                    integrated_couplings[:, :, self.masked_coupled_idx] * self.land_mask
-                )
-                integrated_couplings[
-                    :, :, self.masked_coupled_idx
-                ] = integrated_couplings_masked  # .data
         torch.cuda.nvtx.range_pop()  # CoupledTimeSeriesDataset:__getitem__:retrieve_coupled
 
         torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:process_batch")
@@ -318,43 +269,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
 
         return inputs_result, targets
 
-    def _apply_masks(
-        self, tensor: torch.Tensor, transpose_first: bool = True
-    ) -> torch.Tensor:
-        """Apply land and sea masks to the input tensor.
-
-        Parameters
-        ----------
-        tensor : torch.Tensor
-            Input tensor to mask
-        transpose_first : bool
-            Whether to transpose before masking
-
-        Returns
-        -------
-        torch.Tensor
-            Masked tensor
-        """
-        if not (self.land_mask_indices or self.sea_mask_indices):
-            return tensor
-
-        if transpose_first:
-            tensor = tensor.transpose(1, 2)
-
-            if self.land_mask_indices:
-                self.land_mask_tensor = self.land_mask_tensor.to(tensor.device)
-                for idx in self.land_mask_indices:
-                    tensor[:, :, :, idx] = tensor[:, :, :, idx] * self.land_mask_tensor
-
-            if self.sea_mask_indices:
-                self.sea_mask_tensor = self.sea_mask_tensor.to(tensor.device)
-                for idx in self.sea_mask_indices:
-                    tensor[:, :, :, idx] = tensor[:, :, :, idx] * self.sea_mask_tensor
-
-        if transpose_first:
-            tensor = tensor.transpose(1, 2)
-
-        return tensor
 
     def _get_next_insolation(self, time_offset: int) -> torch.Tensor:
         """Calculate insolation for next integration step.
@@ -409,13 +323,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
             axis=2,
         )
 
-        if self.masked_coupled_idx > -1:
-            integrated_couplings_masked = (
-                integrated_couplings[:, :, self.masked_coupled_idx] * self.land_mask
-            )
-            integrated_couplings[
-                :, :, self.masked_coupled_idx
-            ] = integrated_couplings_masked
 
         return torch.tensor(integrated_couplings)
 
@@ -441,7 +348,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         # Get prognostic inputs from model outputs
         init_time_dim = len(self._input_indices[0])
         prognostic_inputs = model_outputs[:, :, -init_time_dim:]
-        prognostic_inputs = self._apply_masks(prognostic_inputs)
         inputs_result.append(prognostic_inputs)
 
         # Add insolation if needed

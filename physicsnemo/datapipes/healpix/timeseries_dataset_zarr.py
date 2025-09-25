@@ -46,7 +46,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
     """Dataset for sampling from continuous time-series data stored in Zarr format.
 
     This class implements the basic time series dataset functionality without coupling
-    to external data sources. It provides data loading, scaling, masking and batching
+    to external data sources. It provides data loading, scaling, and batching
     capabilities for training and inference.
     """
 
@@ -68,9 +68,6 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         forecast_init_times: Optional[Sequence] = None,
         start_date: Optional[Union[int, str]] = None,
         end_date: Optional[Union[int, str]] = None,
-        land_masked_fields: Optional[Sequence] = None,
-        sea_masked_fields: Optional[Sequence] = None,
-        mask_threshold: float = 0.5,
         add_train_noise: bool = False,
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
@@ -98,9 +95,6 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             forecast_init_times=forecast_init_times,
             start_date=start_date,
             end_date=end_date,
-            land_masked_fields=land_masked_fields,
-            sea_masked_fields=sea_masked_fields,
-            mask_threshold=mask_threshold,
             add_train_noise=add_train_noise,
             train_noise_params=train_noise_params,
             train_noise_seed=train_noise_seed,
@@ -114,7 +108,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
 
         This implementation provides the basic time series data loading functionality:
         1. Load data window for batch
-        2. Apply scaling and masking
+        2. Apply scaling
         3. Extract input and target sequences
         4. Add optional insolation and constant inputs
         5. Format dimensions appropriately
@@ -179,15 +173,6 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             staging_ds -= self.all_scaling["mean"]
             staging_ds /= self.all_scaling["std"]
 
-        if self.land_mask_indices:
-            for idx in self.land_mask_indices:
-                masked_input_field = staging_ds[:, idx] * self.land_mask
-                staging_ds[:, idx] = masked_input_field
-
-        if self.sea_mask_indices:
-            for idx in self.sea_mask_indices:
-                masked_input_field = staging_ds[:, idx] * self.sea_mask
-                staging_ds[:, idx] = masked_input_field
         torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_input")
