@@ -185,7 +185,7 @@ def test_ConstantCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
     assert np.array_equal(expected, coupler.coupled_scaling["std"])
 
     # test incorrect batch size
-    #coupler.coupled_channel_indices = [0, 1]
+    # coupler.coupled_channel_indices = [0, 1]
 
     coupled_fields_batch_size = batch_size
     coupled_fields_timedim = 4
@@ -305,11 +305,8 @@ def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconf
         output_variables=["z500"],
         time_step="3h",
     )
-    with pytest.raises(
-        ValueError, match=("Missing variables in coupled module")
-    ):
+    with pytest.raises(ValueError, match=("Missing variables in coupled module")):
         coupler.setup_coupling(mock_coupled_module)
-
 
     # veryify averaging slices computed correctly
     mock_coupled_module = coupler_helper(
@@ -1118,7 +1115,7 @@ def test_CoupledTimeSeriesDataModule_get_coupled_vars(
 
     # Constant coupler
     # Internally initializes DistributedManager
-    print(f'test name {dataset_name}')
+    print(f"test name {dataset_name}")
     timeseries_dm = CoupledTimeSeriesDataModule(
         src_directory=create_path,
         dst_directory=data_dir,

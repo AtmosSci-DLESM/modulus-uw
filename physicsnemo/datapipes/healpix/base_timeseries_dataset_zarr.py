@@ -22,7 +22,6 @@ from abc import ABC, abstractmethod
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-import numpy.ma as ma
 import pandas as pd
 import xarray as xr
 import zarr
@@ -73,9 +72,7 @@ def _check_availability(path: str) -> None:  # pragma: no cover
                 "Please install fsspec with: pip install fsspec"
             )
     elif not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Dataset not found at specified location: {path}"
-        )
+        raise FileNotFoundError(f"Dataset not found at specified location: {path}")
 
 
 class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
@@ -187,9 +184,12 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
 
         self.ds = zarr.open(dataset_path)
 
-
-        if (start_date is None or end_date is None) and self.forecast_init_times is None:
-            raise ValueError("Either start and end date or forecast_init_times must be provided")
+        if (
+            start_date is None or end_date is None
+        ) and self.forecast_init_times is None:
+            raise ValueError(
+                "Either start and end date or forecast_init_times must be provided"
+            )
 
         # Validate channels exist
         channels = set(self.input_variables).union(self.output_variables)
@@ -214,10 +214,14 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                     f"Requested constants not found in dataset: {missing_constants}"
                 )
 
-        self.constant_variable_indices = [
-            int(np.where(self.ds.channel_c[:] == ch)[0][0])
-            for ch in self.constant_variables
-        ] if self.constant_variables else None
+        self.constant_variable_indices = (
+            [
+                int(np.where(self.ds.channel_c[:] == ch)[0][0])
+                for ch in self.constant_variables
+            ]
+            if self.constant_variables
+            else None
+        )
         self.input_variable_indices = [
             self.all_variables.index(inp_ch) for inp_ch in self.input_variables
         ]
@@ -326,9 +330,13 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             raise KeyError(f"Dataset missing time. Dataset provided {dataset_path}")
 
         if np.datetime64(start_date) < ds.time[0]:
-            warnings.warn(f"Start date {start_date} is before first available date {ds.time[0].values}")            
+            warnings.warn(
+                f"Start date {start_date} is before first available date {ds.time[0].values}"
+            )
         if ds.time[-1] < np.datetime64(end_date):
-            warnings.warn(f"End date {end_date} is after last available date {ds.time[-1].values}")            
+            warnings.warn(
+                f"End date {end_date} is after last available date {ds.time[-1].values}"
+            )
 
         self.time_da = ds.time.copy(deep=True)
         self.total_samples = self.time_da.sel(time=slice(start_date, end_date)).shape[0]
@@ -373,12 +381,14 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                     "setting it now"
                 )
             self._forecast_init_indices = np.array(
-                [int(np.where(self.time_da == s)[0][0]) for s in self.forecast_init_times],
+                [
+                    int(np.where(self.time_da == s)[0][0])
+                    for s in self.forecast_init_times
+                ],
                 dtype="int",
             ) - ((self.input_time_dim - 1) * self.interval)
         else:
             self._forecast_init_indices = None
-
 
     def _get_scaling_da(self) -> None:
         """Setup data scaling parameters.

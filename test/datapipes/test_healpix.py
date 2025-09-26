@@ -107,6 +107,7 @@ def test_open_time_series(data_dir, dataset_name, pytestconfig):
     assert isinstance(ds, xr.Dataset)
     ds.close()
 
+
 @import_or_fail("omegaconf")
 @import_or_fail("netCDF4")
 @nfsdata_or_fail

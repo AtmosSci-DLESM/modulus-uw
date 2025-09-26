@@ -14,11 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import cftime
 import logging
 from abc import ABC, abstractmethod
 from typing import Sequence
 
+import cftime
 import numpy as np
 import pandas as pd
 import torch as th
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 class BaseCoupler(ABC):
     """
     Base class for couplers used to interface two components of earth system.
-    
+
     This class contains common functionality shared by different coupler implementations.
     """
 
@@ -100,10 +100,15 @@ class BaseCoupler(ABC):
         elif type(self.ds) == zr.Group:
             self.use_zarr = True
             self.ds_variable_indices = [
-                i for i, ic in enumerate(self.ds.channel_in) for v in self.variables if ic == v
+                i
+                for i, ic in enumerate(self.ds.channel_in)
+                for v in self.variables
+                if ic == v
             ]
         else:
-            raise TypeError(f"Coupler only supports xarray Datasets or zarr Groups, got {type(self.ds)}")
+            raise TypeError(
+                f"Coupler only supports xarray Datasets or zarr Groups, got {type(self.ds)}"
+            )
 
     def _compute_coupled_integration_dim(self):
         return self.presteps + max(self.output_time_dim // self.input_time_dim, 1)
@@ -170,7 +175,7 @@ class BaseCoupler(ABC):
             if (("-" not in v and oc == v) or (oc == "-".join(v.split("-")[:-1])))
         ]
         # check for missing variables
-        if (len(self.variables) != len(channel_indices)):
+        if len(self.variables) != len(channel_indices):
             found_channels = [
                 oc
                 for oc in output_channels
@@ -208,8 +213,7 @@ class BaseCoupler(ABC):
         """
         # reset integrated couplings
         self.integrated_couplings = np.empty(
-            (bsize, self.coupled_integration_dim, self.timevar_dim)
-            + self.spatial_dims
+            (bsize, self.coupled_integration_dim, self.timevar_dim) + self.spatial_dims
         )
 
         index_range = slice(
@@ -224,7 +228,11 @@ class BaseCoupler(ABC):
             ds_index_range = self.ds.inputs[index_range]
             ds_index_range = ds_index_range[:, self.ds_variable_indices]
         else:
-            ds_index_range = self.ds.inputs.sel(channel_in=self.variables).isel(time=index_range).compute()
+            ds_index_range = (
+                self.ds.inputs.sel(channel_in=self.variables)
+                .isel(time=index_range)
+                .compute()
+            )
 
         return ds_index_range
 
@@ -255,9 +263,11 @@ class BaseCoupler(ABC):
                 raise ValueError(
                     "batch and bsize must be provided when not in coupled_mode"
                 )
-            
-            ds_index_range = self._construct_integrated_couplings_from_dataset(batch, bsize)
-            
+
+            ds_index_range = self._construct_integrated_couplings_from_dataset(
+                batch, bsize
+            )
+
             # Apply scaling if available
             if self.coupled_scaling is not None:
                 ds_index_range -= self.coupled_scaling["mean"]
@@ -268,15 +278,13 @@ class BaseCoupler(ABC):
                 for i in range(self.coupled_integration_dim):
                     if self.use_zarr:
                         coupling_temp = ds_index_range[
-                            self._coupled_offsets[b, i, :],:
+                            self._coupled_offsets[b, i, :], :
                         ]
                     else:
                         coupling_temp = ds_index_range.isel(
                             time=self._coupled_offsets[b, i, :]
                         ).to_numpy()
-                    self.integrated_couplings[
-                        b, i, :, :, :
-                    ] = coupling_temp.reshape(
+                    self.integrated_couplings[b, i, :, :, :] = coupling_temp.reshape(
                         (self.timevar_dim,) + coupling_temp.shape[2:]
                     )
 
@@ -454,23 +462,21 @@ class TrailingAverageCoupler(BaseCoupler):
             input_times=input_times,
             prepared_coupled_data=prepared_coupled_data,
         )
-        
+
         # TrailingAverageCoupler-specific attributes
         self.averaging_window = pd.Timedelta(averaging_window)
-        
+
         if self.use_zarr:
             cf_dates = cftime.num2pydate(
                 self.ds.time[:],
                 units=self.ds.time.attrs["units"],
-                calendar=self.ds.time.attrs["calendar"]
+                calendar=self.ds.time.attrs["calendar"],
             )
             dates = [np.datetime64(date.isoformat()) for date in cf_dates]
             self.time_da = np.asarray(dates)
         else:
             self.time_da = self.ds.time.values
         self._set_time_increments()
-
-
 
     def compute_coupled_indices(self, interval, data_time_step):
         """
@@ -500,9 +506,7 @@ class TrailingAverageCoupler(BaseCoupler):
 
     def _set_time_increments(self):
         # get the dt of the dataset
-        dt = pd.Timedelta(
-            self.time_da[1] - self.time_da[0]
-        ).total_seconds()
+        dt = pd.Timedelta(self.time_da[1] - self.time_da[0]).total_seconds()
         # assert that the time increments are divisible by the dt of the dataset
         if np.any([t.total_seconds() % dt != 0 for t in self.input_times]):
             raise ValueError(
@@ -514,7 +518,7 @@ class TrailingAverageCoupler(BaseCoupler):
     def setup_coupling(self, coupled_module):
         # Call parent method first to set basic coupling
         super().setup_coupling(coupled_module)
-        
+
         # TrailingAverageCoupler-specific setup
         # find averaging periods from component output
         averaging_window_max_indices = [

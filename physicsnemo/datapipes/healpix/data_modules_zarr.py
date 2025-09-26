@@ -16,8 +16,8 @@
 
 # System modules
 import logging
-from pathlib import Path
 import warnings
+from pathlib import Path
 from typing import Optional, Sequence, Union
 
 # numpy
@@ -215,22 +215,31 @@ class TimeSeriesDataModuleZarr:
         # sanity check if dates overlap
         if self.splits:
             train_test_overlap = (
-                (np.datetime64(self.splits["train_date_end"]) >= np.datetime64(self.splits["test_date_start"]))
-                and (np.datetime64(self.splits["train_date_start"]) <= np.datetime64(self.splits["test_date_end"]))
+                np.datetime64(self.splits["train_date_end"])
+                >= np.datetime64(self.splits["test_date_start"])
+            ) and (
+                np.datetime64(self.splits["train_date_start"])
+                <= np.datetime64(self.splits["test_date_end"])
             )
             if train_test_overlap:
                 warnings.warn("Training and test date ranges overlap")
-            
+
             train_val_overlap = (
-                (np.datetime64(self.splits["train_date_end"]) >= np.datetime64(self.splits["val_date_start"]))
-                and (np.datetime64(self.splits["train_date_start"]) <= np.datetime64(self.splits["val_date_end"]))
+                np.datetime64(self.splits["train_date_end"])
+                >= np.datetime64(self.splits["val_date_start"])
+            ) and (
+                np.datetime64(self.splits["train_date_start"])
+                <= np.datetime64(self.splits["val_date_end"])
             )
             if train_val_overlap:
                 warnings.warn("Training and validation date ranges overlap")
 
             test_val_overlap = (
-                (np.datetime64(self.splits["test_date_end"]) >= np.datetime64(self.splits["val_date_start"]))
-                and (np.datetime64(self.splits["test_date_start"]) <= np.datetime64(self.splits["val_date_end"]))
+                np.datetime64(self.splits["test_date_end"])
+                >= np.datetime64(self.splits["val_date_start"])
+            ) and (
+                np.datetime64(self.splits["test_date_start"])
+                <= np.datetime64(self.splits["val_date_end"])
             )
             if test_val_overlap:
                 warnings.warn("Test and validation date ranges overlap")

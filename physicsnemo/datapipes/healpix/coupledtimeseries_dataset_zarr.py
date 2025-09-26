@@ -147,7 +147,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         self.last_batch = None  # keeps track of batch info for coupler
         self.curr_item = None  # keeps track of current initialization
 
-
     def _get_scaling_da(self) -> None:
         """extend scaling to include coupling-specific additions.
 
@@ -272,7 +271,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
 
         return inputs_result, targets
 
-
     def _get_next_insolation(self, time_offset: int) -> torch.Tensor:
         """Calculate insolation for next integration step.
 
@@ -318,11 +316,13 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
 
         # account for multiple integration steps without fetching data
         batch = self.last_batch.copy()
-        batch = {"time": slice(
-            self.last_batch["time"].start + offset,
-            self.last_batch["time"].stop + offset,
-            self.last_batch["time"].step,
-        )}
+        batch = {
+            "time": slice(
+                self.last_batch["time"].start + offset,
+                self.last_batch["time"].stop + offset,
+                self.last_batch["time"].step,
+            )
+        }
         integrated_couplings = np.concatenate(
             [
                 c.construct_integrated_couplings(
@@ -332,7 +332,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
             ],
             axis=2,
         )
-
 
         return torch.tensor(integrated_couplings)
 
