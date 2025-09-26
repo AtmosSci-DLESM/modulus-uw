@@ -936,7 +936,7 @@ def test_CoupledTimeSeriesDataModuleZarr_get_constants(
     )
 
     variables = ["z500", "z1000"]
-    constants = {"lsm": "lsm"}
+    constants = ["lsm"]
 
     # No constants
     # Internally initializes DistributedManager
@@ -946,7 +946,7 @@ def test_CoupledTimeSeriesDataModuleZarr_get_constants(
         batch_size=1,
         scaling=scaling_double_dict,
         splits=splits,
-        constants=None,
+        constant_variables=None,
         couplings=constant_coupler_config,
     )
 
@@ -959,7 +959,7 @@ def test_CoupledTimeSeriesDataModuleZarr_get_constants(
         batch_size=1,
         scaling=scaling_double_dict,
         splits=splits,
-        constants=constants,
+        constant_variables=constants,
         couplings=constant_coupler_config,
     )
 
@@ -969,7 +969,7 @@ def test_CoupledTimeSeriesDataModuleZarr_get_constants(
     # divide by 2 due to scaling
     expected = (
         np.transpose(
-            zarr_ds.constants.sel(channel_c=list(constants.keys())).values,
+            zarr_ds.constants.sel(channel_c=constants).values,
             axes=(1, 0, 2, 3),
         )
         / 2.0
@@ -988,7 +988,7 @@ def test_CoupledTimeSeriesDataModuleZarr_get_constants(
         batch_size=1,
         scaling=scaling_double_dict,
         splits=splits,
-        constants=constants,
+        constant_variables=constants,
         couplings=constant_coupler_config,
     )
 

@@ -655,7 +655,7 @@ def test_TimeSeriesDataModule_get_constants(
     )
 
     input_variables = ["z500", "z1000"]
-    constants = {"lsm": "lsm"}
+    constants = ["lsm"]
 
     # open our test dataset
     zarr_ds = xr.open_zarr(dataset_path)
@@ -668,7 +668,7 @@ def test_TimeSeriesDataModule_get_constants(
         input_variables=input_variables,
         batch_size=1,
         scaling=scaling_double_dict,
-        constants=None,
+        constant_variables=None,
         forecast_init_times=forecast_times,
     )
 
@@ -681,7 +681,7 @@ def test_TimeSeriesDataModule_get_constants(
             input_variables=input_variables,
             batch_size=1,
             scaling=scaling_double_dict,
-            constants={"missing": "missing"},
+            constant_variables={"missing": "missing"},
             forecast_init_times=forecast_times,
         )
 
@@ -691,7 +691,7 @@ def test_TimeSeriesDataModule_get_constants(
         input_variables=input_variables,
         batch_size=1,
         scaling=scaling_double_dict,
-        constants=constants,
+        constant_variables=constants,
         forecast_init_times=forecast_times,
     )
 
@@ -701,7 +701,7 @@ def test_TimeSeriesDataModule_get_constants(
     # dividing by 2 due to scaling
     expected = (
         np.transpose(
-            zarr_ds.constants.sel(channel_c=list(constants.keys())).values,
+            zarr_ds.constants.sel(channel_c=constants).values,
             axes=(1, 0, 2, 3),
         )
         / 2.0
@@ -719,7 +719,7 @@ def test_TimeSeriesDataModule_get_constants(
         input_variables=input_variables,
         batch_size=1,
         scaling=scaling_double_dict,
-        constants=constants,
+        constant_variables=constants,
         splits=splits,
     )
 

@@ -49,7 +49,7 @@ class TimeSeriesDataModuleZarr:
         drop_last: bool = True,
         input_variables: Optional[Sequence] = ["t2m"],
         output_variables: Optional[Sequence] = None,
-        constants: Optional[DictConfig] = None,
+        constant_variables: Optional[Sequence] = None,
         scaling: Optional[DictConfig] = None,
         splits: Optional[DictConfig] = None,
         presteps: int = 0,
@@ -88,9 +88,8 @@ class TimeSeriesDataModuleZarr:
             List of input variable names, to be found in data file name, default "t2m"
         output_variables: Sequence, optional
             List of output variables names. If None, defaults to `input_variables`. default None
-        constants: DictConfig, optional
-            Dictionary with {key: value} corresponding to {constant_name: variable name in file}.
-            default None
+        constant_variables: Sequence, optional
+            List of constant variables names. If None, defaults to `input_variables`. default None
         scaling: DictConfig, optional
             Dictionary containing scaling parameters for data variables, default None
         splits: DictConfig, optional
@@ -140,8 +139,9 @@ class TimeSeriesDataModuleZarr:
         self.drop_last = drop_last
         self.input_variables = input_variables
         self.output_variables = output_variables or input_variables
-        self.constants = constants
-        self.constant_names = list(self.constants.values()) if self.constants else None
+        self.constant_variables = constant_variables
+        # self.constants = constants
+        # self.constant_names = list(self.constants.values()) if self.constants else None
         self.scaling = scaling
         self.splits = splits
         self.input_time_dim = input_time_dim + (presteps * input_time_dim)
@@ -178,7 +178,7 @@ class TimeSeriesDataModuleZarr:
         -------
         np.ndarray: The list of constants, None if there are no constants
         """
-        if self.constants is None:
+        if self.constant_variables is None:
             return None
 
         return (
@@ -193,7 +193,7 @@ class TimeSeriesDataModuleZarr:
             "dataset_path": self.dataset_path,
             "input_variables": self.input_variables,
             "output_variables": self.output_variables,
-            "constant_variables": self.constant_names,
+            "constant_variables": self.constant_variables,
             "batch_size": self.dataset_batch_size,
             "add_insolation": self.add_insolation,
             "input_time_dim": self.input_time_dim,
@@ -427,7 +427,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         drop_last: bool = True,
         input_variables: Optional[Sequence] = None,
         output_variables: Optional[Sequence] = None,
-        constants: Optional[DictConfig] = None,
+        constant_variables: Optional[Sequence] = None,
         scaling: Optional[DictConfig] = None,
         splits: Optional[DictConfig] = None,
         presteps: int = 0,
@@ -461,9 +461,8 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             List of input variable names, to be found in data file name, default None
         output_variables: Sequence, optional
             List of output variables names. If None, defaults to `input_variables`. default None
-        constants: DictConfig, optional
-            Dictionary with {key: value} corresponding to {constant_name: variable name in file}.
-            default None
+        constant_variables: Sequence, optional
+            List of constant variables names. If None, defaults to `input_variables`. default None
         scaling: DictConfig, optional
             Dictionary containing scaling parameters for data variables, default None
         splits: DictConfig, optional
@@ -518,7 +517,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             drop_last,
             input_variables,
             output_variables,
-            constants,
+            constant_variables,
             scaling,
             splits,
             presteps,

@@ -33,7 +33,7 @@ from torch.utils.data import Dataset
 logger = logging.getLogger(__name__)
 
 
-def _is_object_store_path(path: str) -> bool:
+def _is_object_store_path(path: str) -> bool:  # pragma: no cover
     """Check if path is an object store path (contains :// or ::).
 
     Parameters
