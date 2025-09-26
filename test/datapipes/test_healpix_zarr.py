@@ -144,6 +144,7 @@ def test_TimeSeriesDataset_initialization(
             scaling=scaling_dict,
             input_variables = input_variables,
             forecast_init_times=zarr_ds.time[:2],
+            batch_size=1,
         )
 
     # check for failure of gap not being a multiple of datatime step
@@ -175,6 +176,7 @@ def test_TimeSeriesDataset_initialization(
             scaling=invalid_scaling,
             forecast_init_times=time_da[:10],
             input_variables = input_variables,
+            batch_size=1,
         )
 
     # check for warning on batch size > 1 and forecast mode
@@ -315,6 +317,7 @@ def test_TimeSeriesDataset_get_constants(
         scaling=scaling_dict,
         constant_variables=None,
         forecast_init_times=zarr_ds.time[:2],
+        batch_size=1,
     )
 
     assert timeseries_ds.get_constants() == None
@@ -325,6 +328,7 @@ def test_TimeSeriesDataset_get_constants(
         scaling=scaling_dict,
         constant_variables=constant_variables,
         forecast_init_times=zarr_ds.time[:2],
+        batch_size=1,
     )
 
     # constants are reshaped
@@ -346,6 +350,7 @@ def test_TimeSeriesDataset_len(dataset_path, scaling_dict, pytestconfig):
     )
 
     input_variables = ["z500", "z1000"]
+    batch_size = 2
 
     # open our test dataset
     zarr_ds = xr.open_zarr(dataset_path)
@@ -371,7 +376,7 @@ def test_TimeSeriesDataset_len(dataset_path, scaling_dict, pytestconfig):
         time_step="9h",
         input_variables=input_variables,
         scaling=scaling_dict,
-        batch_size=2,
+        batch_size=batch_size,
         start_date=zarr_ds.time[0].values,
         end_date=zarr_ds.time[last_index - 1].values,
     )
@@ -385,7 +390,7 @@ def test_TimeSeriesDataset_len(dataset_path, scaling_dict, pytestconfig):
         time_step="9h",
         input_variables=input_variables,
         scaling=scaling_dict,
-        batch_size=2,
+        batch_size=batch_size,
         drop_last=True,
         start_date = zarr_ds.time[0].values,
         end_date = zarr_ds.time[last_index - 1].values,
@@ -545,7 +550,7 @@ def test_TimeSeriesDataModule_initialization(
         TimeSeriesDataModuleZarr,
     )
 
-    variables = ["z500", "z1000"]
+    input_variables = ["z500", "z1000"]
 
     # open our test dataset
     zarr_ds = xr.open_zarr(dataset_path)
@@ -556,7 +561,7 @@ def test_TimeSeriesDataModule_initialization(
     ):
         timeseries_dm = TimeSeriesDataModuleZarr(
             dataset_path="DoesntExist",
-            input_variables=variables,
+            input_variables=input_variables,
             batch_size=1,
             scaling=scaling_double_dict,
         )
@@ -567,7 +572,7 @@ def test_TimeSeriesDataModule_initialization(
     ):
         timeseries_dm = TimeSeriesDataModuleZarr(
             dataset_path=dataset_path,
-            input_variables=variables,
+            input_variables=input_variables,
             batch_size=1,
             scaling=scaling_double_dict,
         )
@@ -582,7 +587,7 @@ def test_TimeSeriesDataModule_initialization(
         bad_splits["val_date_start"] = splits["train_date_start"]
         timeseries_dm = TimeSeriesDataModuleZarr(
             dataset_path=dataset_path,
-            input_variables=variables,
+            input_variables=input_variables,
             batch_size=1,
             splits=bad_splits,
             scaling=scaling_double_dict,
@@ -598,7 +603,7 @@ def test_TimeSeriesDataModule_initialization(
         bad_splits["test_date_start"] = splits["train_date_start"]
         timeseries_dm = TimeSeriesDataModuleZarr(
             dataset_path=dataset_path,
-            input_variables=variables,
+            input_variables=input_variables,
             batch_size=1,
             splits=bad_splits,
             scaling=scaling_double_dict,
@@ -614,7 +619,7 @@ def test_TimeSeriesDataModule_initialization(
         bad_splits["val_date_end"] = splits["test_date_start"]
         timeseries_dm = TimeSeriesDataModuleZarr(
             dataset_path=dataset_path,
-            input_variables=variables,
+            input_variables=input_variables,
             batch_size=1,
             splits=bad_splits,
             scaling=scaling_double_dict,
@@ -624,7 +629,7 @@ def test_TimeSeriesDataModule_initialization(
     # with init times
     timeseries_dm = TimeSeriesDataModuleZarr(
         dataset_path=dataset_path,
-        input_variables=variables,
+        input_variables=input_variables,
         batch_size=1,
         scaling=scaling_double_dict,
         forecast_init_times=zarr_ds.time[:2],
@@ -634,7 +639,7 @@ def test_TimeSeriesDataModule_initialization(
     # with splits
     timeseries_dm = TimeSeriesDataModuleZarr(
         dataset_path=dataset_path,
-        input_variables=variables,
+        input_variables=input_variables,
         batch_size=1,
         scaling=scaling_double_dict,
         splits=omegaconf.DictConfig(splits),
@@ -656,7 +661,7 @@ def test_TimeSeriesDataModule_get_constants(
         TimeSeriesDataModuleZarr,
     )
 
-    variables = ["z500", "z1000"]
+    input_variables = ["z500", "z1000"]
     constants = {"lsm": "lsm"}
 
     # open our test dataset
@@ -667,7 +672,7 @@ def test_TimeSeriesDataModule_get_constants(
     # Internally initializes DistributedManager
     timeseries_dm = TimeSeriesDataModuleZarr(
         dataset_path=dataset_path,
-        input_variables=variables,
+        input_variables=input_variables,
         batch_size=1,
         scaling=scaling_double_dict,
         constants=None,
@@ -682,7 +687,7 @@ def test_TimeSeriesDataModule_get_constants(
     ):
         timeseries_dm = TimeSeriesDataModuleZarr(
             dataset_path=dataset_path,
-            input_variables=variables,
+            input_variables=input_variables,
             batch_size=1,
             scaling=scaling_double_dict,
             constants={"missing": "missing"},
@@ -692,7 +697,7 @@ def test_TimeSeriesDataModule_get_constants(
     # just lsm as constant
     timeseries_dm = TimeSeriesDataModuleZarr(
         dataset_path=dataset_path,
-        input_variables=variables,
+        input_variables=input_variables,
         batch_size=1,
         scaling=scaling_double_dict,
         constants=constants,
@@ -720,7 +725,7 @@ def test_TimeSeriesDataModule_get_constants(
     # constants from train instead of test dataset
     timeseries_dm = TimeSeriesDataModuleZarr(
         dataset_path=dataset_path,
-        input_variables=variables,
+        input_variables=input_variables,
         batch_size=1,
         scaling=scaling_double_dict,
         constants=constants,

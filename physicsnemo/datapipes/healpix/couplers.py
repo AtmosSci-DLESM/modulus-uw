@@ -268,7 +268,7 @@ class BaseCoupler(ABC):
                 for i in range(self.coupled_integration_dim):
                     if self.use_zarr:
                         coupling_temp = ds_index_range[
-                            [self._coupled_offsets[b, i, :]],:
+                            self._coupled_offsets[b, i, :],:
                         ]
                     else:
                         coupling_temp = ds_index_range.isel(

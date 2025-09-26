@@ -131,6 +131,9 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
             forecast_init_times=forecast_init_times,
             start_date=start_date,
             end_date=end_date,
+            add_train_noise=add_train_noise,
+            train_noise_params=train_noise_params,
+            train_noise_seed=train_noise_seed,
             meta=meta,
         )
 
@@ -313,10 +316,17 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         if not self.couplings:
             return None
 
+        # account for multiple integration steps without fetching data
+        batch = self.last_batch.copy()
+        batch = {"time": slice(
+            self.last_batch["time"].start + offset,
+            self.last_batch["time"].stop + offset,
+            self.last_batch["time"].step,
+        )}
         integrated_couplings = np.concatenate(
             [
                 c.construct_integrated_couplings(
-                    batch=self.last_batch, integration_offset=offset
+                    batch=batch,
                 )
                 for c in self.couplings
             ],
