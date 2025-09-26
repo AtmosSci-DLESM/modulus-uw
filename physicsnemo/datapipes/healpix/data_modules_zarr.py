@@ -45,7 +45,7 @@ class TimeSeriesDataModuleZarr:
         self,
         dataset_path: str,
         batch_size: int = 32,
-        dataloader_batch_size: int = 1,
+        dataloader_batch_size: Optional[int] = None,
         drop_last: bool = True,
         input_variables: Optional[Sequence] = ["t2m"],
         output_variables: Optional[Sequence] = None,
@@ -140,8 +140,7 @@ class TimeSeriesDataModuleZarr:
         self.input_variables = input_variables
         self.output_variables = output_variables or input_variables
         self.constant_variables = constant_variables
-        # self.constants = constants
-        # self.constant_names = list(self.constants.values()) if self.constants else None
+        self.constants = constant_variables
         self.scaling = scaling
         self.splits = splits
         self.input_time_dim = input_time_dim + (presteps * input_time_dim)
@@ -161,12 +160,12 @@ class TimeSeriesDataModuleZarr:
         self.val_dataset = None
         self.test_dataset = None
 
-        if self.batch_size % self.dataloader_batch_size != 0:
+        if self.dataloader_batch_size and self.batch_size % self.dataloader_batch_size != 0:
             raise ValueError(
                 f"Batch size must be divisible by dataloader batch size. Batch size: {self.batch_size}, dataloader batch size: {self.dataloader_batch_size}"
             )
 
-        self.dataset_batch_size = self.batch_size // self.dataloader_batch_size
+        self.dataset_batch_size = self.batch_size // self.dataloader_batch_size if self.dataloader_batch_size else self.batch_size
         self.collate_fn = None
 
         self.setup()
@@ -423,7 +422,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         self,
         dataset_path: str,
         batch_size: int = 32,
-        dataloader_batch_size: int = 1,
+        dataloader_batch_size: Optional[int] = None,
         drop_last: bool = True,
         input_variables: Optional[Sequence] = None,
         output_variables: Optional[Sequence] = None,
