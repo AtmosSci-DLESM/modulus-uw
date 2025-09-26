@@ -179,7 +179,7 @@ class BaseCoupler(ABC):
                 if (("-" not in v and oc == v) or (oc == "-".join(v.split("-")[:-1])))
             ]
             missing_channels = set(self.variables) - set(found_channels)
-            raise ValueError(f"Missing variables in output: {missing_channels}")
+            raise ValueError(f"Missing variables in coupled module: {missing_channels}")
         self.coupled_channel_indices = channel_indices
 
     def reset_coupler(self):

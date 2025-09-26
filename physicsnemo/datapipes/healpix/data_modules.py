@@ -246,18 +246,18 @@ class TimeSeriesDataModule:
                 f"Output variables not found in dataset: {missing_output_vars}"
             )
 
-        # Verify that all constants are available in the dataset
-        missing_constants = set(list(self.constants.values())) - set(
-            dataset.channel_c.values
-        )
-        if missing_constants:
-            raise ValueError(f"Constants not found in dataset: {missing_constants}")
-
         dataset = dataset.sel(
             channel_in=self.input_variables,
             channel_out=self.output_variables,
         )
         if self.constants is not None:
+            # Verify that all constants are available in the dataset
+            missing_constants = set(list(self.constants.values())) - set(
+                dataset.channel_c.values
+            )
+            if missing_constants:
+                raise ValueError(f"Constants not found in dataset: {missing_constants}")
+
             dataset = dataset.sel(channel_c=list(self.constants.values()))
 
         if self.splits is not None and self.forecast_init_times is None:
@@ -559,6 +559,7 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
         self.train_noise_seed = train_noise_seed
 
         super().__init__(
+            src_directory,
             dst_directory,
             dataset_name,
             prefix,
@@ -624,18 +625,17 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
                 f"Output variables not found in dataset: {missing_output_vars}"
             )
 
-        # Verify that all constants are available in the dataset
-        missing_constants = set(list(self.constants.values())) - set(
-            dataset.channel_c.values
-        )
-        if missing_constants:
-            raise ValueError(f"Constants not found in dataset: {missing_constants}")
-
         dataset = dataset.sel(
             channel_in=self.input_variables + coupled_variables,
             channel_out=self.output_variables,
         )
         if self.constants is not None:
+            # Verify that all constants are available in the dataset
+            missing_constants = set(list(self.constants.values())) - set(
+                dataset.channel_c.values
+            )
+            if missing_constants:
+                raise ValueError(f"Constants not found in dataset: {missing_constants}")
             dataset = dataset.sel(channel_c=list(self.constants.values()))
 
         if self.splits is not None and self.forecast_init_times is None:

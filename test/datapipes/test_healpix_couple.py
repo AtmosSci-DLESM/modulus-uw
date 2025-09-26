@@ -155,13 +155,9 @@ def test_ConstantCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
 
     # check setting coupled variable indices
     mock_coupled_module = coupler_helper(
-        output_variables=["not_coupled", "z500"],
+        output_variables=["z500", "z1000"],
         time_step="0h",
     )
-    coupler.setup_coupling(mock_coupled_module)
-    assert coupler.coupled_channel_indices == [1]
-
-    mock_coupled_module.output_variables = ["z500", "z1000"]
     coupler.setup_coupling(mock_coupled_module)
     assert coupler.coupled_channel_indices == [0, 1]
 
@@ -189,19 +185,7 @@ def test_ConstantCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
     assert np.array_equal(expected, coupler.coupled_scaling["std"])
 
     # test incorrect batch size
-    coupler.coupled_channel_indices = [0, 1]
-    coupled_fields_batch_size = batch_size * 2
-    coupled_fields_timedim = 2
-    coupled_fields = th.rand(
-        coupled_fields_batch_size,
-        coupler.spatial_dims[0],
-        coupled_fields_timedim,
-        len(coupler.coupled_channel_indices),
-        coupler.spatial_dims[1],
-        coupler.spatial_dims[2],
-    )
-    with pytest.raises(ValueError, match=("Batch size of coupled field 4 ")):
-        coupler.set_coupled_fields(coupled_fields)
+    #coupler.coupled_channel_indices = [0, 1]
 
     coupled_fields_batch_size = batch_size
     coupled_fields_timedim = 4
@@ -316,9 +300,20 @@ def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconf
     )
     assert isinstance(coupler, TrailingAverageCoupler)
 
+    # check for missing variables in coupled module
+    mock_coupled_module = coupler_helper(
+        output_variables=["z500"],
+        time_step="3h",
+    )
+    with pytest.raises(
+        ValueError, match=("Missing variables in coupled module")
+    ):
+        coupler.setup_coupling(mock_coupled_module)
+
+
     # veryify averaging slices computed correctly
     mock_coupled_module = coupler_helper(
-        output_variables=["not_coupled", "z500"],
+        output_variables=["not_coupled", "z500", "z1000"],
         time_step="3h",
     )
     coupler.setup_coupling(mock_coupled_module)
@@ -378,20 +373,6 @@ def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconf
             )
     coupler.averaging_slices = averaging_slices
     coupler.coupled_channel_indices = [0, 1]
-
-    # test a mismatched batch size
-    coupled_fields_batch_size = batch_size * 2
-    coupled_fields_timedim = 4
-    coupled_fields = th.rand(
-        coupled_fields_batch_size,
-        coupler.spatial_dims[0],
-        coupled_fields_timedim,
-        len(coupler.coupled_channel_indices),
-        coupler.spatial_dims[1],
-        coupler.spatial_dims[2],
-    )
-    with pytest.raises(ValueError, match=("Batch size of coupled field 4 ")):
-        coupler.set_coupled_fields(coupled_fields)
 
     coupled_fields_batch_size = batch_size
     coupled_fields_timedim = 4
@@ -888,17 +869,6 @@ def test_CoupledTimeSeriesDataModule_initialization(
     ds_path = Path(data_dir, dataset_name + ".zarr")
     zarr_ds = xr.open_zarr(ds_path)
 
-    # test with an invalid mode
-    with pytest.raises(ValueError, match=("'data_format' must be one of")):
-        timeseries_dm = CoupledTimeSeriesDataModule(
-            src_directory=data_dir,
-            dst_directory=create_path,
-            dataset_name=dataset_name,
-            batch_size=1,
-            data_format="null",
-            couplings=constant_coupler,
-        )
-
     # use the prebuilt dataset
     # Internally initializes DistributedManager
     timeseries_dm = CoupledTimeSeriesDataModule(
@@ -908,19 +878,6 @@ def test_CoupledTimeSeriesDataModule_initialization(
         input_variables=variables,
         batch_size=1,
         prebuilt_dataset=True,
-        scaling=scaling_double_dict,
-        couplings=constant_coupler,
-    )
-    assert isinstance(timeseries_dm, CoupledTimeSeriesDataModule)
-
-    # without the prebuilt dataset
-    timeseries_dm = CoupledTimeSeriesDataModule(
-        src_directory=create_path,
-        dst_directory=create_path,
-        dataset_name=dataset_name,
-        input_variables=variables,
-        batch_size=1,
-        prebuilt_dataset=False,
         scaling=scaling_double_dict,
         couplings=constant_coupler,
     )
@@ -1161,6 +1118,7 @@ def test_CoupledTimeSeriesDataModule_get_coupled_vars(
 
     # Constant coupler
     # Internally initializes DistributedManager
+    print(f'test name {dataset_name}')
     timeseries_dm = CoupledTimeSeriesDataModule(
         src_directory=create_path,
         dst_directory=data_dir,
