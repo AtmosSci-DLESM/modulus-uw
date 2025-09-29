@@ -44,12 +44,7 @@ class ConvGRUBlock(th.nn.Module):
         kernel_size: int = 1,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
-        conv_layer = torch.nn.Conv2d,
-        add_coriolis = False,
-        batch_size: int = 1,
-        nside_in = 64,
     ):
         """
         Parameters
@@ -67,11 +62,6 @@ class ConvGRUBlock(th.nn.Module):
         """
         super().__init__()
 
-        if isinstance(conv_layer, str):
-            conv_layer = get_class(conv_layer)
-        if isinstance(geometry_layer, str):
-            geometry_layer = get_class(geometry_layer)
-
         self.channels = in_channels
         self.conv_gates = geometry_layer(
             layer=conv_layer,
@@ -82,10 +72,6 @@ class ConvGRUBlock(th.nn.Module):
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
             hpx_padding_mode=hpx_padding_mode,
-            enable_torch_compile=enable_torch_compile,
-            add_coriolis=add_coriolis,
-            nside_in=nside_in,
-            batch_size=batch_size,
         )
         self.conv_can = geometry_layer(
             layer=conv_layer,
@@ -96,10 +82,6 @@ class ConvGRUBlock(th.nn.Module):
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
             hpx_padding_mode=hpx_padding_mode,
-            enable_torch_compile=enable_torch_compile,
-            add_coriolis=add_coriolis,
-            nside_in=nside_in,
-            batch_size=batch_size,
         )
         self.h = th.zeros(1, 1, 1, 1)
 
@@ -138,117 +120,6 @@ class ConvGRUBlock(th.nn.Module):
         """Reset the update gates"""
         self.h = th.zeros_like(self.h)
 
-# class ConvGRUBlock(th.nn.Module):
-#     """Class that implements a Convolutional GRU
-#     Code modified from
-#     https://github.com/happyjin/ConvGRU-pytorch/blob/master/convGRU.py
-#     """
-
-#     def __init__(
-#         self,
-#         geometry_layer: th.nn.Module = HEALPixLayer,
-#         in_channels: int = 3,
-#         kernel_size: int = 1,
-#         enable_nhwc: bool = False,
-#         enable_healpixpad: bool = False,
-#         enable_torch_compile: bool = False,
-#         hpx_padding_mode: str = 'karlbauer',
-#         conv_layer = torch.nn.Conv2d,
-#         add_coriolis = False,
-#         batch_size: int = 1,
-#         nside_in = 64,
-#     ):
-#         """
-#         Parameters
-#         ----------
-#         geometry_layer: torch.nn.Module, optional
-#             The wrapper for the geometry layer
-#         in_channels: int, optional
-#             The number of input channels
-#         kernel_size: int, optional
-#             Size of the convolutioonal kernel
-#         enable_nhwc: bool, optional
-#             Enable nhwc format, passed to wrapper
-#         enable_healpixpad: bool, optional
-#             If HEALPixPadding should be enabled, passed to wrapper
-#         """
-#         super().__init__()
-
-#         if isinstance(conv_layer, str):
-#             conv_layer = get_class(conv_layer)
-#         if isinstance(geometry_layer, str):
-#             geometry_layer = get_class(geometry_layer)
-
-#         self.channels = in_channels
-#         self.conv_gates = geometry_layer(
-#             layer=conv_layer,
-#             in_channels=in_channels + self.channels,
-#             out_channels=2 * self.channels,  # for update_gate,reset_gate respectively
-#             kernel_size=kernel_size,
-#             padding="same",
-#             enable_nhwc=enable_nhwc,
-#             enable_healpixpad=enable_healpixpad,
-#             hpx_padding_mode=hpx_padding_mode,
-#             enable_torch_compile=enable_torch_compile,
-#             add_coriolis=add_coriolis,
-#             nside_in=nside_in,
-#             batch_size=batch_size,
-#         )
-#         self.conv_can = geometry_layer(
-#             layer=conv_layer,
-#             in_channels=in_channels + self.channels,
-#             out_channels=self.channels,  # for candidate neural memory
-#             kernel_size=kernel_size,
-#             padding="same",
-#             enable_nhwc=enable_nhwc,
-#             enable_healpixpad=enable_healpixpad,
-#             hpx_padding_mode=hpx_padding_mode,
-#             enable_torch_compile=enable_torch_compile,
-#             add_coriolis=add_coriolis,
-#             nside_in=nside_in,
-#             batch_size=batch_size,
-#         )
-#         # self.h = th.zeros(1, 1, 1, 1)
-#         self.h = None
-        
-#     def forward(self, inputs: Sequence) -> Sequence:
-#         """Forward pass of the ConvGRUBlock
-
-#         Parameters
-#         ----------
-#         inputs: Sequence
-#             Input to the forward pass
-
-#         Returns
-#         -------
-#         Sequence
-#             Result of the forward pass
-#         """
-#         # if inputs.shape != self.h.shape:
-#         #     self.h = th.zeros_like(inputs)
-#         if self.h is None:
-#             self.h = th.zeros_like(inputs)
-#         combined = th.cat([inputs, self.h], dim=1)
-#         combined_conv = self.conv_gates(combined)
-
-#         gamma, beta = th.split(combined_conv, self.channels, dim=1)
-#         reset_gate = th.sigmoid(gamma)
-#         update_gate = th.sigmoid(beta)
-
-#         combined = th.cat([inputs, reset_gate * self.h], dim=1)
-#         cc_cnm = self.conv_can(combined)
-#         cnm = th.tanh(cc_cnm)
-
-#         h_next = (1 - update_gate) * self.h + update_gate * cnm
-#         self.h = h_next
-
-#         return inputs + h_next
-
-#     def reset(self):
-#         """Reset the update gates"""
-#         if self.h is not None:
-#             self.h = th.zeros_like(self.h)
-
 #
 # CONV BLOCKS
 #
@@ -269,12 +140,7 @@ class BasicConvBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
-        conv_layer = torch.nn.Conv2d,
-        add_coriolis = False,
-        batch_size: int = 1,
-        nside_in: int = 64
     ):
         """
         Parameters
@@ -302,11 +168,6 @@ class BasicConvBlock(th.nn.Module):
         """
         super().__init__()
 
-        if isinstance(conv_layer, str):
-            conv_layer = get_class(conv_layer)
-        if isinstance(geometry_layer, str):
-            geometry_layer = get_class(geometry_layer)
-
         if latent_channels is None:
             latent_channels = max(in_channels, out_channels)
         convblock = []
@@ -320,11 +181,7 @@ class BasicConvBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
-                    enable_torch_compile=enable_torch_compile,
                     hpx_padding_mode=hpx_padding_mode,
-                    add_coriolis=add_coriolis,
-                    batch_size=batch_size,
-                    nside_in=nside_in,
                 )
             )
             if activation is not None:
@@ -364,7 +221,6 @@ class ConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
     ):
         """
@@ -404,7 +260,6 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
             )
         # Convolution block
@@ -419,7 +274,6 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
             )
         )
@@ -435,7 +289,6 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
             )
         )
@@ -450,7 +303,6 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
             )
         )
@@ -491,12 +343,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
-        conv_layer = torch.nn.Conv2d,
-        add_coriolis = False,
-        batch_size: int = 1,
-        nside_in: int = 64,
     ):
         """
         Parameters:
@@ -524,11 +371,6 @@ class DoubleConvNeXtBlock(th.nn.Module):
         """
         super().__init__()
 
-        if isinstance(conv_layer, str):
-            conv_layer = get_class(conv_layer)
-        if isinstance(geometry_layer, str):
-            geometry_layer = get_class(geometry_layer)
-
         if in_channels == int(latent_channels):
             self.skip_module1 = (
                 lambda x: x
@@ -541,11 +383,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=add_coriolis,
-                batch_size=batch_size,
-                nside_in=nside_in,
             )
         if out_channels == int(latent_channels):
             self.skip_module2 = (
@@ -559,11 +397,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=add_coriolis,
-                batch_size=batch_size,
-                nside_in=nside_in,
             )
 
         # 1st ConvNeXt block, the output of this one remains internal
@@ -578,11 +412,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=add_coriolis,
-                batch_size=batch_size,
-                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -597,11 +427,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=add_coriolis,
-                batch_size=batch_size,
-                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -616,11 +442,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=add_coriolis,
-                batch_size=batch_size,
-                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -639,11 +461,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=add_coriolis,
-                batch_size=batch_size,
-                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -658,11 +476,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
-                batch_size=batch_size,
-                nside_in=nside_in,
-                add_coriolis=add_coriolis,
             )
         )
         if activation is not None:
@@ -677,11 +491,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=add_coriolis,
-                batch_size=batch_size,
-                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -727,7 +537,6 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         batch_norm: bool = False,
         dropout: float = 0.0,
         conditional_layer_norm: Callable = None,
-        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
     ):
         """
@@ -764,7 +573,6 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                     batch_norm=batch_norm,
                     dropout=dropout,
                     conditional_layer_norm=conditional_layer_norm if conditional_layer_norm is not None else None,
-                    enable_torch_compile=enable_torch_compile,
                     hpx_padding_mode=hpx_padding_mode,
                 ),
             )
@@ -799,10 +607,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         batch_norm: bool = False,
         dropout: float = 0.0,
         conditional_layer_norm: th.nn.Module = None,
-        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
-        conv_layer = torch.nn.Conv2d,
-        add_coriolis = False,
     ):
         """
         Parameters
@@ -840,11 +645,6 @@ class SymmetricConvNeXtBlock(th.nn.Module):
 
         super().__init__()
 
-        if isinstance(conv_layer, str):
-            conv_layer = get_class(conv_layer)
-        if isinstance(geometry_layer, str):
-            geometry_layer = get_class(geometry_layer)
-
         self.use_block_skip_connection = use_block_skip_connection
         self.activation = activation
         self.dropout = dropout > 0.0
@@ -861,9 +661,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     kernel_size=1,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
-                    enable_torch_compile=enable_torch_compile,
                     hpx_padding_mode=hpx_padding_mode,
-                    add_coriolis=add_coriolis,
                 )
 
         # Collect conv->norm->activation->dropout operations in list for sequential execution
@@ -879,9 +677,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=add_coriolis,
             )
         )
         if batch_norm:
@@ -906,9 +702,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=add_coriolis,
             )
         )
         if batch_norm:
@@ -932,9 +726,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=add_coriolis,
             )
         )
         if batch_norm:
@@ -957,9 +749,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=add_coriolis,
             )
         )
         if activation is not None:
@@ -1013,7 +803,6 @@ class MaxPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
     ):
         """
@@ -1034,7 +823,6 @@ class MaxPool(th.nn.Module):
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
-            enable_torch_compile=enable_torch_compile,
             hpx_padding_mode=hpx_padding_mode,
         )
 
@@ -1065,7 +853,6 @@ class AvgPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
     ):
         """
@@ -1081,14 +868,12 @@ class AvgPool(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         """
         super().__init__()
-        if isinstance(geometry_layer, str):
-            geometry_layer = get_class(geometry_layer)
+
         self.avgpool = geometry_layer(
             layer=torch.nn.AvgPool2d,
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
-            enable_torch_compile=enable_torch_compile,
             hpx_padding_mode=hpx_padding_mode,
         )
 
@@ -1126,11 +911,8 @@ class TransposedConvUpsample(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
         add_coriolis = False,
-        batch_size: int = 1,
-        nside_in = 64,
     ):
         """
         Parameters
@@ -1151,9 +933,6 @@ class TransposedConvUpsample(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         """
         super().__init__()
-
-        if isinstance(geometry_layer, str):
-            geometry_layer = get_class(geometry_layer)   
                      
         upsampler = []
         # Upsample transpose conv
@@ -1167,7 +946,6 @@ class TransposedConvUpsample(th.nn.Module):
                 padding=0,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
             )
         )
@@ -1190,117 +968,6 @@ class TransposedConvUpsample(th.nn.Module):
         """
         return self.upsampler(x)
 
-class ResizeConv(th.nn.Module):
-    """
-    Class for sequentially interpolating then applying a simple Conv2d on
-    HEALPix tensor data
-    """
-
-    def __init__(
-        self,
-        geometry_layer: th.nn.Module = HEALPixLayer,
-        in_channels = 3,
-        out_channels = 3,
-        kernel_size = 3,
-        dilation = 1,
-        scale_factor = 2,
-        mode = 'bilinear',
-        enable_nhwc = False,
-        enable_healpixpad = True,
-        enable_torch_compile: bool = False,
-        activation: th.nn.Module = None,
-        hpx_padding_mode: str = 'karlbauer',     
-        conv_layer = torch.nn.Conv2d,
-        add_coriolis = False,
-    ):
-        """
-        Parameters
-        ----------
-        scale_factor: int, optional
-            Multiplier for spatial size, passed to torch.nn.functional.interpolate
-        mode: str, optional
-            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
-        geometry_layer: torch.nn.Module, optional
-            The wrapper for the geometry of the tensor
-        in_channels: int, optional
-            The number of input channels
-        out_channels: int, optional
-            The number of output channels
-        kernel_size: int, optional
-            Size of the convolutional kernel
-        activation: torch.nn.Module, optional
-            Activation function used in upsampling
-        enable_nhwc: bool, optional
-            Enable nhwc format, passed to wrapper
-        enable_healpixpad: bool, optional
-            If HEALPixPadding should be enabled, passed to wrapper
-        """
-        super().__init__()
-
-        if isinstance(conv_layer, str):
-            conv_layer = get_class(conv_layer)
-        if isinstance(geometry_layer, str):
-            geometry_layer = get_class(geometry_layer)
-
-        if dilation > 1:
-            raise Exception(
-                f"dilation > 1 is not currently supported for hpx resize \
-                convolutions, received dilation = {dilation}"
-            )
-
-        # Precompute the amount of extra padding to trim between interpolation
-        # and conv
-        padding = ((kernel_size - 1) // 2) * dilation
-        # trim_size = padding * (scale_factor - 1)
-        trim_size = 2 * padding
-
-        block = []
-        block += [
-            geometry_layer(
-                layer=Interpolate,
-                scale_factor=scale_factor,
-                mode=mode,
-                trim_size=trim_size,
-                enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
-                hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=False,
-            ),
-            geometry_layer(
-                layer=conv_layer,
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=kernel_size,
-                dilation=dilation,
-                enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
-                hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=add_coriolis
-            ),
-        ]
-        if activation is not None:
-            block.append(activation)
-        self.block = th.nn.Sequential(*block)
-
-    def forward(self, x: th.Tensor) -> th.Tensor:
-        """
-        Forward pass of the ResizeConv layer
-
-        Parameters
-        ----------
-        x: torch.Tensor
-            inputs to the forward pass
-
-        Returns
-        -------
-        torch.Tensor
-            result of the forward pass
-        """
-        out = self.block(x)
-        return out
-
 class SmoothedInterpolateConv(th.nn.Module):
     """
     Class for sequentially interpolating then applying a simple Conv2d on
@@ -1316,15 +983,10 @@ class SmoothedInterpolateConv(th.nn.Module):
         dilation = 1,
         scale_factor = 2,
         mode = 'nearest',
+        activation: th.nn.Module = None,
         enable_nhwc = False,
         enable_healpixpad = True,
-        enable_torch_compile: bool = False,
-        activation: th.nn.Module = None,
-        hpx_padding_mode: str = 'karlbauer',     
-        conv_layer = torch.nn.Conv2d,
-        add_coriolis = False,
-        batch_size: int = 1,
-        nside_in: int = 64,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -1349,11 +1011,6 @@ class SmoothedInterpolateConv(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         """
         super().__init__()
-
-        if isinstance(conv_layer, str):
-            conv_layer = get_class(conv_layer)
-        if isinstance(geometry_layer, str):
-            geometry_layer = get_class(geometry_layer)
 
         if dilation > 1:
             raise Exception(
@@ -1374,11 +1031,7 @@ class SmoothedInterpolateConv(th.nn.Module):
                 trim_size=trim_size,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=False,
-                batch_size=batch_size,
-                nside_in=nside_in,
             ),
             geometry_layer(
                 layer=conv_layer,
@@ -1388,11 +1041,7 @@ class SmoothedInterpolateConv(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                enable_torch_compile=enable_torch_compile,
                 hpx_padding_mode=hpx_padding_mode,
-                add_coriolis=add_coriolis,
-                batch_size=batch_size,
-                nside_in=scale_factor*nside_in,
             )
         ]
 
@@ -1420,7 +1069,6 @@ class SmoothedInterpolateConv(th.nn.Module):
 #
 # Helper classes
 #
-
 
 class Interpolate(th.nn.Module):
     """Helper class that handles interpolation
@@ -1477,9 +1125,9 @@ class SmoothedInterpolate(th.nn.Module):
 
     def __init__(
         self,
-        in_channels = 3,
-        scale_factor=2,
-        mode='nearest',
+        in_channels: int = 3,
+        scale_factor: int = 2,
+        mode: str = 'nearest',
         trim_size: int = 0,
     ):
         super().__init__()

@@ -37,8 +37,6 @@ class UNetEncoder(th.nn.Module):
         enable_healpixpad: bool = False,
         enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
-        batch_size: int = 1,
-        nside_in = (64,32,16)
     ):
         """
         Parameters
@@ -97,8 +95,6 @@ class UNetEncoder(th.nn.Module):
                     enable_healpixpad=enable_healpixpad,
                     enable_torch_compile=enable_torch_compile,
                     hpx_padding_mode=hpx_padding_mode,
-                    batch_size=batch_size,
-                    nside_in=nside_in[n],
                 )
             )
             old_channels = curr_channel
