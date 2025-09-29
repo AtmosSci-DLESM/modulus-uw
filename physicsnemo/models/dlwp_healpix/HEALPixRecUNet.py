@@ -66,7 +66,6 @@ class HEALPixRecUNet(Module):
         presteps: int = 1,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        enable_torch_compile: bool = False,
         couplings: list = [],
         hpx_padding_mode: str = 'karlbauer',
         enforce_reflectional_equivariance: bool = False,
@@ -144,7 +143,6 @@ class HEALPixRecUNet(Module):
         self.presteps = presteps
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
-        self.enable_torch_compile = enable_torch_compile
         self.hpx_padding_mode = hpx_padding_mode
         self.enforce_reflectional_equivariance = enforce_reflectional_equivariance
         self.register_buffer("refl_face_order", th.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=th.long))
@@ -165,7 +163,6 @@ class HEALPixRecUNet(Module):
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
-            enable_torch_compile=self.enable_torch_compile,
             hpx_padding_mode=self.hpx_padding_mode,
         )
         self.encoder_depth = len(self.encoder.n_channels)
@@ -174,7 +171,6 @@ class HEALPixRecUNet(Module):
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
-            enable_torch_compile=self.enable_torch_compile,
             hpx_padding_mode=self.hpx_padding_mode,
         )
         
