@@ -21,6 +21,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 
+
 class UNetDecoder(th.nn.Module):
     """Generic UNetDecoder that can be applied to arbitrary meshes."""
 
@@ -138,7 +139,6 @@ class UNetDecoder(th.nn.Module):
             )
 
         self.decoder = th.nn.ModuleList(self.decoder)
-
         # (Linear) Output layer
         self.output_layer = instantiate(
             config=output_layer,
@@ -153,7 +153,7 @@ class UNetDecoder(th.nn.Module):
             nside_in=nside_in[n],
         )
 
-    def forward(self, inputs: Sequence) -> th.Tensor:
+    def forward(self, inputs: Sequence, conditions_cln: Sequence = None) -> th.Tensor:
         """
         Forward pass of the HEALPix Unet decoder
 
@@ -161,6 +161,8 @@ class UNetDecoder(th.nn.Module):
         ----------
         inputs: Sequence
             The inputs to decode
+        conditions_cln: Sequence, optional
+            The conditional inputs for the normalization layers.
 
         Returns
         -------
@@ -171,7 +173,15 @@ class UNetDecoder(th.nn.Module):
             if layer["upsamp"] is not None:
                 up = layer["upsamp"](x)
                 x = th.cat([up, inputs[-1 - n]], dim=self.channel_dim)
-            x = layer["conv"](x)
+            # apply the conv block, check if the layer accepts conditional inputs
+            if conditions_cln is not None:
+                if hasattr(layer["conv"], "cln_enabled") and layer["conv"].cln_enabled:
+                    x = layer["conv"](x, conditions_cln=conditions_cln)
+                else:
+                    raise ValueError("Conditional input passed but conv block does not support conditional inputs.")
+            else:
+                x = layer["conv"](x)
+            # apply the recurrent block if it exists
             if layer["recurrent"] is not None:
                 x = layer["recurrent"](x)
         return self.output_layer(x)
