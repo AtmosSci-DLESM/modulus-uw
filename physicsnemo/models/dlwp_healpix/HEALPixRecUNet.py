@@ -69,7 +69,6 @@ class HEALPixRecUNet(Module):
         enable_torch_compile: bool = False,
         couplings: list = [],
         hpx_padding_mode: str = 'karlbauer',
-        batch_size: int = 1,
         enforce_reflectional_equivariance: bool = False,
         constraints = None,
     ):
@@ -147,7 +146,6 @@ class HEALPixRecUNet(Module):
         self.enable_healpixpad = enable_healpixpad
         self.enable_torch_compile = enable_torch_compile
         self.hpx_padding_mode = hpx_padding_mode
-        self.batch_size = batch_size
         self.enforce_reflectional_equivariance = enforce_reflectional_equivariance
         self.register_buffer("refl_face_order", th.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=th.long))
 
@@ -169,7 +167,6 @@ class HEALPixRecUNet(Module):
             enable_healpixpad=self.enable_healpixpad,
             enable_torch_compile=self.enable_torch_compile,
             hpx_padding_mode=self.hpx_padding_mode,
-            batch_size=self.batch_size,
         )
         self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
@@ -179,12 +176,8 @@ class HEALPixRecUNet(Module):
             enable_healpixpad=self.enable_healpixpad,
             enable_torch_compile=self.enable_torch_compile,
             hpx_padding_mode=self.hpx_padding_mode,
-            batch_size=self.batch_size,
         )
-        self.constraints = None
-        if constraints is not None:
-            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
-            
+        
     @property
     def integration_steps(self):
         """Number of integration steps"""
@@ -567,11 +560,6 @@ class HEALPixRecUNet(Module):
             reshaped = self._reshape_outputs(
                 input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
             )
-            
-            # Apply constraints
-            if self.constraints is not None:
-                for constraint in self.constraints:
-                    reshaped = constraint(reshaped)
 
             outputs.append(reshaped)
 
