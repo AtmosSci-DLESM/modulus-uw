@@ -69,7 +69,6 @@ class HEALPixRecUNet(Module):
         couplings: list = [],
         hpx_padding_mode: str = 'karlbauer',
         enforce_reflectional_equivariance: bool = False,
-        constraints = None,
     ):
         """
         Parameters
@@ -350,10 +349,6 @@ class HEALPixRecUNet(Module):
         x = th.index_select(x, dim=1, index=self.refl_face_order.to(x.device))
         x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
         return x
-
-    def set_constraints(self, constraints):
-        if constraints is not None:
-            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
 
     def _initialize_hidden(
         self, inputs: Sequence, outputs: Sequence, step: int, conditions_cln: Sequence = None

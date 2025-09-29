@@ -35,7 +35,6 @@ class UNetEncoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        enable_torch_compile: bool = False,
         hpx_padding_mode: str = 'karlbauer',
     ):
         """
@@ -79,7 +78,6 @@ class UNetEncoder(th.nn.Module):
                         config=down_sampling_block,
                         enable_nhwc=enable_nhwc,
                         enable_healpixpad=enable_healpixpad,
-                        enable_torch_compile=enable_torch_compile,
                         hpx_padding_mode=hpx_padding_mode,
                     )
                 )
@@ -93,7 +91,6 @@ class UNetEncoder(th.nn.Module):
                     n_layers=n_layers[n],
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
-                    enable_torch_compile=enable_torch_compile,
                     hpx_padding_mode=hpx_padding_mode,
                 )
             )
