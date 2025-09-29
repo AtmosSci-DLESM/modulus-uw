@@ -64,7 +64,7 @@ class ConvGRUBlock(th.nn.Module):
 
         self.channels = in_channels
         self.conv_gates = geometry_layer(
-            layer=conv_layer,
+            layer=torch.nn.Conv2d,
             in_channels=in_channels + self.channels,
             out_channels=2 * self.channels,  # for update_gate,reset_gate respectively
             kernel_size=kernel_size,
@@ -74,7 +74,7 @@ class ConvGRUBlock(th.nn.Module):
             hpx_padding_mode=hpx_padding_mode,
         )
         self.conv_can = geometry_layer(
-            layer=conv_layer,
+            layer=torch.nn.Conv2d,
             in_channels=in_channels + self.channels,
             out_channels=self.channels,  # for candidate neural memory
             kernel_size=kernel_size,
@@ -174,7 +174,7 @@ class BasicConvBlock(th.nn.Module):
         for n in range(n_layers):
             convblock.append(
                 geometry_layer(
-                    layer=conv_layer,
+                    layer=torch.nn.Conv2d,
                     in_channels=in_channels if n == 0 else latent_channels,
                     out_channels=out_channels if n == n_layers - 1 else latent_channels,
                     kernel_size=kernel_size,
@@ -377,7 +377,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
             )  # Identity-function required in forward pass
         else:
             self.skip_module1 = geometry_layer(
-                layer=conv_layer,
+                layer=torch.nn.Conv2d,
                 in_channels=in_channels,
                 out_channels=int(latent_channels),
                 kernel_size=1,
@@ -391,7 +391,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
             )  # Identity-function required in forward pass
         else:
             self.skip_module2 = geometry_layer(
-                layer=conv_layer,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels),
                 out_channels=out_channels,
                 kernel_size=1,
@@ -405,7 +405,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         # 3x3 convolution establishing latent channels channels
         convblock1.append(
             geometry_layer(
-                layer=conv_layer,
+                layer=torch.nn.Conv2d,
                 in_channels=in_channels,
                 out_channels=int(latent_channels),
                 kernel_size=kernel_size,
@@ -420,7 +420,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         # 1x1 convolution establishing increased channels
         convblock1.append(
             geometry_layer(
-                layer=conv_layer,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels),
                 out_channels=int(latent_channels * upscale_factor),
                 kernel_size=1,
@@ -435,7 +435,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         # 1x1 convolution returning to latent channels
         convblock1.append(
             geometry_layer(
-                layer=conv_layer,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels * upscale_factor),
                 out_channels=int(latent_channels),
                 kernel_size=1,
@@ -454,7 +454,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         # 3x3 convolution establishing latent channels channels
         convblock2.append(
             geometry_layer(
-                layer=conv_layer,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels),
                 out_channels=int(latent_channels),
                 kernel_size=kernel_size,
@@ -469,7 +469,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         # 1x1 convolution establishing increased channels
         convblock2.append(
             geometry_layer(
-                layer=conv_layer,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels),
                 out_channels=int(latent_channels * upscale_factor),
                 kernel_size=1,
@@ -484,7 +484,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         # 1x1 convolution reducing to output channels
         convblock2.append(
             geometry_layer(
-                layer=conv_layer,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels * upscale_factor),
                 out_channels=out_channels,
                 kernel_size=1,
@@ -655,7 +655,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 self.skip_module = lambda x: x
             else:
                 self.skip_module = geometry_layer(
-                    layer=conv_layer,
+                    layer=torch.nn.Conv2d,
                     in_channels=in_channels,
                     out_channels=out_channels,
                     kernel_size=1,
@@ -670,7 +670,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 3x3: in → latent
         convblock.append(
             geometry_layer(
-                layer=conv_layer,
+                layer=torch.nn.Conv2d,
                 in_channels=in_channels,
                 out_channels=int(latent_channels),
                 kernel_size=kernel_size,
@@ -695,7 +695,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 1x1: latent → latent * upscale
         convblock.append(
             geometry_layer(
-                layer=conv_layer,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels),
                 out_channels=int(latent_channels * upscale_factor),
                 kernel_size=1,
@@ -719,7 +719,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 1x1: upscale → latent
         convblock.append(
             geometry_layer(
-                layer=conv_layer,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels * upscale_factor),
                 out_channels=int(latent_channels),
                 kernel_size=1,
@@ -742,7 +742,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 3x3: latent → out (no norm on this one, following convnext)
         convblock.append(
             geometry_layer(
-                layer=conv_layer,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels),
                 out_channels=out_channels,
                 kernel_size=kernel_size,
@@ -1034,7 +1034,7 @@ class SmoothedInterpolateConv(th.nn.Module):
                 hpx_padding_mode=hpx_padding_mode,
             ),
             geometry_layer(
-                layer=conv_layer,
+                layer=torch.nn.Conv2d,
                 in_channels=in_channels,
                 out_channels=out_channels,
                 kernel_size=kernel_size,
