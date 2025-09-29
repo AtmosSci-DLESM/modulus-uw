@@ -432,7 +432,7 @@ class HEALPixRecUNet(Module):
                     self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
                 ]
 
-            self.decoder(self.encoder(input_tensor))
+            self.decoder(self.encoder(input_tensor, conditions_cln=conditions_cln), conditions_cln=conditions_cln)
 
             if self.enforce_reflectional_equivariance:
 
@@ -448,7 +448,7 @@ class HEALPixRecUNet(Module):
                                 else orig_hidden_states[n]
 
                 # Forward through model with reflected input
-                self.decoder(self.encoder(self.hpx_reflect(input_tensor)))
+                self.decoder(self.encoder(self.hpx_reflect(input_tensor), conditions_cln=conditions_cln), conditions_cln=conditions_cln)
                 new_hidden_states_refl = [
                     self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
                 ]
