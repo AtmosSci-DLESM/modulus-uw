@@ -69,6 +69,7 @@ class HEALPixRecUNet(Module):
         couplings: list = [],
         hpx_padding_mode: str = 'karlbauer',
         enforce_reflectional_equivariance: bool = False,
+        constraints = None,
     ):
         """
         Parameters
@@ -172,7 +173,10 @@ class HEALPixRecUNet(Module):
             enable_healpixpad=self.enable_healpixpad,
             hpx_padding_mode=self.hpx_padding_mode,
         )
-        
+
+        self.constraints = None
+        self.set_constraints(constraints)
+
     @property
     def integration_steps(self):
         """Number of integration steps"""
@@ -349,6 +353,10 @@ class HEALPixRecUNet(Module):
         x = th.index_select(x, dim=1, index=self.refl_face_order.to(x.device))
         x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
         return x
+
+    def set_constraints(self, constraints):
+        if constraints is not None:
+            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
 
     def _initialize_hidden(
         self, inputs: Sequence, outputs: Sequence, step: int, conditions_cln: Sequence = None
@@ -569,6 +577,11 @@ class HEALPixRecUNet(Module):
             reshaped = self._reshape_outputs(
                 input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
             )
+
+            # Apply constraints
+            if self.constraints is not None:
+                for constraint in self.constraints:
+                    reshaped = constraint(reshaped)
 
             outputs.append(reshaped)
 
