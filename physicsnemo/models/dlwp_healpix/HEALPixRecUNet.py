@@ -70,6 +70,8 @@ class HEALPixRecUNet(Module):
         couplings: list = [],
         hpx_padding_mode: str = 'karlbauer',
         batch_size: int = 1,
+        enforce_reflectional_equivariance: bool = False,
+        constraints = None,
     ):
         """
         Parameters
@@ -146,6 +148,8 @@ class HEALPixRecUNet(Module):
         self.enable_torch_compile = enable_torch_compile
         self.hpx_padding_mode = hpx_padding_mode
         self.batch_size = batch_size
+        self.enforce_reflectional_equivariance = enforce_reflectional_equivariance
+        self.register_buffer("refl_face_order", th.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=th.long))
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -177,7 +181,10 @@ class HEALPixRecUNet(Module):
             hpx_padding_mode=self.hpx_padding_mode,
             batch_size=self.batch_size,
         )
-
+        self.constraints = None
+        if constraints is not None:
+            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
+            
     @property
     def integration_steps(self):
         """Number of integration steps"""
@@ -344,6 +351,21 @@ class HEALPixRecUNet(Module):
 
         return res
 
+    def hpx_reflect(self, x):
+        '''
+        Helper function to reflect a HPX tensor across its horizontal axis.
+        Assumes x has shape [B*F,C,H,W]
+        '''
+        x = th.rot90(th.flip(x, dims=[3]), dims=(-1,-2))
+        x = x.reshape(-1, 12, *x.shape[1:])
+        x = th.index_select(x, dim=1, index=self.refl_face_order.to(x.device))
+        x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
+        return x
+
+    def set_constraints(self, constraints):
+        if constraints is not None:
+            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
+
     def _initialize_hidden(
         self, inputs: Sequence, outputs: Sequence, step: int
     ) -> None:
@@ -401,7 +423,38 @@ class HEALPixRecUNet(Module):
                         inputs=[outputs[s - 1]] + list(inputs[1:]), step=s + 1
                     )
             # Forward the data through the model to initialize hidden states
+            
+            # Save initial hidden states
+            if self.enforce_reflectional_equivariance:
+                orig_hidden_states = [
+                    self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
+                ]
+
             self.decoder(self.encoder(input_tensor))
+
+            if self.enforce_reflectional_equivariance:
+
+                new_hidden_states = [
+                    self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
+                ]
+
+                # Reset hidden states to original
+                for n in range(len(self.decoder.decoder)):
+                    self.decoder.decoder[n].recurrent.h = \
+                        self.hpx_reflect(orig_hidden_states[n]) \
+                            if orig_hidden_states[n].shape != (1,1,1,1) \
+                                else orig_hidden_states[n]
+
+                # Forward through model with reflected input
+                self.decoder(self.encoder(self.hpx_reflect(input_tensor)))
+                new_hidden_states_refl = [
+                    self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
+                ]
+                
+                # Average of new hidden states resulting from the default forward
+                # pass and the reflected forward pass
+                for n in range(len(self.decoder.decoder)):
+                    self.decoder.decoder[n].recurrent.h = 0.5 * (new_hidden_states[n] + self.hpx_reflect(new_hidden_states_refl[n]))
 
     def forward(self, inputs: Sequence, output_only_last=False) -> th.Tensor:
         """
@@ -470,23 +523,56 @@ class HEALPixRecUNet(Module):
                     )
 
             # Forward through model
+
+            # Save original hidden states if enforcing reflectional equivariance
+            if self.enforce_reflectional_equivariance:
+                orig_hidden_states = [
+                    self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
+                ]
+
             encodings = self.encoder(input_tensor)
             decodings = self.decoder(encodings)
 
-            # steady_state_tendency = th.load('/pscratch/sd/y/yikwill/datasets/29ch_model_steady_state_tendency_retrain.pt')
-            # decodings -= steady_state_tendency
+            if self.enforce_reflectional_equivariance:
 
+                new_hidden_states = [
+                    self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
+                ]
+                
+                # Reset hidden states to original
+                for n in range(len(self.decoder.decoder)):
+                    self.decoder.decoder[n].recurrent.h = \
+                        self.hpx_reflect(orig_hidden_states[n]) \
+                            if orig_hidden_states[n].shape != (1,1,1,1) \
+                                else orig_hidden_states[n]
+
+                # Forward through model with reflected input
+                input_tensor_refl = self.hpx_reflect(input_tensor)
+                encodings_refl = self.encoder(input_tensor_refl)
+                decodings_refl = self.decoder(encodings_refl)                
+
+                new_hidden_states_refl = [
+                    self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
+                ]
+
+                # Average of new hidden states resulting from the default forward
+                # pass and the reflected forward pass
+                for n in range(len(self.decoder.decoder)):
+                    self.decoder.decoder[n].recurrent.h = 0.5 * (new_hidden_states[n] + self.hpx_reflect(new_hidden_states_refl[n]))
+
+                # Average of decodings ()
+                decodings = 0.5 * (decodings + self.hpx_reflect(decodings_refl))
+            
             # Residual prediction
             reshaped = self._reshape_outputs(
                 input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
             )
-            # if step == 0:
-            #     print(f'input_tensor.shape={input_tensor.shape}')
-            #     print(f'decodings.shape={decodings.shape}')
-            #     print(f'test shape={(decodings-input_tensor[:, : self.input_channels * self.input_time_dim]).shape}')
-            #     steady_state_tendency = decodings-input_tensor[:, : self.input_channels * self.input_time_dim]
-            #     th.save(decodings, '/pscratch/sd/y/yikwill/datasets/29ch_model_steady_state_tendency_retrain.pt')
-            #     print(f'SAVED')
+            
+            # Apply constraints
+            if self.constraints is not None:
+                for constraint in self.constraints:
+                    reshaped = constraint(reshaped)
+
             outputs.append(reshaped)
 
         if output_only_last:
