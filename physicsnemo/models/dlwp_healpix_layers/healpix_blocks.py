@@ -21,6 +21,8 @@ import torch as th
 
 from .healpix_layers import HEALPixLayer
 
+from hydra.utils import get_class
+
 #
 # RECURRENT BLOCKS
 #
@@ -39,6 +41,12 @@ class ConvGRUBlock(th.nn.Module):
         kernel_size: int = 1,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
+        conv_layer = torch.nn.Conv2d,
+        add_coriolis = False,
+        batch_size: int = 1,
+        nside_in = 64,
     ):
         """
         Parameters
@@ -56,24 +64,39 @@ class ConvGRUBlock(th.nn.Module):
         """
         super().__init__()
 
+        if isinstance(conv_layer, str):
+            conv_layer = get_class(conv_layer)
+        if isinstance(geometry_layer, str):
+            geometry_layer = get_class(geometry_layer)
+
         self.channels = in_channels
         self.conv_gates = geometry_layer(
-            layer=torch.nn.Conv2d,
+            layer=conv_layer,
             in_channels=in_channels + self.channels,
             out_channels=2 * self.channels,  # for update_gate,reset_gate respectively
             kernel_size=kernel_size,
             padding="same",
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
+            enable_torch_compile=enable_torch_compile,
+            add_coriolis=add_coriolis,
+            nside_in=nside_in,
+            batch_size=batch_size,
         )
         self.conv_can = geometry_layer(
-            layer=torch.nn.Conv2d,
+            layer=conv_layer,
             in_channels=in_channels + self.channels,
             out_channels=self.channels,  # for candidate neural memory
             kernel_size=kernel_size,
             padding="same",
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
+            enable_torch_compile=enable_torch_compile,
+            add_coriolis=add_coriolis,
+            nside_in=nside_in,
+            batch_size=batch_size,
         )
         self.h = th.zeros(1, 1, 1, 1)
 
@@ -112,6 +135,116 @@ class ConvGRUBlock(th.nn.Module):
         """Reset the update gates"""
         self.h = th.zeros_like(self.h)
 
+# class ConvGRUBlock(th.nn.Module):
+#     """Class that implements a Convolutional GRU
+#     Code modified from
+#     https://github.com/happyjin/ConvGRU-pytorch/blob/master/convGRU.py
+#     """
+
+#     def __init__(
+#         self,
+#         geometry_layer: th.nn.Module = HEALPixLayer,
+#         in_channels: int = 3,
+#         kernel_size: int = 1,
+#         enable_nhwc: bool = False,
+#         enable_healpixpad: bool = False,
+#         enable_torch_compile: bool = False,
+#         hpx_padding_mode: str = 'karlbauer',
+#         conv_layer = torch.nn.Conv2d,
+#         add_coriolis = False,
+#         batch_size: int = 1,
+#         nside_in = 64,
+#     ):
+#         """
+#         Parameters
+#         ----------
+#         geometry_layer: torch.nn.Module, optional
+#             The wrapper for the geometry layer
+#         in_channels: int, optional
+#             The number of input channels
+#         kernel_size: int, optional
+#             Size of the convolutioonal kernel
+#         enable_nhwc: bool, optional
+#             Enable nhwc format, passed to wrapper
+#         enable_healpixpad: bool, optional
+#             If HEALPixPadding should be enabled, passed to wrapper
+#         """
+#         super().__init__()
+
+#         if isinstance(conv_layer, str):
+#             conv_layer = get_class(conv_layer)
+#         if isinstance(geometry_layer, str):
+#             geometry_layer = get_class(geometry_layer)
+
+#         self.channels = in_channels
+#         self.conv_gates = geometry_layer(
+#             layer=conv_layer,
+#             in_channels=in_channels + self.channels,
+#             out_channels=2 * self.channels,  # for update_gate,reset_gate respectively
+#             kernel_size=kernel_size,
+#             padding="same",
+#             enable_nhwc=enable_nhwc,
+#             enable_healpixpad=enable_healpixpad,
+#             hpx_padding_mode=hpx_padding_mode,
+#             enable_torch_compile=enable_torch_compile,
+#             add_coriolis=add_coriolis,
+#             nside_in=nside_in,
+#             batch_size=batch_size,
+#         )
+#         self.conv_can = geometry_layer(
+#             layer=conv_layer,
+#             in_channels=in_channels + self.channels,
+#             out_channels=self.channels,  # for candidate neural memory
+#             kernel_size=kernel_size,
+#             padding="same",
+#             enable_nhwc=enable_nhwc,
+#             enable_healpixpad=enable_healpixpad,
+#             hpx_padding_mode=hpx_padding_mode,
+#             enable_torch_compile=enable_torch_compile,
+#             add_coriolis=add_coriolis,
+#             nside_in=nside_in,
+#             batch_size=batch_size,
+#         )
+#         # self.h = th.zeros(1, 1, 1, 1)
+#         self.h = None
+        
+#     def forward(self, inputs: Sequence) -> Sequence:
+#         """Forward pass of the ConvGRUBlock
+
+#         Parameters
+#         ----------
+#         inputs: Sequence
+#             Input to the forward pass
+
+#         Returns
+#         -------
+#         Sequence
+#             Result of the forward pass
+#         """
+#         # if inputs.shape != self.h.shape:
+#         #     self.h = th.zeros_like(inputs)
+#         if self.h is None:
+#             self.h = th.zeros_like(inputs)
+#         combined = th.cat([inputs, self.h], dim=1)
+#         combined_conv = self.conv_gates(combined)
+
+#         gamma, beta = th.split(combined_conv, self.channels, dim=1)
+#         reset_gate = th.sigmoid(gamma)
+#         update_gate = th.sigmoid(beta)
+
+#         combined = th.cat([inputs, reset_gate * self.h], dim=1)
+#         cc_cnm = self.conv_can(combined)
+#         cnm = th.tanh(cc_cnm)
+
+#         h_next = (1 - update_gate) * self.h + update_gate * cnm
+#         self.h = h_next
+
+#         return inputs + h_next
+
+#     def reset(self):
+#         """Reset the update gates"""
+#         if self.h is not None:
+#             self.h = th.zeros_like(self.h)
 
 #
 # CONV BLOCKS
@@ -133,6 +266,12 @@ class BasicConvBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
+        conv_layer = torch.nn.Conv2d,
+        add_coriolis = False,
+        batch_size: int = 1,
+        nside_in: int = 64
     ):
         """
         Parameters
@@ -159,19 +298,30 @@ class BasicConvBlock(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         """
         super().__init__()
+
+        if isinstance(conv_layer, str):
+            conv_layer = get_class(conv_layer)
+        if isinstance(geometry_layer, str):
+            geometry_layer = get_class(geometry_layer)
+
         if latent_channels is None:
             latent_channels = max(in_channels, out_channels)
         convblock = []
         for n in range(n_layers):
             convblock.append(
                 geometry_layer(
-                    layer=torch.nn.Conv2d,
+                    layer=conv_layer,
                     in_channels=in_channels if n == 0 else latent_channels,
                     out_channels=out_channels if n == n_layers - 1 else latent_channels,
                     kernel_size=kernel_size,
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    enable_torch_compile=enable_torch_compile,
+                    hpx_padding_mode=hpx_padding_mode,
+                    add_coriolis=add_coriolis,
+                    batch_size=batch_size,
+                    nside_in=nside_in,
                 )
             )
             if activation is not None:
@@ -193,7 +343,6 @@ class BasicConvBlock(th.nn.Module):
         """
         return self.convblock(x)
 
-
 class ConvNeXtBlock(th.nn.Module):
     """Class implementing a modified ConvNeXt network as described in https://arxiv.org/pdf/2201.03545.pdf
     and shown in figure 4
@@ -212,6 +361,8 @@ class ConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -250,6 +401,8 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
             )
         # Convolution block
         convblock = []
@@ -263,6 +416,8 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -277,6 +432,8 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -290,6 +447,8 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         self.convblock = th.nn.Sequential(*convblock)
@@ -329,6 +488,12 @@ class DoubleConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
+        conv_layer = torch.nn.Conv2d,
+        add_coriolis = False,
+        batch_size: int = 1,
+        nside_in: int = 64,
     ):
         """
         Parameters:
@@ -356,18 +521,28 @@ class DoubleConvNeXtBlock(th.nn.Module):
         """
         super().__init__()
 
+        if isinstance(conv_layer, str):
+            conv_layer = get_class(conv_layer)
+        if isinstance(geometry_layer, str):
+            geometry_layer = get_class(geometry_layer)
+
         if in_channels == int(latent_channels):
             self.skip_module1 = (
                 lambda x: x
             )  # Identity-function required in forward pass
         else:
             self.skip_module1 = geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=in_channels,
                 out_channels=int(latent_channels),
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=nside_in,
             )
         if out_channels == int(latent_channels):
             self.skip_module2 = (
@@ -375,12 +550,17 @@ class DoubleConvNeXtBlock(th.nn.Module):
             )  # Identity-function required in forward pass
         else:
             self.skip_module2 = geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=int(latent_channels),
                 out_channels=out_channels,
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=nside_in,
             )
 
         # 1st ConvNeXt block, the output of this one remains internal
@@ -388,13 +568,18 @@ class DoubleConvNeXtBlock(th.nn.Module):
         # 3x3 convolution establishing latent channels channels
         convblock1.append(
             geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=in_channels,
                 out_channels=int(latent_channels),
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -402,13 +587,18 @@ class DoubleConvNeXtBlock(th.nn.Module):
         # 1x1 convolution establishing increased channels
         convblock1.append(
             geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=int(latent_channels),
                 out_channels=int(latent_channels * upscale_factor),
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -416,13 +606,18 @@ class DoubleConvNeXtBlock(th.nn.Module):
         # 1x1 convolution returning to latent channels
         convblock1.append(
             geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=int(latent_channels * upscale_factor),
                 out_channels=int(latent_channels),
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -434,13 +629,18 @@ class DoubleConvNeXtBlock(th.nn.Module):
         # 3x3 convolution establishing latent channels channels
         convblock2.append(
             geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=int(latent_channels),
                 out_channels=int(latent_channels),
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -448,13 +648,18 @@ class DoubleConvNeXtBlock(th.nn.Module):
         # 1x1 convolution establishing increased channels
         convblock2.append(
             geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=int(latent_channels),
                 out_channels=int(latent_channels * upscale_factor),
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                batch_size=batch_size,
+                nside_in=nside_in,
+                add_coriolis=add_coriolis,
             )
         )
         if activation is not None:
@@ -462,13 +667,18 @@ class DoubleConvNeXtBlock(th.nn.Module):
         # 1x1 convolution reducing to output channels
         convblock2.append(
             geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=int(latent_channels * upscale_factor),
                 out_channels=out_channels,
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=nside_in,
             )
         )
         if activation is not None:
@@ -512,6 +722,8 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -540,6 +752,8 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                     activation=activation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    enable_torch_compile=enable_torch_compile,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
 
@@ -569,6 +783,11 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        use_block_skip_connection: bool = True,
+        enable_torch_compile: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
+        conv_layer = torch.nn.Conv2d,
+        add_coriolis = False,
     ):
         """
         Parameters
@@ -593,33 +812,49 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             Enable nhwc format, passed to wrapper
         enable_healpixpad: bool, optional
             If HEALPixPadding should be enabled, passed to wrapper
+        use_block_skip_connection: bool, optional
+            Whether or not to use block-level skip connection
         """
         super().__init__()
 
-        if in_channels == int(latent_channels):
-            self.skip_module = lambda x: x  # Identity-function required in forward pass
-        else:
-            self.skip_module = geometry_layer(
-                layer=torch.nn.Conv2d,
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=1,
-                enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
-            )
+        self.use_block_skip_connection = use_block_skip_connection
+
+        if isinstance(conv_layer, str):
+            conv_layer = get_class(conv_layer)
+        if isinstance(geometry_layer, str):
+            geometry_layer = get_class(geometry_layer)
+
+        if use_block_skip_connection:
+            if in_channels == int(latent_channels):
+                self.skip_module = lambda x: x  # Identity-function required in forward pass
+            else:
+                self.skip_module = geometry_layer(
+                    layer=conv_layer,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=1,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                    enable_torch_compile=enable_torch_compile,
+                    hpx_padding_mode=hpx_padding_mode,
+                    add_coriolis=add_coriolis,
+                )
 
         # 1st ConvNeXt block, the output of this one remains internal
         convblock = []
         # 3x3 convolution establishing latent channels channels
         convblock.append(
             geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=in_channels,
                 out_channels=int(latent_channels),
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
             )
         )
         if activation is not None:
@@ -627,13 +862,16 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 1x1 convolution establishing increased channels
         convblock.append(
             geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=int(latent_channels),
                 out_channels=int(latent_channels * upscale_factor),
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
             )
         )
         if activation is not None:
@@ -641,13 +879,16 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 1x1 convolution returning to latent channels
         convblock.append(
             geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=int(latent_channels * upscale_factor),
                 out_channels=int(latent_channels),
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
             )
         )
         if activation is not None:
@@ -655,13 +896,16 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 3x3 convolution from latent channels to latent channels
         convblock.append(
             geometry_layer(
-                layer=torch.nn.Conv2d,
+                layer=conv_layer,
                 in_channels=int(latent_channels),
                 out_channels=out_channels,  # int(latent_channels),
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
             )
         )
         if activation is not None:
@@ -682,7 +926,10 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             result of the forward pass
         """
         # residual connection with reshaped inpute and output of conv block
-        return self.skip_module(x) + self.convblock(x)
+        if self.use_block_skip_connection:
+            return self.skip_module(x) + self.convblock(x)
+        else:
+            return self.convblock(x)
 
 
 #
@@ -701,6 +948,8 @@ class MaxPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -720,6 +969,8 @@ class MaxPool(th.nn.Module):
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            enable_torch_compile=enable_torch_compile,
+            hpx_padding_mode=hpx_padding_mode,
         )
 
     def forward(self, x):
@@ -749,6 +1000,8 @@ class AvgPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -763,11 +1016,15 @@ class AvgPool(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         """
         super().__init__()
+        if isinstance(geometry_layer, str):
+            geometry_layer = get_class(geometry_layer)
         self.avgpool = geometry_layer(
             layer=torch.nn.AvgPool2d,
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            enable_torch_compile=enable_torch_compile,
+            hpx_padding_mode=hpx_padding_mode,
         )
 
     def forward(self, x):
@@ -784,7 +1041,6 @@ class AvgPool(th.nn.Module):
             The averaged values
         """
         return self.avgpool(x)
-
 
 #
 # UPSAMPLING BLOCKS
@@ -805,6 +1061,11 @@ class TransposedConvUpsample(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        enable_torch_compile: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
+        add_coriolis = False,
+        batch_size: int = 1,
+        nside_in = 64,
     ):
         """
         Parameters
@@ -825,6 +1086,10 @@ class TransposedConvUpsample(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         """
         super().__init__()
+
+        if isinstance(geometry_layer, str):
+            geometry_layer = get_class(geometry_layer)   
+                     
         upsampler = []
         # Upsample transpose conv
         upsampler.append(
@@ -837,6 +1102,8 @@ class TransposedConvUpsample(th.nn.Module):
                 padding=0,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -858,6 +1125,232 @@ class TransposedConvUpsample(th.nn.Module):
         """
         return self.upsampler(x)
 
+class ResizeConv(th.nn.Module):
+    """
+    Class for sequentially interpolating then applying a simple Conv2d on
+    HEALPix tensor data
+    """
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels = 3,
+        out_channels = 3,
+        kernel_size = 3,
+        dilation = 1,
+        scale_factor = 2,
+        mode = 'bilinear',
+        enable_nhwc = False,
+        enable_healpixpad = True,
+        enable_torch_compile: bool = False,
+        activation: th.nn.Module = None,
+        hpx_padding_mode: str = 'karlbauer',     
+        conv_layer = torch.nn.Conv2d,
+        add_coriolis = False,
+    ):
+        """
+        Parameters
+        ----------
+        scale_factor: int, optional
+            Multiplier for spatial size, passed to torch.nn.functional.interpolate
+        mode: str, optional
+            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
+        geometry_layer: torch.nn.Module, optional
+            The wrapper for the geometry of the tensor
+        in_channels: int, optional
+            The number of input channels
+        out_channels: int, optional
+            The number of output channels
+        kernel_size: int, optional
+            Size of the convolutional kernel
+        activation: torch.nn.Module, optional
+            Activation function used in upsampling
+        enable_nhwc: bool, optional
+            Enable nhwc format, passed to wrapper
+        enable_healpixpad: bool, optional
+            If HEALPixPadding should be enabled, passed to wrapper
+        """
+        super().__init__()
+
+        if isinstance(conv_layer, str):
+            conv_layer = get_class(conv_layer)
+        if isinstance(geometry_layer, str):
+            geometry_layer = get_class(geometry_layer)
+
+        if dilation > 1:
+            raise Exception(
+                f"dilation > 1 is not currently supported for hpx resize \
+                convolutions, received dilation = {dilation}"
+            )
+
+        # Precompute the amount of extra padding to trim between interpolation
+        # and conv
+        padding = ((kernel_size - 1) // 2) * dilation
+        # trim_size = padding * (scale_factor - 1)
+        trim_size = 2 * padding
+
+        block = []
+        block += [
+            geometry_layer(
+                layer=Interpolate,
+                scale_factor=scale_factor,
+                mode=mode,
+                trim_size=trim_size,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=False,
+            ),
+            geometry_layer(
+                layer=conv_layer,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis
+            ),
+        ]
+        if activation is not None:
+            block.append(activation)
+        self.block = th.nn.Sequential(*block)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """
+        Forward pass of the ResizeConv layer
+
+        Parameters
+        ----------
+        x: torch.Tensor
+            inputs to the forward pass
+
+        Returns
+        -------
+        torch.Tensor
+            result of the forward pass
+        """
+        out = self.block(x)
+        return out
+
+class SmoothedInterpolateConv(th.nn.Module):
+    """
+    Class for sequentially interpolating then applying a simple Conv2d on
+    HEALPix tensor data
+    """
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels = 3,
+        out_channels = 3,
+        kernel_size = 3,
+        dilation = 1,
+        scale_factor = 2,
+        mode = 'nearest',
+        enable_nhwc = False,
+        enable_healpixpad = True,
+        enable_torch_compile: bool = False,
+        activation: th.nn.Module = None,
+        hpx_padding_mode: str = 'karlbauer',     
+        conv_layer = torch.nn.Conv2d,
+        add_coriolis = False,
+        batch_size: int = 1,
+        nside_in: int = 64,
+    ):
+        """
+        Parameters
+        ----------
+        scale_factor: int, optional
+            Multiplier for spatial size, passed to torch.nn.functional.interpolate
+        mode: str, optional
+            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
+        geometry_layer: torch.nn.Module, optional
+            The wrapper for the geometry of the tensor
+        in_channels: int, optional
+            The number of input channels
+        out_channels: int, optional
+            The number of output channels
+        kernel_size: int, optional
+            Size of the convolutional kernel
+        activation: torch.nn.Module, optional
+            Activation function used in upsampling
+        enable_nhwc: bool, optional
+            Enable nhwc format, passed to wrapper
+        enable_healpixpad: bool, optional
+            If HEALPixPadding should be enabled, passed to wrapper
+        """
+        super().__init__()
+
+        if isinstance(conv_layer, str):
+            conv_layer = get_class(conv_layer)
+        if isinstance(geometry_layer, str):
+            geometry_layer = get_class(geometry_layer)
+
+        if dilation > 1:
+            raise Exception(
+                f"dilation > 1 is not currently supported for hpx resize \
+                convolutions, received dilation = {dilation}"
+            )
+
+        # TODO: explain this
+        trim_size = 1 
+
+        block = []
+        block += [
+            geometry_layer(
+                layer=SmoothedInterpolate,
+                in_channels=in_channels,
+                scale_factor=scale_factor,
+                mode=mode,
+                trim_size=trim_size,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=False,
+                batch_size=batch_size,
+                nside_in=nside_in,
+            ),
+            geometry_layer(
+                layer=conv_layer,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+                enable_torch_compile=enable_torch_compile,
+                hpx_padding_mode=hpx_padding_mode,
+                add_coriolis=add_coriolis,
+                batch_size=batch_size,
+                nside_in=scale_factor*nside_in,
+            )
+        ]
+
+        if activation is not None:
+            block.append(activation)
+        self.block = th.nn.Sequential(*block)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """
+        Forward pass of the ResizeConv layer
+
+        Parameters
+        ----------
+        x: torch.Tensor
+            inputs to the forward pass
+
+        Returns
+        -------
+        torch.Tensor
+            result of the forward pass
+        """
+        x = self.block(x)
+        return x
 
 #
 # Helper classes
@@ -869,7 +1362,17 @@ class Interpolate(th.nn.Module):
     This is done as a class so that scale and mode can be stored
     """
 
-    def __init__(self, scale_factor: Union[int, Tuple], mode: str = "nearest"):
+    def __init__(
+        self,
+        scale_factor: Union[int, Tuple],
+        mode: str = "nearest",
+        trim_size: int = 0,
+        # Options below are not used but needed for hydra instantiation to work
+        in_channels = 3,
+        out_channels = 3,
+        enable_nhwc = False,
+        enable_healpixpad = True,
+    ):
         """
         Parameters:
         ----------
@@ -877,11 +1380,15 @@ class Interpolate(th.nn.Module):
             Multiplier for spatial size, passed to torch.nn.functional.interpolate
         mode: str, optional
             Interpolation mode used for upsampling, passed to torch.nn.functional.interpolate
+        trim_size: int, optional
+            Number of rows/columns to trim after interpolation, useful if interpolation
+            immediately follows a HPX padding layer to avoid edge artifacts
         """
         super().__init__()
         self.interp = th.nn.functional.interpolate
         self.scale_factor = scale_factor
         self.mode = mode
+        self.trim_size = trim_size
 
     def forward(self, inputs):
         """Forward pass of the Interpolate layer
@@ -896,4 +1403,48 @@ class Interpolate(th.nn.Module):
         torch.Tensor
             the interpolated values
         """
-        return self.interp(inputs, scale_factor=self.scale_factor, mode=self.mode)
+        x = self.interp(inputs, scale_factor=self.scale_factor, mode=self.mode)
+        if self.trim_size > 0:
+            x = x[..., self.trim_size:-self.trim_size, self.trim_size:-self.trim_size]
+        return x
+
+class SmoothedInterpolate(th.nn.Module):
+
+    def __init__(
+        self,
+        in_channels = 3,
+        scale_factor=2,
+        mode='nearest',
+        trim_size: int = 0,
+    ):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.scale_factor = scale_factor
+        self.mode = mode
+        self.trim_size = trim_size
+        self.interp = th.nn.functional.interpolate
+
+        self.smoother_kernel = torch.tensor(
+            [[0.,1.,0.],
+             [1.,0.,1.],
+             [0.,1.,0.]]
+        )
+        self.smoother_kernel = self.smoother_kernel.unsqueeze(0).unsqueeze(0)  # shape (1,1,3,3)
+        self.smoother_kernel = self.smoother_kernel.repeat((in_channels,1,1,1))
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        self.smoother_kernel = self.smoother_kernel.to(device=x.device, dtype=x.dtype)
+
+        x = self.interp(x, scale_factor=self.scale_factor, mode=self.mode)
+        x = torch.nn.functional.conv2d(
+            x,
+            self.smoother_kernel,
+            padding=0,
+            groups=self.in_channels
+        ) / 4 # divide by 4 to take average of 4 neighbors
+
+        if self.trim_size > 0:
+            x = x[..., self.trim_size:-self.trim_size, self.trim_size:-self.trim_size]
+
+        return x
