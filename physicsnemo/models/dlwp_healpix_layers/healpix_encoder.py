@@ -85,7 +85,6 @@ class UNetEncoder(th.nn.Module):
                         hpx_padding_mode=hpx_padding_mode,
                     )
                 )
-
             modules.append(
                 instantiate(
                     config=conv_block,
@@ -108,23 +107,35 @@ class UNetEncoder(th.nn.Module):
 
         self.encoder = th.nn.ModuleList(self.encoder)
 
-    def forward(self, inputs: Sequence) -> Sequence:
+    def forward(self, inputs: Sequence, conditions_cln: th.Tensor=None) -> Sequence:
         """
         Forward pass of the HEALPix Unet encoder
 
         Parameters
         ----------
         inputs: Sequence
-            The inputs to enccode
+            The inputs to encode
+        conditions_cln: th.Tensor: optional
+            The conditional inputs for the normalization layers.
 
         Returns
         -------
         Sequence: The encoded values
         """
         outputs = []
-        for layer in self.encoder:
-            outputs.append(layer(inputs))
+        for layer_group in self.encoder:
+            interim_output = inputs
+            for layer in layer_group:
+                # check if class accepts cln inputs
+                if getattr(layer, 'cln_enabled', False):
+                    if conditions_cln is None:
+                        raise ValueError("Conditional inputs are required for layers with cln_enabled=True")
+                    interim_output = layer(interim_output, conditions_cln=conditions_cln)
+                else:
+                    interim_output = layer(interim_output)
+            outputs.append(interim_output)
             inputs = outputs[-1]
+        # Return the outputs of the last layer
         return outputs
 
     def reset(self):
