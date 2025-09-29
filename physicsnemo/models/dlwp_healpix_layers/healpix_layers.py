@@ -1050,8 +1050,8 @@ class HEALPixLayer(th.nn.Module):
                 layers.append(
                     HEALPixPadding(
                         padding=padding,
-                        hpx_padding_mode=hpx_padding_mode,
                         enable_nhwc=enable_nhwc,
+                        hpx_padding_mode=hpx_padding_mode,
                     )
                 )
 
