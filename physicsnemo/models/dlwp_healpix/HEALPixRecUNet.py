@@ -67,8 +67,6 @@ class HEALPixRecUNet(Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         couplings: list = [],
-        hpx_padding_mode: str = 'karlbauer',
-        enforce_reflectional_equivariance: bool = False,
         constraints = None,
     ):
         """
@@ -332,17 +330,6 @@ class HEALPixRecUNet(Module):
         )
 
         return res
-
-    def hpx_reflect(self, x):
-        '''
-        Helper function to reflect a HPX tensor across its horizontal axis.
-        Assumes x has shape [B*F,C,H,W]
-        '''
-        x = th.rot90(th.flip(x, dims=[3]), dims=(-1,-2))
-        x = x.reshape(-1, 12, *x.shape[1:])
-        x = th.index_select(x, dim=1, index=self.refl_face_order.to(x.device))
-        x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
-        return x
 
     def set_constraints(self, constraints):
         if constraints is not None:
