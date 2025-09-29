@@ -912,7 +912,6 @@ class TransposedConvUpsample(th.nn.Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         hpx_padding_mode: str = 'karlbauer',
-        add_coriolis = False,
     ):
         """
         Parameters
@@ -1075,17 +1074,7 @@ class Interpolate(th.nn.Module):
     This is done as a class so that scale and mode can be stored
     """
 
-    def __init__(
-        self,
-        scale_factor: Union[int, Tuple],
-        mode: str = "nearest",
-        trim_size: int = 0,
-        # Options below are not used but needed for hydra instantiation to work
-        in_channels = 3,
-        out_channels = 3,
-        enable_nhwc = False,
-        enable_healpixpad = True,
-    ):
+    def __init__(self, scale_factor: Union[int, Tuple], mode: str = "nearest"):
         """
         Parameters:
         ----------
@@ -1093,15 +1082,11 @@ class Interpolate(th.nn.Module):
             Multiplier for spatial size, passed to torch.nn.functional.interpolate
         mode: str, optional
             Interpolation mode used for upsampling, passed to torch.nn.functional.interpolate
-        trim_size: int, optional
-            Number of rows/columns to trim after interpolation, useful if interpolation
-            immediately follows a HPX padding layer to avoid edge artifacts
         """
         super().__init__()
         self.interp = th.nn.functional.interpolate
         self.scale_factor = scale_factor
         self.mode = mode
-        self.trim_size = trim_size
 
     def forward(self, inputs):
         """Forward pass of the Interpolate layer
@@ -1116,10 +1101,7 @@ class Interpolate(th.nn.Module):
         torch.Tensor
             the interpolated values
         """
-        x = self.interp(inputs, scale_factor=self.scale_factor, mode=self.mode)
-        if self.trim_size > 0:
-            x = x[..., self.trim_size:-self.trim_size, self.trim_size:-self.trim_size]
-        return x
+        return self.interp(inputs, scale_factor=self.scale_factor, mode=self.mode)
 
 class SmoothedInterpolate(th.nn.Module):
 
