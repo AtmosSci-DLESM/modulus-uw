@@ -212,13 +212,13 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
                 f"index {item} out of range for dataset with length {len(self)}"
             )
 
+        # start range
+        torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__")
+
         if self.forecast_mode:
             inputs_result = super().__getitem__(item)
         else:
             inputs_result, targets = super().__getitem__(item)
-
-        # start range
-        torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__")
 
         # used by the couplers to determine what time index to load
         # see method "next_integration()" for details
@@ -240,7 +240,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
             )
         torch.cuda.nvtx.range_pop()  # CoupledTimeSeriesDataset:__getitem__:retrieve_coupled
 
-        torch.cuda.nvtx.range_push("CoupledTimeSeriesDataset:__getitem__:process_batch")
         # Insolation
         if self.add_insolation:
             # update current item and reset integration_step counter for further integrations which need
@@ -259,7 +258,7 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
                         scale=self.train_noise_params["couplings"][v]["std"],
                         size=integrated_couplings[i, :, :].shape,
                     )
-            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_pop()  # CoupledTimeSeriesDataset:__getitem__:add_train_noise
 
         # append integrated couplings
         if len(self.couplings) > 0:
