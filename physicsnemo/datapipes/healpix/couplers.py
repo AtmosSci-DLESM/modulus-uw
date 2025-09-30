@@ -170,12 +170,16 @@ class ConstantCoupler:
         # we check if the coupled model output var is in self.variables.
         #
         # for example 'z1000' is in 'z1000-48H'
-        channel_indices = [
-            i
-            for i, oc in enumerate(output_channels)
-            for v in self.variables
-            if oc == v.split("-")[0]
-        ]
+        channel_indices = []
+        for v in self.variables:
+            if v == "ttr-3h-48H":
+                # Special case for ttr-3h-48H
+                channel_indices.append(list(output_channels).index("ttr-3h"))
+            else:
+                for i, oc in enumerate(output_channels):
+                    if oc == v.split("-")[0]:
+                        channel_indices.append(i)
+                
         self.coupled_channel_indices = channel_indices
 
     def reset_coupler(self):
@@ -428,12 +432,16 @@ class TrailingAverageCoupler:
         # we check if the coupled model output var is in self.variables.
         #
         # for example 'z1000' is in 'z1000-48H'
-        channel_indices = [
-            i
-            for i, oc in enumerate(output_channels)
-            for v in self.variables
-            if oc == v.split("-")[0]
-        ]
+        channel_indices = []
+        for v in self.variables:
+            if v == "ttr-3h-48H":
+                # Special case for ttr-3h-48H
+                channel_indices.append(list(output_channels).index("ttr-3h"))
+            else:
+                for i, oc in enumerate(output_channels):
+                    if oc == v.split("-")[0]:
+                        channel_indices.append(i)
+
         self.coupled_channel_indices = channel_indices
 
         # find averaging periods from componenet output
