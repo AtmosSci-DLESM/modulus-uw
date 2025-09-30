@@ -63,6 +63,7 @@ class HEALPixUNet(Module):
         presteps: int = 0,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        use_residual: bool = False,
         couplings: list = [],
     ):
         """
@@ -121,6 +122,7 @@ class HEALPixUNet(Module):
         self.channel_dim = 2  # Now 2 with [B, F, C*T, H, W]. Was 1 in old data format with [B, T*C, F, H, W]
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
+        self.use_residual = use_residual
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -349,7 +351,12 @@ class HEALPixUNet(Module):
             encodings = self.encoder(input_tensor)
             decodings = self.decoder(encodings)
 
-            reshaped = self._reshape_outputs(decodings)  # Absolute prediction
+            if self.use_residual:
+                reshaped = self._reshape_outputs(
+                    input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
+                )
+            else:
+               reshaped = self._reshape_outputs(decodings)  # Absolute prediction
             outputs.append(reshaped)
 
         if output_only_last:
