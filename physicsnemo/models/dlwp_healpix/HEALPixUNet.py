@@ -64,6 +64,7 @@ class HEALPixUNet(Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         couplings: list = [],
+        residual_prediction: bool = False,
     ):
         """
         Parameters
@@ -95,6 +96,8 @@ class HEALPixUNet(Module):
             Enable CUDA HEALPixPadding if installed. default: False
         couplings: list, optional
             sequence of dictionaries that describe coupling mechanisms
+        residual_prediction: bool, optional
+            If the model should predict the residual between the input and the output. Default: False
         """
         super().__init__()
 
@@ -121,6 +124,7 @@ class HEALPixUNet(Module):
         self.channel_dim = 2  # Now 2 with [B, F, C*T, H, W]. Was 1 in old data format with [B, T*C, F, H, W]
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
+        self.residual_prediction = residual_prediction
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -311,7 +315,7 @@ class HEALPixUNet(Module):
 
         return res
 
-    def forward(self, inputs: Sequence, output_only_last=False) -> th.Tensor:
+    def forward(self, inputs: Sequence, output_only_last=False, conditions_cln: Sequence=None) -> th.Tensor:
         """
         Forward pass of the HEALPixUnet
 
@@ -323,7 +327,12 @@ class HEALPixUNet(Module):
             [F, C, H, W] is the format for constants
         output_only_last: bool, optional
             If only the last dimension of the outputs should be returned. default: False
-
+        conditions_cln: Sequence, optional
+            If the model is using conditional normalization, this is a sequence of tensors that will be used to condition the 
+            normalization layers. The shape of the tensors should be [Cond*B, N], where N is the size of the conditions, Cond is the 
+            number of conditions, and B is the batch size. It is expected that the inputs have a leading dimension of Cond*B (e.g., data
+            for different ensmble members/conditions has been duplicated along this dimension). The sequence should have length equal to
+            the model's `n_integration_steps` attribute.
         Returns
         -------
         th.Tensor: Predicted outputs
@@ -346,10 +355,24 @@ class HEALPixUNet(Module):
                     input_tensor = self._reshape_inputs(
                         [outputs[-1]] + list(inputs[1:]), step
                     )
-            encodings = self.encoder(input_tensor)
-            decodings = self.decoder(encodings)
 
-            reshaped = self._reshape_outputs(decodings)  # Absolute prediction
+            kwargs = {}
+            if conditions_cln is not None:
+                kwargs = {"conditions_cln": conditions_cln[step]}
+            else:
+                kwargs = {}
+
+            encodings = self.encoder(input_tensor, **kwargs)
+            decodings = self.decoder(encodings, **kwargs)
+
+            if self.residual_prediction:
+                prediction = input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
+            else:
+                prediction = decodings
+            
+            reshaped = self._reshape_outputs(
+                prediction
+            )
             outputs.append(reshaped)
 
         if output_only_last:
