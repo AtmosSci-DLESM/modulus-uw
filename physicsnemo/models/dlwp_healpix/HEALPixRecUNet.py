@@ -67,6 +67,7 @@ class HEALPixRecUNet(Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         couplings: list = [],
+        residual_prediction: bool = True,
         hpx_padding_mode: str = 'karlbauer',
         enforce_reflectional_equivariance: bool = False,
     ):
@@ -105,6 +106,8 @@ class HEALPixRecUNet(Module):
             Enable CUDA HEALPixPadding if installed
         couplings: list, optional
             sequence of dictionaries that describe coupling mechanisms
+        residual_prediction: bool, optional
+            If the model should predict the residual between the input and the output. Default: True
         """
         super().__init__()
         self.channel_dim = 2  # Now 2 with [B, F, T*C, H, W]. Was 1 in old data format with [B, T*C, F, H, W]
@@ -142,6 +145,7 @@ class HEALPixRecUNet(Module):
         self.presteps = presteps
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
+        self.residual_prediction = residual_prediction
         self.hpx_padding_mode = hpx_padding_mode
         self.enforce_reflectional_equivariance = enforce_reflectional_equivariance
         self.register_buffer("refl_face_order", th.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=th.long))
@@ -461,7 +465,9 @@ class HEALPixRecUNet(Module):
         conditions_cln: Sequence, optional
             If the model is using conditional normalization, this is a sequence of tensors that will be used to condition the 
             normalization layers. The shape of the tensors should be [Cond*B, N], where N is the size of the conditions, Cond is the 
-            number of conditions, and B is the batch size.
+            number of conditions, and B is the batch size. It is expected that the inputs have a leading dimension of Cond*B (e.g., data
+            for different ensmble members/conditions has been duplicated along this dimension). The sequence should have length equal to
+            the model's `n_integration_steps` attribute.
 
         Returns
         -------
@@ -472,7 +478,10 @@ class HEALPixRecUNet(Module):
         for step in range(self.integration_steps):
             # (Re-)initialize recurrent hidden states
             if (step * (self.delta_t * self.input_time_dim)) % self.reset_cycle == 0:
-                self._initialize_hidden(inputs=inputs, outputs=outputs, step=step, conditions_cln=conditions_cln)
+                if conditions_cln is not None:
+                    self._initialize_hidden(inputs=inputs, outputs=outputs, step=step, conditions_cln=conditions_cln[step])
+                else:
+                    self._initialize_hidden(inputs=inputs, outputs=outputs, step=step)
 
             # Construct concatenated input: [prognostics|TISR|constants]
             if step == 0:
@@ -524,11 +533,12 @@ class HEALPixRecUNet(Module):
 
             # Forward through model, with or without conditions
             if conditions_cln is not None:
-                encodings = self.encoder(input_tensor, conditions_cln=conditions_cln)
-                decodings = self.decoder(encodings, conditions_cln=conditions_cln)
+                kwargs = {"conditions_cln": conditions_cln[step]}
             else:
-                encodings = self.encoder(input_tensor)
-                decodings = self.decoder(encodings)
+                kwargs = {}
+
+            encodings = self.encoder(input_tensor, **kwargs)
+            decodings = self.decoder(encodings, **kwargs)
 
             # Foward through model again with reflected input and original hidden states
             if self.enforce_reflectional_equivariance:
@@ -546,12 +556,8 @@ class HEALPixRecUNet(Module):
 
                 # Forward through model with reflected input
                 input_tensor_refl = self.hpx_reflect(input_tensor)
-                if conditions_cln is not None:
-                    encodings_refl = self.encoder(input_tensor_refl, conditions_cln=conditions_cln)
-                    decodings_refl = self.decoder(encodings_refl, conditions_cln=conditions_cln)
-                else:
-                    encodings_refl = self.encoder(input_tensor_refl)
-                    decodings_refl = self.decoder(encodings_refl)                
+                encodings_refl = self.encoder(input_tensor_refl, **kwargs)
+                decodings_refl = self.decoder(encodings_refl, **kwargs)               
 
                 new_hidden_states_refl = [
                     self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
@@ -566,8 +572,12 @@ class HEALPixRecUNet(Module):
                 decodings = 0.5 * (decodings + self.hpx_reflect(decodings_refl))
             
             # Residual prediction
+            if self.residual_prediction:
+                prediction = input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
+            else:
+                prediction = decodings
             reshaped = self._reshape_outputs(
-                input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
+                prediction
             )
 
             outputs.append(reshaped)
