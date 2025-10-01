@@ -380,14 +380,14 @@ class HEALPixRecUNet(Module):
                 s = step - self.presteps + prestep
                 if len(self.couplings) > 0:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[s - 1]]
+                        inputs=[outputs[s - 1][:, :, :, :self.input_channels]]
                         + list(inputs[1:3])
                         + [inputs[3][step - (prestep - self.presteps)]],
                         step=s + 1,
                     )
                 else:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[s - 1]] + list(inputs[1:]), step=s + 1
+                        inputs=[outputs[s - 1][:, :, :, :self.input_channels]] + list(inputs[1:]), step=s + 1
                     )
             # Forward the data through the model to initialize hidden states
             self.decoder(self.encoder(input_tensor, conditions_cln=conditions_cln), conditions_cln=conditions_cln)
@@ -460,16 +460,22 @@ class HEALPixRecUNet(Module):
             else:
                 if len(self.couplings) > 0:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[-1]]
+                        inputs=[outputs[-1][:, :, :, :self.input_channels]]
                         + list(inputs[1:3])
                         + [inputs[3][self.presteps + step]],
                         step=step + self.presteps,
                     )
                 else:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[-1]] + list(inputs[1:]),
+                        inputs=[outputs[-1][:, :, :, :self.input_channels]] + list(inputs[1:]),
                         step=step + self.presteps,
                     )
+
+            # Save original hidden states for restoration later
+            if self.enforce_reflectional_equivariance:
+                orig_hidden_states = [
+                    self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
+                ]
 
             # Forward through model, with or without conditions
             if conditions_cln is not None:
@@ -479,14 +485,57 @@ class HEALPixRecUNet(Module):
 
             encodings = self.encoder(input_tensor, **kwargs)
             decodings = self.decoder(encodings, **kwargs)
-            # Residual prediction
+
+            # Foward through model again with reflected input and original hidden states
+            if self.enforce_reflectional_equivariance:
+
+                new_hidden_states = [
+                    self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
+                ]
+                
+                # Reset hidden states to original
+                for n in range(len(self.decoder.decoder)):
+                    self.decoder.decoder[n].recurrent.h = \
+                        self.hpx_reflect(orig_hidden_states[n]) \
+                            if orig_hidden_states[n].shape != (1,1,1,1) \
+                                else orig_hidden_states[n]
+
+                # Forward through model with reflected input
+                input_tensor_refl = self.hpx_reflect(input_tensor)
+                encodings_refl = self.encoder(input_tensor_refl, **kwargs)
+                decodings_refl = self.decoder(encodings_refl, **kwargs)               
+
+                new_hidden_states_refl = [
+                    self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
+                ]
+
+                # Average of new hidden states resulting from the default forward
+                # pass and the reflected forward pass
+                for n in range(len(self.decoder.decoder)):
+                    self.decoder.decoder[n].recurrent.h = 0.5 * (new_hidden_states[n] + self.hpx_reflect(new_hidden_states_refl[n]))
+
+                # Average of decodings ()
+                decodings = 0.5 * (decodings + self.hpx_reflect(decodings_refl))
+            
+            # Reshape from [B*F, T*C, H, W] to [B, F, T, C, H, W]
+            combined = self._reshape_outputs(decodings)
+            prognostics = combined[:, :, :, :self.input_channels]
             if self.residual_prediction:
-                prediction = input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
-            else:
-                prediction = decodings
-            reshaped = self._reshape_outputs(
-                prediction
-            )
+                prognostics += self._reshape_outputs(
+                    input_tensor[:, :self.input_channels * self.input_time_dim]
+                )
+            diagnostics = combined[:, :, :, self.input_channels:]
+
+            out = th.cat(
+                [prognostics, diagnostics], # [B, F, T, C, H, W]
+                dim=3
+            )     
+
+            # Apply constraints
+            if self.constraints is not None:
+                for constraint in self.constraints:
+                    reshaped = constraint(reshaped)
+
             outputs.append(reshaped)
 
         if output_only_last:
