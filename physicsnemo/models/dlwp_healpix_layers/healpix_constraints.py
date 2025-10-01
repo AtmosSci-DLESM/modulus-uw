@@ -14,6 +14,9 @@ class NonnegativeConstraint(torch.nn.Module):
         self.channels = channels
         self.scaling = scaling
 
+        # Only apply constraint to variables that are used by model
+        self.variables = [var for var in self.variables if var in channels]
+
         var_indices = torch.tensor(
             [channels.index(var) for var in self.variables],
             dtype=torch.long
