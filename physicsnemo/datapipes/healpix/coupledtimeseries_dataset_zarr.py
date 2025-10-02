@@ -187,7 +187,7 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
             - Model inputs [B, F, T, C, H, W]
             - Insolation (if enabled) [B, F, T, 1, H, W]
             - Constants (if provided) [F, C, H, W]
-            - Coupled inputs (if provided) [B, T, C, H, W]
+            - Coupled inputs (if provided) [T, B, C, F, H, W]
 
             Target array has shape [B, F, T, C, H, W]
             where:

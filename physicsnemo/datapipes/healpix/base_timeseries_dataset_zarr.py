@@ -604,8 +604,8 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
 
             Input arrays are in order:
             - Model inputs [B, F, T, C, H, W]
-            - Insolation (if enabled)
-            - Constants (if provided)
+            - Insolation (if enabled) [B, F, T, 1, H, W]
+            - Constants (if provided) [F, C, H, W]
             - Additional data (in subclasses)
 
             Target array has shape [B, F, T, C, H, W]

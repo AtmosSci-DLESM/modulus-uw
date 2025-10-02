@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 class TimeSeriesDataModuleZarr:
-    """pytorch-lightning module for complete model train, validation, and test data loading. Uses
+    """Module for complete model train, validation, and test data loading. Uses
     dlwp.data.data_loading.TimeSeriesDataset under-the-hood.
     """
 
@@ -63,24 +63,20 @@ class TimeSeriesDataModuleZarr:
         num_workers: int = 4,
         pin_memory: bool = True,
         forecast_init_times: Optional[Sequence] = None,
+        add_train_noise: Optional[bool] = False,
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
     ):
         """
         Parameters
         ----------
-        dst_directory: str, optional
-            The directory containing joint data files, default "."
-        dataset_name: str, optional
-            The name of the dataset, default "dataset"
-        prefix: str, optional
-            Prefix appended to all data files, default None
-        suffix: str, optional
-            Suffix appended to all data files, default None
+        dataset_path: str, optional
+            The path to the dataset, default "."
         batch_size: int, optional
-            Size of batches to draw from data, defualt 32
+            The number of sequential samples to load from the dataset to load, default 32
         dataloader_batch_size: int, optional
-            Size of batches to draw from data for the dataloader, defualt 1
+            Passed to nn.DataLoader as batch_size. Used to assemble batches of samples from the dataloader
+            The total number of samples will be dataloader_batch_size*dataloader_batch_size, default None
         drop_last: bool, optional
             Whether to drop the last batch if it is smaller than batch_size, it is
             recommended to set this to true to avoid issues with mismatched sizes, default True
@@ -89,18 +85,17 @@ class TimeSeriesDataModuleZarr:
         output_variables: Sequence, optional
             List of output variables names. If None, defaults to `input_variables`. default None
         constant_variables: Sequence, optional
-            List of constant variables names. If None, defaults to `input_variables`. default None
+            List of constant variables names. default None
         scaling: DictConfig, optional
             Dictionary containing scaling parameters for data variables, default None
-        splits: DictConfig, optional
-            Dictionary with train/validation/test set start/end dates. If not provided, loads the entire
-            data time series as the test set. default None
+        splits: DictConfig
+            Dictionary with train/validation/test set start/end dates.
         presteps: int, optional
             Number of time steps to initialize recurrent hidden states. default 0
         input_time_dim: int, optional
             Number of time steps in the input array, default 1
         output_time_dim: int, optional
-            Number of time steps in the output array, default 1
+            Number of time steps in the target/ground truth array, default 1
         data_time_step: Union[int, str], optional
             Either integer hours or a str interpretable by pandas: time between steps in the
             original data time series, default "3h"
@@ -111,9 +106,9 @@ class TimeSeriesDataModuleZarr:
             either integer hours or a str interpretable by pandas: time step between the last input time and
             the first output time. Defaults to `time_step`.
         shuffle: bool, optional
-            Option to shuffle the training data, default True
+            Whether to shuffle the training data, default True
         add_insolation: bool, optional
-            Option to add prescribed insolation as a decoder input feature, default True
+            Whether to add prescribed insolation as a decoder input feature, default False
         num_workers: int, optional
             Number of parallel data loading workers, default 4
         pin_memory: bool, optional
@@ -126,7 +121,7 @@ class TimeSeriesDataModuleZarr:
                 - providing this parameter configures the data loader to only produce this number of samples, and
                     NOT produce any target array.
         add_train_noise: bool, optional
-            Add noise to the training data to inputs and integrated couplings to improve generalization, default False
+            Wether to add noise to the training data to inputs and integrated couplings to improve generalization, default False
         train_noise_params: DictConfig, optional
             Dictionary containing parameters for adding noise to the training data
         train_noise_seed: int, optional
@@ -134,7 +129,7 @@ class TimeSeriesDataModuleZarr:
         """
         super().__init__()
         self.dataset_path = Path(dataset_path)
-        self.batch_size = batch_size
+        self.dataset_batch_size = batch_size
         self.dataloader_batch_size = dataloader_batch_size
         self.drop_last = drop_last
         self.input_variables = input_variables
@@ -153,6 +148,7 @@ class TimeSeriesDataModuleZarr:
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.forecast_init_times = forecast_init_times
+        self.add_train_noise = add_train_noise
         self.train_noise_params = train_noise_params
         self.train_noise_seed = train_noise_seed
 
@@ -160,12 +156,6 @@ class TimeSeriesDataModuleZarr:
         self.val_dataset = None
         self.test_dataset = None
 
-        if self.dataloader_batch_size and self.batch_size % self.dataloader_batch_size != 0:
-            raise ValueError(
-                f"Batch size must be divisible by dataloader batch size. Batch size: {self.batch_size}, dataloader batch size: {self.dataloader_batch_size}"
-            )
-
-        self.dataset_batch_size = self.batch_size // self.dataloader_batch_size if self.dataloader_batch_size else self.batch_size
         self.collate_fn = None
 
         self.setup()
@@ -268,6 +258,7 @@ class TimeSeriesDataModuleZarr:
                 start_date=self.splits["train_date_start"],
                 end_date=self.splits["train_date_end"],
                 drop_last=self.drop_last,
+                add_train_noise=self.add_train_noise,
                 train_noise_params=self.train_noise_params,
                 train_noise_seed=self.train_noise_seed + int(dist.rank),
                 **common_kwargs,
@@ -441,6 +432,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         pin_memory: bool = True,
         forecast_init_times: Optional[Sequence] = None,
         couplings: Sequence = None,
+        add_train_noise: Optional[bool] = False,
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
     ):
@@ -450,9 +442,10 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         dataset_path: str, optional
             The path to the dataset, default "."
         batch_size: int, optional
-            Size of batches to draw from data, defualt 32
+            The number of sequential samples to load from the dataset to load, default 32
         dataloader_batch_size: int, optional
-            Size of batches to draw from data for the dataloader, defualt 1
+            Passed to nn.DataLoader as batch_size. Used to assemble batches of samples from the dataloader
+            The total number of samples will be dataloader_batch_size*dataloader_batch_size, default None
         drop_last: bool, optional
             Whether to drop the last batch if it is smaller than batch_size, it is
             recommended to set this to true to avoid issues with mismatched sizes, default True
@@ -461,18 +454,17 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         output_variables: Sequence, optional
             List of output variables names. If None, defaults to `input_variables`. default None
         constant_variables: Sequence, optional
-            List of constant variables names. If None, defaults to `input_variables`. default None
+            List of constant variables names. default None
         scaling: DictConfig, optional
             Dictionary containing scaling parameters for data variables, default None
-        splits: DictConfig, optional
-            Dictionary with train/validation/test set start/end dates. If not provided, loads the entire
-            data time series as the test set. default None
+        splits: DictConfig
+            Dictionary with train/validation/test set start/end dates.
         presteps: int, optional
             Number of time steps to initialize recurrent hidden states. default 0
         input_time_dim: int, optional
             Number of time steps in the input array, default 1
         output_time_dim: int, optional
-            Number of time steps in the output array, default 1
+            Number of time steps in the target/ground truth array, default 1
         data_time_step: Union[int, str], optional
             Either integer hours or a str interpretable by pandas: time between steps in the
             original data time series, default "3h"
@@ -483,9 +475,9 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             either integer hours or a str interpretable by pandas: time step between the last input time and
             the first output time. default None.
         shuffle: bool, optional
-            Option to shuffle the training data, default True
+            Whether to shuffle the training data, default True
         add_insolation: bool, optional
-            Option to add prescribed insolation as a decoder input feature, default False
+            Whether to add prescribed insolation as a decoder input feature, default False
         num_workers: int, optional
             Number of parallel data loading workers, default 4
         pin_memory: bool, optional
@@ -500,14 +492,14 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         couplings: Sequence, optional
             a Sequence of dictionaries that define the mechanics of couplings with other earth system
             components. default None
+        add_train_noise: bool, optional
+            Wether to add noise to the training data to inputs and integrated couplings to improve generalization, default False
         train_noise_params: DictConfig, optional
             Dictionary containing parameters for adding noise to the training data
         train_noise_seed: int, optional
             Seed for the random number generator for adding noise to the training data, default 42
         """
         self.couplings = couplings
-        self.train_noise_params = train_noise_params
-        self.train_noise_seed = train_noise_seed
 
         super().__init__(
             dataset_path,
@@ -530,6 +522,9 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             num_workers,
             pin_memory,
             forecast_init_times,
+            add_train_noise,
+            train_noise_params,
+            train_noise_seed,
         )
 
     def _get_coupled_vars(self):
