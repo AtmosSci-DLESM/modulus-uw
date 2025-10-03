@@ -67,6 +67,7 @@ class HEALPixRecUNet(Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         couplings: list = [],
+        residual_prediction: bool = True,
     ):
         """
         Parameters
@@ -103,6 +104,8 @@ class HEALPixRecUNet(Module):
             Enable CUDA HEALPixPadding if installed
         couplings: list, optional
             sequence of dictionaries that describe coupling mechanisms
+        residual_prediction: bool, optional
+            If the model should predict the residual between the input and the output. Default: True
         """
         super().__init__()
         self.channel_dim = 2  # Now 2 with [B, F, T*C, H, W]. Was 1 in old data format with [B, T*C, F, H, W]
@@ -137,6 +140,7 @@ class HEALPixRecUNet(Module):
         self.presteps = presteps
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
+        self.residual_prediction = residual_prediction
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -209,7 +213,7 @@ class HEALPixRecUNet(Module):
 
         Returns
         -------
-        torch.Tensor: reshaped Tensor in expected shape for model encoder
+        torch.Tensor: reshaped Tensor in expected shape for model encoder [F*B, T*C+n_constants+(coupled_channels*coupled_input_times), H, W]
         """
 
         if len(self.couplings) > 0:
@@ -328,7 +332,7 @@ class HEALPixRecUNet(Module):
         return res
 
     def _initialize_hidden(
-        self, inputs: Sequence, outputs: Sequence, step: int
+        self, inputs: Sequence, outputs: Sequence, step: int, conditions_cln: Sequence = None
     ) -> None:
         """Initialize the hidden layers
 
@@ -340,6 +344,8 @@ class HEALPixRecUNet(Module):
             Outputs to use to initialize the hideen layers
         step: int
             Current step number of the initialization
+        conditions_cln: Sequence, optional
+            Conditional inputs for the normalization layers.
         """
         self.reset()
         for prestep in range(self.presteps):
@@ -384,20 +390,30 @@ class HEALPixRecUNet(Module):
                         inputs=[outputs[s - 1]] + list(inputs[1:]), step=s + 1
                     )
             # Forward the data through the model to initialize hidden states
-            self.decoder(self.encoder(input_tensor))
+            self.decoder(self.encoder(input_tensor, conditions_cln=conditions_cln), conditions_cln=conditions_cln)
 
-    def forward(self, inputs: Sequence, output_only_last=False) -> th.Tensor:
+    def forward(self, inputs: Sequence, output_only_last=False, conditions_cln=None) -> th.Tensor:
         """
         Forward pass of the HEALPixUnet
 
         Parameters
         ----------
         inputs: Sequence
-            Inputs to the model, of the form [prognostics|TISR|constants]
-            [B, F, T, C, H, W] is the format for prognostics and TISR
+            Inputs to the model, of the form [prognostics|TISR|constants|coupled inputs].
+            [B*Cond, F, T, C, H, W] is the format for prognostics and TISR. Cond is the number of (optional) conditional inputs.
+                Note the time dimension in prognostics is for initialization and hidden state priming (input_time_dim*2) while
+                the T dimension in TISR is for initialization and hidden state priming as well as roll-out. There are 2 additional 
+                time steps provided to TISR that are apparently not used. 
             [F, C, H, W] is the format for constants
+            [T, B*Cond, C, F, H, W] is the format for coupled inputs. Here time is for initialization and roll-out (one per model step).
         output_only_last: bool, optional
             If only the last dimension of the outputs should be returned
+        conditions_cln: Sequence, optional
+            If the model is using conditional normalization, this is a sequence of tensors that will be used to condition the 
+            normalization layers. The shape of the tensors should be [Cond*B, N], where N is the size of the conditions, Cond is the 
+            number of conditions, and B is the batch size. It is expected that the inputs have a leading dimension of Cond*B (e.g., data
+            for different ensmble members/conditions has been duplicated along this dimension). The sequence should have length equal to
+            the model's `n_integration_steps` attribute.
 
         Returns
         -------
@@ -408,7 +424,10 @@ class HEALPixRecUNet(Module):
         for step in range(self.integration_steps):
             # (Re-)initialize recurrent hidden states
             if (step * (self.delta_t * self.input_time_dim)) % self.reset_cycle == 0:
-                self._initialize_hidden(inputs=inputs, outputs=outputs, step=step)
+                if conditions_cln is not None:
+                    self._initialize_hidden(inputs=inputs, outputs=outputs, step=step, conditions_cln=conditions_cln[step])
+                else:
+                    self._initialize_hidden(inputs=inputs, outputs=outputs, step=step)
 
             # Construct concatenated input: [prognostics|TISR|constants]
             if step == 0:
@@ -452,13 +471,21 @@ class HEALPixRecUNet(Module):
                         step=step + self.presteps,
                     )
 
-            # Forward through model
-            encodings = self.encoder(input_tensor)
-            decodings = self.decoder(encodings)
+            # Forward through model, with or without conditions
+            if conditions_cln is not None:
+                kwargs = {"conditions_cln": conditions_cln[step]}
+            else:
+                kwargs = {}
 
+            encodings = self.encoder(input_tensor, **kwargs)
+            decodings = self.decoder(encodings, **kwargs)
             # Residual prediction
+            if self.residual_prediction:
+                prediction = input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
+            else:
+                prediction = decodings
             reshaped = self._reshape_outputs(
-                input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
+                prediction
             )
             outputs.append(reshaped)
 
