@@ -28,7 +28,6 @@ from omegaconf import DictConfig
 # RECURRENT BLOCKS
 #
 
-
 class ConvGRUBlock(th.nn.Module):
     """Class that implements a Convolutional GRU
     Code modified from
@@ -42,6 +41,7 @@ class ConvGRUBlock(th.nn.Module):
         kernel_size: int = 1,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -68,6 +68,7 @@ class ConvGRUBlock(th.nn.Module):
             padding="same",
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
         self.conv_can = geometry_layer(
             layer=torch.nn.Conv2d,
@@ -77,6 +78,7 @@ class ConvGRUBlock(th.nn.Module):
             padding="same",
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
         self.h = th.zeros(1, 1, 1, 1)
 
@@ -115,11 +117,9 @@ class ConvGRUBlock(th.nn.Module):
         """Reset the update gates"""
         self.h = th.zeros_like(self.h)
 
-
 #
 # CONV BLOCKS
 #
-
 
 class BasicConvBlock(th.nn.Module):
     """Convolution block consisting of n subsequent convolutions and activations"""
@@ -136,6 +136,7 @@ class BasicConvBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -162,6 +163,7 @@ class BasicConvBlock(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         """
         super().__init__()
+
         if latent_channels is None:
             latent_channels = max(in_channels, out_channels)
         convblock = []
@@ -175,6 +177,7 @@ class BasicConvBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if activation is not None:
@@ -196,7 +199,6 @@ class BasicConvBlock(th.nn.Module):
         """
         return self.convblock(x)
 
-
 class ConvNeXtBlock(th.nn.Module):
     """Class implementing a modified ConvNeXt network as described in https://arxiv.org/pdf/2201.03545.pdf
     and shown in figure 4
@@ -215,6 +217,7 @@ class ConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -253,6 +256,7 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         # Convolution block
         convblock = []
@@ -266,6 +270,7 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -280,6 +285,7 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -293,6 +299,7 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         self.convblock = th.nn.Sequential(*convblock)
@@ -332,6 +339,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters:
@@ -371,6 +379,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         if out_channels == int(latent_channels):
             self.skip_module2 = (
@@ -384,6 +393,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
 
         # 1st ConvNeXt block, the output of this one remains internal
@@ -398,6 +408,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -412,6 +423,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -426,6 +438,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -444,6 +457,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -458,6 +472,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -472,6 +487,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -517,6 +533,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         batch_norm: bool = False,
         dropout: float = 0.0,
         conditional_layer_norm: Callable = None,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -552,6 +569,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                     batch_norm=batch_norm,
                     dropout=dropout,
                     conditional_layer_norm=conditional_layer_norm if conditional_layer_norm is not None else None,
+                    hpx_padding_mode=hpx_padding_mode,
                 ),
             )
 
@@ -585,6 +603,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         batch_norm: bool = False,
         dropout: float = 0.0,
         conditional_layer_norm: th.nn.Module = None,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -626,18 +645,19 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         self.activation = activation
         self.dropout = dropout > 0.0
         self.cln_enabled = conditional_layer_norm is not None
-
+        
         if use_block_skip_connection:
             if in_channels == int(out_channels):
                 self.skip_module = lambda x: x
             else:
                 self.skip_module = geometry_layer(
-                    layer=th.nn.Conv2d,
+                    layer=torch.nn.Conv2d,
                     in_channels=in_channels,
                     out_channels=out_channels,
                     kernel_size=1,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
 
         # Collect conv->norm->activation->dropout operations in list for sequential execution
@@ -646,13 +666,14 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 3x3: in → latent
         convblock.append(
             geometry_layer(
-                layer=th.nn.Conv2d,
+                layer=torch.nn.Conv2d,
                 in_channels=in_channels,
                 out_channels=int(latent_channels),
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if batch_norm:
@@ -670,13 +691,14 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 1x1: latent → latent * upscale
         convblock.append(
             geometry_layer(
-                layer=th.nn.Conv2d,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels),
                 out_channels=int(latent_channels * upscale_factor),
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if batch_norm:
@@ -693,13 +715,14 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 1x1: upscale → latent
         convblock.append(
             geometry_layer(
-                layer=th.nn.Conv2d,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels * upscale_factor),
                 out_channels=int(latent_channels),
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if batch_norm:
@@ -715,13 +738,14 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 3x3: latent → out (no norm on this one, following convnext)
         convblock.append(
             geometry_layer(
-                layer=th.nn.Conv2d,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels),
                 out_channels=out_channels,
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -758,11 +782,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
 
         return x + residual
 
-
 #
 # DOWNSAMPLING BLOCKS
 #
-
 
 class MaxPool(th.nn.Module):
     """This class provides a wrapper for a HEALPix (or other) tensor data
@@ -775,6 +797,7 @@ class MaxPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -794,6 +817,7 @@ class MaxPool(th.nn.Module):
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
 
     def forward(self, x):
@@ -823,6 +847,7 @@ class AvgPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -837,11 +862,13 @@ class AvgPool(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         """
         super().__init__()
+
         self.avgpool = geometry_layer(
             layer=torch.nn.AvgPool2d,
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
 
     def forward(self, x):
@@ -859,11 +886,9 @@ class AvgPool(th.nn.Module):
         """
         return self.avgpool(x)
 
-
 #
 # UPSAMPLING BLOCKS
 #
-
 
 class TransposedConvUpsample(th.nn.Module):
     """This class provides a wrapper for a HEALPix (or other) tensor data
@@ -879,6 +904,7 @@ class TransposedConvUpsample(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -899,6 +925,7 @@ class TransposedConvUpsample(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         """
         super().__init__()
+                     
         upsampler = []
         # Upsample transpose conv
         upsampler.append(
@@ -911,6 +938,7 @@ class TransposedConvUpsample(th.nn.Module):
                 padding=0,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -932,11 +960,9 @@ class TransposedConvUpsample(th.nn.Module):
         """
         return self.upsampler(x)
 
-
 #
 # Helper classes
 #
-
 
 class Interpolate(th.nn.Module):
     """Helper class that handles interpolation
