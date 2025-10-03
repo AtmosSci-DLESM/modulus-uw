@@ -25,8 +25,8 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import zarr
-from modulus.datapipes.datapipe import Datapipe
-from modulus.datapipes.meta import DatapipeMetaData
+from physicsnemo.datapipes.datapipe import Datapipe
+from physicsnemo.datapipes.meta import DatapipeMetaData
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import Dataset
 
