@@ -160,13 +160,11 @@ class BaseCoupler(ABC):
         # To expedite the coupling process the coupled_forecast
         # get proper channels from coupled component output
         output_channels = coupled_module.output_variables
-        # A bit convoluted. Prepared coupled variables
-        # are given a suffix for training associated with their
-        # trailing average increment e.g. 'z1000-48H'. Some variables
-        # may have an additional suffix, e.g. 'z1000-3H-48H'. The final
-        # suffix is used to determine the coupling increment. To extract
-        # the proper field from the coupled model output
-        #
+        # A bit convoluted. Some variable names are present in the dataset as is,
+        # Some prepared coupled variables are given a suffix for training associated
+        # with a time increment suach as a trailing average increment e.g. 'z1000-48H'.
+        # Some variables may have an additional suffix, e.g. 'z1000-3H-48H'. The final
+        # suffix (if it exists) is used to determine the coupling increment.
         channel_indices = [
             i
             for i, oc in enumerate(output_channels)
