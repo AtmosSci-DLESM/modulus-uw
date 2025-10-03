@@ -37,6 +37,7 @@ class UNetDecoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -82,6 +83,7 @@ class UNetDecoder(th.nn.Module):
                     out_channels=curr_channel,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
 
             next_channel = (
@@ -99,6 +101,7 @@ class UNetDecoder(th.nn.Module):
                 n_layers=n_layers[n],
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
 
             # Recurrent module
@@ -106,7 +109,9 @@ class UNetDecoder(th.nn.Module):
                 rec_module = instantiate(
                     config=recurrent_block,
                     in_channels=next_channel,
+                    enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             else:
                 rec_module = None
@@ -130,6 +135,7 @@ class UNetDecoder(th.nn.Module):
             dilation=dilations[-1],
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
 
     def forward(self, inputs: Sequence, conditions_cln: Sequence = None) -> th.Tensor:
