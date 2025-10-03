@@ -56,7 +56,8 @@ class BaseCoupler(ABC):
             forecasting batch size should be 1
         variables: Sequence
             sequence of strings that indicate the coupled variable
-            names in the dataset
+            names in the dataset. All names should be in the dataset with 
+            an optional time component at the end, eg ttr-48h
         presteps: int, optional
             the number of model steps used to initialize the hidden state.
             If not using a GRU, prestep is 0, default 0
@@ -157,6 +158,14 @@ class BaseCoupler(ABC):
         }
 
     def setup_coupling(self, coupled_module):
+        """
+        Sets up the coupling between the coupled variables and the provided module
+
+        Parameters
+        ----------
+        coupled_module: physicsnemo.datapipes.healpix.TimeSeriesDataset
+            The module which this coupler will be coupled against.
+        """
         # To expedite the coupling process the coupled_forecast
         # get proper channels from coupled component output
         output_channels = coupled_module.output_variables
