@@ -68,6 +68,7 @@ class HEALPixRecUNet(Module):
         enable_healpixpad: bool = False,
         couplings: list = [],
         residual_prediction: bool = True,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -136,12 +137,16 @@ class HEALPixRecUNet(Module):
         self.input_time_dim = input_time_dim
         self.output_time_dim = output_time_dim
         self.delta_t = int(pd.Timedelta(delta_time).total_seconds() // 3600)
-        self.reset_cycle = int(pd.Timedelta(reset_cycle).total_seconds() // 3600)
+        if reset_cycle == float('inf'):
+            self.reset_cycle = reset_cycle
+        else:
+            self.reset_cycle = int(pd.Timedelta(reset_cycle).total_seconds() // 3600)
         self.presteps = presteps
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
         self.residual_prediction = residual_prediction
-
+        self.hpx_padding_mode = hpx_padding_mode
+        
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
         if not self.is_diagnostic and (self.output_time_dim % self.input_time_dim != 0):
@@ -166,7 +171,7 @@ class HEALPixRecUNet(Module):
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
         )
-
+        
     @property
     def integration_steps(self):
         """Number of integration steps"""
@@ -294,8 +299,10 @@ class HEALPixRecUNet(Module):
             ]
             res = th.cat(result, dim=self.channel_dim)
 
-        # fold faces into batch dim
+        # fold faces into batch dim (BF, C, H, W)
         res = self.fold(res)
+        if self.enable_nhwc:
+            res = res.to(memory_format=th.channels_last)
         return res
 
     def _reshape_outputs(self, outputs: th.Tensor) -> th.Tensor:
@@ -479,6 +486,7 @@ class HEALPixRecUNet(Module):
 
             encodings = self.encoder(input_tensor, **kwargs)
             decodings = self.decoder(encodings, **kwargs)
+            
             # Residual prediction
             if self.residual_prediction:
                 prediction = input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
@@ -487,6 +495,7 @@ class HEALPixRecUNet(Module):
             reshaped = self._reshape_outputs(
                 prediction
             )
+
             outputs.append(reshaped)
 
         if output_only_last:
