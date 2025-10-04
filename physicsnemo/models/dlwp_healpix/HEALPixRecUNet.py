@@ -163,6 +163,7 @@ class HEALPixRecUNet(Module):
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
+            hpx_padding_mode=self.hpx_padding_mode,
         )
         self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
@@ -170,6 +171,7 @@ class HEALPixRecUNet(Module):
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
+            hpx_padding_mode=self.hpx_padding_mode,
         )
         
     @property
