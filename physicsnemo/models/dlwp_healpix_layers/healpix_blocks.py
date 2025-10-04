@@ -24,8 +24,6 @@ from .normalization import ConditionalLayerNorm
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
-from hydra.utils import get_class
-
 #
 # RECURRENT BLOCKS
 #
