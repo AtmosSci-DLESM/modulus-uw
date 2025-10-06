@@ -70,7 +70,7 @@ class HEALPixRecUNet(Module):
         residual_prediction: bool = True,
         hpx_padding_mode: str = 'karlbauer',
         enforce_reflectional_equivariance: bool = False,
-        constraints = None,
+        constraints: list[DictConfig] = None,
     ):
         """
         Parameters
@@ -358,7 +358,15 @@ class HEALPixRecUNet(Module):
         x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
         return x
 
-    def set_constraints(self, constraints):
+    def set_constraints(self, constraints: list[DictConfig] = None):
+        """
+        Sets constraints (e.g., non-negative) to be applied to the model outputs
+
+        Parameters
+        ----------
+        constraints: list[DictConfig]
+            List of hydra instantiable DictConfigs specifying constraints
+        """
         if constraints is not None:
             self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
 

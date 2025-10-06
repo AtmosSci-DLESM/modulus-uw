@@ -14,10 +14,8 @@ class NonnegativeConstraint(torch.nn.Module):
         self.channels = channels
         self.scaling = scaling
 
-        for var in self.variables:
-            if var not in channels:
-                print(f'Variable {var} not found in channels list, removing {var} from variables.')
-                self.variables.remove(var)
+        # Only apply constraint to variables that are used by model
+        self.variables = [var for var in self.variables if var in channels]
 
         var_indices = torch.tensor(
             [channels.index(var) for var in self.variables],
