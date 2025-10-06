@@ -67,7 +67,7 @@ class HEALPixRecUNet(Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         couplings: list = [],
-        constraints = None,
+        constraints: list[DictConfig] = None,
     ):
         """
         Parameters
@@ -331,7 +331,15 @@ class HEALPixRecUNet(Module):
 
         return res
 
-    def set_constraints(self, constraints):
+    def set_constraints(self, constraints: list[DictConfig] = None):
+        """
+        Sets constraints (e.g., non-negative) to be applied to the model outputs
+
+        Parameters
+        ----------
+        constraints: list[DictConfig]
+            List of hydra instantiable DictConfigs specifying constraints
+        """
         if constraints is not None:
             self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
 
