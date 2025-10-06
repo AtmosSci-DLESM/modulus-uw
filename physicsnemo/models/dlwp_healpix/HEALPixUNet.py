@@ -65,6 +65,7 @@ class HEALPixUNet(Module):
         enable_healpixpad: bool = False,
         couplings: list = [],
         residual_prediction: bool = False,
+        constraints: list[DictConfig] = None,
     ):
         """
         Parameters
@@ -150,6 +151,9 @@ class HEALPixUNet(Module):
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
         )
+
+    self.constraints = None
+    self.set_constraints(constraints)
 
     @property
     def integration_steps(self):
@@ -315,6 +319,17 @@ class HEALPixUNet(Module):
 
         return res
 
+    def set_constraints(self, constraints: list[DictConfig] = None):
+        """
+        Sets constraints (e.g., non-negative) to be applied to the model outputs
+        Parameters
+        ----------
+        constraints: list[DictConfig]
+            List of hydra instantiable DictConfigs specifying constraints
+        """
+        if constraints is not None:
+            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
+
     def forward(self, inputs: Sequence, output_only_last=False, conditions_cln: Sequence=None) -> th.Tensor:
         """
         Forward pass of the HEALPixUnet
@@ -373,6 +388,12 @@ class HEALPixUNet(Module):
             reshaped = self._reshape_outputs(
                 prediction
             )
+
+            # Apply constraints
+            if self.constraints is not None:
+                for constraint in self.constraints:
+                    reshaped = constraint(reshaped)
+
             outputs.append(reshaped)
 
         if output_only_last:
