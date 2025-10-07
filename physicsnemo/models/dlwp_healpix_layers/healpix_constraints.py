@@ -5,10 +5,20 @@ import xarray as xr
 class NonnegativeConstraint(torch.nn.Module):
     def __init__(
         self,
-        variables,
-        channels,
-        scaling,
+        variables: list[str],
+        channels: list[str],
+        scaling: dict[str, dict[str, float]],
     ):
+        """
+        Parameters
+        ----------
+        variables: list[str]
+            List of variable names to apply the constraint to.
+        channels: list[str]
+            List of all input channel names in the model.
+        scaling: dict[str, dict[str, float]]
+            Dictionary containing the mean and std for each variable.
+        """
         super().__init__()
         self.variables = variables
         self.channels = channels
@@ -34,7 +44,6 @@ class NonnegativeConstraint(torch.nn.Module):
         '''
         Tensors are expected to be in the shape [B, F, T, C, H, W]
         '''
-        
         selected_vars = torch.index_select(x, dim=3, index=self.var_indices)
         clamped = torch.maximum(selected_vars, self.thresholds)
         x.index_copy_(3, self.var_indices, clamped)
