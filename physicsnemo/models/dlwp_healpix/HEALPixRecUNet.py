@@ -489,10 +489,8 @@ class HEALPixRecUNet(Module):
                 )
             diagnostics = combined[:, :, :, self.input_channels:]
 
-            out = th.cat(
-                [prognostics, diagnostics], # [B, F, T, C, H, W]
-                dim=3
-            )
+            # Concat along channel dim, shape is [B, F, T, C, H, W]
+            out = th.cat([prognostics, diagnostics], dim=3)
 
             outputs.append(out)
 
