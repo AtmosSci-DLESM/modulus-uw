@@ -45,7 +45,7 @@ class NonnegativeConstraint(torch.nn.Module):
         Tensors are expected to be in the shape [B, F, T, C, H, W]
         '''
         selected_vars = torch.index_select(x, dim=3, index=self.var_indices)
-        clamped = torch.maximum(selected_vars, self.thresholds)
+        clamped = torch.maximum(selected_vars, self.thresholds).to(x.dtype)
         x.index_copy_(3, self.var_indices, clamped)
 
         return x
