@@ -665,7 +665,6 @@ class HEALPixPadding(th.nn.Module):
         -------
             The assembled top left corner (only the sub-part that is required for padding)
         """
-        # print("USING TL K24 FILLING")
         ret = th.zeros_like(top)[..., : self.p, : self.p]  # super ugly but super fast
 
         # Bottom left point
@@ -780,7 +779,6 @@ class HEALPixPadding(th.nn.Module):
         -------
             The assembled bottom right corner (only the sub-part that is required for padding)
         """
-        # print("USING BR ISOLAT FILLING")
         ret = th.zeros_like(b)[..., :self.p, :self.p]
 
         # Number of diagonals which need to be filled in order to reach a
