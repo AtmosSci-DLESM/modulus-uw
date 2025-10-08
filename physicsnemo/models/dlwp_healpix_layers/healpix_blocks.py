@@ -969,7 +969,8 @@ class TransposedConvUpsample(th.nn.Module):
 
 class SmoothedInterpolateConv(th.nn.Module):
     """
-    Class for sequentially interpolating then applying a simple Conv2d on
+    Class for sequentially interpolating, applying a smoothing filter which
+    preserves zonally uniform signals, then applying a simple Conv2d on
     HEALPix tensor data
     """
 
@@ -985,23 +986,24 @@ class SmoothedInterpolateConv(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc = False,
         enable_healpixpad = True,
-        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
         ----------
-        scale_factor: int, optional
-            Multiplier for spatial size, passed to torch.nn.functional.interpolate
-        mode: str, optional
-            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
         geometry_layer: torch.nn.Module, optional
-            The wrapper for the geometry of the tensor
+            The wrapper for the geometry of the tensor being bassed to this module
         in_channels: int, optional
             The number of input channels
         out_channels: int, optional
             The number of output channels
         kernel_size: int, optional
             Size of the convolutional kernel
+        dilation: int, optional
+            Spacing between kernel points, passed to torch.nn.Conv2d
+        scale_factor: int, optional
+            Multiplier for spatial size, passed to torch.nn.functional.interpolate
+        mode: str, optional
+            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
         activation: torch.nn.Module, optional
             Activation function used in upsampling
         enable_nhwc: bool, optional
@@ -1017,7 +1019,11 @@ class SmoothedInterpolateConv(th.nn.Module):
                 convolutions, received dilation = {dilation}"
             )
 
-        # TODO: explain this
+        # We pad first before upsampling to prevent edge artifacts at seams
+        # between HPX faces. This means that our final upsampled signal will
+        # have extra padding which we need to trim before passing to conv. We
+        # only require padding=1 before upsampling, so only need to trim 1 row/
+        # column from each side of result.
         trim_size = 1 
 
         block = []
@@ -1030,7 +1036,6 @@ class SmoothedInterpolateConv(th.nn.Module):
                 trim_size=trim_size,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                hpx_padding_mode=hpx_padding_mode,
             ),
             geometry_layer(
                 layer=torch.nn.Conv2d,
@@ -1040,7 +1045,6 @@ class SmoothedInterpolateConv(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                hpx_padding_mode=hpx_padding_mode,
             )
         ]
 
@@ -1104,7 +1108,12 @@ class Interpolate(th.nn.Module):
         return self.interp(inputs, scale_factor=self.scale_factor, mode=self.mode)
 
 class SmoothedInterpolate(th.nn.Module):
-
+    """
+    Helper class for interpolating a HEALPix signal then applying a four point
+    smoother which preserves zonal uniformity if the upsampling mode is nearest
+    neighbor or bilinear.
+    """
+    
     def __init__(
         self,
         in_channels: int = 3,
@@ -1112,6 +1121,19 @@ class SmoothedInterpolate(th.nn.Module):
         mode: str = 'nearest',
         trim_size: int = 0,
     ):
+        """
+        Parameters
+        ----------
+        in_channels: int, optional
+            The number of input channels
+        scale_factor: int, optional
+            Multiplier for spatial size, passed to torch.nn.functional.interpolate
+        mode: str, optional
+            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
+        trim_size: int, optional
+            Amount of padding to trim from final tensor, which is assumed to be
+            square
+        """
         super().__init__()
 
         self.in_channels = in_channels
@@ -1120,6 +1142,9 @@ class SmoothedInterpolate(th.nn.Module):
         self.trim_size = trim_size
         self.interp = th.nn.functional.interpolate
 
+        # Four point smoother specific to HPX grid. This smooths out the specific
+        # type of aliasing that nearest neighbor and bilinear upsampling introduce
+        # into zonally uniform signals
         self.smoother_kernel = torch.tensor(
             [[0.,1.,0.],
              [1.,0.,1.],
@@ -1131,7 +1156,9 @@ class SmoothedInterpolate(th.nn.Module):
     def forward(self, x: th.Tensor) -> th.Tensor:
         self.smoother_kernel = self.smoother_kernel.to(device=x.device, dtype=x.dtype)
 
+        # Interpolate, smooth, trim in order
         x = self.interp(x, scale_factor=self.scale_factor, mode=self.mode)
+
         x = torch.nn.functional.conv2d(
             x,
             self.smoother_kernel,
