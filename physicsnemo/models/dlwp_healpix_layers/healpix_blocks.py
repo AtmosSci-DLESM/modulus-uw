@@ -981,6 +981,7 @@ class SmoothedInterpolateConv(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc = False,
         enable_healpixpad = True,
+        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters
@@ -1031,6 +1032,7 @@ class SmoothedInterpolateConv(th.nn.Module):
                 trim_size=trim_size,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             ),
             geometry_layer(
                 layer=torch.nn.Conv2d,
@@ -1040,6 +1042,7 @@ class SmoothedInterpolateConv(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         ]
 
