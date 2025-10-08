@@ -71,6 +71,7 @@ class HEALPixRecUNet(Module):
         hpx_padding_mode: str = 'karlbauer',
         enforce_reflectional_equivariance: bool = False,
         constraints: list[DictConfig] = None,
+        enforce_reflectional_equivariance: bool = False,
     ):
         """
         Parameters
@@ -541,6 +542,12 @@ class HEALPixRecUNet(Module):
                         step=step + self.presteps,
                     )
 
+            # Save original hidden states for restoration later
+            if self.enforce_reflectional_equivariance:
+                orig_hidden_states = [
+                    self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
+                ]
+
             # Forward through model, with or without conditions
             if conditions_cln is not None:
                 kwargs = {"conditions_cln": conditions_cln[step]}
@@ -549,6 +556,38 @@ class HEALPixRecUNet(Module):
 
             encodings = self.encoder(input_tensor, **kwargs)
             decodings = self.decoder(encodings, **kwargs)
+
+            # Foward through model again with reflected input and original hidden states
+            if self.enforce_reflectional_equivariance:
+
+                new_hidden_states = [
+                    self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
+                ]
+                
+                # Reset hidden states to original
+                for n in range(len(self.decoder.decoder)):
+                    self.decoder.decoder[n].recurrent.h = \
+                        self.hpx_reflect(orig_hidden_states[n]) \
+                            if orig_hidden_states[n].shape != (1,1,1,1) \
+                                else orig_hidden_states[n]
+
+                # Forward through model with reflected input
+                input_tensor_refl = self.hpx_reflect(input_tensor)
+                encodings_refl = self.encoder(input_tensor_refl, **kwargs)
+                decodings_refl = self.decoder(encodings_refl, **kwargs)               
+
+                new_hidden_states_refl = [
+                    self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
+                ]
+
+                # Average of new hidden states resulting from the default forward
+                # pass and the reflected forward pass
+                for n in range(len(self.decoder.decoder)):
+                    self.decoder.decoder[n].recurrent.h = 0.5 * (new_hidden_states[n] + self.hpx_reflect(new_hidden_states_refl[n]))
+
+                # Average of decodings ()
+                decodings = 0.5 * (decodings + self.hpx_reflect(decodings_refl))
+            
             
             # Reshape from [B*F, T*C, H, W] to [B, F, T, C, H, W]
             combined = self._reshape_outputs(decodings)
