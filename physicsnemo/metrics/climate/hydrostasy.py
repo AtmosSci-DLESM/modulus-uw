@@ -232,6 +232,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         surface_geopotential_name: str,
         surface_geopotential_mean: float = -597.7115478515625,
         surface_geopotential_std: float = 55658.21484375,
+        convert_topography_to_meters: bool = True,
         R: float = 287,  # J K^{-1} kg^{-1}
         g0: float = 9.81,  # m s^{-2}
         topography_masking: bool = True,
@@ -247,6 +248,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.loss_weights = torch.tensor(weights)
         self.device = None
         self.g0 = g0
+        self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
 
         # Get channel index to pressure level mapping
@@ -346,7 +348,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             surface_geopotential_std * ds.constants.sel(channel_c=surface_geopotential_name).values
             + surface_geopotential_mean
         )
-        if surface_geopotential_name != "z_nonnorm":
+        if self.convert_topography_to_meters:
             self.topography /= self.g0
 
         self.topography = torch.tensor(
