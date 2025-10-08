@@ -253,7 +253,17 @@ def test_ConstantCoupler(dataset_path, scaling_dict, pytestconfig):
     expected = expected.repeat(
         coupler.coupled_integration_dim, 1, coupled_fields_batch_size, 1, 1, 1
     )
+    result = coupler.construct_integrated_couplings()
     assert th.equal(expected, coupler.construct_integrated_couplings())
+
+    # verify that dimensions aren't reordered when time_first is false
+    coupler.time_first = False
+    coupler.set_coupled_fields(coupled_fields)
+    # [T, B, C, F, H, W]
+    expected = expected.permute(1, 3, 0, 2, 4, 5)
+    result = coupler.construct_integrated_couplings()
+    assert th.equal(expected, result)
+    coupler.time_first = True
 
     # test coupler reset
     coupler.reset_coupler()

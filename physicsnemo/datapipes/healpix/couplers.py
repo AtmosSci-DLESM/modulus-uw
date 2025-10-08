@@ -44,7 +44,8 @@ class BaseCoupler(ABC):
         input_time_dim: int = 2,
         output_time_dim: int = 2,
         input_times: Sequence = [pd.Timedelta("24h"), pd.Timedelta("48h")],
-        prepared_coupled_data=True,
+        prepared_coupled_data: bool = True,
+        time_first: bool = True,
     ):
         """
         Parameters
@@ -73,6 +74,9 @@ class BaseCoupler(ABC):
             averages have already been calculated so that each time step denotes
             the right side of a averaging_window window.
             This is highly recommended for training, default True
+        time_first: boolean, optional
+            Whether the coupled data should be permuted to have the time dimension first 
+            [T, B, C, F, H, W] rather than [B, F, T, C, H, W]
         """
         # extract important meta data from ds
         self.ds = dataset
@@ -92,6 +96,7 @@ class BaseCoupler(ABC):
         self.coupled_mode = False
         self.integrated_couplings = None
         self.ds_variable_indices = []
+        self.time_first = time_first
 
         if not prepared_coupled_data:
             raise NotImplementedError("Data preparation not yet implemented")
@@ -294,10 +299,12 @@ class BaseCoupler(ABC):
                     self.integrated_couplings[b, i, :, :, :] = coupling_temp.reshape(
                         (self.timevar_dim,) + coupling_temp.shape[2:]
                     )
-
-            return self.integrated_couplings.transpose((1, 0, 2, 3, 4, 5)).astype(
-                "float32"
-            )  # cast to float for compatibility
+            if self.time_first:
+                return self.integrated_couplings.transpose((1, 0, 2, 3, 4, 5)).astype(
+                    "float32"
+                )  # cast to float for compatibility
+            else:
+                return self.integrated_couplings.astype("float32")
 
 
 class ConstantCoupler(BaseCoupler):
@@ -396,16 +403,18 @@ class ConstantCoupler(BaseCoupler):
         # create buffer for coupling
         coupled_fields = coupled_fields[
             :, :, :, self.coupled_channel_indices, :, :
-        ].permute(2, 0, 3, 1, 4, 5)
+        ] 
         self.preset_coupled_fields = th.empty(
-            [self.coupled_integration_dim, coupled_fields.shape[1], self.timevar_dim]
-            + list(self.spatial_dims)
+            [coupled_fields.shape[0], self.spatial_dims[0], self.coupled_integration_dim, self.timevar_dim]
+            + list(self.spatial_dims[1:])
         )
         # we use a constant set of values so we just copy time 0
-        for i in range(len(self.preset_coupled_fields)):
-            self.preset_coupled_fields[i, :, :, :, :, :] = coupled_fields[
-                0, :, -1:, :, :, :
+        for i in range(self.coupled_integration_dim):
+            self.preset_coupled_fields[:, :, i, :, :, :] = coupled_fields[
+                :, :, 0, -1:, :, :
             ]
+        if self.time_first:
+            self.preset_coupled_fields = self.preset_coupled_fields.permute(2, 0, 3, 1, 4, 5)
         # flag for construct integrated coupling method to use this array
         self.coupled_mode = True
 
@@ -568,6 +577,8 @@ class TrailingAverageCoupler(BaseCoupler):
             coupled_averaging_periods.append(th.concat(averaging_periods, dim=3))
         self.preset_coupled_fields = th.concat(
             coupled_averaging_periods, dim=2
-        ).permute(2, 0, 3, 1, 4, 5)
+        )
+        if self.time_first:
+            self.preset_coupled_fields = self.preset_coupled_fields.permute(2, 0, 3, 1, 4, 5)
         # flag for construct integrated coupling method to use this array
         self.coupled_mode = True
