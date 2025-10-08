@@ -221,6 +221,8 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
     def __init__(
         self,
         hPa_levels: Sequence[int],
+        extend_to_surface: bool = False,
+        transformed_sp: bool = False,
         channels: Sequence[str],
         weights: Sequence,
         alpha: Sequence[float],  # K
@@ -247,6 +249,8 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         super().__init__()
         self.loss_weights = torch.tensor(weights)
         self.device = None
+        self.extend_to_surface = extend_to_surface
+        self.transformed_sp = transformed_sp
         self.g0 = g0
         self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
@@ -272,6 +276,38 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             if f"q{int(pl)}" in channels:
                 self.q_index_offset = i
                 break
+
+        if self.extend_to_surface:
+            if self.transformed_sp:
+                surface_vars = ['sp-boxcox', 't2m', 'q2m']
+            else:
+                surface_vars = ['sp', 't2m', 'q2m']
+            for sv in surface_vars:
+                if sv not in channels:
+                    raise ValueError(f"Expected surface variable {sv} in channels")
+
+            self.sp_mapping = channels.index(surface_vars[0])
+            self.T_surface_mapping = channels.index(surface_vars[1])
+            self.q2m_mapping = channels.index(surface_vars[2])
+
+            self.sp_mean = torch.tensor(
+                scaling[f"{surface_vars[0]}"]["mean"]
+            ).reshape((1, 1, 1, -1, 1, 1))
+            self.sp_std = torch.tensor(
+                scaling[f"{surface_vars[0]}"]["std"]
+            ).reshape((1, 1, 1, -1, 1, 1))
+            self.T_surface_mean = torch.tensor(
+                scaling[f"{surface_vars[1]}"]["mean"]
+            ).reshape((1, 1, 1, -1, 1, 1))
+            self.T_surface_std = torch.tensor(
+                scaling[f"{surface_vars[1]}"]["std"]
+            ).reshape((1, 1, 1, -1, 1, 1))
+            self.q_surface_mean = torch.tensor(
+                scaling[f"{surface_vars[2]}"]["mean"]
+            ).reshape((1, 1, 1, -1, 1, 1))
+            self.q_surface_std = torch.tensor(
+                scaling[f"{surface_vars[2]}"]["std"]
+            ).reshape((1, 1, 1, -1, 1, 1))
 
         # Create mapping for new tensor that holds only the constraint variables
         self.z_constraint_pressure_levels = {
@@ -315,9 +351,9 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         ).reshape((1, 1, 1, -1, 1, 1))
 
         # Set per level alphas
-        if len(alpha) != len(hPa_levels) - 1:
+        if len(alpha) != len(hPa_levels) - 1 + self.extend_to_surface:
             raise AssertionError(
-                f"Incorrect number of alpha values. Expected len(hPa_levels)-1 [{len(hPa_levels)-1}], got {len(alpha)}"
+                f"Incorrect number of alpha values. Expected len(hPa_levels)-1+self.extend_to_surface [{len(hPa_levels)-1+self.extend_to_surface}], got {len(alpha)}"
             )
         self.alpha = torch.Tensor(alpha).reshape((1, 1, -1, 1, 1))
 
