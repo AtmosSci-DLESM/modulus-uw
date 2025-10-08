@@ -226,16 +226,6 @@ class HEALPixPadding(th.nn.Module):
             self.ps = self.ps_isolat
             self.tl = self.tl_isolat
             self.br = self.br_isolat
-        elif hpx_padding_mode == "isolatv2":
-            if padding > 1:
-                raise ValueError(
-                    f"Padding > 1 is not currently supported for isolatv2 \
-                    padding, received padding={padding}"
-                )
-            self.pn = self.pn_isolatv2
-            self.ps = self.ps_isolatv2
-            self.tl = self.tl_isolat
-            self.br = self.br_isolat
         else:
             raise ValueError(
                 f"Invalid value for 'mode', expected one of ['karlbauer', 'isolat'] but received {hpx_padding_mode}"
@@ -458,11 +448,9 @@ class HEALPixPadding(th.nn.Module):
         torch.Tensor:
             The padded tensor p
         """
-        # print('USING PN_ISOLAT')
         p = self.p  # Padding size
         d = self.d  # Dimensions for rotations
 
-        # Modify the top face to preserve isolatitude structure after padding
         t = t.rot90(1, dims=d)[..., -p:, :]
         for i in range(p):
             # Roll column towards equator (southward)
@@ -470,7 +458,6 @@ class HEALPixPadding(th.nn.Module):
             # Fill the now empty polar points by copying the most poleward point
             t[..., -i-1, :2*i+1] = t[..., -i-1, 2*i+1].unsqueeze(-1)
 
-        # Modify the left face to preserve isolatitude structure after padding
         lft = lft.rot90(-1, dims=d)[..., -p:]
         for i in range(p):
             # Roll row towards equator (southward)
@@ -483,68 +470,6 @@ class HEALPixPadding(th.nn.Module):
         # Assemble the left and right pads including the corner faces
         left = th.cat((tl.rot90(2, d)[..., -p:, -p:], lft, bl[..., :p, -p:]), dim=-2)
         right = th.cat((tr[..., -p:, :p], rgt[..., :p], br[..., :p, :p]), dim=-2)
-
-        return th.cat((left, c, right), dim=-1)
-
-    def pn_isolatv2(
-        self,
-        c: th.Tensor,
-        t: th.Tensor,
-        tl: th.Tensor,
-        lft: th.Tensor,
-        bl: th.Tensor,
-        b: th.Tensor,
-        br: th.Tensor,
-        rgt: th.Tensor,
-        tr: th.Tensor,
-    ) -> th.Tensor:
-        """
-        Applies padding to a northern hemisphere face c under consideration of
-        its given neighbors according to the isolatitude strategy.v2
-
-        Parameters
-        ----------
-        c: torch.Tensor
-            The central face and tensor that is subject for padding
-        t: torch.Tensor
-            The top neighboring face tensor
-        tl: torch.Tensor
-            The top left neighboring face tensor
-        lft: torch.Tensor
-            The left neighboring face tensor
-        bl: torch.Tensor
-            The bottom left neighboring face tensor
-        b: torch.Tensor
-            The bottom neighboring face tensor
-        br: torch.Tensor
-            The bottom right neighboring face tensor
-        rgt: torch.Tensor
-            The right neighboring face tensor
-        tr: torch.Tensor
-            The top right neighboring face  tensor
-
-        Returns
-        -------
-        torch.Tensor:
-            The padded tensor p
-        """
-        # print('USING PN_ISOLATV2')
-        d = self.d  # Dimensions for rotations
-
-        # Roll top and left face padding towards equator
-        t = t.rot90(1, dims=d)[..., -1:, :]
-        t[..., -1, :] = torch.roll(t[..., -1, :], 1, dims=-1)
-        t[..., -1, 0] = tl.rot90(2, d)[..., -2, -1] # fill opened point
-
-        lft = lft.rot90(-1, dims=d)[..., -1:]
-        lft[..., -1] = torch.roll(lft[..., -1], 1, dims=-1)
-        lft[..., 0, -1] = tl.rot90(2, d)[..., -1, -2] # fill opened point
-
-        # Assemble the center pads including the center face
-        c = th.cat((t, c, b[..., :1, :]), dim=-2)
-        # Assemble the left and right pads including the corner faces
-        left = th.cat((tl.rot90(2, d)[..., -2:-1, -2:-1], lft, bl[..., :1, -1:]), dim=-2)
-        right = th.cat((tr[..., -1:, :1], rgt[..., :1], br[..., :1, :1]), dim=-2)
 
         return th.cat((left, c, right), dim=-1)
 
@@ -699,11 +624,9 @@ class HEALPixPadding(th.nn.Module):
         torch.Tensor:
             The padded tensor p
         """
-        # print('USING PS_ISOLAT')
         p = self.p  # Padding size
         d = self.d  # Dimensions for rotations
 
-        # Modify the bottom face to preserve isolatitude structure after padding
         b = b.rot90(1, d)[..., :p, :]
         for i in range(p):
             # Roll the column towards equator (northward)
@@ -711,7 +634,6 @@ class HEALPixPadding(th.nn.Module):
             # Fill the now empty polar points by copying the most poleward point
             b[..., i, -(2*i+1):] = b[..., i, -(2*i+1)-1].unsqueeze(-1)
 
-        # Modify the right face to preserve isolatitude structure after padding
         rgt = rgt.rot90(-1, d)[..., :p]
         for i in range(p):
             # Roll the row towards equator (northward)
@@ -724,68 +646,6 @@ class HEALPixPadding(th.nn.Module):
         # Assemble the left and right pads including the corner faces
         left = th.cat((tl[..., -p:, -p:], lft[..., -p:], bl[..., :p, -p:]), dim=-2)
         right = th.cat((tr[..., -p:, :p], rgt, br.rot90(2, d)[..., :p, :p]), dim=-2)
-
-        return th.cat((left, c, right), dim=-1)
-
-    def ps_isolatv2(
-        self,
-        c: th.Tensor,
-        t: th.Tensor,
-        tl: th.Tensor,
-        lft: th.Tensor,
-        bl: th.Tensor,
-        b: th.Tensor,
-        br: th.Tensor,
-        rgt: th.Tensor,
-        tr: th.Tensor,
-    ) -> th.Tensor:
-        """
-        Applies padding to a southern hemisphere face c under consideration of
-        its given neighbors according to isolatitude strategy v2.
-
-        Parameters
-        ----------
-        c: torch.Tensor
-            The central face and tensor that is subject for padding
-        t: torch.Tensor
-            The top neighboring face tensor
-        tl: torch.Tensor
-            The top left neighboring face tensor
-        lft: torch.Tensor
-            The left neighboring face tensor
-        bl: torch.Tensor
-            The bottom left neighboring face tensor
-        b: torch.Tensor
-            The bottom neighboring face tensor
-        br: torch.Tensor
-            The bottom right neighboring face tensor
-        rgt: torch.Tensor
-            The right neighboring face tensor
-        tr: torch.Tensor
-            The top right neighboring face  tensor
-
-        Returns
-        -------
-        torch.Tensor:
-            The padded tensor p
-        """
-        # print('USING PS_ISOLATV2')
-        d = self.d  # Dimensions for rotations
-
-        # Roll bottom and right padding towards equator
-        b = b.rot90(1, d)[..., :1, :]
-        b[..., 0, :] = torch.roll(b[..., 0, :], -1, dims=-1)
-        b[..., 0, -1] = br.rot90(2, d)[..., 1, 0] # fill opened point
-
-        rgt = rgt.rot90(-1, d)[..., :1]
-        rgt[..., 0] = torch.roll(rgt[..., 0], -1, dims=-1)
-        rgt[..., -1, 0] = br.rot90(2, d)[..., 0, 1] # fill opened point
-            
-        # Assemble the center pads including the center face
-        c = th.cat((t[..., -1:, :], c, b), dim=-2)
-        # Assemble the left and right pads including the corner faces
-        left = th.cat((tl[..., -1:, -1:], lft[..., -1:], bl[..., :1, -1:]), dim=-2)
-        right = th.cat((tr[..., -1:, :1], rgt, br.rot90(2, d)[..., 1:2, 1:2]), dim=-2)
 
         return th.cat((left, c, right), dim=-1)
 
@@ -843,7 +703,6 @@ class HEALPixPadding(th.nn.Module):
         -------
             The assembled top left corner (only the sub-part that is required for padding)
         """
-        # print("USING TL ISOLAT FILLING")
         ret = th.zeros_like(top)[..., : self.p, : self.p]
 
         # Number of diagonals which need to be filled in order to reach a
@@ -853,15 +712,9 @@ class HEALPixPadding(th.nn.Module):
         if n+1 > top.shape[-1]:
             raise Exception(f"Padding {self.p} must not exceed half the face height/width {top.shape[-1]}")
 
-        # Get lengths of the diagonals we wish to fill
-        # Will be an array [1, 2, ..., n, n-1, ..., 1]
-        # fill_lens = th.arange(1, self.p+1)
-        # fill_lens = th.cat((fill_lens, th.flip(fill_lens[:-1], dims=(0,))))
-
-        # Get the diagonals we wish to fill
-        # Diagonal 3 is the third diagonal above the main diagonal, for example
+        # Get the diagonals we wish to fill. Diagonal 3 is the third diagonal
+        # above the main diagonal, for example
         diag_nums = th.arange(self.p-1, -(self.p-1)-1, -1)
-        # assert(len(fill_lens) == len(diag_nums))
 
         for i in range(n):
             
@@ -874,11 +727,6 @@ class HEALPixPadding(th.nn.Module):
             # Fill along the diagonal
             for i in range(len(diag_indices[0])):
                 ret[...,diag_indices[0][i],diag_indices[1][i]] = fill_val
-
-            # These are other valid ways to do this filling but require dynamic memory allocation
-            # so are not compatible with the CUDA graphs used in the training script
-            # ret[...,diag_indices[0],diag_indices[1]] = th.repeat_interleave(fill_val[...,None], fill_lens[i], axis=-1)
-            # ret[...,diag_indices[0],diag_indices[1]] = fill_val.unsqueeze(-1).expand(*([-1]*fill_val.ndim), fill_lens[i])
 
         # Rotate so face is oriented properly
         ret = th.rot90(ret, k=-1, dims=self.d)
@@ -944,15 +792,9 @@ class HEALPixPadding(th.nn.Module):
         if n+1 > b.shape[-1]:
             raise Exception(f"Padding {self.p} must not exceed half the face height/width {b.shape[-1]}")
 
-        # Get lengths of the diagonals we wish to fill
-        # Will be an array [1, 2, ..., n, n-1, ..., 1]
-        # fill_lens = th.arange(1, self.p+1)
-        # fill_lens = th.cat((fill_lens, th.flip(fill_lens[:-1], dims=(0,))))
-
-        # Get the diagonals we wish to fill
-        # Diagonal 3 is the third diagonal above the main diagonal, for example
+        # Get the diagonals we wish to fill. Diagonal 3 is the third diagonal
+        # above the main diagonal, for example
         diag_nums = th.arange(self.p-1, -(self.p-1)-1, -1)
-        # assert(len(fill_lens) == len(diag_nums))
 
         for i in range(n):
 
@@ -965,11 +807,6 @@ class HEALPixPadding(th.nn.Module):
             # Fill along the diagonal
             for i in range(len(diag_indices[0])):
                 ret[...,diag_indices[0][i],diag_indices[1][i]] = fill_val
-
-            # These are other valid ways to do this filling but require dynamic memory allocation
-            # so are not compatible with the CUDA graphs used in the training script
-            # ret[...,diag_indices[0],diag_indices[1]] = th.repeat_interleave(fill_val[...,None], fill_lens[i], axis=-1)
-            # ret[...,diag_indices[0],diag_indices[1]] = fill_val.unsqueeze(-1).expand(*([-1]*fill_val.ndim), fill_lens[i])
 
         # Rotate so face is oriented properly
         ret = th.rot90(ret, k=1, dims=self.d)

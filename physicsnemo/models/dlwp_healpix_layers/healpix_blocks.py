@@ -30,7 +30,6 @@ from hydra.utils import get_class
 # RECURRENT BLOCKS
 #
 
-
 class ConvGRUBlock(th.nn.Module):
     """Class that implements a Convolutional GRU
     Code modified from
@@ -123,7 +122,6 @@ class ConvGRUBlock(th.nn.Module):
 #
 # CONV BLOCKS
 #
-
 
 class BasicConvBlock(th.nn.Module):
     """Convolution block consisting of n subsequent convolutions and activations"""
@@ -786,11 +784,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
 
         return x + residual
 
-
 #
 # DOWNSAMPLING BLOCKS
 #
-
 
 class MaxPool(th.nn.Module):
     """This class provides a wrapper for a HEALPix (or other) tensor data
@@ -895,7 +891,6 @@ class AvgPool(th.nn.Module):
 #
 # UPSAMPLING BLOCKS
 #
-
 
 class TransposedConvUpsample(th.nn.Module):
     """This class provides a wrapper for a HEALPix (or other) tensor data
