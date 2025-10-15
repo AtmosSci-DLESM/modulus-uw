@@ -124,10 +124,12 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
         anchor_T_channel: int,
         R: float,
         g0: float,
+        extend_to_surface: bool = False,
     ) -> None:
         super().__init__()
         self.R = R
         self.g0 = g0
+        self.extend_to_surface = extend_to_surface
 
         assert (
             anchor_z_channel in z_pressure_levels.keys()
@@ -155,6 +157,8 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
         self.z_channels = list(self.z_pressure_levels.keys())
         self.Tv_channels = list(self.Tv_pressure_levels.keys())
 
+        self.pressure_levels = sorted(z_pressure_levels.values())
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
@@ -167,12 +171,21 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
         torch.Tensor
         """
         Tv_avg_size = [
-            len(self.z_pressure_levels) - 1 if i == 2 else s
+            len(self.z_pressure_levels) - 1 + self.extend_to_surface if i == 2 else s
             for i, s in enumerate(x.size())
         ]
         Tv_avg = torch.empty(
             Tv_avg_size, dtype=x.dtype, layout=x.layout, device=x.device
         )
+        
+        p_levs_size = [
+            len(self.pressure_levels) if i == 2 else s
+            for i, s in enumerate(x.size())
+        ]
+        p_levs = torch.ones(
+            p_levs_size, dtype=x.dtype, layout=x.layout, device=x.device
+        )
+        p_levs *= torch.tensor(self.pressure_levels, dtype=x.dtype, device=x.device).view(1,1,-1,1,1)
 
         # Go up in index (down in vertical level) from anchor
         # TODO: remove constraint that first z_channel is 0
@@ -188,6 +201,26 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
                 zip1,
                 self.z_pressure_levels[z_channel],
                 self.z_pressure_levels[z_channel_p1],
+                self.R,
+                self.g0,
+            )
+
+        if self.extend_to_surface:
+            pass
+            above_surface_mask = x[:, :, : len(self.z_pressure_levels), :, :] > self.topography
+            lowest_lev_idx = above_surface_mask.int().flip(2).argmax(dim=2)
+            lowest_lev_idx = len(self.z_pressure_levels) - 1 - lowest_lev_idx
+            zi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
+            zip1 = self.topography
+            p1 = torch.gather(p_levs, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
+            p2 = x[:, :, -1, ...]
+            Tv_avg[
+                :, :, len(self.z_pressure_levels)-1, ...
+            ] = _average_virtual_temperature_from_geopotential_height(
+                zi,
+                zip1,
+                p1,
+                p2,
                 self.R,
                 self.g0,
             )
@@ -210,7 +243,6 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
 
         return Tv_avg, Tv_model_avg
 
-
 class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
 
     """
@@ -221,8 +253,6 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
     def __init__(
         self,
         hPa_levels: Sequence[int],
-        extend_to_surface: bool = False,
-        transformed_sp: bool = False,
         channels: Sequence[str],
         weights: Sequence,
         alpha: Sequence[float],  # K
@@ -238,6 +268,8 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         R: float = 287,  # J K^{-1} kg^{-1}
         g0: float = 9.81,  # m s^{-2}
         topography_masking: bool = True,
+        extend_to_surface: bool = False,
+        transformed_sp: bool = False,
     ):
         """
         Parameters
@@ -254,6 +286,8 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.g0 = g0
         self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
+
+        
 
         # Get channel index to pressure level mapping
         self.pressure_levels = sorted(hPa_levels)
@@ -276,38 +310,6 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             if f"q{int(pl)}" in channels:
                 self.q_index_offset = i
                 break
-
-        if self.extend_to_surface:
-            if self.transformed_sp:
-                surface_vars = ['sp-boxcox', 't2m', 'q2m']
-            else:
-                surface_vars = ['sp', 't2m', 'q2m']
-            for sv in surface_vars:
-                if sv not in channels:
-                    raise ValueError(f"Expected surface variable {sv} in channels")
-
-            self.sp_mapping = channels.index(surface_vars[0])
-            self.T_surface_mapping = channels.index(surface_vars[1])
-            self.q2m_mapping = channels.index(surface_vars[2])
-
-            self.sp_mean = torch.tensor(
-                scaling[f"{surface_vars[0]}"]["mean"]
-            ).reshape((1, 1, 1, -1, 1, 1))
-            self.sp_std = torch.tensor(
-                scaling[f"{surface_vars[0]}"]["std"]
-            ).reshape((1, 1, 1, -1, 1, 1))
-            self.T_surface_mean = torch.tensor(
-                scaling[f"{surface_vars[1]}"]["mean"]
-            ).reshape((1, 1, 1, -1, 1, 1))
-            self.T_surface_std = torch.tensor(
-                scaling[f"{surface_vars[1]}"]["std"]
-            ).reshape((1, 1, 1, -1, 1, 1))
-            self.q_surface_mean = torch.tensor(
-                scaling[f"{surface_vars[2]}"]["mean"]
-            ).reshape((1, 1, 1, -1, 1, 1))
-            self.q_surface_std = torch.tensor(
-                scaling[f"{surface_vars[2]}"]["std"]
-            ).reshape((1, 1, 1, -1, 1, 1))
 
         # Create mapping for new tensor that holds only the constraint variables
         self.z_constraint_pressure_levels = {
@@ -360,6 +362,46 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         # Molecular weight ratio factor of water vapor to air
         self.Mw_ratio = 28.97 / 18.016 - 1.0  # 0.6078
 
+        if self.extend_to_surface:
+            self.T_pressure_levels[channels.index("t2m")] = "surface"
+            self.q_pressure_levels[channels.index("q2m")] = "surface"
+
+            self.T2m_mean = torch.tensor(
+                scaling["t2m"]["mean"]
+            ).reshape((1, 1, 1, -1, 1, 1))
+            self.T2m_std = torch.tensor(
+                scaling["t2m"]["std"]
+            ).reshape((1, 1, 1, -1, 1, 1))
+            self.q2m_mean = torch.tensor(
+                scaling["q2m"]["mean"]
+            ).reshape((1, 1, 1, -1, 1, 1))
+            self.q2m_std = torch.tensor(
+                scaling["q2m"]["std"]
+            ).reshape((1, 1, 1, -1, 1, 1))
+
+            self.T_mean = torch.cat((self.T_mean, self.T2m_mean), dim=3)
+            self.T_std = torch.cat((self.T_std, self.T2m_std), dim=3)
+            self.q_mean = torch.cat((self.q_mean, self.q2m_mean), dim=3)
+            self.q_std = torch.cat((self.q_std, self.q2m_std), dim=3)
+
+            sp_name = 'sp-boxcox' if self.transformed_sp else 'sp'
+
+            self.sp_mean = torch.tensor(
+                scaling[sp_name]["mean"]
+            ).reshape((1, 1, 1, -1, 1, 1))
+            self.sp_std = torch.tensor(
+                scaling[sp_name]["std"]
+            ).reshape((1, 1, 1, -1, 1, 1))
+            self.sp_mapping = channels.index(sp_name)
+
+            # if self.transformed_sp:
+            #     surface_vars = ['sp-boxcox', 't2m', 'q2m']
+            # else:
+            #     surface_vars = ['sp', 't2m', 'q2m']
+            # for sv in surface_vars:
+            #     if sv not in channels:
+            #         raise ValueError(f"Expected surface variable {sv} in channels")
+
         # Create the constraint
         # TODO: remove anchor levels since it's not needed for the
         # differential constraint
@@ -370,10 +412,11 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             len(self.z_pressure_levels),
             R,
             self.g0,
+            self.extend_to_surface,
         )
 
-        self.num_z_levels = len(self.z_constraint_pressure_levels)
-        self.num_Tv_levels = len(self.Tv_constraint_pressure_levels)
+        self.num_z_levels = len(self.z_constraint_pressure_levels) + self.extend_to_surface
+        self.num_Tv_levels = len(self.Tv_constraint_pressure_levels) + self.extend_to_surface
         self.z_level_mapping = torch.tensor(list(self.z_pressure_levels.keys()))
         self.T_level_mapping = torch.tensor(list(self.T_pressure_levels.keys()))
         self.q_level_mapping = torch.tensor(list(self.q_pressure_levels.keys()))
@@ -425,6 +468,16 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         # Move topography
         self.topography = self.topography.to(device=trainer.device)
 
+    def reverse_transform_sp(
+        x,
+        lam,
+        max_val,
+    ):
+        x = torch.exp(torch.log(x * lam + 1)/lam) # reverse Box-Cox
+        x *= max_val # Rescaling back to Pa
+        x *= 100 # hPa to Pa
+        return x
+
     def scale(self, x):
         """
         Scale inputs to physical values and compute virtual temperature
@@ -433,6 +486,8 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         # N, B, F, C, H, W = x.shape
         N, F, B, C, H, W = x.shape
         C_scaled = self.num_z_levels + self.num_Tv_levels
+        if self.extend_to_surface:
+            C_scaled += 2 # surface geopotential and surface pressure
         x_scaled = torch.zeros(
             # (N, B, F, C_scaled, H, W), device=x.device, dtype=torch.float
             (N, F, B, C_scaled, H, W),
@@ -440,11 +495,23 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             dtype=torch.float,
         )
         # Get scaled geopotential heights
-        x_scaled[:, :, :, : self.num_z_levels, :, :] = (
+        x_scaled[:, :, :, : self.num_z_levels-self.extend_to_surface, :, :] = (
             x[:, :, :, self.z_level_mapping, :, :] * self.z_std + self.z_mean
         ) / self.g0  # divide by g0 for heights
+        if self.extend_to_surface:
+            # Add surface geopotential
+            surface_Z = self.topography.unsqueeze(2)
+            surface_Z = torch.tile(surface_Z, (N, 1, B, 1, 1, 1))
+            x_scaled[:, :, :, self.num_z_levels, :, :] = surface_Z
+
+            # Add surface pressure
+            x_scaled[:, :, :, -1, :, :] = (
+                x[:, :, :, self.sp_mapping, :, :] * self.sp_std + self.sp_mean
+            )
+            x_scaled[:, :, :, -1, :, :] = self.reverse_transform_sp(x_scaled[:, :, :, -1, :, :])
+        
         # Get scaled temperatures
-        x_scaled[:, :, :, self.num_z_levels :, :, :] = (
+        x_scaled[:, :, :, self.num_z_levels : self.num_z_levels + self.num_Tv_levels, :, :] = (
             x[:, :, :, self.T_level_mapping, :, :] * self.T_std + self.T_mean
         )
         # Add q correction to get virtual temperature for levels with non-zero q
@@ -452,7 +519,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             :,
             :,
             :,
-            (self.num_z_levels + self.q_index_offset) :,
+            (self.num_z_levels + self.q_index_offset) : self.num_z_levels + self.num_Tv_levels,
             :,
             :,
         ] *= 1.0 + self.Mw_ratio * (
