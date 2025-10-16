@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 def _average_virtual_temperature_from_geopotential_height(z1, z2, p1, p2, R, g0):
-    return g0 / (R * np.log(p1 / p2)) * (z2 - z1)
+    return g0 / (R * torch.log(p1 / p2)) * (z2 - z1)
 
 
 def _virtual_temperature_from_geopotential_height(z1, z2, p1, p2, T1, R, g0):
@@ -202,8 +202,8 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
             ] = _average_virtual_temperature_from_geopotential_height(
                 zi,
                 zip1,
-                self.z_pressure_levels[z_channel],
-                self.z_pressure_levels[z_channel_p1],
+                torch.tensor(self.z_pressure_levels[z_channel]),
+                torch.tensor(self.z_pressure_levels[z_channel_p1]),
                 self.R,
                 self.g0,
             )
@@ -225,45 +225,51 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
             Tv_model_avg[:, :, i, ...] = 0.5 * (Tvi + Tvip1)
 
         if self.extend_to_surface:
+            pass
             # Generate tensor of pressure levels
-            p_levs_size = [
-                len(self.pressure_levels) if i == 2 else s
-                for i, s in enumerate(x.size())
-            ]
-            p_levs = torch.ones(
-                p_levs_size, dtype=x.dtype, layout=x.layout, device=x.device
-            )
-            p_levs *= torch.tensor(self.pressure_levels, dtype=x.dtype, device=x.device).view(1,1,-1,1,1)
+            # p_levs_size = [
+            #     len(self.pressure_levels) if i == 2 else s
+            #     for i, s in enumerate(x.size())
+            # ]
+            # p_levs = torch.ones(
+            #     p_levs_size, dtype=x.dtype, layout=x.layout, device=x.device
+            # )
+            # p_levs *= torch.tensor(self.pressure_levels, dtype=x.dtype, device=x.device).view(1,1,-1,1,1)
 
-            # Get boolean mask of levels above surface using geopotential heights
-            # Assumes first z_channel is the highest altitude level
-            above_surface_mask = x[:, :, : len(self.z_pressure_levels), :, :] > x[:, :, len(self.z_pressure_levels), :, :]
+            # # Get boolean mask of levels above surface using geopotential heights
+            # # Assumes first z_channel is the highest altitude level
+            # above_surface_mask = (
+            #     x[:, :, : len(self.z_pressure_levels), :, :] >
+            #     x[:, :, len(self.z_pressure_levels):len(self.z_pressure_levels)+1, :, :]
+            # )
+            # print(above_surface_mask.shape, flush=True)
 
-            # Get index of lowest level above surface
-            lowest_lev_idx = above_surface_mask.int().flip(2).argmax(dim=2)
-            lowest_lev_idx = len(self.z_pressure_levels) - 1 - lowest_lev_idx
+            # # Get index of lowest level above surface
+            # lowest_lev_idx = above_surface_mask.int().flip(2).argmax(dim=2)
+            # lowest_lev_idx = len(self.z_pressure_levels) - 1 - lowest_lev_idx
+            # print(lowest_lev_idx.shape, flush=True)
 
-            # Compute average virtual temperature between lowest level and surface
-            # from geopotential heights
-            zi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
-            zip1 = x[:, :, self.z_channels[-1], ...]
-            p1 = torch.gather(p_levs, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
-            p2 = x[:, :, -1, ...]
-            Tv_avg[
-                :, :, -1, ...
-            ] = _average_virtual_temperature_from_geopotential_height(
-                zi,
-                zip1,
-                p1,
-                p2,
-                self.R,
-                self.g0,
-            )
+            # # Compute average virtual temperature between lowest level and surface
+            # # from geopotential heights
+            # zi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
+            # zip1 = x[:, :, self.z_channels[-1], ...]
+            # p1 = torch.gather(p_levs, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
+            # p2 = x[:, :, -1, ...]
+            # Tv_avg[
+            #     :, :, -1, ...
+            # ] = _average_virtual_temperature_from_geopotential_height(
+            #     zi,
+            #     zip1,
+            #     p1,
+            #     p2,
+            #     self.R,
+            #     self.g0,
+            # )
 
-            # Get average model virtual temperature between lowest level and surface
-            Tvi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
-            Tvip1 = x[:, :, self.Tv_channels[-1], ...]
-            Tv_model_avg[:, :, -1, ...] = 0.5 * (Tvi + Tvip1)
+            # # Get average model virtual temperature between lowest level and surface
+            # Tvi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
+            # Tvip1 = x[:, :, self.Tv_channels[-1], ...]
+            # Tv_model_avg[:, :, -1, ...] = 0.5 * (Tvi + Tvip1)
 
         return Tv_avg, Tv_model_avg
 
@@ -431,7 +437,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             self.z_constraint_pressure_levels,
             self.Tv_constraint_pressure_levels,
             0,
-            len(self.z_pressure_levels),
+            len(self.z_pressure_levels)+self.extend_to_surface,
             R,
             self.g0,
             self.extend_to_surface,
@@ -444,7 +450,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.q_level_mapping = torch.tensor(list(self.q_pressure_levels.keys()))
 
         # Get topography information
-        ds = xr.open_zarr(f"{src_directory}{dataset_name}.zarr")
+        ds = xr.open_zarr(f"{src_directory}/{dataset_name}.zarr")
         self.topography = (
             surface_geopotential_std * ds.constants.sel(channel_c=surface_geopotential_name).values
             + surface_geopotential_mean
@@ -464,7 +470,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         pushes weights to cuda device
         """
 
-        if len(trainer.output_variables) + len(self.z_pressure_levels) - 1 != len(
+        if len(trainer.output_variables) + len(self.z_pressure_levels) + self.extend_to_surface - 1 != len(
             self.loss_weights
         ):
             raise ValueError("Length of outputs and loss_weights is not the same!")
@@ -478,6 +484,9 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.T_std = self.T_std.to(device=trainer.device)
         self.q_mean = self.q_mean.to(device=trainer.device)
         self.q_std = self.q_std.to(device=trainer.device)
+        if self.extend_to_surface:
+            self.sp_mean = self.sp_mean.to(device=trainer.device)
+            self.sp_std = self.sp_std.to(device=trainer.device)
 
         # Move alphas
         self.alpha = self.alpha.to(device=trainer.device)
@@ -491,10 +500,12 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.topography = self.topography.to(device=trainer.device)
 
     def reverse_transform_sp(
+        self,
         x,
-        lam,
-        max_val,
+        lam=19.632015209145543,
+        max_val=106806.3515625,
     ):
+        # TODO: this causes an error related to in place operations in CUDA graphs
         x = torch.exp(torch.log(x * lam + 1)/lam) # reverse Box-Cox
         x *= max_val # Rescaling back to Pa
         x *= 100 # hPa to Pa
@@ -524,13 +535,14 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             # Add surface geopotential
             surface_Z = self.topography.unsqueeze(2)
             surface_Z = torch.tile(surface_Z, (N, 1, B, 1, 1, 1))
-            x_scaled[:, :, :, self.num_z_levels, :, :] = surface_Z
+            x_scaled[:, :, :, self.num_z_levels:self.num_z_levels+1, :, :] = surface_Z
 
             # Add surface pressure
             x_scaled[:, :, :, -1, :, :] = (
                 x[:, :, :, self.sp_mapping, :, :] * self.sp_std + self.sp_mean
             )
-            x_scaled[:, :, :, -1, :, :] = self.reverse_transform_sp(x_scaled[:, :, :, -1, :, :])
+            if self.transformed_sp:
+                x_scaled[:, :, :, -1, :, :] = self.reverse_transform_sp(x_scaled[:, :, :, -1, :, :])
         
         # Get scaled temperatures
         x_scaled[:, :, :, self.num_z_levels : self.num_z_levels + self.num_Tv_levels, :, :] = (
