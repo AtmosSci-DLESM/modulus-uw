@@ -505,10 +505,9 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         lam=19.632015209145543,
         max_val=106806.3515625,
     ):
-        # TODO: this causes an error related to in place operations in CUDA graphs
         x = torch.exp(torch.log(x * lam + 1)/lam) # reverse Box-Cox
-        x *= max_val # Rescaling back to Pa
-        x *= 100 # hPa to Pa
+        x = x * max_val # Rescaling back to Pa
+        x = x * 100 # hPa to Pa
         return x
 
     def scale(self, x):
@@ -538,12 +537,11 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             x_scaled[:, :, :, self.num_z_levels:self.num_z_levels+1, :, :] = surface_Z
 
             # Add surface pressure
-            x_scaled[:, :, :, -1, :, :] = (
-                x[:, :, :, self.sp_mapping, :, :] * self.sp_std + self.sp_mean
-            )
+            sp = x[:, :, :, self.sp_mapping, :, :] * self.sp_std + self.sp_mean
             if self.transformed_sp:
-                x_scaled[:, :, :, -1, :, :] = self.reverse_transform_sp(x_scaled[:, :, :, -1, :, :])
-        
+                sp = self.reverse_transform_sp(sp)
+            x_scaled[:, :, :, -1, :, :] = sp
+
         # Get scaled temperatures
         x_scaled[:, :, :, self.num_z_levels : self.num_z_levels + self.num_Tv_levels, :, :] = (
             x[:, :, :, self.T_level_mapping, :, :] * self.T_std + self.T_mean
