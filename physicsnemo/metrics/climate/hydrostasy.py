@@ -167,8 +167,13 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
         self.z_channels = list(self.z_pressure_levels.keys())
         self.Tv_channels = list(self.Tv_pressure_levels.keys())
 
-        self.pressure_levels = sorted(
+        pressure_levels = sorted(
             {k: v for k, v in z_pressure_levels.items() if not isinstance(v, str)}.values()
+        )
+        self.register_buffer(
+            'pressure_levels',
+            torch.tensor(pressure_levels).view(1,1,-1,1,1),
+            persistent=False
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -225,36 +230,35 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
             Tv_model_avg[:, :, i, ...] = 0.5 * (Tvi + Tvip1)
 
         if self.extend_to_surface:
-            pass
             # Generate tensor of pressure levels
-            # p_levs_size = [
-            #     len(self.pressure_levels) if i == 2 else s
-            #     for i, s in enumerate(x.size())
-            # ]
-            # p_levs = torch.ones(
-            #     p_levs_size, dtype=x.dtype, layout=x.layout, device=x.device
-            # )
-            # p_levs *= torch.tensor(self.pressure_levels, dtype=x.dtype, device=x.device).view(1,1,-1,1,1)
+            p_levs_size = [
+                len(self.pressure_levels) if i == 2 else s
+                for i, s in enumerate(x.size())
+            ]
+            p_levs = torch.ones(
+                p_levs_size, dtype=x.dtype, layout=x.layout, device=x.device
+            )
+            p_levs = p_levs * self.pressure_levels
 
-            # # Get boolean mask of levels above surface using geopotential heights
-            # # Assumes first z_channel is the highest altitude level
-            # above_surface_mask = (
-            #     x[:, :, : len(self.z_pressure_levels), :, :] >
-            #     x[:, :, len(self.z_pressure_levels):len(self.z_pressure_levels)+1, :, :]
-            # )
-            # print(above_surface_mask.shape, flush=True)
+            # Get boolean mask of levels above surface using geopotential heights
+            # Assumes first z_channel is the highest altitude level
+            above_surface_mask = (
+                x[:, :, : len(self.z_pressure_levels), :, :] >
+                x[:, :, len(self.z_pressure_levels):len(self.z_pressure_levels)+1, :, :]
+            )
 
-            # # Get index of lowest level above surface
-            # lowest_lev_idx = above_surface_mask.int().flip(2).argmax(dim=2)
-            # lowest_lev_idx = len(self.z_pressure_levels) - 1 - lowest_lev_idx
-            # print(lowest_lev_idx.shape, flush=True)
+            # Get index of lowest level above surface
+            lowest_lev_idx = above_surface_mask.int().flip(2).argmax(dim=2)
+            lowest_lev_idx = len(self.z_pressure_levels) - 1 - lowest_lev_idx
 
-            # # Compute average virtual temperature between lowest level and surface
-            # # from geopotential heights
-            # zi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
-            # zip1 = x[:, :, self.z_channels[-1], ...]
-            # p1 = torch.gather(p_levs, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
-            # p2 = x[:, :, -1, ...]
+            # Compute average virtual temperature between lowest level and surface
+            # from geopotential heights
+            zi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
+            zip1 = x[:, :, self.z_channels[-1], ...]
+            print(torch.unique(lowest_lev_idx))
+            p1 = torch.gather(p_levs, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
+            # p1 = torch.gather(p_levs, 2, 7*torch.ones(lowest_lev_idx.shape, dtype=torch.long, device=x.device).unsqueeze(2)).squeeze(2)
+            p2 = x[:, :, -1, ...]
             # Tv_avg[
             #     :, :, -1, ...
             # ] = _average_virtual_temperature_from_geopotential_height(
