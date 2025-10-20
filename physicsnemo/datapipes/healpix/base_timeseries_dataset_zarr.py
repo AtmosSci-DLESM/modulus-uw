@@ -566,7 +566,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             timedeltas = (
                 np.array(self._input_indices[0] + self._output_indices[0])
             ) * self.data_time_step
-            return self.time_da[self.start_index].values + timedeltas
+            return self.time_da[time_index[0]].values + timedeltas
         return self.time_da[slice(*time_index)].values
 
     def __len__(self) -> int:
