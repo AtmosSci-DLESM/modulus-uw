@@ -292,7 +292,6 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         src_directory: str,
         dst_directory: str,
         dataset_name: str,
-        data_format: str,
         surface_geopotential_name: str,
         surface_geopotential_mean: float = -597.7115478515625,
         surface_geopotential_std: float = 55658.21484375,
@@ -300,7 +299,6 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         R: float = 287,  # J K^{-1} kg^{-1}
         g0: float = 9.81,  # m s^{-2}
         topography_masking: bool = True,
-        transformed_sp: bool = False,
     ):
         """
         Parameters
@@ -312,28 +310,25 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         super().__init__()
         self.loss_weights = torch.tensor(weights)
         self.device = None
-        self.extend_to_surface = extend_to_surface
-        self.transformed_sp = transformed_sp
         self.g0 = g0
         self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
 
-        # Get channel index to pressure level mapping
         if "surface" in hPa_levels:
             self.extend_to_surface = True
             hPa_levels.remove("surface")
             logger.info(
-                "Extending hydrostasy constraint to surface level, ensure that \
-                surface pressure is constrained to be non-negative using \
-                constraints module."
+                "Extending hydrostasy constraint to surface level, ensure that surface pressure is constrained to be non-negative using constraints module."
             )
             if "sp" not in channels and "sp-boxcox" not in channels:
                 raise ValueError(
-                    "Surface pressure channel (sp or sp-boxcox) must be \
-                    included in model channels when extending hydrostasy \
-                    constraint to surface."
+                    "Surface pressure channel (sp or sp-boxcox) must be included in model channels when extending hydrostasy constraint to surface."
                 )
+            self.transformed_sp = True if "sp-boxcox" in channels else False
+        else:
+            self.extend_to_surface = False
 
+        # Get channel index to pressure level mapping
         self.pressure_levels = sorted(hPa_levels)
         self.z_pressure_levels = {
             channels.index(f"z{int(pl)}"): pl
