@@ -24,6 +24,8 @@ class NonnegativeConstraint(torch.nn.Module):
         self.channels = channels
         self.scaling = scaling
 
+        SP_BOXCOX_LAM = 19.632015209145543
+
         # Only apply constraint to variables that are used by model
         self.variables = [var for var in self.variables if var in channels]
 
@@ -37,6 +39,11 @@ class NonnegativeConstraint(torch.nn.Module):
         self.var_stds = torch.tensor([scaling[var]['std'] for var in self.variables])
 
         thresholds = (0. - self.var_means) / self.var_stds
+        if 'sp-boxcox' in self.variables:
+            sp_idx = self.variables.index('sp-boxcox')
+            # Inverse Box-Cox transform to find the threshold in boxcox space
+            thresholds[sp_idx] = ((0.**SP_BOXCOX_LAM-1)/SP_BOXCOX_LAM - self.var_means[sp_idx]) / self.var_stds[sp_idx]
+
         thresholds = thresholds.view(1, 1, 1, -1, 1, 1)
         self.register_buffer('thresholds', thresholds, persistent=False)
 

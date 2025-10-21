@@ -197,6 +197,7 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
         
         # Go up in index (down in vertical level) from anchor
         # TODO: remove constraint that first z_channel is 0
+        # print('HERE', flush=True)
         for i in range(len(self.z_pressure_levels) - 1 - self.extend_to_surface):
             z_channel = self.z_channels[i]
             z_channel_p1 = self.z_channels[i + 1]
@@ -212,6 +213,9 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
                 self.R,
                 self.g0,
             )
+            # print(f'zi: {torch.any(torch.isnan(zi))}', flush=True)
+            # print(f'zip1: {torch.any(torch.isnan(zip1))}', flush=True)
+            # print(f'Tv_avg: {torch.any(torch.isnan(Tv_avg[:, :, i, ...]))}', flush=True)
 
         Tv_model_avg_size = [
             len(self.Tv_pressure_levels) - 1 if i == 2 else s
@@ -243,37 +247,43 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
             # Get boolean mask of levels above surface using geopotential heights
             # Assumes first z_channel is the highest altitude level
             above_surface_mask = (
-                x[:, :, : len(self.z_pressure_levels), :, :] >
-                x[:, :, len(self.z_pressure_levels):len(self.z_pressure_levels)+1, :, :]
+                x[:, :, : len(self.z_pressure_levels)-1, :, :] >
+                x[:, :, len(self.z_pressure_levels)-1:len(self.z_pressure_levels), :, :]
             )
 
             # Get index of lowest level above surface
             lowest_lev_idx = above_surface_mask.int().flip(2).argmax(dim=2)
-            lowest_lev_idx = len(self.z_pressure_levels) - 1 - lowest_lev_idx
+            lowest_lev_idx = (len(self.z_pressure_levels)-1) - 1 - lowest_lev_idx
 
             # Compute average virtual temperature between lowest level and surface
             # from geopotential heights
             zi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
             zip1 = x[:, :, self.z_channels[-1], ...]
-            print(torch.unique(lowest_lev_idx))
             p1 = torch.gather(p_levs, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
-            # p1 = torch.gather(p_levs, 2, 7*torch.ones(lowest_lev_idx.shape, dtype=torch.long, device=x.device).unsqueeze(2)).squeeze(2)
             p2 = x[:, :, -1, ...]
+            Tv_avg[
+                :, :, -1, ...
+            ] = _average_virtual_temperature_from_geopotential_height(
+                zi,
+                zip1,
+                p1,
+                p2,
+                self.R,
+                self.g0,
+            )
             # Tv_avg[
             #     :, :, -1, ...
-            # ] = _average_virtual_temperature_from_geopotential_height(
-            #     zi,
-            #     zip1,
-            #     p1,
-            #     p2,
-            #     self.R,
-            #     self.g0,
-            # )
+            # ] = torch.ones_like(Tv_avg[:, :, -1, ...])
 
-            # # Get average model virtual temperature between lowest level and surface
-            # Tvi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
-            # Tvip1 = x[:, :, self.Tv_channels[-1], ...]
-            # Tv_model_avg[:, :, -1, ...] = 0.5 * (Tvi + Tvip1)
+            # Get average model virtual temperature between lowest level and surface
+            Tvi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
+            Tvip1 = x[:, :, self.Tv_channels[-1], ...]
+            Tv_model_avg[:, :, -1, ...] = 0.5 * (Tvi + Tvip1)
+            # Tv_model_avg[:, :, -1, ...] = torch.ones_like(Tv_model_avg[:, :, -1, ...])
+
+            # # for i in range(Tv_avg.shape[2]):
+            # #     print(f'LAYER {i}: {torch.any(torch.isnan(Tv_avg[:, :, i, ...]))}, {torch.any(torch.isnan(Tv_model_avg[:, :, i, ...]))}', flush=True)
+            # # print(torch.any(torch.isnan(Tv_avg)), torch.any(torch.isnan(Tv_model_avg)), flush=True)
 
         return Tv_avg, Tv_model_avg
 
@@ -507,11 +517,10 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self,
         x,
         lam=19.632015209145543,
-        max_val=106806.3515625,
+        max_val=1068.063515625,
     ):
-        x = torch.exp(torch.log(x * lam + 1)/lam) # reverse Box-Cox
-        x = x * max_val # Rescaling back to Pa
-        x = x * 100 # hPa to Pa
+        x = torch.exp(torch.log(x * lam + 1 + 1e-8)/lam) # reverse Box-Cox
+        x = x * max_val # Rescaling back to hPa
         return x
 
     def scale(self, x):
@@ -544,6 +553,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             sp = x[:, :, :, self.sp_mapping, :, :] * self.sp_std + self.sp_mean
             if self.transformed_sp:
                 sp = self.reverse_transform_sp(sp)
+            # print(f'min sp: {torch.min(sp)}, max sp: {torch.max(sp)}', flush=True)
             x_scaled[:, :, :, -1, :, :] = sp
 
         # Get scaled temperatures
@@ -642,7 +652,10 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
 
             # Scale to physical units and compute virtual temperature
             x = self.scale(prediction)
+            # print(f'prediction: {torch.any(torch.isnan(prediction))}', flush=True)
+            # print(f'scaled x: {torch.any(torch.isnan(x))}', flush=True)
             Tv_avg, Tv_model_avg = self.constraint(x)
+            # print(torch.any(torch.isnan(Tv_avg)), torch.any(torch.isnan(Tv_model_avg)), flush=True)
             Tv_error = ((Tv_avg - Tv_model_avg) / self.alpha) ** 2
 
             # Mask out error in regions below the surface
@@ -654,6 +667,9 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
 
             data_loss = ((target - prediction) ** 2).mean(dim=(0, 1, 2, 4, 5))
             d = torch.concatenate((data_loss, Tv_loss)) * self.loss_weights
+            # print(f'd: {torch.any(torch.isnan(d))}', flush=True)
+            # print(f'{torch.min(d)},{torch.max(d)}', flush=True)
+            # print(f'{d}', flush=True)
 
             if average_channels:
                 return torch.mean(d)
