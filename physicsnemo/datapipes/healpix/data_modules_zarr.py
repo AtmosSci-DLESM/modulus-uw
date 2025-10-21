@@ -76,7 +76,7 @@ class TimeSeriesDataModuleZarr:
             The number of sequential samples to load from the dataset to load, default 32
         dataloader_batch_size: int, optional
             Passed to nn.DataLoader as batch_size. Used to assemble batches of samples from the dataloader
-            The total number of samples will be dataloader_batch_size*dataloader_batch_size, default None
+            The total number of samples will be batch_size*dataloader_batch_size, default None
         drop_last: bool, optional
             Whether to drop the last batch if it is smaller than batch_size, it is
             recommended to set this to true to avoid issues with mismatched sizes, default True

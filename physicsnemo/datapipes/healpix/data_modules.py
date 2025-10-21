@@ -25,6 +25,8 @@ import numpy as np
 # distributed stuff
 import xarray as xr
 
+import warnings
+
 # External modules
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
@@ -168,6 +170,13 @@ class TimeSeriesDataModule:
                     NOT produce any target array.
         """
         super().__init__()
+
+        warnings.warn(
+            "TimeSeriesDataModule will be removed in a future release, please switch to using TimeSeriesDataModuleZarr",
+            DeprecationWarning,
+            stacklevel=2
+        )
+
         self.dst_directory = dst_directory
         self.dataset_name = dataset_name
         self.prefix = prefix
