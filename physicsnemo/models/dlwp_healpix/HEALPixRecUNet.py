@@ -144,6 +144,7 @@ class HEALPixRecUNet(Module):
         self.presteps = presteps
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
+        self.residual_prediction = residual_prediction
         self.couplings_time_first = couplings_time_first
 
         # Number of passes through the model, or a diagnostic model with only one output time
