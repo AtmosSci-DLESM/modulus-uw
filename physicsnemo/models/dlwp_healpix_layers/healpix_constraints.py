@@ -27,10 +27,8 @@ class NonnegativeConstraint(torch.nn.Module):
         super().__init__()
         self.variables = variables
         if out_channels is not None:
-            print("USING OUT CHANNELS")
             self.channels = out_channels
         else:
-            print("USING IN CHANNELS")
             self.channels = in_channels
         self.scaling = scaling
         self.sp_boxcox_lambda = sp_boxcox_lambda
