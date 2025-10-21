@@ -16,5 +16,6 @@
 
 from .HEALPixRecUNet import HEALPixRecUNet
 from .HEALPixUNet import HEALPixUNet
+from .HEALPixResNet import HEALPixResNet
 
-__all__ = ["HEALPixRecUNet", "HEALPixUNet"]
+__all__ = ["HEALPixRecUNet", "HEALPixUNet", "HEALPixResNet"]
