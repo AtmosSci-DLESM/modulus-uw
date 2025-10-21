@@ -300,7 +300,6 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         R: float = 287,  # J K^{-1} kg^{-1}
         g0: float = 9.81,  # m s^{-2}
         topography_masking: bool = True,
-        extend_to_surface: bool = False,
         transformed_sp: bool = False,
     ):
         """
@@ -320,6 +319,21 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.topography_masking = topography_masking
 
         # Get channel index to pressure level mapping
+        if "surface" in hPa_levels:
+            self.extend_to_surface = True
+            hPa_levels.remove("surface")
+            logger.info(
+                "Extending hydrostasy constraint to surface level, ensure that \
+                surface pressure is constrained to be non-negative using \
+                constraints module."
+            )
+            if "sp" not in channels and "sp-boxcox" not in channels:
+                raise ValueError(
+                    "Surface pressure channel (sp or sp-boxcox) must be \
+                    included in model channels when extending hydrostasy \
+                    constraint to surface."
+                )
+
         self.pressure_levels = sorted(hPa_levels)
         self.z_pressure_levels = {
             channels.index(f"z{int(pl)}"): pl
