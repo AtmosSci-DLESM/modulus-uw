@@ -152,8 +152,8 @@ class HEALPixUNet(Module):
             enable_healpixpad=self.enable_healpixpad,
         )
 
-    self.constraints = None
-    self.set_constraints(constraints)
+        self.constraints = None
+        self.set_constraints(constraints)
 
     @property
     def integration_steps(self):
