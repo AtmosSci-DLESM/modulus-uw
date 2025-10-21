@@ -197,7 +197,6 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
         
         # Go up in index (down in vertical level) from anchor
         # TODO: remove constraint that first z_channel is 0
-        # print('HERE', flush=True)
         for i in range(len(self.z_pressure_levels) - 1 - self.extend_to_surface):
             z_channel = self.z_channels[i]
             z_channel_p1 = self.z_channels[i + 1]
@@ -213,9 +212,6 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
                 self.R,
                 self.g0,
             )
-            # print(f'zi: {torch.any(torch.isnan(zi))}', flush=True)
-            # print(f'zip1: {torch.any(torch.isnan(zip1))}', flush=True)
-            # print(f'Tv_avg: {torch.any(torch.isnan(Tv_avg[:, :, i, ...]))}', flush=True)
 
         Tv_model_avg_size = [
             len(self.Tv_pressure_levels) - 1 if i == 2 else s
@@ -271,19 +267,11 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
                 self.R,
                 self.g0,
             )
-            # Tv_avg[
-            #     :, :, -1, ...
-            # ] = torch.ones_like(Tv_avg[:, :, -1, ...])
 
             # Get average model virtual temperature between lowest level and surface
             Tvi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
             Tvip1 = x[:, :, self.Tv_channels[-1], ...]
             Tv_model_avg[:, :, -1, ...] = 0.5 * (Tvi + Tvip1)
-            # Tv_model_avg[:, :, -1, ...] = torch.ones_like(Tv_model_avg[:, :, -1, ...])
-
-            # # for i in range(Tv_avg.shape[2]):
-            # #     print(f'LAYER {i}: {torch.any(torch.isnan(Tv_avg[:, :, i, ...]))}, {torch.any(torch.isnan(Tv_model_avg[:, :, i, ...]))}', flush=True)
-            # # print(torch.any(torch.isnan(Tv_avg)), torch.any(torch.isnan(Tv_model_avg)), flush=True)
 
         return Tv_avg, Tv_model_avg
 
@@ -526,15 +514,13 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
     def scale(self, x):
         """
         Scale inputs to physical values and compute virtual temperature
-        Tensors are expected to be in the shape [N, B, F, C, H, W]
+        Tensors are expected to be in the shape [N, F, B, C, H, W]
         """
-        # N, B, F, C, H, W = x.shape
         N, F, B, C, H, W = x.shape
         C_scaled = self.num_z_levels + self.num_Tv_levels
         if self.extend_to_surface:
             C_scaled += 1  # Add surface pressure
         x_scaled = torch.zeros(
-            # (N, B, F, C_scaled, H, W), device=x.device, dtype=torch.float
             (N, F, B, C_scaled, H, W),
             device=x.device,
             dtype=torch.float,
@@ -553,7 +539,6 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             sp = x[:, :, :, self.sp_mapping, :, :] * self.sp_std + self.sp_mean
             if self.transformed_sp:
                 sp = self.reverse_transform_sp(sp)
-            # print(f'min sp: {torch.min(sp)}, max sp: {torch.max(sp)}', flush=True)
             x_scaled[:, :, :, -1, :, :] = sp
 
         # Get scaled temperatures
@@ -626,7 +611,6 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
     def forward(self, prediction, target, average_channels=True):
         """
         Forward pass of the WeightedMSE pass
-        #Tensors are expected to be in the shape [N, B, F, C, H, W]
         Tensors are expected to be in the shape [N, F, B, C, H, W]
         Parameters
         ----------
@@ -644,7 +628,6 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             prediction = prediction.float()
             target = target.float()
 
-            # N, B, F, C, H, W = tuple(prediction.shape)
             N, F, B, C, H, W = tuple(prediction.shape)
 
             if not (prediction.ndim == 6 and target.ndim == 6):
@@ -652,10 +635,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
 
             # Scale to physical units and compute virtual temperature
             x = self.scale(prediction)
-            # print(f'prediction: {torch.any(torch.isnan(prediction))}', flush=True)
-            # print(f'scaled x: {torch.any(torch.isnan(x))}', flush=True)
             Tv_avg, Tv_model_avg = self.constraint(x)
-            # print(torch.any(torch.isnan(Tv_avg)), torch.any(torch.isnan(Tv_model_avg)), flush=True)
             Tv_error = ((Tv_avg - Tv_model_avg) / self.alpha) ** 2
 
             # Mask out error in regions below the surface
@@ -667,9 +647,6 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
 
             data_loss = ((target - prediction) ** 2).mean(dim=(0, 1, 2, 4, 5))
             d = torch.concatenate((data_loss, Tv_loss)) * self.loss_weights
-            # print(f'd: {torch.any(torch.isnan(d))}', flush=True)
-            # print(f'{torch.min(d)},{torch.max(d)}', flush=True)
-            # print(f'{d}', flush=True)
 
             if average_channels:
                 return torch.mean(d)
