@@ -61,7 +61,6 @@ class HEALPixRecUNet(Module):
         decoder_input_channels: int,
         input_time_dim: int,
         output_time_dim: int,
-        channels: Sequence[str],
         delta_time: str = "6h",
         reset_cycle: str = "24h",
         presteps: int = 1,
@@ -72,6 +71,7 @@ class HEALPixRecUNet(Module):
         hpx_padding_mode: str = 'karlbauer',
         constraints: list[DictConfig] = None,
         enforce_reflectional_equivariance: bool = False,
+        channels: Sequence[str] = None,
     ):
         """
         Parameters
@@ -139,7 +139,6 @@ class HEALPixRecUNet(Module):
         self.decoder_input_channels = decoder_input_channels
         self.input_time_dim = input_time_dim
         self.output_time_dim = output_time_dim
-        self.channels = channels
         self.delta_t = int(pd.Timedelta(delta_time).total_seconds() // 3600)
         if reset_cycle == float('inf'):
             self.reset_cycle = reset_cycle
@@ -151,14 +150,22 @@ class HEALPixRecUNet(Module):
         self.residual_prediction = residual_prediction
         self.hpx_padding_mode = hpx_padding_mode
         self.enforce_reflectional_equivariance = enforce_reflectional_equivariance
+        self.channels = channels
+
+        # Setting variables which are used for enforcing reflectional equivariance
         self.register_buffer("refl_face_order", th.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=th.long))
-        if any(var.startswith('v') for var in self.channels):
+        v_channel_indices = None
+        if self.channels is None:
+            logger.warning(
+                "No list of channels provided, if your model has v-velocity \
+                components, reflectional equivariance will not be enforced \
+                correctly."
+            )
+        else:
             v_channel_indices = th.tensor(
                 [i for i, var in enumerate(self.channels) if var.startswith('v')],
                 dtype=th.long
             )
-        else:
-            v_channel_indices = None
         self.register_buffer("v_channel_indices", v_channel_indices, persistent=False)
 
         # Number of passes through the model, or a diagnostic model with only one output time
@@ -373,7 +380,7 @@ class HEALPixRecUNet(Module):
         x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
 
         # Flip sign of v-velocity components
-        if self.v_channel_indices is not None:
+        if (self.v_channel_indices is not None) and (len(self.v_channel_indices) > 0):
             x.index_copy_(
                 1,
                 self.v_channel_indices,
