@@ -37,12 +37,8 @@ Details on the HEALPix can be found at https://iopscience.iop.org/article/10.108
 
 """
 
-import sys
-
-import torch
 import torch as th
 
-sys.path.append("/home/disk/quicksilver/nacc/dlesm/HealPixPad")
 have_healpixpad = True
 try:
     from earth2grid.healpix import pad as healpix_pad
@@ -56,7 +52,7 @@ class HEALPixPad(th.nn.Module):
         super().__init__()
         self.padding = padding
 
-    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+    def forward(self, tensor: th.Tensor) -> th.Tensor:
         return healpix_pad(tensor, self.padding)
 
 
@@ -73,7 +69,7 @@ class HEALPixFoldFaces(th.nn.Module):
         super().__init__()
         self.enable_nhwc = enable_nhwc
 
-    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+    def forward(self, tensor: th.Tensor) -> th.Tensor:
         """
         Forward pass that folds a HEALPix tensor
         [B, F, C, H, W] -> [B*F, C, H, W]
@@ -90,10 +86,10 @@ class HEALPixFoldFaces(th.nn.Module):
 
         """
         N, F, C, H, W = tensor.shape
-        tensor = torch.reshape(tensor, shape=(N * F, C, H, W))
+        tensor = th.reshape(tensor, shape=(N * F, C, H, W))
 
         if self.enable_nhwc:
-            tensor = tensor.to(memory_format=torch.channels_last)
+            tensor = tensor.to(memory_format=th.channels_last)
 
         return tensor
 
@@ -114,7 +110,7 @@ class HEALPixUnfoldFaces(th.nn.Module):
         self.num_faces = num_faces
         self.enable_nhwc = enable_nhwc
 
-    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+    def forward(self, tensor: th.Tensor) -> th.Tensor:
         """
         Forward pass that unfolds a HEALPix tensor
         [B*F, C, H, W] -> [B, F, C, H, W]
@@ -131,7 +127,7 @@ class HEALPixUnfoldFaces(th.nn.Module):
 
         """
         NF, C, H, W = tensor.shape
-        tensor = torch.reshape(tensor, shape=(-1, self.num_faces, C, H, W))
+        tensor = th.reshape(tensor, shape=(-1, self.num_faces, C, H, W))
 
         return tensor
 
@@ -177,13 +173,13 @@ class HEALPixPaddingv2(th.nn.Module):
         torch.Tensor
             The padded tensor where each face's height and width are increased by 2*p
         """
-        #torch.cuda.nvtx.range_push("HEALPixPaddingv2:forward")
+        #th.cuda.nvtx.range_push("HEALPixPaddingv2:forward")
 
         x = self.unfold(x)
         xp = self.padding(x)
         xp = self.fold(xp)
 
-        #torch.cuda.nvtx.range_pop()
+        #th.cuda.nvtx.range_pop()
 
         return xp
 
@@ -235,14 +231,14 @@ class HEALPixPadding(th.nn.Module):
         torch.Tensor
             The padded tensor where each face's height and width are increased by 2*p
         """
-        #torch.cuda.nvtx.range_push("HEALPixPadding:forward")
+        #th.cuda.nvtx.range_push("HEALPixPadding:forward")
 
         # unfold faces from batch dim
         data = self.unfold(data)
 
         # Extract the twelve faces (as views of the original tensors)
         f00, f01, f02, f03, f04, f05, f06, f07, f08, f09, f10, f11 = [
-            torch.squeeze(x, dim=1)
+            th.squeeze(x, dim=1)
             for x in th.split(tensor=data, split_size_or_sections=1, dim=1)
         ]
 
@@ -327,7 +323,7 @@ class HEALPixPadding(th.nn.Module):
         # fold faces into batch dim
         res = self.fold(res)
 
-        #torch.cuda.nvtx.range_pop()
+        #th.cuda.nvtx.range_pop()
 
         return res
 
@@ -616,7 +612,7 @@ class HEALPixLayer(th.nn.Module):
         self.layers = th.nn.Sequential(*layers)
 
         if enable_nhwc:
-            self.layers = self.layers.to(memory_format=torch.channels_last)
+            self.layers = self.layers.to(memory_format=th.channels_last)
 
     def forward(self, x: th.Tensor) -> th.Tensor:
         """
