@@ -77,6 +77,10 @@ fignet = [
     "webdataset>=0.2",
 ]
 
+dlesym = [
+    "earth2grid",
+]
+
 all = [
     "h5py>=3.7.0",
     "netcdf4>=1.6.3",
@@ -92,6 +96,7 @@ all = [
     "shapely>=2.0.6",
     "nvidia-modulus[launch]",
     "nvidia-modulus[dev]",
+    "nvidia-modulus[dlesym]",
     "nvidia-modulus[makani]",
     "nvidia-modulus[fignet]",
 ]
