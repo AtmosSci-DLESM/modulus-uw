@@ -364,6 +364,18 @@ class HEALPixRecUNet(Module):
 
         return res
 
+    def set_constraints(self, constraints: list[DictConfig] = None):
+        """
+        Sets constraints (e.g., non-negative) to be applied to the model outputs
+
+        Parameters
+        ----------
+        constraints: list[DictConfig]
+            List of hydra instantiable DictConfigs specifying constraints
+        """
+        if constraints is not None:
+            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
+
     def hpx_reflect(self, x):
         '''
         Helper function to reflect a HPX tensor across its horizontal axis.
@@ -388,18 +400,6 @@ class HEALPixRecUNet(Module):
             )
 
         return x
-
-    def set_constraints(self, constraints: list[DictConfig] = None):
-        """
-        Sets constraints (e.g., non-negative) to be applied to the model outputs
-
-        Parameters
-        ----------
-        constraints: list[DictConfig]
-            List of hydra instantiable DictConfigs specifying constraints
-        """
-        if constraints is not None:
-            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
 
     def _initialize_hidden(
         self, inputs: Sequence, outputs: Sequence, step: int, conditions_cln: Sequence = None
