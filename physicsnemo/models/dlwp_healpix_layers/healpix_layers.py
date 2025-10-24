@@ -173,13 +173,10 @@ class HEALPixPaddingv2(th.nn.Module):
         torch.Tensor
             The padded tensor where each face's height and width are increased by 2*p
         """
-        #th.cuda.nvtx.range_push("HEALPixPaddingv2:forward")
 
         x = self.unfold(x)
         xp = self.padding(x)
         xp = self.fold(xp)
-
-        #th.cuda.nvtx.range_pop()
 
         return xp
 
@@ -231,8 +228,6 @@ class HEALPixPadding(th.nn.Module):
         torch.Tensor
             The padded tensor where each face's height and width are increased by 2*p
         """
-        #th.cuda.nvtx.range_push("HEALPixPadding:forward")
-
         # unfold faces from batch dim
         data = self.unfold(data)
 
@@ -322,8 +317,6 @@ class HEALPixPadding(th.nn.Module):
 
         # fold faces into batch dim
         res = self.fold(res)
-
-        #th.cuda.nvtx.range_pop()
 
         return res
 
