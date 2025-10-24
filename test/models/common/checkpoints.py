@@ -20,7 +20,7 @@ from typing import Tuple
 
 import torch
 
-import modulus
+import physicsnemo
 
 from .utils import compare_output
 
@@ -30,11 +30,12 @@ logger = logging.getLogger("__name__")
 
 @torch.no_grad()
 def validate_checkpoint(
-    model_1: modulus.Module,
-    model_2: modulus.Module,
+    model_1: physicsnemo.Module,
+    model_2: physicsnemo.Module,
     in_args: Tuple[Tensor] = (),
     rtol: float = 1e-5,
     atol: float = 1e-5,
+    enable_autocast: bool = False,
 ) -> bool:
     """Check network's checkpoint safely saves and loads the state of the model
 
@@ -44,16 +45,18 @@ def validate_checkpoint(
 
     Parameters
     ----------
-    model_1 : modulus.Module
-        Modulus model to save checkpoint from
-    model_2 : modulus.Module
-        Modulus model to load checkpoint to
+    model_1 : physicsnemo.Module
+        PhysicsNeMo model to save checkpoint from
+    model_2 : physicsnemo.Module
+        PhysicsNeMo model to load checkpoint to
     in_args : Tuple[Tensor], optional
         Input arguments, by default ()
     rtol : float, optional
         Relative tolerance of error allowed, by default 1e-5
     atol : float, optional
         Absolute tolerance of error allowed, by default 1e-5
+    enable_autocast: bool, optional
+        Whether to enable autocast in model forward
 
     Returns
     -------
@@ -72,8 +75,9 @@ def validate_checkpoint(
         pass
 
     # Now test forward passes
-    output_1 = model_1.forward(*in_args)
-    output_2 = model_2.forward(*in_args)
+    with torch.autocast("cuda", enabled=enable_autocast):
+        output_1 = model_1.forward(*in_args)
+        output_2 = model_2.forward(*in_args)
 
     # Model outputs should initially be different
     assert not compare_output(
@@ -85,12 +89,15 @@ def validate_checkpoint(
     model_2.load("checkpoint.mdlus")
 
     # Forward with loaded checkpoint
-    output_2 = model_2.forward(*in_args)
+    with torch.autocast("cuda", enabled=enable_autocast):
+        output_2 = model_2.forward(*in_args)
+
     loaded_checkpoint = compare_output(output_1, output_2, rtol, atol)
 
     # Restore checkpoint with from_checkpoint, checks initialization of model directly from checkpoint
-    model_2 = modulus.Module.from_checkpoint("checkpoint.mdlus").to(model_1.device)
-    output_2 = model_2.forward(*in_args)
+    model_2 = physicsnemo.Module.from_checkpoint("checkpoint.mdlus").to(model_1.device)
+    with torch.autocast("cuda", enabled=enable_autocast):
+        output_2 = model_2.forward(*in_args)
     restored_checkpoint = compare_output(output_1, output_2, rtol, atol)
 
     # Delete checkpoint file (it should exist!)
