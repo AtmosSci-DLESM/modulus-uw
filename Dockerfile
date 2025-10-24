@@ -124,9 +124,6 @@ RUN if [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
         echo "Skipping onnxruntime_gpu install."; \
     fi
 
-# Install earth2grid
-RUN pip install --no-build-isolation https://github.com/NVlabs/earth2grid/archive/f1d534bf16870bf12ef1a2d9b13ee5de65d869b7.tar.gz
-
 # cleanup of stage
 RUN rm -rf /physicsnemo/
 
