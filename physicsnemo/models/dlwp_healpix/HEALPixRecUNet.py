@@ -66,7 +66,6 @@ class HEALPixRecUNet(Module):
         presteps: int = 1,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        enable_torch_compile: bool = False,
         couplings: list = [],
         residual_prediction: bool = True,
         constraints: list[DictConfig] = None,
@@ -142,7 +141,6 @@ class HEALPixRecUNet(Module):
         self.presteps = presteps
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
-        self.enable_torch_compile = enable_torch_compile
         self.residual_prediction = residual_prediction
 
         # Number of passes through the model, or a diagnostic model with only one output time
@@ -161,7 +159,6 @@ class HEALPixRecUNet(Module):
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
-            enable_torch_compile=self.enable_torch_compile,
         )
         self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
@@ -169,12 +166,7 @@ class HEALPixRecUNet(Module):
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
-            enable_torch_compile=self.enable_torch_compile,
         )
-        #self.compile = True
-        #if self.compile:
-        #    self.encoder = th.compile(self.encoder)
-        #    self.decoder = th.compile(self.decoder)
 
         self.constraints = None
         self.set_constraints(constraints)

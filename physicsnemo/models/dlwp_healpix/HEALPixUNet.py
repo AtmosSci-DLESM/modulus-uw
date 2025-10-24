@@ -63,7 +63,6 @@ class HEALPixUNet(Module):
         presteps: int = 0,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        enable_torch_compile: bool = False,
         couplings: list = [],
         residual_prediction: bool = False,
         constraints: list[DictConfig] = None,
@@ -126,7 +125,6 @@ class HEALPixUNet(Module):
         self.channel_dim = 2  # Now 2 with [B, F, C*T, H, W]. Was 1 in old data format with [B, T*C, F, H, W]
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
-        self.enable_torch_compile = enable_torch_compile
         self.residual_prediction = residual_prediction
 
         # Number of passes through the model, or a diagnostic model with only one output time
@@ -145,7 +143,6 @@ class HEALPixUNet(Module):
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
-            enable_torch_compile=self.enable_torch_compile,
         )
         self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
@@ -153,7 +150,6 @@ class HEALPixUNet(Module):
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
-            enable_torch_compile=self.enable_torch_compile,
         )
 
         self.constraints = None

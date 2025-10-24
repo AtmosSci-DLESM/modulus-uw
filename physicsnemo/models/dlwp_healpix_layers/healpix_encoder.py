@@ -35,7 +35,6 @@ class UNetEncoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        enable_torch_compile: bool = False,
     ):
         """
         Parameters
@@ -78,7 +77,6 @@ class UNetEncoder(th.nn.Module):
                         config=down_sampling_block,
                         enable_nhwc=enable_nhwc,
                         enable_healpixpad=enable_healpixpad,
-                        enable_torch_compile=enable_torch_compile,
                     )
                 )
             modules.append(
@@ -91,7 +89,6 @@ class UNetEncoder(th.nn.Module):
                     n_layers=n_layers[n],
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
-                    enable_torch_compile=enable_torch_compile,
                 )
             )
             old_channels = curr_channel

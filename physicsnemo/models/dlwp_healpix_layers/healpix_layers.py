@@ -593,11 +593,6 @@ class HEALPixLayer(th.nn.Module):
             del kwargs["enable_healpixpad"]
         else:
             enable_healpixpad = False
-        if "enable_torch_compile" in kwargs:
-            enable_torch_compile = kwargs["enable_torch_compile"]
-            del kwargs["enable_torch_compile"]
-        else:
-            enable_torch_compile = False
 
         # Define a HEALPixPadding layer if the given layer is a convolution layer
         if (
@@ -617,11 +612,7 @@ class HEALPixLayer(th.nn.Module):
             else:
                 layers.append(HEALPixPadding(padding=padding, enable_nhwc=enable_nhwc))
 
-        if enable_torch_compile:
-            print(f"compiling layer {layer}")
-            layers.append(torch.compile(layer(**kwargs)))
-        else:
-            layers.append(layer(**kwargs))
+        layers.append(layer(**kwargs))
         self.layers = th.nn.Sequential(*layers)
 
         if enable_nhwc:
