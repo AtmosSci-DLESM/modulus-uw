@@ -72,7 +72,6 @@ class HEALPixRecUNet(Module):
         hpx_padding_mode: str = 'karlbauer',
         enforce_reflectional_equivariance: bool = False,
         channels: Sequence[str] = None,
->>>>>>>>> Temporary merge branch 2
     ):
         """
         Parameters
