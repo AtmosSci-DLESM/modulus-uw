@@ -883,9 +883,8 @@ class HEALPixLayer(th.nn.Module):
                 if hpx_padding_mode != "karlbauer":
                     raise ValueError(
                         f"enable_healpixpad is True but hpx_padding_mode is "
-                        f"not 'karlbauer'. Received hpx_padding_mode: {hpx_padding_mode}. "
-                        f"Currently, HEALPixPaddingv2 (using earth2grid) only "
-                        f"supports 'karlbauer' mode."
+                        f"{hpx_padding_mode}. Currently, HEALPixPaddingv2 "
+                        f"(using earth2grid) only supports 'karlbauer' mode."
                     )
                 layers.append(HEALPixPaddingv2(padding=padding))
             else:
