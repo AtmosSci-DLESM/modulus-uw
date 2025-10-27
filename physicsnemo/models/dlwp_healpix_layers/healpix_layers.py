@@ -37,19 +37,28 @@ Details on the HEALPix can be found at https://iopscience.iop.org/article/10.108
 
 """
 
-import sys
-
-import torch
+import logging
 import torch as th
 from typing import Union, Optional
 
-sys.path.append("/home/disk/quicksilver/nacc/dlesm/HealPixPad")
+logger = logging.getLogger(__name__)
+
 have_healpixpad = True
 try:
-    from healpixpad import HEALPixPad
+    from earth2grid.healpix import pad as healpix_pad
 except ImportError:
-    print("Warning, cannot find healpixpad module")
+    logger.warning("Could not import pad from earth2grid.healpix.")
     have_healpixpad = False
+
+
+class HEALPixPad(th.nn.Module):
+    def __init__(self, padding: int):
+        super().__init__()
+        self.padding = padding
+
+    def forward(self, tensor: th.Tensor) -> th.Tensor:
+        return healpix_pad(tensor, self.padding)
+
 
 class HEALPixFoldFaces(th.nn.Module):
     """Class that folds the faces of a HealPIX tensor"""
@@ -64,7 +73,7 @@ class HEALPixFoldFaces(th.nn.Module):
         super().__init__()
         self.enable_nhwc = enable_nhwc
 
-    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+    def forward(self, tensor: th.Tensor) -> th.Tensor:
         """
         Forward pass that folds a HEALPix tensor
         [B, F, C, H, W] -> [B*F, C, H, W]
@@ -81,10 +90,10 @@ class HEALPixFoldFaces(th.nn.Module):
 
         """
         N, F, C, H, W = tensor.shape
-        tensor = torch.reshape(tensor, shape=(N * F, C, H, W))
+        tensor = th.reshape(tensor, shape=(N * F, C, H, W))
 
         if self.enable_nhwc:
-            tensor = tensor.to(memory_format=torch.channels_last)
+            tensor = tensor.to(memory_format=th.channels_last)
 
         return tensor
 
@@ -105,7 +114,7 @@ class HEALPixUnfoldFaces(th.nn.Module):
         self.num_faces = num_faces
         self.enable_nhwc = enable_nhwc
 
-    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+    def forward(self, tensor: th.Tensor) -> th.Tensor:
         """
         Forward pass that unfolds a HEALPix tensor
         [B*F, C, H, W] -> [B, F, C, H, W]
@@ -122,7 +131,7 @@ class HEALPixUnfoldFaces(th.nn.Module):
 
         """
         NF, C, H, W = tensor.shape
-        tensor = torch.reshape(tensor, shape=(-1, self.num_faces, C, H, W))
+        tensor = th.reshape(tensor, shape=(-1, self.num_faces, C, H, W))
 
         return tensor
 
@@ -168,13 +177,10 @@ class HEALPixPaddingv2(th.nn.Module):
         torch.Tensor
             The padded tensor where each face's height and width are increased by 2*p
         """
-        # torch.cuda.nvtx.range_push("HEALPixPaddingv2:forward")
 
         x = self.unfold(x)
         xp = self.padding(x)
         xp = self.fold(xp)
-
-        # torch.cuda.nvtx.range_pop()
 
         return xp
 
@@ -246,14 +252,12 @@ class HEALPixPadding(th.nn.Module):
         torch.Tensor
             The padded tensor where each face's height and width are increased by 2*p
         """
-        # torch.cuda.nvtx.range_push("HEALPixPadding:forward")
-
         # unfold faces from batch dim
         data = self.unfold(data)
 
         # Extract the twelve faces (as views of the original tensors)
         f00, f01, f02, f03, f04, f05, f06, f07, f08, f09, f10, f11 = [
-            torch.squeeze(x, dim=1)
+            th.squeeze(x, dim=1)
             for x in th.split(tensor=data, split_size_or_sections=1, dim=1)
         ]
 
@@ -338,10 +342,9 @@ class HEALPixPadding(th.nn.Module):
         # fold faces into batch dim
         res = self.fold(res)
 
-        # torch.cuda.nvtx.range_pop()
 
         if self.enable_nhwc:
-            res = res.to(memory_format=torch.channels_last)
+            res = res.to(memory_format=th.channels_last)
 
         return res
 
@@ -454,14 +457,14 @@ class HEALPixPadding(th.nn.Module):
         t = t.rot90(1, dims=d)[..., -p:, :]
         for i in range(p):
             # Roll column towards equator (southward)
-            t[..., -i-1, :] = torch.roll(t[..., -i-1, :], 2*i+1, dims=-1)
+            t[..., -i-1, :] = th.roll(t[..., -i-1, :], 2*i+1, dims=-1)
             # Fill the now empty polar points by copying the most poleward point
             t[..., -i-1, :2*i+1] = t[..., -i-1, 2*i+1].unsqueeze(-1)
 
         lft = lft.rot90(-1, dims=d)[..., -p:]
         for i in range(p):
             # Roll row towards equator (southward)
-            lft[..., -i-1] = torch.roll(lft[..., -i-1], 2*i+1, dims=-1)
+            lft[..., -i-1] = th.roll(lft[..., -i-1], 2*i+1, dims=-1)
             # Fill the now empty polar points by copying the most poleward point
             lft[..., :2*i+1, -i-1] = lft[..., 2*i+1, -i-1].unsqueeze(-1)
 
@@ -630,14 +633,14 @@ class HEALPixPadding(th.nn.Module):
         b = b.rot90(1, d)[..., :p, :]
         for i in range(p):
             # Roll the column towards equator (northward)
-            b[..., i, :] = torch.roll(b[..., i, :], -(2*i+1), dims=-1)
+            b[..., i, :] = th.roll(b[..., i, :], -(2*i+1), dims=-1)
             # Fill the now empty polar points by copying the most poleward point
             b[..., i, -(2*i+1):] = b[..., i, -(2*i+1)-1].unsqueeze(-1)
 
         rgt = rgt.rot90(-1, d)[..., :p]
         for i in range(p):
             # Roll the row towards equator (northward)
-            rgt[..., i] = torch.roll(rgt[..., i], -(2*i+1), dims=-1)
+            rgt[..., i] = th.roll(rgt[..., i], -(2*i+1), dims=-1)
             # Fill the now empty polar points by copying the most poleward point
             rgt[..., -(2*i+1):, i] = rgt[..., -(2*i+1)-1, i].unsqueeze(-1)
             
@@ -876,10 +879,14 @@ class HEALPixLayer(th.nn.Module):
                 enable_healpixpad
                 and have_healpixpad
                 and th.cuda.is_available()
-                and not enable_nhwc
             ):  # pragma: no cover
-                # TODO: missing library, need to decide if we can get library
-                # or if this needs to be removed
+                if hpx_padding_mode != "karlbauer":
+                    raise ValueError(
+                        f"enable_healpixpad is True but hpx_padding_mode is "
+                        f"not 'karlbauer'. Received hpx_padding_mode: {hpx_padding_mode}. "
+                        f"Currently, HEALPixPaddingv2 (using earth2grid) only "
+                        f"supports 'karlbauer' mode."
+                    )
                 layers.append(HEALPixPaddingv2(padding=padding))
             else:
                 layers.append(
@@ -894,7 +901,7 @@ class HEALPixLayer(th.nn.Module):
         self.layers = th.nn.Sequential(*layers)
 
         if enable_nhwc:
-            self.layers = self.layers.to(memory_format=torch.channels_last)
+            self.layers = self.layers.to(memory_format=th.channels_last)
 
     def forward(self, x: th.Tensor) -> th.Tensor:
         """
