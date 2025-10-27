@@ -68,6 +68,7 @@ class HEALPixRecUNet(Module):
         enable_healpixpad: bool = False,
         couplings: list = [],
         residual_prediction: bool = True,
+        constraints: list[DictConfig] = None,
         hpx_padding_mode: str = 'karlbauer',
     ):
         """
@@ -173,7 +174,10 @@ class HEALPixRecUNet(Module):
             enable_healpixpad=self.enable_healpixpad,
             hpx_padding_mode=self.hpx_padding_mode,
         )
-        
+
+        self.constraints = None
+        self.set_constraints(constraints)
+
     @property
     def integration_steps(self):
         """Number of integration steps"""
@@ -340,6 +344,18 @@ class HEALPixRecUNet(Module):
 
         return res
 
+    def set_constraints(self, constraints: list[DictConfig] = None):
+        """
+        Sets constraints (e.g., non-negative) to be applied to the model outputs
+
+        Parameters
+        ----------
+        constraints: list[DictConfig]
+            List of hydra instantiable DictConfigs specifying constraints
+        """
+        if constraints is not None:
+            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
+
     def _initialize_hidden(
         self, inputs: Sequence, outputs: Sequence, step: int, conditions_cln: Sequence = None
     ) -> None:
@@ -431,6 +447,7 @@ class HEALPixRecUNet(Module):
         self.reset()
         outputs = []
         for step in range(self.integration_steps):
+            th.cuda.nvtx.range_push(f"Integration step: {step}")
             # (Re-)initialize recurrent hidden states
             if (step * (self.delta_t * self.input_time_dim)) % self.reset_cycle == 0:
                 if conditions_cln is not None:
@@ -479,6 +496,7 @@ class HEALPixRecUNet(Module):
                         inputs=[outputs[-1]] + list(inputs[1:]),
                         step=step + self.presteps,
                     )
+            th.cuda.nvtx.range_pop()
 
             # Forward through model, with or without conditions
             if conditions_cln is not None:
@@ -486,19 +504,31 @@ class HEALPixRecUNet(Module):
             else:
                 kwargs = {}
 
+            th.cuda.nvtx.range_push("Encoder")
             encodings = self.encoder(input_tensor, **kwargs)
+            th.cuda.nvtx.range_pop()
+            th.cuda.nvtx.range_push("Dencoder")
             decodings = self.decoder(encodings, **kwargs)
-            
+            th.cuda.nvtx.range_pop()
+
             # Residual prediction
             if self.residual_prediction:
                 prediction = input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
             else:
                 prediction = decodings
+            th.cuda.nvtx.range_push("Reshape outputs")
             reshaped = self._reshape_outputs(
                 prediction
             )
+            th.cuda.nvtx.range_pop()
+
+            # Apply constraints
+            if self.constraints is not None:
+                for constraint in self.constraints:
+                    reshaped = constraint(reshaped)
 
             outputs.append(reshaped)
+            th.cuda.nvtx.range_pop()
 
         if output_only_last:
             return outputs[-1]
