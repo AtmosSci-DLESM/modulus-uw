@@ -37,13 +37,16 @@ Details on the HEALPix can be found at https://iopscience.iop.org/article/10.108
 
 """
 
+import logging
 import torch as th
+
+logger = logging.getLogger(__name__)
 
 have_healpixpad = True
 try:
     from earth2grid.healpix import pad as healpix_pad
 except ImportError:
-    print("Warning, cannot find healpixpad module")
+    logger.warning("Could not import pad from earth2grid.healpix.")
     have_healpixpad = False
 
 
@@ -340,7 +343,7 @@ class HEALPixPadding(th.nn.Module):
 
 
         if self.enable_nhwc:
-            res = res.to(memory_format=torch.channels_last)
+            res = res.to(memory_format=th.channels_last)
 
         return res
 
@@ -453,14 +456,14 @@ class HEALPixPadding(th.nn.Module):
         t = t.rot90(1, dims=d)[..., -p:, :]
         for i in range(p):
             # Roll column towards equator (southward)
-            t[..., -i-1, :] = torch.roll(t[..., -i-1, :], 2*i+1, dims=-1)
+            t[..., -i-1, :] = th.roll(t[..., -i-1, :], 2*i+1, dims=-1)
             # Fill the now empty polar points by copying the most poleward point
             t[..., -i-1, :2*i+1] = t[..., -i-1, 2*i+1].unsqueeze(-1)
 
         lft = lft.rot90(-1, dims=d)[..., -p:]
         for i in range(p):
             # Roll row towards equator (southward)
-            lft[..., -i-1] = torch.roll(lft[..., -i-1], 2*i+1, dims=-1)
+            lft[..., -i-1] = th.roll(lft[..., -i-1], 2*i+1, dims=-1)
             # Fill the now empty polar points by copying the most poleward point
             lft[..., :2*i+1, -i-1] = lft[..., 2*i+1, -i-1].unsqueeze(-1)
 
@@ -629,14 +632,14 @@ class HEALPixPadding(th.nn.Module):
         b = b.rot90(1, d)[..., :p, :]
         for i in range(p):
             # Roll the column towards equator (northward)
-            b[..., i, :] = torch.roll(b[..., i, :], -(2*i+1), dims=-1)
+            b[..., i, :] = th.roll(b[..., i, :], -(2*i+1), dims=-1)
             # Fill the now empty polar points by copying the most poleward point
             b[..., i, -(2*i+1):] = b[..., i, -(2*i+1)-1].unsqueeze(-1)
 
         rgt = rgt.rot90(-1, d)[..., :p]
         for i in range(p):
             # Roll the row towards equator (northward)
-            rgt[..., i] = torch.roll(rgt[..., i], -(2*i+1), dims=-1)
+            rgt[..., i] = th.roll(rgt[..., i], -(2*i+1), dims=-1)
             # Fill the now empty polar points by copying the most poleward point
             rgt[..., -(2*i+1):, i] = rgt[..., -(2*i+1)-1, i].unsqueeze(-1)
             
@@ -875,6 +878,13 @@ class HEALPixLayer(th.nn.Module):
                 and have_healpixpad
                 and th.cuda.is_available()
             ):  # pragma: no cover
+                if hpx_padding_mode != "karlbauer":
+                    raise ValueError(
+                        f"enable_healpixpad is True but hpx_padding_mode is "
+                        f"not 'karlbauer'. Received hpx_padding_mode: {hpx_padding_mode}. "
+                        f"Currently, HEALPixPaddingv2 (using earth2grid) only "
+                        f"supports 'karlbauer' mode."
+                    )
                 layers.append(HEALPixPaddingv2(padding=padding))
             else:
                 layers.append(

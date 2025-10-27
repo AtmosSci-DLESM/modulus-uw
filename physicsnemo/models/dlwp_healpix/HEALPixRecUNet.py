@@ -108,6 +108,12 @@ class HEALPixRecUNet(Module):
             sequence of dictionaries that describe coupling mechanisms
         residual_prediction: bool, optional
             If the model should predict the residual between the input and the output. Default: True
+        constraints: list[DictConfig], optional
+            List of hydra instantiable DictConfigs specifying constraints 
+            (e.g., nonnegativity) to be applied to the model outputs
+        hpx_padding_mode: str, optional
+            Method to use for padding HEALPix faces for convolutions. Options
+            are 'karlbauer' (default) and 'isolatitude'.
         """
         super().__init__()
         self.channel_dim = 2  # Now 2 with [B, F, T*C, H, W]. Was 1 in old data format with [B, T*C, F, H, W]
