@@ -519,6 +519,7 @@ class HEALPixRecUNet(Module):
         self.reset()
         outputs = []
         for step in range(self.integration_steps):
+            th.cuda.nvtx.range_push(f"Integration step: {step}")
             # (Re-)initialize recurrent hidden states
             if (step * (self.delta_t * self.input_time_dim)) % self.reset_cycle == 0:
                 if conditions_cln is not None:
@@ -567,6 +568,7 @@ class HEALPixRecUNet(Module):
                         inputs=[outputs[-1]] + list(inputs[1:]),
                         step=step + self.presteps,
                     )
+            th.cuda.nvtx.range_pop()
 
             # Save original hidden states for restoration later
             if self.enforce_reflectional_equivariance:
@@ -580,7 +582,10 @@ class HEALPixRecUNet(Module):
             else:
                 kwargs = {}
 
+            th.cuda.nvtx.range_push("Encoder")
             encodings = self.encoder(input_tensor, **kwargs)
+            th.cuda.nvtx.range_pop()
+            th.cuda.nvtx.range_push("Dencoder")
             decodings = self.decoder(encodings, **kwargs)
 
             # Foward through model again with reflected input and original hidden states
@@ -614,14 +619,18 @@ class HEALPixRecUNet(Module):
                 # Average of decodings ()
                 decodings = 0.5 * (decodings + self.hpx_reflect(decodings_refl))
             
+            th.cuda.nvtx.range_pop()
+
             # Residual prediction
             if self.residual_prediction:
                 prediction = input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
             else:
                 prediction = decodings
+            th.cuda.nvtx.range_push("Reshape outputs")
             reshaped = self._reshape_outputs(
                 prediction
             )
+            th.cuda.nvtx.range_pop()
 
             # Apply constraints
             if self.constraints is not None:
@@ -629,6 +638,7 @@ class HEALPixRecUNet(Module):
                     reshaped = constraint(reshaped)
 
             outputs.append(reshaped)
+            th.cuda.nvtx.range_pop()
 
         if output_only_last:
             return outputs[-1]

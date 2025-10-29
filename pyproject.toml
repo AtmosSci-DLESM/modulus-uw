@@ -83,6 +83,10 @@ shardtensor = [
     "wrapt>=1.15.0",
 ]
 
+dlesym = [
+    "earth2grid",
+]
+
 all = [
     "h5py>=3.7.0",
     "netcdf4>=1.6.3",
@@ -96,6 +100,8 @@ all = [
     "einops>=0.7.0",
     "pyspng>=0.1.0",
     "shapely>=2.0.6",
+    "nvidia-modulus[makani]",
+    "nvidia-modulus[fignet]",
     "pytz>=2023.3",
     "nvtx>=0.2.8",
     "nvidia-physicsnemo[launch]",
@@ -103,6 +109,7 @@ all = [
     "nvidia-physicsnemo[makani]",
     "nvidia-physicsnemo[fignet]",
     "nvidia-physicsnemo[storage]",
+    "nvidia-physicsnemo[dlesym]",
 ]
 
 
