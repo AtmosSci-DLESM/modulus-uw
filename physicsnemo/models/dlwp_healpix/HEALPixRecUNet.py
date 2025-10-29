@@ -628,6 +628,9 @@ class HEALPixRecUNet(Module):
             # Reshape from [B*F, T*C, H, W] to [B, F, T, C, H, W]
             combined = self._reshape_outputs(decodings)
             prognostics = combined[:, :, :, :self.input_channels]
+            th.cuda.nvtx.range_pop()
+
+            # Residual prediction
             if self.residual_prediction:
                 prognostics += self._reshape_outputs(
                     input_tensor[:, :self.input_channels * self.input_time_dim]
