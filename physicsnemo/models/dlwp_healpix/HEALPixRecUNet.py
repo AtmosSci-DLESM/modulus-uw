@@ -584,12 +584,6 @@ class HEALPixRecUNet(Module):
                     self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
                 ]
 
-            # Save original hidden states for restoration later
-            if self.enforce_reflectional_equivariance:
-                orig_hidden_states = [
-                    self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
-                ]
-
             # Forward through model, with or without conditions
             if conditions_cln is not None:
                 kwargs = {"conditions_cln": conditions_cln[step]}
@@ -599,7 +593,7 @@ class HEALPixRecUNet(Module):
             encodings = self.encoder(input_tensor, **kwargs)
             decodings = self.decoder(encodings, **kwargs)
 
-            # Foward through model again with reflected input and original hidden states
+            # Forward through model again with reflected input and original hidden states
             if self.enforce_reflectional_equivariance:
 
                 new_hidden_states = [
