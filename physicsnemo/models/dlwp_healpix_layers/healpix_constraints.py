@@ -74,17 +74,17 @@ class DryAirMassConstraint(torch.nn.Module):
         self.sp_boxcox_lambda = sp_boxcox_lambda
 
         sp_name = "sp-boxcox" if transformed_sp else "sp"
-        sp_index = torch.tensor(
+        sp_idx = torch.tensor(
             channels.index(sp_name),
             dtype=torch.long
         )
-        self.register_buffer('sp_index', sp_index, persistent=False)
+        self.register_buffer('sp_idx', sp_idx, persistent=False)
 
-        tcwv_index = torch.tensor(
+        tcwv_idx = torch.tensor(
             channels.index("tcwv"),
             dtype=torch.long
         )
-        self.register_buffer('tcwv_index', tcwv_index, persistent=False)
+        self.register_buffer('tcwv_idx', tcwv_idx, persistent=False)
 
         ps_mean = torch.tensor(scaling[sp_name]['mean'])
         ps_std = torch.tensor(scaling[sp_name]['std'])
@@ -132,19 +132,19 @@ class DryAirMassConstraint(torch.nn.Module):
         x = prediction
 
         # Get predicted sp and tcwv
-        sp = torch.index_select(x, dim=3, index=self.sp_index)
+        sp = torch.index_select(x, dim=3, index=self.sp_idx)
         sp = sp * self.ps_std + self.ps_mean
         if self.transformed_sp:
             sp = self.reverse_transform_sp(sp)
-        tcwv = torch.index_select(x, dim=3, index=self.tcwv_index)
+        tcwv = torch.index_select(x, dim=3, index=self.tcwv_idx)
         tcwv = tcwv * self.tcwv_std + self.tcwv_mean
 
         # Get last time step sp and tcwv from input
-        sp_0 = torch.index_select(input, dim=3, index=self.sp_index)[:, :, -1:]
+        sp_0 = torch.index_select(input, dim=3, index=self.sp_idx)[:, :, -1:]
         sp_0 = sp_0 * self.ps_std + self.ps_mean
         if self.transformed_sp:
             sp_0 = self.reverse_transform_sp(sp_0)
-        tcwv_0 = torch.index_select(input, dim=3, index=self.tcwv_index)[:, :, -1:]
+        tcwv_0 = torch.index_select(input, dim=3, index=self.tcwv_idx)[:, :, -1:]
         tcwv_0 = tcwv_0 * self.tcwv_std + self.tcwv_mean
 
         # Get predicted and initial dry sp
@@ -159,5 +159,7 @@ class DryAirMassConstraint(torch.nn.Module):
         sp_corrected = (sp_corrected - self.ps_mean) / self.ps_std
         if self.transformed_sp:
             sp_corrected = self.transform_sp(sp_corrected)
+
+        x.index_copy_(3, self.sp_idx, sp_corrected)
 
         return x
