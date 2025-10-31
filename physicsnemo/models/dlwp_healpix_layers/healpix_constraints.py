@@ -101,6 +101,7 @@ class DryAirMassConstraint(torch.nn.Module):
             sp_threshold = (0.**self.sp_boxcox_lambda-1)/self.sp_boxcox_lambda
             sp_threshold = (sp_threshold - self.var_means[sp_idx]) / self.var_stds[sp_idx]
         sp_threshold = sp_threshold.view(1, 1, 1, -1, 1, 1)
+        self.register_buffer('sp_threshold', sp_threshold, persistent=False)
 
         self.g0 = 9.81
 
@@ -153,12 +154,10 @@ class DryAirMassConstraint(torch.nn.Module):
         correction = (sp_dry - sp_0_dry).mean(dim=[-2,-1], keepdim=True)
         sp_corrected = sp - correction
 
+        # Ensure sp is non-negative and rescale back to normalized space
+        sp_corrected = torch.clamp(sp_corrected, min=0.)
         sp_corrected = (sp_corrected - self.ps_mean) / self.ps_std
         if self.transformed_sp:
             sp_corrected = self.transform_sp(sp_corrected)
-
-        # Ensure sp is non-negative
-        clamped = torch.maximum(sp_corrected, self.sp_threshold).to(x.dtype)
-        x.index_copy_(3, self.sp_index, clamped)
 
         return x
