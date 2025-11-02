@@ -160,9 +160,21 @@ class ConstantCoupler:
         }
 
     def setup_coupling(self, coupled_module):
+        """
+        get proper channels from coupled component output   
+        Parameters
+        ----------
+        coupled_module: module or sequence of modules
+            the module(s) that are being coupled to
+        """
         # To expediate the coupling process the coupled_forecast
         # get proper channels from coupled component output
-        output_channels = coupled_module.output_variables
+        if isinstance(coupled_module, (list, tuple)):
+            output_channels = []
+            for cm in coupled_module:
+                output_channels = output_channels + list(cm.output_variables)
+        else:
+            output_channels = coupled_module.output_variables
         # A bit convoluted. Prepared coupled variables
         # are given a suffix for training associated with their
         # trailing average increment e.g. 'z1000-48H'. To extract
@@ -196,10 +208,16 @@ class ConstantCoupler:
 
         Parameters
         ----------
-        coupled_fields: th.tensor
-            The data to use when the dataloader requests coupled fields. Expected
-            format is [B, F, T, C, H, W]
+        coupled_fields: th.tensor or sequence of th.tensors
+            The data to use when the dataloader requests coupled fields. If coupled to multiple components 
+            will provide sequence of tensors. Each has expected shape [B, F, T, C, H, W]
         """
+
+
+        # if coupled_fields is a list of tensors, concatenate along channel dimension
+        if isinstance(coupled_fields, (list, tuple)):
+            coupled_fields = th.cat(coupled_fields, dim=3)
+
         # create buffer for coupling
         coupled_fields = coupled_fields[
             :, :, :, self.coupled_channel_indices, :, :
@@ -424,7 +442,12 @@ class TrailingAverageCoupler:
 
         # To expediate the coupling process the coupled_forecast
         # get proper channels from coupled component output
-        output_channels = coupled_module.output_variables
+        if isinstance(coupled_module, (list, tuple)):
+            output_channels = []
+            for cm in coupled_module:
+                output_channels = output_channels + list(cm.output_variables)
+        else:
+            output_channels = coupled_module.output_variables
         # A bit convoluted. Prepared coupled variables
         # are given a suffix for training associated with their
         # trailing average increment e.g. 'z1000-48H'. To extract
@@ -476,10 +499,14 @@ class TrailingAverageCoupler:
 
         Parameters
         ----------
-        coupled_fields: th.tensor
-            The data to use when the dataloader requests coupled fields. Expected
-            format is [B, F, T, C, H, W]
+        coupled_fields: th.tensor or sequence of th.tensors
+            The data to use when the dataloader requests coupled fields. Also accepts sequence of tensors for 3+ component inference.
+            Expected tensor format is [B, F, T, C, H, W]
         """
+        # if coupled_fields is a list of tensors, concatenate along channel dimension
+        if isinstance(coupled_fields, (list, tuple)):
+            coupled_fields = th.cat(coupled_fields, dim=3)
+        
         coupled_fields = coupled_fields[:, :, :, self.coupled_channel_indices, :, :]
         # TODO: Now support output_time_dim =/= input_time_dim, but presteps need to be 0, will add support for presteps>0
         coupled_averaging_periods = []

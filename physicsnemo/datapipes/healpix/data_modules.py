@@ -835,6 +835,7 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
         add_train_noise: Optional[bool] = False,
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
+        distributed: bool = True
     ):
         """
         Parameters
@@ -914,11 +915,14 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
             Dictionary containing parameters for adding noise to the training data
         train_noise_seed: int, optional
             Seed for the random number generator for adding noise to the training data, default 42
+        distributed: bool, optional
+            Whether to initialize the distributed manager, default True. Set to false if performing non-distributed inference
         """
         self.couplings = couplings
         self.add_train_noise = add_train_noise
         self.train_noise_params = train_noise_params
         self.train_noise_seed = train_noise_seed
+        self.distributed = distributed
 
         super().__init__(
             src_directory,
@@ -969,10 +973,13 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
             raise ValueError("'data_format' must be one of ['classic', 'zarr']")
 
         coupled_variables = self._get_coupled_vars()
-        # make sure distributed manager is initalized
-        if not DistributedManager.is_initialized():
-            DistributedManager.initialize()
-        dist = DistributedManager()
+        # make sure distributed manager is initalized if indicated
+        # if performing non-distributed inference, this needs to be skipped
+        # to avoid hanging on the barrier call below
+        if self.distributed:
+            if not DistributedManager.is_initialized():
+                DistributedManager.initialize()
+            dist = DistributedManager()
 
         if torch.distributed.is_initialized():
             if self.prebuilt_dataset:
