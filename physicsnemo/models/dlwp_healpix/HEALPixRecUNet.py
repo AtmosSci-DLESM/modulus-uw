@@ -71,6 +71,7 @@ class HEALPixRecUNet(Module):
         constraints: list[DictConfig] = None,
         enforce_reflectional_equivariance: bool = False,
         channels: Sequence[str] = None,
+        constants: Sequence[str] = None,
     ):
         """
         Parameters
@@ -149,22 +150,28 @@ class HEALPixRecUNet(Module):
         self.residual_prediction = residual_prediction
         self.enforce_reflectional_equivariance = enforce_reflectional_equivariance
         self.channels = channels
+        self.constants = constants
 
         # Setting variables which are used for enforcing reflectional equivariance
         self.register_buffer("refl_face_order", th.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=th.long))
-        v_channel_indices = None
-        if self.channels is None:
+
+        if self.channels is None or self.constants is None:
             logger.warning(
-                "No list of channels provided, if your model has v-velocity \
-                components, reflectional equivariance will not be enforced \
-                correctly."
+                "No list of channels or constants provided, if your model has "
+                "v-velocity components or f as input, reflectional equivariance "
+                "will not be enforced correctly."
             )
         else:
-            v_channel_indices = th.tensor(
-                [i for i, var in enumerate(self.channels) if var.startswith('v')],
-                dtype=th.long
-            )
-        self.register_buffer("v_channel_indices", v_channel_indices, persistent=False)
+            v_channel_idx = [i for i, var in enumerate(self.channels) if var.startswith('v')]
+            f_idx = [
+                self.input_time_dim * (self.input_channels + self.decoder_input_channels) + self.constants.index('f')
+            ] if 'f' in self.constants else []
+            odd_in_vars_idx = v_channel_idx + f_idx
+            odd_out_vars_idx = v_channel_idx
+            odd_in_vars_idx = th.tensor(odd_in_vars_idx, dtype=th.long)
+            odd_out_vars_idx = th.tensor(odd_out_vars_idx, dtype=th.long)
+        self.register_buffer("odd_in_vars_idx", odd_in_vars_idx, persistent=False)
+        self.register_buffer("odd_out_vars_idx", odd_out_vars_idx, persistent=False)
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -372,7 +379,12 @@ class HEALPixRecUNet(Module):
         if constraints is not None:
             self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
 
-    def hpx_reflect(self, x):
+    def hpx_reflect(
+        self,
+        x,
+        invert_odd_in_vars: bool = False,
+        invert_odd_out_vars: bool = False,
+    ):
         '''
         Helper function to reflect a global HPX signal across the equator
         Assumes x has shape [B*F,C,H,W]
@@ -387,12 +399,18 @@ class HEALPixRecUNet(Module):
         # Refold faces into batch dimension
         x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
 
-        # Flip sign of v-velocity components
-        if (self.v_channel_indices is not None) and (len(self.v_channel_indices) > 0):
+        # Flip sign of odd variables (e.g., v-velocity, f)
+        if invert_odd_in_vars and len(self.odd_in_vars_idx) > 0:
             x.index_copy_(
                 1,
-                self.v_channel_indices,
-                -1 * th.index_select(x, dim=1, index=self.v_channel_indices)
+                self.odd_in_vars_idx,
+                -1 * th.index_select(x, dim=1, index=self.odd_in_vars_idx)
+            )
+        if invert_odd_out_vars and len(self.odd_out_vars_idx) > 0:
+            x.index_copy_(
+                1,
+                self.odd_out_vars_idx,
+                -1 * th.index_select(x, dim=1, index=self.odd_out_vars_idx)
             )
 
         return x
@@ -479,7 +497,7 @@ class HEALPixRecUNet(Module):
                                 else orig_hidden_states[n]
 
                 # Forward through model with reflected input
-                self.decoder(self.encoder(self.hpx_reflect(input_tensor), conditions_cln=conditions_cln), conditions_cln=conditions_cln)
+                self.decoder(self.encoder(self.hpx_reflect(input_tensor, invert_odd_in_vars=True), conditions_cln=conditions_cln), conditions_cln=conditions_cln)
                 new_hidden_states_refl = [
                     self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
                 ]
@@ -603,7 +621,7 @@ class HEALPixRecUNet(Module):
                                 else orig_hidden_states[n]
 
                 # Forward through model with reflected input
-                input_tensor_refl = self.hpx_reflect(input_tensor)
+                input_tensor_refl = self.hpx_reflect(input_tensor, invert_odd_in_vars=True)
                 encodings_refl = self.encoder(input_tensor_refl, **kwargs)
                 decodings_refl = self.decoder(encodings_refl, **kwargs)               
 
@@ -617,7 +635,7 @@ class HEALPixRecUNet(Module):
                     self.decoder.decoder[n].recurrent.h = 0.5 * (new_hidden_states[n] + self.hpx_reflect(new_hidden_states_refl[n]))
 
                 # Average of decodings ()
-                decodings = 0.5 * (decodings + self.hpx_reflect(decodings_refl))
+                decodings = 0.5 * (decodings + self.hpx_reflect(decodings_refl, invert_odd_out_vars=True))
             
             th.cuda.nvtx.range_pop()
 
