@@ -72,6 +72,7 @@ class HEALPixRecUNet(Module):
         enforce_reflectional_equivariance: bool = False,
         channels: Sequence[str] = None,
         constants: Sequence[str] = None,
+        scaling: dict[str, dict[str, float]] = None,
     ):
         """
         Parameters
@@ -151,18 +152,21 @@ class HEALPixRecUNet(Module):
         self.enforce_reflectional_equivariance = enforce_reflectional_equivariance
         self.channels = channels
         self.constants = constants
+        self.scaling = scaling
 
         # Setting variables which are used for enforcing reflectional equivariance
-        self.register_buffer("refl_face_order", th.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=th.long))
+        self.register_buffer("refl_face_order", th.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=th.long), persistent=False)
 
-        if self.channels is None or self.constants is None:
-            logger.warning(
-                "No list of channels or constants provided, if your model has "
-                "v-velocity components or f as input, reflectional equivariance "
-                "will not be enforced correctly."
-            )
-        else:
-            v_channel_idx = [i for i, var in enumerate(self.channels) if var.startswith('v')]
+        # TODO: clean this up, make sure f and v-velocity are handled correctly
+        if self.enforce_reflectional_equivariance:
+            if None in [self.channels, self.constants, self.scaling]:
+                raise ValueError(
+                    "Channels, constants, and scaling must be provided to enforce reflectional equivariance."
+                )
+            v_vars = [var for var in self.channels if var.startswith('v')]
+            v_channel_idx = [self.channels.index(var) for var in v_vars]
+            v_var_means = th.tensor([self.scaling[var]['mean'] for var in v_vars])
+            v_var_stds = th.tensor([self.scaling[var]['std'] for var in v_vars])
             f_idx = [
                 self.input_time_dim * (self.input_channels + self.decoder_input_channels) + self.constants.index('f')
             ] if 'f' in self.constants else []
@@ -170,8 +174,10 @@ class HEALPixRecUNet(Module):
             odd_out_vars_idx = v_channel_idx
             odd_in_vars_idx = th.tensor(odd_in_vars_idx, dtype=th.long)
             odd_out_vars_idx = th.tensor(odd_out_vars_idx, dtype=th.long)
-        self.register_buffer("odd_in_vars_idx", odd_in_vars_idx, persistent=False)
-        self.register_buffer("odd_out_vars_idx", odd_out_vars_idx, persistent=False)
+            self.register_buffer("odd_in_vars_idx", odd_in_vars_idx, persistent=False)
+            self.register_buffer("odd_out_vars_idx", odd_out_vars_idx, persistent=False)
+            self.register_buffer("v_var_means", v_var_means, persistent=False)
+            self.register_buffer("v_var_stds", v_var_stds, persistent=False)
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -401,10 +407,14 @@ class HEALPixRecUNet(Module):
 
         # Flip sign of odd variables (e.g., v-velocity, f)
         if invert_odd_in_vars and len(self.odd_in_vars_idx) > 0:
+            v = th.index_select(x, dim=1, index=self.odd_in_vars_idx)
+            v = v * self.v_var_stds.view(1, -1, 1, 1) + self.v_var_means.view(1, -1, 1, 1)
+            v = -1 * v
+            v = (v - self.v_var_means.view(1, -1, 1, 1)) / self.v_var_stds.view(1, -1, 1, 1)
             x.index_copy_(
                 1,
                 self.odd_in_vars_idx,
-                -1 * th.index_select(x, dim=1, index=self.odd_in_vars_idx)
+                v
             )
         if invert_odd_out_vars and len(self.odd_out_vars_idx) > 0:
             x.index_copy_(
