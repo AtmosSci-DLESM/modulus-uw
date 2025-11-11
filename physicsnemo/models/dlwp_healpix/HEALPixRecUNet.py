@@ -72,6 +72,8 @@ class HEALPixRecUNet(Module):
         constraints: list[DictConfig] = None,
         hpx_padding_mode: str = 'karlbauer',
         enforce_reflectional_equivariance: bool = False,
+        odd_prognostic_variables: Sequence[str] = None,
+        odd_constants: Sequence[str] = None,
         channels: Sequence[str] = None,
         constants: Sequence[str] = None,
         scaling: dict[str, dict[str, float]] = None,
@@ -162,6 +164,8 @@ class HEALPixRecUNet(Module):
         self.couplings_time_first = couplings_time_first
         self.hpx_padding_mode = hpx_padding_mode
         self.enforce_reflectional_equivariance = enforce_reflectional_equivariance
+        self.odd_prognostic_variables = odd_prognostic_variables
+        self.odd_constants = odd_constants
         self.channels = channels
         self.constants = constants
         self.scaling = scaling
@@ -169,27 +173,40 @@ class HEALPixRecUNet(Module):
         # Setting variables which are used for enforcing reflectional equivariance
         self.register_buffer("refl_face_order", th.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=th.long), persistent=False)
 
-        # TODO: clean this up, make sure f and v-velocity are handled correctly
+        # TODO: add some checks
         if self.enforce_reflectional_equivariance:
-            if None in [self.channels, self.constants, self.scaling]:
-                raise ValueError(
-                    "Channels, constants, and scaling must be provided to enforce reflectional equivariance."
-                )
-            v_vars = [var for var in self.channels if var.startswith('v')]
-            v_channel_idx = [self.channels.index(var) for var in v_vars]
-            v_var_means = th.tensor([self.scaling[var]['mean'] for var in v_vars])
-            v_var_stds = th.tensor([self.scaling[var]['std'] for var in v_vars])
-            f_idx = [
-                self.input_time_dim * (self.input_channels + self.decoder_input_channels) + self.constants.index('f')
-            ] if 'f' in self.constants else []
-            odd_in_vars_idx = v_channel_idx + f_idx
-            odd_out_vars_idx = v_channel_idx
-            odd_in_vars_idx = th.tensor(odd_in_vars_idx, dtype=th.long)
-            odd_out_vars_idx = th.tensor(odd_out_vars_idx, dtype=th.long)
-            self.register_buffer("odd_in_vars_idx", odd_in_vars_idx, persistent=False)
-            self.register_buffer("odd_out_vars_idx", odd_out_vars_idx, persistent=False)
-            self.register_buffer("v_var_means", v_var_means, persistent=False)
-            self.register_buffer("v_var_stds", v_var_stds, persistent=False)
+
+            odd_out_var_idx = th.tensor([self.channels.index(v) for v in self.odd_prognostic_variables], dtype=th.long) \
+                if self.odd_prognostic_variables is not None else None
+            odd_out_var_mean = th.tensor([self.scaling[var]['mean'] for var in self.odd_prognostic_variables]) \
+                if self.odd_prognostic_variables is not None else None
+            odd_out_var_std = th.tensor([self.scaling[var]['std'] for var in self.odd_prognostic_variables]) \
+                if self.odd_prognostic_variables is not None else None
+
+            self.register_buffer("odd_out_var_idx", odd_out_var_idx, persistent=False)
+            self.register_buffer("odd_out_var_mean", odd_out_var_mean, persistent=False)
+            self.register_buffer("odd_out_var_std", odd_out_var_std, persistent=False)
+
+            odd_in_vars = []
+            odd_in_var_idx = []
+            if self.odd_prognostic_variables is not None:
+                odd_in_vars += self.odd_prognostic_variables
+                odd_in_var_idx = [self.channels.index(v) for v in odd_in_vars]
+            if self.odd_constants is not None:
+                odd_in_vars += self.odd_constants
+                odd_const_idx = [
+                    self.input_time_dim * (self.input_channels + self.decoder_input_channels) + self.constants.index(c)
+                    for c in self.odd_constants
+                ]
+                odd_in_var_idx += odd_const_idx
+
+            odd_in_var_idx = th.tensor(odd_in_var_idx, dtype=th.long) if len(odd_in_vars) > 0 else None
+            odd_in_var_mean = th.tensor([self.scaling[var]['mean'] for var in odd_in_vars]) if len(odd_in_vars) > 0 else None
+            odd_in_var_std = th.tensor([self.scaling[var]['std'] for var in odd_in_vars]) if len(odd_in_vars) > 0 else None
+
+            self.register_buffer("odd_in_var_idx", odd_in_var_idx, persistent=False)
+            self.register_buffer("odd_in_var_mean", odd_in_var_mean, persistent=False)
+            self.register_buffer("odd_in_var_std", odd_in_var_std, persistent=False)
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -402,8 +419,7 @@ class HEALPixRecUNet(Module):
     def hpx_reflect(
         self,
         x,
-        invert_odd_in_vars: bool = False,
-        invert_odd_out_vars: bool = False,
+        input_includes_constants: bool = False,
     ):
         '''
         Helper function to reflect a HPX tensor across its horizontal axis.
@@ -420,21 +436,24 @@ class HEALPixRecUNet(Module):
         x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
 
         # Flip sign of odd variables (e.g., v-velocity, f)
-        if invert_odd_in_vars and len(self.odd_in_vars_idx) > 0:
-            v = th.index_select(x, dim=1, index=self.odd_in_vars_idx)
-            v = v * self.v_var_stds.view(1, -1, 1, 1) + self.v_var_means.view(1, -1, 1, 1)
+        if input_includes_constants:
+            var_idx = self.odd_in_var_idx
+            var_mean = self.odd_in_var_mean
+            var_std = self.odd_in_var_std
+        else:
+            var_idx = self.odd_out_var_idx
+            var_mean = self.odd_out_var_mean
+            var_std = self.odd_out_var_std
+
+        if var_idx is not None:
+            v = th.index_select(x, dim=1, index=var_idx)
+            v = v * var_std.view(1, -1, 1, 1) + var_mean.view(1, -1, 1, 1)
             v = -1 * v
-            v = (v - self.v_var_means.view(1, -1, 1, 1)) / self.v_var_stds.view(1, -1, 1, 1)
+            v = (v - var_mean.view(1, -1, 1, 1)) / var_std.view(1, -1, 1, 1)
             x.index_copy_(
                 1,
-                self.odd_in_vars_idx,
+                var_idx,
                 v
-            )
-        if invert_odd_out_vars and len(self.odd_out_vars_idx) > 0:
-            x.index_copy_(
-                1,
-                self.odd_out_vars_idx,
-                -1 * th.index_select(x, dim=1, index=self.odd_out_vars_idx)
             )
 
         return x
