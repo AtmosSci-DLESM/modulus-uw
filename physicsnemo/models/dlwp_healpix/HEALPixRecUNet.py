@@ -506,19 +506,19 @@ class HEALPixRecUNet(Module):
 
             # Residual prediction
             th.cuda.nvtx.range_push("Reshape outputs")
-            input = self._reshape_outputs(input_tensor[:, : self.input_channels * self.input_time_dim])
+            orig_input = self._reshape_outputs(input_tensor[:, : self.input_channels * self.input_time_dim])
             output = self._reshape_outputs(decodings)
             th.cuda.nvtx.range_pop()
 
             if self.residual_prediction:
-                prediction = input + output
+                prediction = orig_input + output
             else:
                 prediction = output
 
             # Apply constraints
             if self.constraints is not None:
                 for constraint in self.constraints:
-                    prediction = constraint(prediction, input)
+                    prediction = constraint(prediction, orig_input)
 
             outputs.append(prediction)
             th.cuda.nvtx.range_pop()
