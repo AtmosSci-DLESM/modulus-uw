@@ -679,14 +679,13 @@ class HEALPixRecUNet(Module):
             # Reshape from [B*F, T*C, H, W] to [B, F, T, C, H, W]
             combined = self._reshape_outputs(decodings)
             prognostics = combined[:, :, :, :self.input_channels]
-            th.cuda.nvtx.range_pop()
 
             # Residual prediction
-            inputs = self._reshape_outputs(
+            orig_input = self._reshape_outputs(
                     input_tensor[:, :self.input_channels * self.input_time_dim]
                 )
             if self.residual_prediction:
-                prognostics += inputs
+                prognostics += orig_input
             diagnostics = combined[:, :, :, self.input_channels:]
 
             # Concat along channel dim, shape is [B, F, T, C, H, W]
@@ -695,10 +694,9 @@ class HEALPixRecUNet(Module):
             # Apply constraints
             if self.constraints is not None:
                 for constraint in self.constraints:
-                    out = constraint(out, input)
+                    out = constraint(out, orig_input)
 
             outputs.append(out)
-            th.cuda.nvtx.range_pop()
 
         if output_only_last:
             return outputs[-1]

@@ -109,11 +109,12 @@ class DryAirMassConstraint(torch.nn.Module):
         self.register_buffer('tcwv_mean', tcwv_mean, persistent=False)
         self.register_buffer('tcwv_std', tcwv_std, persistent=False)
 
-        sp_threshold = (0. - ps_mean) / ps_std
         if transformed_sp:
             # Find threshold in Box-Cox space that corresponds to 0 Pa in physical space
             sp_threshold = (0.**self.sp_boxcox_lambda-1)/self.sp_boxcox_lambda
-            sp_threshold = (sp_threshold - self.var_means[sp_idx]) / self.var_stds[sp_idx]
+            sp_threshold = (sp_threshold - ps_mean) / ps_std
+        else:
+            sp_threshold = (0. - ps_mean) / ps_std
         sp_threshold = sp_threshold.view(1, 1, 1, -1, 1, 1)
         self.register_buffer('sp_threshold', sp_threshold, persistent=False)
 
@@ -143,37 +144,38 @@ class DryAirMassConstraint(torch.nn.Module):
         '''
         Tensors are expected to be in the shape [B, F, T, C, H, W]
         '''
-        x = prediction
+        with torch.cuda.amp.autocast(enabled=False):
+            x = prediction.float()
 
-        # Get predicted sp and tcwv
-        sp = torch.index_select(x, dim=3, index=self.sp_idx)
-        sp = sp * self.ps_std + self.ps_mean
-        if self.transformed_sp:
-            sp = self.reverse_transform_sp(sp)
-        tcwv = torch.index_select(x, dim=3, index=self.tcwv_idx)
-        tcwv = tcwv * self.tcwv_std + self.tcwv_mean
+            # Get predicted sp and tcwv
+            sp = torch.index_select(x, dim=3, index=self.sp_idx)
+            sp = sp * self.ps_std + self.ps_mean
+            if self.transformed_sp:
+                sp = self.reverse_transform_sp(sp)
+            tcwv = torch.index_select(x, dim=3, index=self.tcwv_idx)
+            tcwv = tcwv * self.tcwv_std + self.tcwv_mean
 
-        # Get last time step sp and tcwv from input
-        sp_0 = torch.index_select(input, dim=3, index=self.sp_idx)[:, :, -1:]
-        sp_0 = sp_0 * self.ps_std + self.ps_mean
-        if self.transformed_sp:
-            sp_0 = self.reverse_transform_sp(sp_0)
-        tcwv_0 = torch.index_select(input, dim=3, index=self.tcwv_idx)[:, :, -1:]
-        tcwv_0 = tcwv_0 * self.tcwv_std + self.tcwv_mean
+            # Get last time step sp and tcwv from input
+            sp_0 = torch.index_select(input, dim=3, index=self.sp_idx)[:, :, -1:]
+            sp_0 = sp_0 * self.ps_std + self.ps_mean
+            if self.transformed_sp:
+                sp_0 = self.reverse_transform_sp(sp_0)
+            tcwv_0 = torch.index_select(input, dim=3, index=self.tcwv_idx)[:, :, -1:]
+            tcwv_0 = tcwv_0 * self.tcwv_std + self.tcwv_mean
 
-        # Get predicted and initial dry sp
-        sp_dry = sp - self.g0 * tcwv
-        sp_0_dry = sp_0 - self.g0 * tcwv_0
-        # Correction is average of dry air mass difference
-        correction = (sp_dry - sp_0_dry).mean(dim=[-2,-1], keepdim=True)
-        sp_corrected = sp - correction
+            # Get predicted and initial dry sp
+            sp_dry = sp - self.g0 * tcwv/100.
+            sp_0_dry = sp_0 - self.g0 * tcwv_0/100.
+            # Correction is spatial average of dry air mass difference
+            correction = (sp_dry - sp_0_dry).mean(dim=[1,4,5], keepdim=True)
+            sp_corrected = sp - correction
 
-        # Ensure sp is non-negative and rescale back to normalized space
-        sp_corrected = torch.clamp(sp_corrected, min=0.)
-        sp_corrected = (sp_corrected - self.ps_mean) / self.ps_std
-        if self.transformed_sp:
-            sp_corrected = self.transform_sp(sp_corrected)
+            # Ensure sp is non-negative and rescale back to normalized space
+            sp_corrected = torch.clamp(sp_corrected, min=0.)
+            if self.transformed_sp:
+                sp_corrected = self.transform_sp(sp_corrected)
+            sp_corrected = (sp_corrected - self.ps_mean) / self.ps_std
 
-        x.index_copy_(3, self.sp_idx, sp_corrected)
+            x.index_copy_(3, self.sp_idx, sp_corrected)
 
-        return x
+            return x
