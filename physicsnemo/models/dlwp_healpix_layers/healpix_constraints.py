@@ -131,14 +131,15 @@ class DryAirMassConstraint(torch.nn.Module):
         Tensors are expected to be in the shape [B, F, T, C, H, W]
         '''
         with torch.cuda.amp.autocast(enabled=False):
-            x = prediction.float()
+            prediction = prediction.float()
+            input = input.float()
 
             # Get predicted sp and tcwv
-            sp = torch.index_select(x, dim=3, index=self.sp_idx)
+            sp = torch.index_select(prediction, dim=3, index=self.sp_idx)
             sp = sp * self.ps_std + self.ps_mean
             if self.transformed_sp:
                 sp = self.reverse_transform_sp(sp)
-            tcwv = torch.index_select(x, dim=3, index=self.tcwv_idx)
+            tcwv = torch.index_select(prediction, dim=3, index=self.tcwv_idx)
             tcwv = tcwv * self.tcwv_std + self.tcwv_mean
 
             # Get last time step sp and tcwv from input
@@ -162,6 +163,6 @@ class DryAirMassConstraint(torch.nn.Module):
                 sp_corrected = self.transform_sp(sp_corrected)
             sp_corrected = (sp_corrected - self.ps_mean) / self.ps_std
 
-            x.index_copy_(3, self.sp_idx, sp_corrected)
+            prediction.index_copy_(3, self.sp_idx, sp_corrected)
 
-            return x
+            return prediction
