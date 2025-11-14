@@ -200,6 +200,7 @@ class HEALPixRecUNet(Module):
                 ]
                 odd_in_var_idx += odd_const_idx
 
+            print(f'odd_in_vars: {odd_in_vars}')
             odd_in_var_idx = th.tensor(odd_in_var_idx, dtype=th.long) if len(odd_in_vars) > 0 else None
             odd_in_var_mean = th.tensor([self.scaling[var]['mean'] for var in odd_in_vars]) if len(odd_in_vars) > 0 else None
             odd_in_var_std = th.tensor([self.scaling[var]['std'] for var in odd_in_vars]) if len(odd_in_vars) > 0 else None
@@ -419,7 +420,8 @@ class HEALPixRecUNet(Module):
     def hpx_reflect(
         self,
         x,
-        input_includes_constants: bool = False,
+        latent_tensor: bool = False,
+        includes_constants: bool = False,
     ):
         '''
         Helper function to reflect a HPX tensor across its horizontal axis.
@@ -436,25 +438,26 @@ class HEALPixRecUNet(Module):
         x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
 
         # Flip sign of odd variables (e.g., v-velocity, f)
-        if input_includes_constants:
-            var_idx = self.odd_in_var_idx
-            var_mean = self.odd_in_var_mean
-            var_std = self.odd_in_var_std
-        else:
-            var_idx = self.odd_out_var_idx
-            var_mean = self.odd_out_var_mean
-            var_std = self.odd_out_var_std
+        if not latent_tensor:
+            if includes_constants:
+                var_idx = self.odd_in_var_idx
+                var_mean = self.odd_in_var_mean
+                var_std = self.odd_in_var_std
+            else:
+                var_idx = self.odd_out_var_idx
+                var_mean = self.odd_out_var_mean
+                var_std = self.odd_out_var_std
 
-        if var_idx is not None:
-            v = th.index_select(x, dim=1, index=var_idx)
-            v = v * var_std.view(1, -1, 1, 1) + var_mean.view(1, -1, 1, 1)
-            v = -1 * v
-            v = (v - var_mean.view(1, -1, 1, 1)) / var_std.view(1, -1, 1, 1)
-            x.index_copy_(
-                1,
-                var_idx,
-                v
-            )
+            if var_idx is not None:
+                v = th.index_select(x, dim=1, index=var_idx)
+                v = v * var_std.view(1, -1, 1, 1) + var_mean.view(1, -1, 1, 1)
+                v = -1 * v
+                v = (v - var_mean.view(1, -1, 1, 1)) / var_std.view(1, -1, 1, 1)
+                x.index_copy_(
+                    1,
+                    var_idx,
+                    v
+                )
 
         return x
 
@@ -535,12 +538,12 @@ class HEALPixRecUNet(Module):
                 # Reset hidden states to original
                 for n in range(len(self.decoder.decoder)):
                     self.decoder.decoder[n].recurrent.h = \
-                        self.hpx_reflect(orig_hidden_states[n]) \
+                        self.hpx_reflect(orig_hidden_states[n], latent_tensor=True) \
                             if orig_hidden_states[n].shape != (1,1,1,1) \
                                 else orig_hidden_states[n]
 
                 # Forward through model with reflected input
-                self.decoder(self.encoder(self.hpx_reflect(input_tensor, invert_odd_in_vars=True), conditions_cln=conditions_cln), conditions_cln=conditions_cln)
+                self.decoder(self.encoder(self.hpx_reflect(input_tensor, includes_constants=True), conditions_cln=conditions_cln), conditions_cln=conditions_cln)
                 new_hidden_states_refl = [
                     self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
                 ]
@@ -548,7 +551,7 @@ class HEALPixRecUNet(Module):
                 # Average of new hidden states resulting from the default forward
                 # pass and the reflected forward pass
                 for n in range(len(self.decoder.decoder)):
-                    self.decoder.decoder[n].recurrent.h = 0.5 * (new_hidden_states[n] + self.hpx_reflect(new_hidden_states_refl[n]))
+                    self.decoder.decoder[n].recurrent.h = 0.5 * (new_hidden_states[n] + self.hpx_reflect(new_hidden_states_refl[n], latent_tensor=True))
 
     def forward(self, inputs: Sequence, output_only_last=False, conditions_cln=None) -> th.Tensor:
         """
@@ -654,12 +657,21 @@ class HEALPixRecUNet(Module):
                 # Reset hidden states to original
                 for n in range(len(self.decoder.decoder)):
                     self.decoder.decoder[n].recurrent.h = \
-                        self.hpx_reflect(orig_hidden_states[n]) \
+                        self.hpx_reflect(orig_hidden_states[n], latent_tensor=True) \
                             if orig_hidden_states[n].shape != (1,1,1,1) \
                                 else orig_hidden_states[n]
 
                 # Forward through model with reflected input
-                input_tensor_refl = self.hpx_reflect(input_tensor, invert_odd_in_vars=True)
+                input_tensor_refl = self.hpx_reflect(input_tensor, includes_constants=True)
+                # print(f'Ah Step {step}: ')
+                # for i in range(input_tensor.shape[1]):
+                #     if not th.all(th.isclose(input_tensor[:,i], input_tensor_refl[:,i])):
+                #         print("Input tensor and reflected input tensor differ for channel ", i)
+                        # if step == 1:
+                        #     print(f'input_tensor channel 0 mean {th.mean(input_tensor[:,0])}')
+                        #     print(f'input_tensor channel 28 mean {th.mean(input_tensor[:,28])}')
+                        #     print(f'orig: {input_tensor[:,i]}')
+                        #     print(f'refl: {input_tensor_refl[:,i]}')
                 encodings_refl = self.encoder(input_tensor_refl, **kwargs)
                 decodings_refl = self.decoder(encodings_refl, **kwargs)               
 
@@ -670,12 +682,20 @@ class HEALPixRecUNet(Module):
                 # Average of new hidden states resulting from the default forward
                 # pass and the reflected forward pass
                 for n in range(len(self.decoder.decoder)):
-                    self.decoder.decoder[n].recurrent.h = 0.5 * (new_hidden_states[n] + self.hpx_reflect(new_hidden_states_refl[n]))
+                    self.decoder.decoder[n].recurrent.h = 0.5 * (new_hidden_states[n] + self.hpx_reflect(new_hidden_states_refl[n], latent_tensor=True))
 
                 # Average of decodings ()
-                decodings = 0.5 * (decodings + self.hpx_reflect(decodings_refl, invert_odd_out_vars=True))
+                decodings = 0.5 * (decodings + self.hpx_reflect(decodings_refl, includes_constants=False))
             
-            
+            # print(f'Test step {step}: ')
+            # a = decodings
+            # b = self.hpx_reflect(decodings, includes_constants=False)
+            # for i in range(a.shape[1]):
+            #     if not th.all(th.isclose(a[:,i], b[:,i])):
+            #         print("Decodings and reflected decodings differ for channel ", i)
+            # print(f"Decodings channel 0 mean: {th.mean(a[:,0])}")
+            # print(f"Decodings channel 28 mean: {th.mean(a[:,28])}")
+
             # Reshape from [B*F, T*C, H, W] to [B, F, T, C, H, W]
             combined = self._reshape_outputs(decodings)
             prognostics = combined[:, :, :, :self.input_channels]
