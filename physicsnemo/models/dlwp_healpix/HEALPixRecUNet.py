@@ -200,7 +200,6 @@ class HEALPixRecUNet(Module):
                 ]
                 odd_in_var_idx += odd_const_idx
 
-            print(f'odd_in_vars: {odd_in_vars}')
             odd_in_var_idx = th.tensor(odd_in_var_idx, dtype=th.long) if len(odd_in_vars) > 0 else None
             odd_in_var_mean = th.tensor([self.scaling[var]['mean'] for var in odd_in_vars]) if len(odd_in_vars) > 0 else None
             odd_in_var_std = th.tensor([self.scaling[var]['std'] for var in odd_in_vars]) if len(odd_in_vars) > 0 else None
@@ -456,7 +455,7 @@ class HEALPixRecUNet(Module):
                 x.index_copy_(
                     1,
                     var_idx,
-                    v
+                    v.to(x.dtype)
                 )
 
         return x
@@ -663,15 +662,10 @@ class HEALPixRecUNet(Module):
 
                 # Forward through model with reflected input
                 input_tensor_refl = self.hpx_reflect(input_tensor, includes_constants=True)
-                # print(f'Ah Step {step}: ')
+                # print(f'Step {step}: ')
                 # for i in range(input_tensor.shape[1]):
                 #     if not th.all(th.isclose(input_tensor[:,i], input_tensor_refl[:,i])):
                 #         print("Input tensor and reflected input tensor differ for channel ", i)
-                        # if step == 1:
-                        #     print(f'input_tensor channel 0 mean {th.mean(input_tensor[:,0])}')
-                        #     print(f'input_tensor channel 28 mean {th.mean(input_tensor[:,28])}')
-                        #     print(f'orig: {input_tensor[:,i]}')
-                        #     print(f'refl: {input_tensor_refl[:,i]}')
                 encodings_refl = self.encoder(input_tensor_refl, **kwargs)
                 decodings_refl = self.decoder(encodings_refl, **kwargs)               
 
@@ -686,15 +680,6 @@ class HEALPixRecUNet(Module):
 
                 # Average of decodings ()
                 decodings = 0.5 * (decodings + self.hpx_reflect(decodings_refl, includes_constants=False))
-            
-            # print(f'Test step {step}: ')
-            # a = decodings
-            # b = self.hpx_reflect(decodings, includes_constants=False)
-            # for i in range(a.shape[1]):
-            #     if not th.all(th.isclose(a[:,i], b[:,i])):
-            #         print("Decodings and reflected decodings differ for channel ", i)
-            # print(f"Decodings channel 0 mean: {th.mean(a[:,0])}")
-            # print(f"Decodings channel 28 mean: {th.mean(a[:,28])}")
 
             # Reshape from [B*F, T*C, H, W] to [B, F, T, C, H, W]
             combined = self._reshape_outputs(decodings)
