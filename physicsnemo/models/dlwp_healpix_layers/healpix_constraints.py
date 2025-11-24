@@ -54,7 +54,7 @@ class NonnegativeConstraint(torch.nn.Module):
         thresholds = thresholds.view(1, 1, 1, -1, 1, 1)
         self.register_buffer('thresholds', thresholds, persistent=False)
 
-    def forward(self, prediction, input, step):
+    def forward(self, prediction, input):
         '''
         Tensors are expected to be in the shape [B, F, T, C, H, W]
         '''
@@ -142,12 +142,12 @@ class DryAirMassConstraint(torch.nn.Module):
         self,
         x
     ):
-        x = torch.exp(torch.log(x * self.sp_lambda + 1 + 1e-8)/self.sp_lambda)
-        # x = (x * self.sp_lambda + 1)**(1/self.sp_lambda)
+        # x = torch.exp(torch.log(x * self.sp_lambda + 1 + 1e-8)/self.sp_lambda)
+        x = (x * self.sp_lambda + 1)**(1/self.sp_lambda)
         x = x * self.sp_max_val # Rescaling back to hPa
         return x
 
-    def forward(self, prediction, input, step):
+    def forward(self, prediction, input):
         '''
         Tensors are expected to be in the shape [B, F, T, C, H, W]
         '''
@@ -158,13 +158,8 @@ class DryAirMassConstraint(torch.nn.Module):
             # Get predicted sp and tcwv
             sp = torch.index_select(prediction, dim=3, index=self.sp_idx)
             sp = sp * self.ps_std + self.ps_mean
-            # print(f'sp mean: {sp.mean()}, {sp.dtype}', flush=True)
-            # if step == 0:
-            #     print(f'Saving sp at step 0', flush=True)
-            #     torch.save(sp, '/global/homes/y/yikwill/uw-research/yikwill/dlesym/notebooks/sp_pred_step_0.pt')
             if self.sp_boxcox_transformed:
                 sp = self._reverse_boxcox_transform_sp(sp)
-            # print(f'sp after reverse boxcox mean: {sp.mean()}, {sp.dtype}', flush=True)
             tcwv = torch.index_select(prediction, dim=3, index=self.tcwv_idx)
             tcwv = tcwv * self.tcwv_std + self.tcwv_mean
 
@@ -172,42 +167,22 @@ class DryAirMassConstraint(torch.nn.Module):
             # compute initial dry air mass which is to be conserved.
             sp_0 = torch.index_select(input, dim=3, index=self.sp_idx)[:, :, -1:]
             sp_0 = sp_0 * self.ps_std + self.ps_mean
-            # print(f'sp_0 mean: {sp_0.mean()}', flush=True)
-            # if step == 0:
-            #     print(f'Saving sp_0 at step 0', flush=True)
-            #     torch.save(sp_0, '/global/homes/y/yikwill/uw-research/yikwill/dlesym/notebooks/sp_0_step_0.pt')
             if self.sp_boxcox_transformed:
                 sp_0 = self._reverse_boxcox_transform_sp(sp_0)
-            # print(f'sp_0 after reverse boxcox mean: {sp_0.mean()}', flush=True)
             tcwv_0 = torch.index_select(input, dim=3, index=self.tcwv_idx)[:, :, -1:]
             tcwv_0 = tcwv_0 * self.tcwv_std + self.tcwv_mean
 
             # Get predicted and initial dry sp
             sp_dry = sp - self.g0 * tcwv/100.
             sp_0_dry = sp_0 - self.g0 * tcwv_0/100.
-            # print(sp.shape, sp_0.shape, flush=True)
-            # print(f'Test: {sp.mean()}, {tcwv.mean()}, {sp_0.mean()}, {tcwv_0.mean()}', flush=True)
-            # print({sp_dry.mean(), sp_0_dry.mean()}, flush=True)
             # Correction is spatial average of dry air mass difference
             correction = (sp_dry - sp_0_dry).mean(dim=[1,4,5], keepdim=True)
             sp_corrected = sp - correction
-            # print(f'sp shape: {sp.shape}, correction shape: {correction.shape}, sp_corrected shape: {sp_corrected.shape}', flush=True)
-            print(f'Correction stats: {sp.mean()}, {correction.mean()}, {sp_corrected.mean()}', flush=True)
-            print(f'sp min: {sp.min()}', flush=True)
-
-            # print({sp_corrected.mean()}, flush=True)
-            # print('', flush=True)
 
             # Ensure sp is non-negative and rescale back to normalized space
             sp_corrected = torch.clamp(sp_corrected, min=0.)
-            # print(f'sp_corrected after clamp min 0 mean: {sp_corrected.mean()}', flush=True)
-            # print(f'sp_corrected min: {sp_corrected.min()}', flush=True)
-            # print(f'{sp_corrected.shape}', flush=True)
-            # torch.save(sp_corrected, '/global/homes/y/yikwill/uw-research/yikwill/dlesym/notebooks/sp_corrected.pt')
             if self.sp_boxcox_transformed:
                 sp_corrected = self._boxcox_transform_sp(sp_corrected)
-            # print(f'sp_corrected mean: {sp_corrected.mean()}', flush=True)
-            # print('', flush=True)
             sp_corrected = (sp_corrected - self.ps_mean) / self.ps_std
 
             prediction.index_copy_(3, self.sp_idx, sp_corrected)
