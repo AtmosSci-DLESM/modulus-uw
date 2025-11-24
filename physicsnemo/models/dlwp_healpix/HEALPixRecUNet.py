@@ -699,7 +699,7 @@ class HEALPixRecUNet(Module):
             # Apply constraints
             if self.constraints is not None:
                 for constraint in self.constraints:
-                    out = constraint(out, orig_input)
+                    out = constraint(out, orig_input, step)
 
             outputs.append(out)
 
