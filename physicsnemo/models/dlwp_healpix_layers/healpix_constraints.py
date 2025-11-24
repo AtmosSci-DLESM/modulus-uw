@@ -96,6 +96,13 @@ class DryAirMassConstraint(torch.nn.Module):
                     f"sp_boxcox_transformed is True. Received "
                     f"sp_lambda={sp_lambda}, sp_max_val={sp_max_val}"
                 )
+        else:
+            if sp_lambda is not None or sp_max_val is not None:
+                raise ValueError(
+                    f"sp_lambda and sp_max_val should not be provided if "
+                    f"sp_boxcox_transformed is False. Received "
+                    f"sp_lambda={sp_lambda}, sp_max_val={sp_max_val}"
+                )
 
         sp_name = "sp-boxcox" if sp_boxcox_transformed else "sp"
         sp_idx = torch.tensor(
@@ -119,15 +126,6 @@ class DryAirMassConstraint(torch.nn.Module):
         self.register_buffer('tcwv_mean', tcwv_mean, persistent=False)
         self.register_buffer('tcwv_std', tcwv_std, persistent=False)
 
-        if sp_boxcox_transformed:
-            # Find threshold in Box-Cox space that corresponds to 0 Pa in physical space
-            sp_threshold = (0.**self.sp_lambda-1)/self.sp_lambda
-            sp_threshold = (sp_threshold - ps_mean) / ps_std
-        else:
-            sp_threshold = (0. - ps_mean) / ps_std
-        sp_threshold = sp_threshold.view(1, 1, 1, -1, 1, 1)
-        self.register_buffer('sp_threshold', sp_threshold, persistent=False)
-
         self.g0 = 9.81
 
     def _boxcox_transform_sp(
@@ -142,9 +140,11 @@ class DryAirMassConstraint(torch.nn.Module):
         self,
         x
     ):
-        # x = torch.exp(torch.log(x * self.sp_lambda + 1 + 1e-8)/self.sp_lambda)
-        x = (x * self.sp_lambda + 1)**(1/self.sp_lambda)
-        x = x * self.sp_max_val # Rescaling back to hPa
+        x = torch.exp(torch.log(x * self.sp_lambda + 1 + 1e-8)/self.sp_lambda)
+        # Equivalent to the operation above, but more prone to numerical issues
+        # in float16 for some reason
+        # x = (x * self.sp_lambda + 1)**(1/self.sp_lambda)
+        x = x * self.sp_max_val # Rescaling back to Pa
         return x
 
     def forward(self, prediction, input):
@@ -173,8 +173,8 @@ class DryAirMassConstraint(torch.nn.Module):
             tcwv_0 = tcwv_0 * self.tcwv_std + self.tcwv_mean
 
             # Get predicted and initial dry sp
-            sp_dry = sp - self.g0 * tcwv/100.
-            sp_0_dry = sp_0 - self.g0 * tcwv_0/100.
+            sp_dry = sp - self.g0 * tcwv
+            sp_0_dry = sp_0 - self.g0 * tcwv_0
             # Correction is spatial average of dry air mass difference
             correction = (sp_dry - sp_0_dry).mean(dim=[1,4,5], keepdim=True)
             sp_corrected = sp - correction
