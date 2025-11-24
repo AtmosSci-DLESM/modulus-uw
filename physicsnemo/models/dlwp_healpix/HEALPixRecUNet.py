@@ -161,19 +161,11 @@ class HEALPixRecUNet(Module):
         # Setting variables which are used for enforcing reflectional equivariance
         self.register_buffer("refl_face_order", th.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=th.long), persistent=False)
 
-        # TODO: add some checks
         if self.enforce_reflectional_equivariance:
 
             odd_out_var_idx = th.tensor([self.channels.index(v) for v in self.odd_prognostic_variables], dtype=th.long) \
                 if self.odd_prognostic_variables is not None else None
-            odd_out_var_mean = th.tensor([self.scaling[var]['mean'] for var in self.odd_prognostic_variables]) \
-                if self.odd_prognostic_variables is not None else None
-            odd_out_var_std = th.tensor([self.scaling[var]['std'] for var in self.odd_prognostic_variables]) \
-                if self.odd_prognostic_variables is not None else None
-
             self.register_buffer("odd_out_var_idx", odd_out_var_idx, persistent=False)
-            self.register_buffer("odd_out_var_mean", odd_out_var_mean, persistent=False)
-            self.register_buffer("odd_out_var_std", odd_out_var_std, persistent=False)
 
             odd_in_vars = []
             odd_in_var_idx = []
@@ -189,12 +181,22 @@ class HEALPixRecUNet(Module):
                 odd_in_var_idx += odd_const_idx
 
             odd_in_var_idx = th.tensor(odd_in_var_idx, dtype=th.long) if len(odd_in_vars) > 0 else None
-            odd_in_var_mean = th.tensor([self.scaling[var]['mean'] for var in odd_in_vars]) if len(odd_in_vars) > 0 else None
-            odd_in_var_std = th.tensor([self.scaling[var]['std'] for var in odd_in_vars]) if len(odd_in_vars) > 0 else None
-
             self.register_buffer("odd_in_var_idx", odd_in_var_idx, persistent=False)
-            self.register_buffer("odd_in_var_mean", odd_in_var_mean, persistent=False)
-            self.register_buffer("odd_in_var_std", odd_in_var_std, persistent=False)
+            
+            odd_in_var_mean = th.tensor([self.scaling[var]['mean'] for var in odd_in_vars]) if len(odd_in_vars) > 0 else None
+            for i, mean in enumerate(odd_in_var_mean):
+                if mean != 0.0:
+                    raise ValueError(
+                        f"Reflectional equivariance can only be enforced if all odd variables have zero mean. "
+                        f"Odd variable {odd_in_vars[i]} has mean {mean.item()}"
+                    )
+
+            if len(odd_in_vars) == 0:
+                logger.warning(
+                    "Reflectional equivariance is enabled but no odd variables "
+                    "were specified. The model will be reflectionally equivariant "
+                    "only if all input variables are even scalars."
+                )
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -424,20 +426,12 @@ class HEALPixRecUNet(Module):
 
         # Flip sign of odd variables (e.g., v-velocity, f)
         if not latent_tensor:
-            if includes_constants:
-                var_idx = self.odd_in_var_idx
-                var_mean = self.odd_in_var_mean
-                var_std = self.odd_in_var_std
-            else:
-                var_idx = self.odd_out_var_idx
-                var_mean = self.odd_out_var_mean
-                var_std = self.odd_out_var_std
+            
+            var_idx = self.odd_in_var_idx if includes_constants else self.odd_out_var_idx
 
             if var_idx is not None:
                 v = th.index_select(x, dim=1, index=var_idx)
-                v = v * var_std.view(1, -1, 1, 1) + var_mean.view(1, -1, 1, 1)
                 v = -1 * v
-                v = (v - var_mean.view(1, -1, 1, 1)) / var_std.view(1, -1, 1, 1)
                 x.index_copy_(
                     1,
                     var_idx,
