@@ -1,6 +1,9 @@
+import logging
 import numpy as np
 import torch
 import xarray as xr
+
+logger = logging.getLogger(__name__)
 
 class NonnegativeConstraint(torch.nn.Module):
     def __init__(
@@ -9,7 +12,7 @@ class NonnegativeConstraint(torch.nn.Module):
         in_channels: list[str],
         out_channels: list[str],
         scaling: dict[str, dict[str, float]],
-        sp_boxcox_lambda: float = 19.632015209145543,
+        sp_boxcox_lambda: float | None = None,
     ):
         """
         Parameters
@@ -35,6 +38,19 @@ class NonnegativeConstraint(torch.nn.Module):
 
         # Only apply constraint to variables that are used by model
         self.variables = [var for var in self.variables if var in self.channels]
+
+        logger.warning(
+            f"Requested non-negative constrained variables "
+            f"{[v for v in variables if v not in self.variables]} not found in "
+            f"model channels and will be ignored."
+        )
+
+        if 'sp-boxcox' in self.variables and self.sp_boxcox_lambda is None:
+            raise ValueError(
+                f"sp_boxcox_lambda must be provided if 'sp-boxcox' is in "
+                f"the list of constrained variables. Received "
+                f"sp_boxcox_lambda={self.sp_boxcox_lambda}"
+            )
 
         var_indices = torch.tensor(
             [self.channels.index(var) for var in self.variables],
