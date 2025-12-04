@@ -244,9 +244,14 @@ class TimeSeriesDataset(Dataset, Datapipe):
             # we use channel_out instead of channel_in because
             # the list of input channels may contain data fetched outside
             # the datasets such as coupled fields
-            self.input_scaling = scaling_da.sel(
-                index=self.ds.channel_out.values
-            ).rename({"index": "channel_in"})
+            if "tp6" in self.ds["targets"].channel_out:
+                self.input_scaling = scaling_da.sel(
+                    index=self.ds.channel_in.values
+                ).rename({"index": "channel_in"})
+            else:
+                self.input_scaling = scaling_da.sel(
+                    index=self.ds.channel_out.values
+                ).rename({"index": "channel_in"})
             self.input_scaling = {
                 "mean": np.expand_dims(
                     self.input_scaling["mean"].to_numpy(), (0, 2, 3, 4)

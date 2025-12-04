@@ -596,6 +596,7 @@ class HEALPixLayer(th.nn.Module):
                 enable_healpixpad
                 and have_healpixpad
                 and th.cuda.is_available()
+                and not enable_nhwc
             ):  # pragma: no cover
                 layers.append(HEALPixPaddingv2(padding=padding))
             else:
