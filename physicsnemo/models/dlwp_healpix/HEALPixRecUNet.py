@@ -659,7 +659,7 @@ class HEALPixRecUNet(Module):
                 for n in range(len(self.decoder.decoder)):
                     self.decoder.decoder[n].recurrent.h = 0.5 * (new_hidden_states[n] + self.hpx_reflect(new_hidden_states_refl[n], latent_tensor=True))
 
-                # Average of decodings ()
+                # Average of decodings
                 decodings = 0.5 * (decodings + self.hpx_reflect(decodings_refl, includes_constants=False))
 
             # Reshape from [B*F, T*C, H, W] to [B, F, T, C, H, W]
