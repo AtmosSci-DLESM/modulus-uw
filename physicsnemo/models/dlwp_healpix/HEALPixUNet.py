@@ -502,25 +502,14 @@ class HEALPixUNet(Module):
             # Reshape from [B*F, T*C, H, W] to [B, F, T, C, H, W]
             combined = self._reshape_outputs(decodings)
             prognostics = combined[:, :, :, :self.input_channels]
-            if self.residual_prediction:
-                prognostics += self._reshape_outputs(
-                    input_tensor[:, :self.input_channels * self.input_time_dim]
-                )
             diagnostics = combined[:, :, :, self.input_channels:]
 
-            if self.residual_prediction:
-                prediction = input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
-            else:
-                prediction = decodings
-            
-            # Reshape from [B*F, T*C, H, W] to [B, F, T, C, H, W]
-            combined = self._reshape_outputs(decodings)
-            prognostics = combined[:, :, :, :self.input_channels]
-            if self.residual_prediction:
-                prognostics += self._reshape_outputs(
+            # Residual prediction
+            orig_input = self._reshape_outputs(
                     input_tensor[:, :self.input_channels * self.input_time_dim]
                 )
-            diagnostics = combined[:, :, :, self.input_channels:]
+            if self.residual_prediction:
+                prognostics += orig_input
 
             # Concat along channel dim, shape is [B, F, T, C, H, W]
             out = th.cat([prognostics, diagnostics], dim=3)
@@ -528,7 +517,7 @@ class HEALPixUNet(Module):
             # Apply constraints
             if self.constraints is not None:
                 for constraint in self.constraints:
-                    out = constraint(out)
+                    out = constraint(out, orig_input)
 
             outputs.append(out)
 
