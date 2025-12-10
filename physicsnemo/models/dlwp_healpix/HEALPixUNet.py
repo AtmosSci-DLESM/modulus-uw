@@ -68,6 +68,12 @@ class HEALPixUNet(Module):
         couplings_time_first: bool = True,
         constraints: list[DictConfig] = None,
         hpx_padding_mode: str = 'karlbauer',
+        enforce_reflectional_equivariance: bool = False,
+        odd_prognostic_variables: Sequence[str] = None,
+        odd_constants: Sequence[str] = None,
+        channels: Sequence[str] = None,
+        constants: Sequence[str] = None,
+        scaling: dict[str, dict[str, float]] = None,
     ):
         """
         Parameters
@@ -138,6 +144,52 @@ class HEALPixUNet(Module):
         self.residual_prediction = residual_prediction
         self.couplings_time_first = couplings_time_first
         self.hpx_padding_mode = hpx_padding_mode
+        self.enforce_reflectional_equivariance = enforce_reflectional_equivariance
+        self.odd_prognostic_variables = odd_prognostic_variables
+        self.odd_constants = odd_constants
+        self.channels = channels
+        self.constants = constants
+        self.scaling = scaling
+
+        # Setting variables which are used for enforcing reflectional equivariance
+        self.register_buffer("refl_face_order", th.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=th.long), persistent=False)
+
+        if self.enforce_reflectional_equivariance:
+
+            odd_out_var_idx = th.tensor([self.channels.index(v) for v in self.odd_prognostic_variables], dtype=th.long) \
+                if self.odd_prognostic_variables is not None else None
+            self.register_buffer("odd_out_var_idx", odd_out_var_idx, persistent=False)
+
+            odd_in_vars = []
+            odd_in_var_idx = []
+            if self.odd_prognostic_variables is not None:
+                odd_in_vars += self.odd_prognostic_variables
+                odd_in_var_idx = [self.channels.index(v) for v in odd_in_vars]
+            if self.odd_constants is not None:
+                odd_in_vars += self.odd_constants
+                odd_const_idx = [
+                    self.input_time_dim * (self.input_channels + self.decoder_input_channels) + self.constants.index(c)
+                    for c in self.odd_constants
+                ]
+                odd_in_var_idx += odd_const_idx
+
+            odd_in_var_idx = th.tensor(odd_in_var_idx, dtype=th.long) if len(odd_in_vars) > 0 else None
+            self.register_buffer("odd_in_var_idx", odd_in_var_idx, persistent=False)
+            
+            odd_in_var_mean = th.tensor([self.scaling[var]['mean'] for var in odd_in_vars]) if len(odd_in_vars) > 0 else None
+            for i, mean in enumerate(odd_in_var_mean):
+                if mean != 0.0:
+                    raise ValueError(
+                        f"Reflectional equivariance can only be enforced if all odd variables have zero mean. "
+                        f"Odd variable {odd_in_vars[i]} has mean {mean.item()}"
+                    )
+
+            if len(odd_in_vars) == 0:
+                logger.warning(
+                    "Reflectional equivariance is enabled but no odd variables "
+                    "were specified. The model will be reflectionally equivariant "
+                    "only if all input variables are even scalars."
+                )
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -344,6 +396,42 @@ class HEALPixUNet(Module):
         if constraints is not None:
             self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
 
+    def hpx_reflect(
+        self,
+        x,
+        latent_tensor: bool = False,
+        includes_constants: bool = False,
+    ):
+        '''
+        Helper function to reflect a HPX tensor across its horizontal axis.
+        Assumes x has shape [B*F,C,H,W]
+        '''
+        # Reflect each face individually
+        x = th.rot90(th.flip(x, dims=[3]), dims=(-1,-2))
+
+        # Unfold faces from batch dimension and reorder to swap N/S faces
+        x = x.reshape(-1, 12, *x.shape[1:])
+        x = th.index_select(x, dim=1, index=self.refl_face_order.to(x.device))
+
+        # Refold faces into batch dimension
+        x = x.reshape(x.shape[0]*x.shape[1], *x.shape[2:])
+
+        # Flip sign of odd variables (e.g., v-velocity, f)
+        if not latent_tensor:
+            
+            var_idx = self.odd_in_var_idx if includes_constants else self.odd_out_var_idx
+
+            if var_idx is not None:
+                v = th.index_select(x, dim=1, index=var_idx)
+                v = -1 * v
+                x.index_copy_(
+                    1,
+                    var_idx,
+                    v.to(x.dtype)
+                )
+
+        return x
+
     def forward(self, inputs: Sequence, output_only_last=False, conditions_cln: Sequence=None) -> th.Tensor:
         """
         Forward pass of the HEALPixUnet
@@ -399,6 +487,31 @@ class HEALPixUNet(Module):
 
             encodings = self.encoder(input_tensor, **kwargs)
             decodings = self.decoder(encodings, **kwargs)
+
+            # Forward through model again with reflected input and original hidden states
+            if self.enforce_reflectional_equivariance:
+
+                # Forward through model with reflected input
+                input_tensor_refl = self.hpx_reflect(input_tensor, includes_constants=True)
+                encodings_refl = self.encoder(input_tensor_refl, **kwargs)
+                decodings_refl = self.decoder(encodings_refl, **kwargs)               
+
+                # Average of decodings
+                decodings = 0.5 * (decodings + self.hpx_reflect(decodings_refl, includes_constants=False))
+            
+            # Reshape from [B*F, T*C, H, W] to [B, F, T, C, H, W]
+            combined = self._reshape_outputs(decodings)
+            prognostics = combined[:, :, :, :self.input_channels]
+            if self.residual_prediction:
+                prognostics += self._reshape_outputs(
+                    input_tensor[:, :self.input_channels * self.input_time_dim]
+                )
+            diagnostics = combined[:, :, :, self.input_channels:]
+
+            if self.residual_prediction:
+                prediction = input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
+            else:
+                prediction = decodings
             
             # Reshape from [B*F, T*C, H, W] to [B, F, T, C, H, W]
             combined = self._reshape_outputs(decodings)
