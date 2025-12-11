@@ -502,6 +502,7 @@ class HEALPixRecUNet(Module):
             th.cuda.nvtx.range_pop()
             th.cuda.nvtx.range_push("Dencoder")
             decodings = self.decoder(encodings, **kwargs)
+            th.cuda.nvtx.range_pop()
             
             # Reshape from [B*F, T*C, H, W] to [B, F, T, C, H, W]
             combined = self._reshape_outputs(decodings)
