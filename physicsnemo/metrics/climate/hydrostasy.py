@@ -78,39 +78,37 @@ class HydrostaticBalance(torch.nn.Module):
         Tv = torch.empty(Tv_size, dtype=x.dtype, layout=x.layout, device=x.device)
         Tv[:, :, self.anchor_z_index, ...] = x[:, :, self.anchor_T_channel, ...]
 
-        if self.anchor_z_index > 0:
-            # Go down in index (up in vertical level) from anchor
-            for i in range(self.anchor_z_index, 0, -1):
-                z_channel = self.z_channels[i]
-                z_channel_m1 = self.z_channels[i - 1]
-                zi = x[:, :, z_channel, ...]
-                zim1 = x[:, :, z_channel_m1, ...]
-                Tv[:, :, i - 1, ...] = _virtual_temperature_from_geopotential_height(
-                    zi,
-                    zim1,
-                    self.z_pressure_levels[z_channel],
-                    self.z_pressure_levels[z_channel_m1],
-                    Tv[:, :, i, ...],
-                    self.R,
-                    self.g0,
-                )
+        # Go down in index (up in vertical level) from anchor
+        for i in range(self.anchor_z_index, 0, -1):
+            z_channel = self.z_channels[i]
+            z_channel_m1 = self.z_channels[i - 1]
+            zi = x[:, :, z_channel, ...]
+            zim1 = x[:, :, z_channel_m1, ...]
+            Tv[:, :, i - 1, ...] = _virtual_temperature_from_geopotential_height(
+                zi,
+                zim1,
+                self.z_pressure_levels[z_channel],
+                self.z_pressure_levels[z_channel_m1],
+                Tv[:, :, i, ...],
+                self.R,
+                self.g0,
+            )
 
-        if self.anchor_z_index < len(self.z_pressure_levels) - 1:
-            # Go up in index (down in vertical level) from anchor
-            for i in range(self.anchor_z_index, len(self.z_pressure_levels) - 1):
-                z_channel = self.z_channels[i]
-                z_channel_p1 = self.z_channels[i + 1]
-                zi = x[:, :, z_channel, ...]
-                zip1 = x[:, :, z_channel_p1, ...]
-                Tv[:, :, i + 1, ...] = _virtual_temperature_from_geopotential_height(
-                    zi,
-                    zip1,
-                    self.z_pressure_levels[z_channel],
-                    self.z_pressure_levels[z_channel_p1],
-                    Tv[:, :, i, ...],
-                    self.R,
-                    self.g0,
-                )
+        # Go up in index (down in vertical level) from anchor
+        for i in range(self.anchor_z_index, len(self.z_pressure_levels) - 1):
+            z_channel = self.z_channels[i]
+            z_channel_p1 = self.z_channels[i + 1]
+            zi = x[:, :, z_channel, ...]
+            zip1 = x[:, :, z_channel_p1, ...]
+            Tv[:, :, i + 1, ...] = _virtual_temperature_from_geopotential_height(
+                zi,
+                zip1,
+                self.z_pressure_levels[z_channel],
+                self.z_pressure_levels[z_channel_p1],
+                Tv[:, :, i, ...],
+                self.R,
+                self.g0,
+            )
 
         return Tv
 
