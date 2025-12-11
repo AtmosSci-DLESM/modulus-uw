@@ -506,11 +506,11 @@ class HEALPixUNet(Module):
 
             # Residual prediction
             orig_input = self._reshape_outputs(
-                    input_tensor[:, :self.input_channels * self.input_time_dim]
-                )
+                input_tensor[:, :self.input_channels * self.input_time_dim]
+            )
             if self.residual_prediction:
                 prognostics += orig_input
-
+            
             # Concat along channel dim, shape is [B, F, T, C, H, W]
             out = th.cat([prognostics, diagnostics], dim=3)
 

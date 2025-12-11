@@ -670,18 +670,18 @@ class HEALPixRecUNet(Module):
 
                 # Average of decodings
                 decodings = 0.5 * (decodings + self.hpx_reflect(decodings_refl, includes_constants=False))
-
+            
             # Reshape from [B*F, T*C, H, W] to [B, F, T, C, H, W]
             combined = self._reshape_outputs(decodings)
             prognostics = combined[:, :, :, :self.input_channels]
+            diagnostics = combined[:, :, :, self.input_channels:]
 
             # Residual prediction
             orig_input = self._reshape_outputs(
-                    input_tensor[:, :self.input_channels * self.input_time_dim]
-                )
+                input_tensor[:, :self.input_channels * self.input_time_dim]
+            )
             if self.residual_prediction:
                 prognostics += orig_input
-            diagnostics = combined[:, :, :, self.input_channels:]
 
             # Concat along channel dim, shape is [B, F, T, C, H, W]
             out = th.cat([prognostics, diagnostics], dim=3)
