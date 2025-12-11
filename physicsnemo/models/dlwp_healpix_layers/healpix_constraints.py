@@ -12,20 +12,18 @@ class NonnegativeConstraint(torch.nn.Module):
         in_channels: list[str],
         out_channels: list[str],
         scaling: dict[str, dict[str, float]],
-        sp_boxcox_lambda: float | None = None,
     ):
         """
         Parameters
         ----------
         variables: list[str]
             List of variable names to apply the constraint to.
-        channels: list[str]
+        in_channels: list[str]
             List of all input channel names in the model.
+        out_channels: list[str]
+            List of all output channel names in the model.
         scaling: dict[str, dict[str, float]]
             Dictionary containing the mean and std for each variable.
-        sp_boxcox_lambda: float
-            The lambda parameter for the Box-Cox transformed surface pressure.
-            Only used if sp-boxcox is an input/output variable.
         """
         super().__init__()
         self.variables = variables
@@ -34,7 +32,6 @@ class NonnegativeConstraint(torch.nn.Module):
         else:
             self.channels = in_channels
         self.scaling = scaling
-        self.sp_boxcox_lambda = sp_boxcox_lambda
 
         # Only apply constraint to variables that are used by model
         self.variables = [var for var in self.variables if var in self.channels]
@@ -44,13 +41,6 @@ class NonnegativeConstraint(torch.nn.Module):
             f"{[v for v in variables if v not in self.variables]} not found in "
             f"model channels and will be ignored."
         )
-
-        if 'sp-boxcox' in self.variables and self.sp_boxcox_lambda is None:
-            raise ValueError(
-                f"sp_boxcox_lambda must be provided if 'sp-boxcox' is in "
-                f"the list of constrained variables. Received "
-                f"sp_boxcox_lambda={self.sp_boxcox_lambda}"
-            )
 
         var_indices = torch.tensor(
             [self.channels.index(var) for var in self.variables],
@@ -62,11 +52,6 @@ class NonnegativeConstraint(torch.nn.Module):
         self.var_stds = torch.tensor([scaling[var]['std'] for var in self.variables])
 
         thresholds = (0. - self.var_means) / self.var_stds
-        if 'sp-boxcox' in self.variables:
-            sp_idx = self.variables.index('sp-boxcox')
-            # Find threshold in Box-Cox space that corresponds to 0 Pa in physical space
-            thresholds[sp_idx] = (0.**self.sp_boxcox_lambda-1)/self.sp_boxcox_lambda
-            thresholds[sp_idx] = (thresholds[sp_idx] - self.var_means[sp_idx]) / self.var_stds[sp_idx]
         thresholds = thresholds.view(1, 1, 1, -1, 1, 1)
         self.register_buffer('thresholds', thresholds, persistent=False)
 
@@ -86,9 +71,6 @@ class DryAirMassConstraint(torch.nn.Module):
         self,
         channels: list[str],
         scaling: dict[str, dict[str, float]],
-        sp_boxcox_transformed: bool = False,
-        sp_lambda: float | None = None,
-        sp_max_val: float | None = None,
     ):
         """
         Parameters
@@ -101,28 +83,9 @@ class DryAirMassConstraint(torch.nn.Module):
         super().__init__()
         self.channels = channels
         self.scaling = scaling
-        self.sp_boxcox_transformed = sp_boxcox_transformed
-        self.sp_lambda = sp_lambda
-        self.sp_max_val = sp_max_val
-        
-        if sp_boxcox_transformed:
-            if sp_lambda is None or sp_max_val is None:
-                raise ValueError(
-                    f"sp_lambda and sp_max_val must be provided if "
-                    f"sp_boxcox_transformed is True. Received "
-                    f"sp_lambda={sp_lambda}, sp_max_val={sp_max_val}"
-                )
-        else:
-            if sp_lambda is not None or sp_max_val is not None:
-                raise ValueError(
-                    f"sp_lambda and sp_max_val should not be provided if "
-                    f"sp_boxcox_transformed is False. Received "
-                    f"sp_lambda={sp_lambda}, sp_max_val={sp_max_val}"
-                )
 
-        sp_name = "sp-boxcox" if sp_boxcox_transformed else "sp"
         sp_idx = torch.tensor(
-            channels.index(sp_name),
+            channels.index('sp'),
             dtype=torch.long
         )
         self.register_buffer('sp_idx', sp_idx, persistent=False)
@@ -144,25 +107,6 @@ class DryAirMassConstraint(torch.nn.Module):
 
         self.g0 = 9.81
 
-    def _boxcox_transform_sp(
-        self,
-        x
-    ):
-        x = x / self.sp_max_val
-        x = (x**self.sp_lambda - 1) / self.sp_lambda
-        return x
-
-    def _reverse_boxcox_transform_sp(
-        self,
-        x
-    ):
-        x = torch.exp(torch.log(x * self.sp_lambda + 1 + 1e-8)/self.sp_lambda)
-        # Equivalent to the operation above, but more prone to numerical issues
-        # in float16 for some reason
-        # x = (x * self.sp_lambda + 1)**(1/self.sp_lambda)
-        x = x * self.sp_max_val # Rescaling back to Pa
-        return x
-
     def forward(self, prediction, input):
         '''
         Tensors are expected to be in the shape [B, F, T, C, H, W]
@@ -174,8 +118,6 @@ class DryAirMassConstraint(torch.nn.Module):
             # Get predicted sp and tcwv
             sp = torch.index_select(prediction, dim=3, index=self.sp_idx)
             sp = sp * self.ps_std + self.ps_mean
-            if self.sp_boxcox_transformed:
-                sp = self._reverse_boxcox_transform_sp(sp)
             tcwv = torch.index_select(prediction, dim=3, index=self.tcwv_idx)
             tcwv = tcwv * self.tcwv_std + self.tcwv_mean
 
@@ -183,8 +125,6 @@ class DryAirMassConstraint(torch.nn.Module):
             # compute initial dry air mass which is to be conserved.
             sp_0 = torch.index_select(input, dim=3, index=self.sp_idx)[:, :, -1:]
             sp_0 = sp_0 * self.ps_std + self.ps_mean
-            if self.sp_boxcox_transformed:
-                sp_0 = self._reverse_boxcox_transform_sp(sp_0)
             tcwv_0 = torch.index_select(input, dim=3, index=self.tcwv_idx)[:, :, -1:]
             tcwv_0 = tcwv_0 * self.tcwv_std + self.tcwv_mean
 
@@ -197,8 +137,6 @@ class DryAirMassConstraint(torch.nn.Module):
 
             # Ensure sp is non-negative and rescale back to normalized space
             sp_corrected = torch.clamp(sp_corrected, min=0.)
-            if self.sp_boxcox_transformed:
-                sp_corrected = self._boxcox_transform_sp(sp_corrected)
             sp_corrected = (sp_corrected - self.ps_mean) / self.ps_std
 
             prediction.index_copy_(3, self.sp_idx, sp_corrected)
