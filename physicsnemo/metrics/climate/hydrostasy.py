@@ -125,12 +125,13 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
         R: float,
         g0: float,
         extend_to_surface: bool = False,
+        min_sfc_layer_thickness: float = 1000.0,
     ) -> None:
         super().__init__()
         self.R = R
         self.g0 = g0
         self.extend_to_surface = extend_to_surface
-
+        self.min_sfc_layer_thickness = min_sfc_layer_thickness
         assert (
             anchor_z_channel in z_pressure_levels.keys()
         ), f"anchor_z_channel ({anchor_z_channel}) not in z_pressure_levels ({z_pressure_levels.keys()})"
@@ -140,20 +141,10 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
 
         # Sort channels by pressure levels for ease of use later
         self.z_pressure_levels = dict(
-            sorted(
-                z_pressure_levels.items(),
-                key=lambda item: (
-                    not isinstance(item[1], (int, float)), item[1] if isinstance(item[1], (int, float)) else float('inf')
-                )
-            )
+            sorted(z_pressure_levels.items(), key=lambda item: item[1])
         )
         self.Tv_pressure_levels = dict(
-            sorted(
-                Tv_pressure_levels.items(),
-                key=lambda item: (
-                    not isinstance(item[1], (int, float)), item[1] if isinstance(item[1], (int, float)) else float('inf')
-                )
-            )
+            sorted(Tv_pressure_levels.items(), key=lambda item: item[1])
         )
         self.anchor_z_channel = anchor_z_channel
         self.anchor_T_channel = anchor_T_channel
@@ -238,25 +229,27 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
             p_levs = torch.ones(
                 p_levs_size, dtype=x.dtype, layout=x.layout, device=x.device
             )
-            p_levs = p_levs * self.pressure_levels
+            p_levs = p_levs * self.pressure_levels.to(x.device)
 
-            # Get boolean mask of levels above surface using geopotential heights
+            # Get boolean mask of levels greater than min_sfc_layer_thickness (in m) 
+            # above surface
             # Assumes first z_channel is the highest altitude level
             above_surface_mask = (
-                x[:, :, : len(self.z_pressure_levels)-1, :, :] >
-                x[:, :, len(self.z_pressure_levels)-1:len(self.z_pressure_levels), :, :]
+                x[:, :, : len(self.z_pressure_levels)-1, :, :] -
+                x[:, :, len(self.z_pressure_levels)-1:len(self.z_pressure_levels), :, :] >
+                self.min_sfc_layer_thickness
             )
 
             # Get index of lowest level above surface
-            lowest_lev_idx = above_surface_mask.int().flip(2).argmax(dim=2)
-            lowest_lev_idx = (len(self.z_pressure_levels)-1) - 1 - lowest_lev_idx
+            lowest_lev_idx = above_surface_mask.int().flip(dims=(2,)).argmax(dim=2)
+            lowest_lev_idx = above_surface_mask.size(2) - 1 - lowest_lev_idx
 
             # Compute average virtual temperature between lowest level and surface
             # from geopotential heights
             zi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
             zip1 = x[:, :, self.z_channels[-1], ...]
             p1 = torch.gather(p_levs, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
-            p2 = x[:, :, -1, ...]
+            p2 = x[:, :, -1, ...].clamp(min=p1.min()) + 1e-6  # prevent log(0)
             Tv_avg[
                 :, :, -1, ...
             ] = _average_virtual_temperature_from_geopotential_height(
@@ -267,9 +260,8 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
                 self.R,
                 self.g0,
             )
-
             # Get average model virtual temperature between lowest level and surface
-            Tvi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
+            Tvi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)+len(self.z_channels)).squeeze(2)
             Tvip1 = x[:, :, self.Tv_channels[-1], ...]
             Tv_model_avg[:, :, -1, ...] = 0.5 * (Tvi + Tvip1)
 
@@ -289,9 +281,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         weights: Sequence,
         alpha: Sequence[float],  # K
         scaling: Dict[str, Dict[str, float]],
-        src_directory: str,
-        dst_directory: str,
-        dataset_name: str,
+        dataset_path: str,
         surface_geopotential_name: str,
         surface_geopotential_mean: float = -597.7115478515625,
         surface_geopotential_std: float = 55658.21484375,
@@ -299,6 +289,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         R: float = 287,  # J K^{-1} kg^{-1}
         g0: float = 9.81,  # m s^{-2}
         topography_masking: bool = True,
+        min_sfc_layer_thickness: float = 1000.0,
     ):
         """
         Parameters
@@ -313,6 +304,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.g0 = g0
         self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
+        self.min_sfc_layer_thickness = min_sfc_layer_thickness
 
         if "surface" in hPa_levels:
             self.extend_to_surface = True
@@ -320,13 +312,15 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             logger.info(
                 "Extending hydrostasy constraint to surface level, ensure that surface pressure is constrained to be non-negative using constraints module."
             )
-            if "sp" not in channels and "sp-boxcox" not in channels:
+            if "sp" not in channels:
                 raise ValueError(
-                    "Surface pressure channel (sp or sp-boxcox) must be included in model channels when extending hydrostasy constraint to surface."
+                    "Surface pressure (sp) channel must be included in model channels when extending hydrostasy constraint to surface."
                 )
-            self.transformed_sp = True if "sp-boxcox" in channels else False
         else:
             self.extend_to_surface = False
+
+        if self.min_sfc_layer_thickness < 0.0:
+            raise ValueError("min_sfc_layer_thickness must be non-negative.")
 
         # Get channel index to pressure level mapping
         self.pressure_levels = sorted(hPa_levels)
@@ -402,16 +396,17 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.Mw_ratio = 28.97 / 18.016 - 1.0  # 0.6078
 
         if self.extend_to_surface:
-            self.T_pressure_levels[channels.index("t2m")] = "surface"
-            self.q_pressure_levels[channels.index("q2m")] = "surface"
+            self.T_pressure_levels[channels.index("t2m")] = np.inf
+            self.q_pressure_levels[channels.index("q2m")] = np.inf
+
             # Add entries to account for adding surface geopotential height
-            self.z_constraint_pressure_levels[len(self.pressure_levels)] = "surface"
-            self.Tv_constraint_pressure_levels[
-                len(self.z_constraint_pressure_levels) + len(self.pressure_levels)
-            ] = "surface"
+            self.z_constraint_pressure_levels[len(self.pressure_levels)] = np.inf
             self.Tv_constraint_pressure_levels = {
                 k+1: v for k, v in self.Tv_constraint_pressure_levels.items()
             }
+            self.Tv_constraint_pressure_levels[
+                len(self.z_constraint_pressure_levels) + len(self.pressure_levels)
+            ] = np.inf
 
             self.T2m_mean = torch.tensor(
                 scaling["t2m"]["mean"]
@@ -431,15 +426,13 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             self.q_mean = torch.cat((self.q_mean, self.q2m_mean), dim=3)
             self.q_std = torch.cat((self.q_std, self.q2m_std), dim=3)
 
-            sp_name = 'sp-boxcox' if self.transformed_sp else 'sp'
-
             self.sp_mean = torch.tensor(
-                scaling[sp_name]["mean"]
+                scaling["sp"]["mean"]
             ).reshape((1, 1, 1, -1, 1, 1))
             self.sp_std = torch.tensor(
-                scaling[sp_name]["std"]
+                scaling["sp"]["std"]
             ).reshape((1, 1, 1, -1, 1, 1))
-            self.sp_mapping = channels.index(sp_name)
+            self.sp_mapping = channels.index("sp")
 
         # Create the constraint
         # TODO: remove anchor levels since it's not needed for the
@@ -452,6 +445,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             R,
             self.g0,
             self.extend_to_surface,
+            self.min_sfc_layer_thickness,
         )
 
         self.num_z_levels = len(self.z_constraint_pressure_levels)
@@ -461,7 +455,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.q_level_mapping = torch.tensor(list(self.q_pressure_levels.keys()))
 
         # Get topography information
-        ds = xr.open_zarr(f"{src_directory}/{dataset_name}.zarr")
+        ds = xr.open_zarr(dataset_path)
         self.topography = (
             surface_geopotential_std * ds.constants.sel(channel_c=surface_geopotential_name).values
             + surface_geopotential_mean
@@ -510,16 +504,6 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         # Move topography
         self.topography = self.topography.to(device=trainer.device)
 
-    def reverse_transform_sp(
-        self,
-        x,
-        lam=19.632015209145543,
-        max_val=1068.063515625,
-    ):
-        x = torch.exp(torch.log(x * lam + 1 + 1e-8)/lam) # reverse Box-Cox
-        x = x * max_val # Rescaling back to hPa
-        return x
-
     def scale(self, x):
         """
         Scale inputs to physical values and compute virtual temperature
@@ -542,13 +526,11 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             # Add surface geopotential
             surface_Z = self.topography.unsqueeze(2)
             surface_Z = torch.tile(surface_Z, (N, 1, B, 1, 1, 1))
-            x_scaled[:, :, :, self.num_z_levels:self.num_z_levels+1, :, :] = surface_Z
+            x_scaled[:, :, :, self.num_z_levels-self.extend_to_surface:self.num_z_levels-self.extend_to_surface+1, :, :] = surface_Z
 
             # Add surface pressure
             sp = x[:, :, :, self.sp_mapping, :, :] * self.sp_std + self.sp_mean
-            if self.transformed_sp:
-                sp = self.reverse_transform_sp(sp)
-            x_scaled[:, :, :, -1, :, :] = sp
+            x_scaled[:, :, :, -1, :, :] = sp / 100 # convert to hPa
 
         # Get scaled temperatures
         x_scaled[:, :, :, self.num_z_levels : self.num_z_levels + self.num_Tv_levels, :, :] = (
@@ -584,7 +566,9 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         Tv_error = Tv_avg - Tv_model_avg
         # Mask out error in regions below the surface
         if self.topography_masking:
-            Tv_error[x[:, :, 1 : self.num_z_levels, :, :] < self.topography] = 0.0
+            Tv_error[:, :, :Tv_error.shape[2]-self.extend_to_surface][
+                x[:, :, 1 : self.num_z_levels-self.extend_to_surface, :, :] < self.topography
+            ] = 0.0
 
         vlevels = Tv_error.shape[2]
         if accumulator is None:
@@ -649,7 +633,9 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
 
             # Mask out error in regions below the surface
             if self.topography_masking:
-                Tv_error[x[:, :, 1 : self.num_z_levels, :, :] < self.topography] = 0.0
+                Tv_error[
+                    x[:, :, 1 : self.num_z_levels-self.extend_to_surface, :, :] < self.topography
+                ] = 0.0
 
             # Compute the error tolerant loss
             Tv_loss = (Tv_error / (1 + torch.exp(1 - Tv_error))).mean(dim=(0, 1, 3, 4))
