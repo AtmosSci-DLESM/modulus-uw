@@ -111,6 +111,9 @@ class DryAirMassConstraint(torch.nn.Module):
         '''
         Tensors are expected to be in the shape [B, F, T, C, H, W]
         '''
+        
+        # Need to scale to physical units and compute small differences of large
+        # surface pressures (in Pa), so disable autocast and force float32 precision
         with torch.cuda.amp.autocast(enabled=False):
             prediction = prediction.float()
             input = input.float()
