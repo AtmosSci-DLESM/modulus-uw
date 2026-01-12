@@ -633,7 +633,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
 
             # Mask out error in regions below the surface
             if self.topography_masking:
-                Tv_error[
+                Tv_error[:, :, :Tv_error.shape[2]-self.extend_to_surface][
                     x[:, :, 1 : self.num_z_levels-self.extend_to_surface, :, :] < self.topography
                 ] = 0.0
 
