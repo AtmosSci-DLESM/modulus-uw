@@ -673,6 +673,9 @@ class LossWithHydrostasy(torch.nn.MSELoss):
         pushes weights to cuda device
         """
 
+        # Call setup for data loss first
+        self.data_loss.setup(trainer)
+
         if len(self.z_pressure_levels) - 1 != len(
             self.loss_weights
         ):
