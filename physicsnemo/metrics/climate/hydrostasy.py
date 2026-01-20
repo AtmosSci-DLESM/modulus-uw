@@ -123,7 +123,7 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
         R: float,
         g0: float,
         extend_to_surface: bool = False,
-        min_sfc_layer_thickness: float = 1000.0,
+        min_sfc_layer_thickness: float = 100.0,
     ) -> None:
         super().__init__()
         self.R = R
@@ -156,6 +156,7 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
         self.z_channels = list(self.z_pressure_levels.keys())
         self.Tv_channels = list(self.Tv_pressure_levels.keys())
 
+        # TODO: no need to filter for strings anymore
         pressure_levels = sorted(
             {k: v for k, v in z_pressure_levels.items() if not isinstance(v, str)}.values()
         )
@@ -219,6 +220,9 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
             Tv_model_avg[:, :, i, ...] = 0.5 * (Tvi + Tvip1)
 
         if self.extend_to_surface:
+            sfc_geopotential_height = x[:, :, self.z_channels[-1], ...]
+            sfc_pressure = x[:, :, -1, ...]
+
             # Generate tensor of pressure levels
             p_levs_size = [
                 len(self.pressure_levels) if i == 2 else s
@@ -229,37 +233,35 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
             )
             p_levs = p_levs * self.pressure_levels.to(x.device)
 
-            # Get boolean mask of levels greater than min_sfc_layer_thickness (in m) 
-            # above surface
-            # Assumes first z_channel is the highest altitude level
-            above_surface_mask = (
-                x[:, :, : len(self.z_pressure_levels)-1, :, :] -
-                x[:, :, len(self.z_pressure_levels)-1:len(self.z_pressure_levels), :, :] >
-                self.min_sfc_layer_thickness
-            )
-
-            # Get index of lowest level above surface
-            lowest_lev_idx = above_surface_mask.int().flip(dims=(2,)).argmax(dim=2)
-            lowest_lev_idx = above_surface_mask.size(2) - 1 - lowest_lev_idx
+            with torch.no_grad():
+                # Get boolean mask of levels greater than min_sfc_layer_thickness (in m) 
+                # above surface, assumes first z_channel is the highest altitude level
+                above_surface_mask = (
+                    p_levs[:, :, :-1, ...] + self.min_sfc_layer_thickness <
+                    sfc_pressure.unsqueeze(2)
+                )
+                # Get index of lowest level above surface
+                lowest_lev_idx = above_surface_mask.int().flip(dims=(2,)).argmax(dim=2)
+                lowest_lev_idx = above_surface_mask.size(2) - 1 - lowest_lev_idx
 
             # Compute average virtual temperature between lowest level and surface
             # from geopotential heights
-            zi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
-            zip1 = x[:, :, self.z_channels[-1], ...]
-            p1 = torch.gather(p_levs, 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
-            p2 = x[:, :, -1, ...].clamp(min=p1.min()) + 1e-6  # prevent log(0)
+            zi = torch.gather(x[:, :, :len(self.z_pressure_levels)-1, ...], 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
+            zip1 = sfc_geopotential_height
+            p1 = torch.gather(p_levs[:, :, :-1, ...], 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
+            p2 = sfc_pressure
             Tv_avg[
                 :, :, -1, ...
             ] = _average_virtual_temperature_from_geopotential_height(
                 zi,
                 zip1,
-                p1,
-                p2,
+                p1.detach(),
+                p2.detach(),  # prevent gradients through surface pressure
                 self.R,
                 self.g0,
             )
             # Get average model virtual temperature between lowest level and surface
-            Tvi = torch.gather(x, 2, lowest_lev_idx.unsqueeze(2)+len(self.z_channels)).squeeze(2)
+            Tvi = torch.gather(x, 2, len(self.z_channels)+lowest_lev_idx.unsqueeze(2)).squeeze(2)
             Tvip1 = x[:, :, self.Tv_channels[-1], ...]
             Tv_model_avg[:, :, -1, ...] = 0.5 * (Tvi + Tvip1)
 
@@ -287,7 +289,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         R: float = 287,  # J K^{-1} kg^{-1}
         g0: float = 9.81,  # m s^{-2}
         topography_masking: bool = True,
-        min_sfc_layer_thickness: float = 1000.0,
+        min_sfc_layer_thickness: float = 100.0,
     ):
         """
         Parameters
@@ -598,6 +600,24 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             bin_edges[l, :] = be
 
         return accumulator, bin_edges
+
+    def get_tv_error(self, prediction):
+        N, F, B, C, H, W = tuple(prediction.shape)
+
+        if not (prediction.ndim == 6):
+            raise AssertionError("Expected predictions to have 6 dimensions")
+
+        # Scale to physical units and compute virtual temperature
+        x = self.scale(prediction)
+        Tv_avg, Tv_model_avg = self.constraint(x)
+        Tv_error = Tv_avg - Tv_model_avg
+        # Mask out error in regions below the surface
+        if self.topography_masking:
+            Tv_error[:, :, :Tv_error.shape[2]-self.extend_to_surface][
+                x[:, :, 1 : self.num_z_levels-self.extend_to_surface, :, :] < self.topography
+            ] = 0.0
+
+        return Tv_error
 
     def forward(self, prediction, target, average_channels=True):
         """
