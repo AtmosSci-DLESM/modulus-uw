@@ -233,6 +233,9 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
             )
             p_levs = p_levs * self.pressure_levels.to(x.device)
 
+            # Disable gradients for finding lowest level above surface so that
+            # sfc hydrostatic error is not dependent on sfc pressure and lowest 
+            # level selection criteria
             with torch.no_grad():
                 # Get boolean mask of levels greater than min_sfc_layer_thickness (in m) 
                 # above surface, assumes first z_channel is the highest altitude level
@@ -255,8 +258,8 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
             ] = _average_virtual_temperature_from_geopotential_height(
                 zi,
                 zip1,
-                p1.detach(),
-                p2.detach(),  # prevent gradients through surface pressure
+                p1,
+                p2.detach(), # detach to avoid gradient flow through sfc pressure
                 self.R,
                 self.g0,
             )
