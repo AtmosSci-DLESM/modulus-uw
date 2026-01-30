@@ -170,12 +170,14 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
         min_sfc_layer_thickness: float = 100.0,
         fixed_sfc_lowest_level_path: Optional[str] = None,
         fixed_sfc_lowest_level_variable: str = "p_lev",
+        detach_sfc_pressure: bool = False,
     ) -> None:
         super().__init__()
         self.R = R
         self.g0 = g0
         self.extend_to_surface = extend_to_surface
         self.min_sfc_layer_thickness = min_sfc_layer_thickness
+        self.detach_sfc_pressure = detach_sfc_pressure
         assert (
             anchor_z_channel in z_pressure_levels.keys()
         ), f"anchor_z_channel ({anchor_z_channel}) not in z_pressure_levels ({z_pressure_levels.keys()})"
@@ -322,14 +324,14 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
             zi = torch.gather(x[:, :, :len(self.z_pressure_levels)-1, ...], 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
             zip1 = sfc_geopotential_height
             p1 = torch.gather(p_levs[:, :, :-1, ...], 2, lowest_lev_idx.unsqueeze(2)).squeeze(2)
-            p2 = sfc_pressure
+            p2 = sfc_pressure.detach() if self.detach_sfc_pressure else sfc_pressure
             Tv_avg[
                 :, :, -1, ...
             ] = _average_virtual_temperature_from_geopotential_height(
                 zi,
                 zip1,
                 p1,
-                p2.detach(), # detach to avoid gradient flow through sfc pressure
+                p2, 
                 self.R,
                 self.g0,
             )
@@ -365,6 +367,8 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         min_sfc_layer_thickness: float = 10.0, # in hPa
         fixed_sfc_lowest_level_path: Optional[str] = None,
         fixed_sfc_lowest_level_variable: str = "p_lev",
+        detach_sfc_pressure: bool = False,
+        weight_surface_error_by_pressure: bool = True,
     ):
         """
         Parameters
@@ -380,6 +384,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
         self.min_sfc_layer_thickness = min_sfc_layer_thickness
+        self.weight_surface_error_by_pressure = weight_surface_error_by_pressure
 
         if "surface" in hPa_levels:
             self.extend_to_surface = True
@@ -523,6 +528,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             self.min_sfc_layer_thickness,
             fixed_sfc_lowest_level_path,
             fixed_sfc_lowest_level_variable,
+            detach_sfc_pressure,
         )
 
         self.num_z_levels = len(self.z_constraint_pressure_levels)
@@ -646,6 +652,12 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             Tv_error[:, :, :Tv_error.shape[2]-self.extend_to_surface][
                 x[:, :, 1 : self.num_z_levels-self.extend_to_surface, :, :] < self.topography
             ] = 0.0
+        # Weight surface level error by exp(p_s - mean_p_s) to reduce dominance of low-pressure regions
+        if self.extend_to_surface and self.weight_surface_error_by_pressure:
+            sfc_pressure = x[:, :, -1, :, :]
+            mean_p_s = sfc_pressure.mean(dim=(1, 2, 3), keepdim=True)
+            exponent = torch.clamp(sfc_pressure - mean_p_s, min=-5.0, max=0.)
+            Tv_error[:, :, -1, :, :] *= torch.exp(exponent)
 
         vlevels = Tv_error.shape[2]
         if accumulator is None:
@@ -693,6 +705,12 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             Tv_error[:, :, :Tv_error.shape[2]-self.extend_to_surface][
                 x[:, :, 1 : self.num_z_levels-self.extend_to_surface, :, :] < self.topography
             ] = 0.0
+        # Weight surface level error by exp(p_s - mean_p_s) to reduce dominance of low-pressure regions
+        if self.extend_to_surface and self.weight_surface_error_by_pressure:
+            sfc_pressure = x[:, :, -1, :, :]
+            mean_p_s = sfc_pressure.mean(dim=(1, 2, 3), keepdim=True)
+            exponent = torch.clamp(sfc_pressure - mean_p_s, min=-20.0, max=0.)
+            Tv_error[:, :, -1, :, :] *= torch.exp(exponent)
 
         return Tv_error
 
@@ -712,7 +730,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
 
         # Need to scale back to physical units here so disable autocast
         # and explicitly cast to float32
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             prediction = prediction.float()
             target = target.float()
 
@@ -724,14 +742,21 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             # Scale to physical units and compute virtual temperature
             x = self.scale(prediction)
             Tv_avg, Tv_model_avg = self.constraint(x)
-            Tv_error = ((Tv_avg - Tv_model_avg) / self.alpha) ** 2
+            unweighted_Tv_error = Tv_avg - Tv_model_avg
+            if self.extend_to_surface and self.weight_surface_error_by_pressure:
+                sfc_pressure = x[:, :, -1, :, :]
+                mean_p_s = sfc_pressure.mean(dim=(1, 2, 3), keepdim=True)
+                # Clamp exponent so exp() does not overflow
+                exponent = torch.clamp(sfc_pressure - mean_p_s, min=-20.0, max=0.)
+                unweighted_Tv_error[:, :, -1, :, :] *= torch.exp(exponent)
+            Tv_error = (unweighted_Tv_error / self.alpha) ** 2
 
             # Mask out error in regions below the surface
             if self.topography_masking:
                 Tv_error[:, :, :Tv_error.shape[2]-self.extend_to_surface][
                     x[:, :, 1 : self.num_z_levels-self.extend_to_surface, :, :] < self.topography
                 ] = 0.0
-
+           
             # Compute the error tolerant loss
             Tv_loss = (Tv_error / (1 + torch.exp(1 - Tv_error))).mean(dim=(0, 1, 3, 4))
 
