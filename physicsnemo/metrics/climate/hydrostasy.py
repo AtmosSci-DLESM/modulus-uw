@@ -292,7 +292,8 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         topography_masking: bool = True,
         min_sfc_layer_thickness: float = 10.0, # in hPa
         detach_sfc_pressure: bool = False,
-        sfc_error_masking: bool = True,
+        sfc_error_land_masking: bool = True,
+        sfc_error_land_mask_threshold: float = 0.25,
     ):
         """
         Parameters
@@ -309,7 +310,8 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.topography_masking = topography_masking
         self.min_sfc_layer_thickness = min_sfc_layer_thickness
         self.detach_sfc_pressure = detach_sfc_pressure
-        self.sfc_error_masking = sfc_error_masking
+        self.sfc_error_land_masking = sfc_error_land_masking
+        self.sfc_error_land_mask_threshold = sfc_error_land_mask_threshold
 
         if "surface" in hPa_levels:
             self.extend_to_surface = True
@@ -476,6 +478,10 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             f"Min/Max topography (m): {self.topography.min()}/{self.topography.max()}"
         )
 
+        # Get land sea mask
+        self.land_sea_mask = ds.constants.sel(channel_c='land_sea_mask').values
+        self.land_sea_mask = torch.tensor(self.land_sea_mask[np.newaxis, :, np.newaxis, :, :], dtype=torch.float)
+
     def setup(self, trainer):
         """
         pushes weights to cuda device
@@ -560,7 +566,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         # Combine N and B dimensions and return
         return x_scaled.reshape((-1, F, C_scaled, H, W))
 
-    def error_histogram(self, prediction, bins, accumulator=None):
+    def error_histogram(self, prediction, bins, accumulator=None, exclude_masked: bool = False):
         N, F, B, C, H, W = tuple(prediction.shape)
 
         if not (prediction.ndim == 6):
@@ -570,16 +576,23 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         x = self.scale(prediction)
         Tv_avg, Tv_model_avg = self.constraint(x)
         Tv_error = Tv_avg - Tv_model_avg
+
+        valid_mask = torch.ones_like(Tv_error, dtype=torch.bool, device=Tv_error.device)
         # Mask out error in regions below the surface
         if self.topography_masking:
+            valid_mask[:, :, :Tv_error.shape[2]-self.extend_to_surface] = (
+                x[:, :, 1 : self.num_z_levels-self.extend_to_surface, :, :] >= self.topography
+            )
             Tv_error[:, :, :Tv_error.shape[2]-self.extend_to_surface][
-                x[:, :, 1 : self.num_z_levels-self.extend_to_surface, :, :] < self.topography
+                ~valid_mask[:, :, :Tv_error.shape[2]-self.extend_to_surface]
             ] = 0.0
-       # Mask out low pressure regions above surface
-        if self.extend_to_surface and self.sfc_error_masking:
-            sfc_pressure = x[:, :, -1, :, :]
-            mean_p_s = sfc_pressure.mean(dim=(1, 2, 3), keepdim=True)
-            Tv_error[:, :, -1, :, :][sfc_pressure < mean_p_s.detach()] = 0.0
+        # Mask out land cells for surface error
+        if self.extend_to_surface and self.sfc_error_land_masking:
+            valid_mask[:, :, -1, :, :] = (
+                self.land_sea_mask.squeeze(2).repeat(Tv_error.shape[0],1,1,1)
+                <= self.sfc_error_land_mask_threshold
+            )
+            Tv_error[:, :, -1, :, :][~valid_mask[:, :, -1, :, :]] = 0.0
 
         vlevels = Tv_error.shape[2]
         if accumulator is None:
@@ -603,8 +616,12 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             bin_edges = bins
 
         for l in range(vlevels):
+            if exclude_masked:
+                values = torch.absolute(Tv_error[:, :, l, :, :][valid_mask[:, :, l, :, :]])
+            else:
+                values = torch.absolute(Tv_error[:, :, l, :, :])
             hist, be = torch.histogram(
-                torch.absolute(Tv_error[:, :, l, :, :]),
+                values,
                 bins=bins if isinstance(bins, int) else bin_edges[l, :],
             )
             accumulator[l, :] += hist
@@ -627,11 +644,13 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             Tv_error[:, :, :Tv_error.shape[2]-self.extend_to_surface][
                 x[:, :, 1 : self.num_z_levels-self.extend_to_surface, :, :] < self.topography
             ] = 0.0
-        # Mask out low pressure regions above surface
-        if self.extend_to_surface and self.sfc_error_masking:
-            sfc_pressure = x[:, :, -1, :, :]
-            mean_p_s = sfc_pressure.mean(dim=(1, 2, 3), keepdim=True)
-            Tv_error[:, :, -1, :, :][sfc_pressure < mean_p_s.detach()] = 0.0
+        # Mask out land cells for surface error
+        if self.extend_to_surface and self.sfc_error_land_masking:
+            sfc_error_land_mask = (
+                self.land_sea_mask.squeeze(2).repeat(Tv_error.shape[0],1,1,1)
+                > self.sfc_error_land_mask_threshold
+            )
+            Tv_error[:, :, -1, :, :][sfc_error_land_mask] = 0.0
 
         return Tv_error
 
@@ -670,11 +689,13 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
                 Tv_error[:, :, :Tv_error.shape[2]-self.extend_to_surface][
                     x[:, :, 1 : self.num_z_levels-self.extend_to_surface, :, :] < self.topography
                 ] = 0.0
-            # Mask out low pressure regions above surface
-            if self.extend_to_surface and self.sfc_error_masking:
-                sfc_pressure = x[:, :, -1, :, :]
-                mean_p_s = sfc_pressure.mean(dim=(1, 2, 3), keepdim=True)
-                Tv_error[:, :, -1, :, :][sfc_pressure < mean_p_s.detach()] = 0.0
+            # Mask out land cells for surface error
+            if self.extend_to_surface and self.sfc_error_land_masking:
+                sfc_error_land_mask = (
+                    self.land_sea_mask.squeeze(2).repeat(Tv_error.shape[0],1,1,1)
+                    > self.sfc_error_land_mask_threshold
+                )
+                Tv_error[:, :, -1, :, :][sfc_error_land_mask] = 0.0
            
             # Compute the error tolerant loss
             Tv_loss = (Tv_error / (1 + torch.exp(1 - Tv_error))).mean(dim=(0, 1, 3, 4))
