@@ -88,6 +88,7 @@ class WeightedMSE(th.nn.MSELoss):
     def __init__(
         self,
         weights: Sequence = [],
+        timestep_weights: Sequence = None,
     ):
         """
         Parameters
@@ -95,9 +96,16 @@ class WeightedMSE(th.nn.MSELoss):
         weights: Sequence
             list of floats that determine weighting of variable loss, assumed to be
             in order consistent with order of model output channels
+        timestep_weights: Sequence
+            list of floats that determine weighting of timestep loss, assumed to be
+            in order consistent with order of model output timesteps
         """
         super().__init__()
-        self.loss_weights = th.tensor(weights)
+        self.loss_weights = th.tensor([channel_weights])
+        if timestep_weights is not None:
+            timestep_weights = th.tensor(timestep_weights)
+            self.loss_weights = self.loss_weights * timestep_weights.view(timestep_weights.shape[0], 1, 1)
+
         self.device = None
 
     def setup(self, trainer):
@@ -105,8 +113,8 @@ class WeightedMSE(th.nn.MSELoss):
         pushes weights to cuda device
         """
 
-        if len(trainer.output_variables) != len(self.loss_weights):
-            raise ValueError("Length of outputs and loss_weights is not the same!")
+        if len(trainer.output_variables) != self.loss_weights.shape[1]:
+            raise ValueError(f"Length of outputs {len(trainer.output_variables)} and loss_weights {self.loss_weights.shape[1]} is not the same!")
 
         self.loss_weights = self.loss_weights.to(device=trainer.device)
 
@@ -127,7 +135,11 @@ class WeightedMSE(th.nn.MSELoss):
         if not (prediction.ndim == 6 and target.ndim == 6):
             raise AssertionError("Expected predictions to have 6 dimensions")
 
-        d = ((target - prediction) ** 2).mean(dim=(0, 1, 2, 4, 5)) * self.loss_weights
+        if self.timestep_weights is not None and not (prediction.shape[0] == self.loss_weights.shape[0]):
+            raise ValueError("Number of timesteps in prediction and timestep_weights is not the same!")
+
+        d = ((target - prediction) ** 2).mean(dim=(1, 2, 4, 5)) * self.loss_weights
+        d = d.mean(dim=0)
         if average_channels:
             return th.mean(d)
         else:
@@ -259,6 +271,7 @@ class WeightedOceanMSE(th.nn.MSELoss):
         open_dict: dict = {"engine": "zarr"},
         selection_dict: dict = {"channel_c": "lsm"},
         weights: Sequence = [],
+        timestep_weights: Sequence = None,
     ):
         """ """
         super().__init__()
@@ -271,7 +284,10 @@ class WeightedOceanMSE(th.nn.MSELoss):
         self.lsm_sum_calculated = False
         self.lsm_sum = None
         self.lsm_var_sum = None
-        self.loss_weights = th.tensor(weights)
+        self.loss_weights = th.tensor([weights])
+        if timestep_weights is not None:
+            timestep_weights = th.tensor(timestep_weights)
+            self.loss_weights = self.loss_weights * timestep_weights.view(timestep_weights.shape[0], 1)
 
     def setup(self, trainer):
         """
@@ -304,7 +320,8 @@ class WeightedOceanMSE(th.nn.MSELoss):
             self.lsm_sum_calculated = True
         # average weighted
         ocean_err = ((target - prediction) ** 2) * self.lsm_tensor
-        ocean_mean_err = ocean_err.sum(dim=(0, 1, 2, 4, 5))
+        ocean_mean_err = ocean_err.sum(dim=(1, 2, 4, 5)) * self.loss_weights
+        ocean_mean_err = ocean_mean_err.mean(dim=0)
         ocean_mean_err = ocean_mean_err * self.loss_weights
 
         if average_channels:
@@ -321,6 +338,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
     def __init__(
         self,
         weights: Sequence = [],
+        timestep_weights: Sequence = None,
         n_members: int = 2,
         alpha: float = 0.95,
         mean_penalty: float = 0.0,
@@ -335,6 +353,9 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         weights: Sequence
             list of floats that determine weighting of variable loss, assumed to be
             in order consistent with order of model output channels
+        timestep_weights: Sequence
+            list of floats that determine weighting of timestep loss, assumed to be
+            in order consistent with order of model output timesteps
         n_members: int
             number of ensemble members in the model output
         alpha: float
@@ -352,7 +373,10 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             weight for the multiscale CRPS loss. Default is 0, no multiscale loss is applied.
         """
         super().__init__()
-        self.loss_weights = th.tensor(weights)
+        self.loss_weights = th.tensor([weights])
+        if timestep_weights is not None:
+            timestep_weights = th.tensor(timestep_weights)
+            self.loss_weights = self.loss_weights * timestep_weights.view(timestep_weights.shape[0], 1, 1)
         if n_members < 2:
             raise ValueError("n_members must be at least 2 for CRPS loss to be defined")
         else:    
@@ -382,8 +406,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         pushes constants to cuda device
         """
 
-        if len(trainer.output_variables) != len(self.loss_weights):
-            raise ValueError("Length of outputs and loss_weights is not the same!")
+        if len(trainer.output_variables) != self.loss_weights.shape[1]:
+            raise ValueError(f"Length of outputs {len(trainer.output_variables)} and loss_weights {self.loss_weights.shape[1]} is not the same!")
 
         self.loss_weights = self.loss_weights.to(device=trainer.device)
         self.averaging_coeff = th.tensor(self.averaging_coeff, device=trainer.device)
@@ -432,14 +456,10 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             raise ValueError(f"Shape of prediction should have ensemble dimension of size {self.n_members}, got {prediction.shape[0]}")
 
         n = self.n_members
-        
-        # Manual Cast
-        prediction = prediction.to(th.float32)
-        target = target.to(th.float32)
-        
+
         # Apply channel weights across channel dims
-        prediction *= self.loss_weights[None, None, None, None, :, None, None]
-        target *= self.loss_weights[None, None, None, :, None, None]
+        prediction *= self.loss_weights[None, None, None, :, :, None, None]
+        target *= self.loss_weights[None, None, :, :, None, None]
 
         if n == 2:
             # Use faster explicit implementation
@@ -510,6 +530,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
     def __init__(
         self,
         weights: Sequence = [],
+        timestep_weights: Sequence = None,
         n_members: int = 2,
         alpha: float = 0.95,
         lambda_spec: float = 0.1,
@@ -527,6 +548,9 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         weights: Sequence
             list of floats that determine weighting of variable loss, assumed to be
             in order consistent with order of model output channels
+        timestep_weights: Sequence
+            list of floats that determine weighting of timestep loss, assumed to be
+            in order consistent with order of model output timesteps
         n_members: int
             number of ensemble members in the model output
         alpha: float
@@ -549,7 +573,10 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
             dictionary of keyword arguments for xarray.open_dataset. Default is {"channel_c": "land_sea_mask"}.
         """
         super().__init__()
-        self.loss_weights = th.tensor(weights)
+        self.loss_weights = th.tensor([weights])
+        if timestep_weights is not None:
+            timestep_weights = th.tensor(timestep_weights)
+            self.loss_weights = self.loss_weights * timestep_weights.view(timestep_weights.shape[0], 1, 1)
         self.n_members = n_members
         self.device = None
         self.lambda_spec = lambda_spec
@@ -590,8 +617,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         pushes constants to cuda device
         """
 
-        if len(trainer.output_variables) != len(self.loss_weights):
-            raise ValueError("Length of outputs and loss_weights is not the same!")
+        if len(trainer.output_variables) != self.loss_weights.shape[1]:
+            raise ValueError(f"Length of outputs {len(trainer.output_variables)} and loss_weights {self.loss_weights.shape[1]} is not the same!")
 
         self.loss_weights = self.loss_weights.to(device=trainer.device)
         self.averaging_coeff = th.tensor(self.averaging_coeff, device=trainer.device)
@@ -683,8 +710,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         target = target.to(th.float32)
 
         # Apply channel weights across channel dims
-        prediction *= self.loss_weights[None, None, None, None, :, None, None]
-        target *= self.loss_weights[None, None, None, :, None, None]
+        prediction *= self.loss_weights[None, None, None, :, :, None, None]
+        target *= self.loss_weights[None, None, :, :, None, None]
 
         if n == 2:
             # Use faster explicit implementation
