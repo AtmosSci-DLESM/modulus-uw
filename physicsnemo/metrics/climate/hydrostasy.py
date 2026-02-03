@@ -515,6 +515,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
 
         # Move topography
         self.topography = self.topography.to(device=trainer.device)
+        self.land_sea_mask = self.land_sea_mask.to(device=trainer.device)
 
     def scale(self, x):
         """
@@ -589,8 +590,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         # Mask out land cells for surface error
         if self.extend_to_surface and self.sfc_error_land_masking:
             valid_mask[:, :, -1, :, :] = (
-                self.land_sea_mask.squeeze(2).repeat(Tv_error.shape[0],1,1,1)
-                <= self.sfc_error_land_mask_threshold
+                self.land_sea_mask.squeeze(2) <= self.sfc_error_land_mask_threshold
             )
             Tv_error[:, :, -1, :, :][~valid_mask[:, :, -1, :, :]] = 0.0
 
@@ -646,11 +646,11 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             ] = 0.0
         # Mask out land cells for surface error
         if self.extend_to_surface and self.sfc_error_land_masking:
-            sfc_error_land_mask = (
-                self.land_sea_mask.squeeze(2).repeat(Tv_error.shape[0],1,1,1)
+            land_mask = (
+                self.land_sea_mask.squeeze(2)
                 > self.sfc_error_land_mask_threshold
             )
-            Tv_error[:, :, -1, :, :][sfc_error_land_mask] = 0.0
+            Tv_error[:, :, -1, :, :] *= (1.0 - land_mask.float())
 
         return Tv_error
 
@@ -691,11 +691,11 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
                 ] = 0.0
             # Mask out land cells for surface error
             if self.extend_to_surface and self.sfc_error_land_masking:
-                sfc_error_land_mask = (
-                    self.land_sea_mask.squeeze(2).repeat(Tv_error.shape[0],1,1,1)
+                land_mask = (
+                    self.land_sea_mask.squeeze(2)
                     > self.sfc_error_land_mask_threshold
                 )
-                Tv_error[:, :, -1, :, :][sfc_error_land_mask] = 0.0
+                Tv_error[:, :, -1, :, :] *= (1.0 - land_mask.float())
            
             # Compute the error tolerant loss
             Tv_loss = (Tv_error / (1 + torch.exp(1 - Tv_error))).mean(dim=(0, 1, 3, 4))
