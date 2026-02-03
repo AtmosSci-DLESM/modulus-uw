@@ -23,51 +23,6 @@ import xarray as xr
 
 logger = logging.getLogger(__name__)
 
-
-def _load_fixed_sfc_lowest_level_from_dataset(
-    path: str,
-    pressure_levels: Sequence[float],
-    variable_name: str = "p_lev",
-) -> torch.Tensor:
-    """
-    Load lowest pressure level above ground from an xarray dataset and convert
-    to level indices.
-
-    The dataset is expected to have a variable (e.g. `p_lev`) with dimensions
-    (face, height, width) and values in hPa. Each value is mapped to the index
-    of the matching pressure level in `pressure_levels`.
-
-    Parameters
-    ----------
-    path : str
-        Path to the dataset (NetCDF or Zarr).
-    pressure_levels : Sequence[float]
-        Sorted list of pressure levels in hPa, in the same order as the
-        constraint's vertical levels.
-    variable_name : str, optional
-        Name of the data variable containing pressure in hPa (default "p_lev").
-
-    Returns
-    -------
-    torch.Tensor
-        Integer tensor of shape (face, height, width) with level indices.
-    """
-    pl_arr = np.asarray(pressure_levels, dtype=np.float64)
-    if path.endswith(".zarr") or path.endswith(".zarr/"):
-        ds = xr.open_zarr(path)
-    else:
-        ds = xr.open_dataset(path)
-
-    p_lev = ds[variable_name]
-    # p_lev: (face, height, width) in hPa
-    p_vals = np.asarray(p_lev.values, dtype=np.float64).ravel()
-    # Map pressure value to index: index of largest level <= value
-    indices = np.searchsorted(pl_arr, p_vals, side="right") - 1
-    indices = np.clip(indices, 0, len(pl_arr) - 1).reshape(p_lev.shape)
-    ds.close()
-    return torch.from_numpy(indices.astype(np.int64))
-
-
 def _average_virtual_temperature_from_geopotential_height(z1, z2, p1, p2, R, g0):
     return g0 / (R * torch.log(p1 / p2)) * (z2 - z1)
 
@@ -167,9 +122,7 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
         R: float,
         g0: float,
         extend_to_surface: bool = False,
-        min_sfc_layer_thickness: float = 100.0,
-        fixed_sfc_lowest_level_path: Optional[str] = None,
-        fixed_sfc_lowest_level_variable: str = "p_lev",
+        min_sfc_layer_thickness: float = 10.0,
         detach_sfc_pressure: bool = False,
     ) -> None:
         super().__init__()
@@ -204,33 +157,12 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
         self.z_channels = list(self.z_pressure_levels.keys())
         self.Tv_channels = list(self.Tv_pressure_levels.keys())
 
-        # TODO: no need to filter for strings anymore
-        pressure_levels = sorted(
-            {k: v for k, v in z_pressure_levels.items() if not isinstance(v, str)}.values()
-        )
+        pressure_levels = sorted(z_pressure_levels.values())
         self.register_buffer(
             'pressure_levels',
             torch.tensor(pressure_levels).view(1,1,-1,1,1),
             persistent=False
         )
-
-        # Handle fixed surface layer selection (load from xarray dataset path)
-        if fixed_sfc_lowest_level_path is not None:
-            # Exclude surface (inf) so indices map to constant pressure levels only
-            pressure_levels_numeric = [p for p in pressure_levels if np.isfinite(p)]
-            fixed_sfc_lowest_level = _load_fixed_sfc_lowest_level_from_dataset(
-                fixed_sfc_lowest_level_path,
-                pressure_levels_numeric,
-                variable_name=fixed_sfc_lowest_level_variable,
-            )
-            self.register_buffer(
-                'fixed_sfc_lowest_level',
-                fixed_sfc_lowest_level,
-                persistent=False
-            )
-            self.use_fixed_sfc_level = True
-        else:
-            self.use_fixed_sfc_level = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -299,25 +231,19 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
             )
             p_levs = p_levs * self.pressure_levels.to(x.device)
 
-            # Get lowest level index - either from fixed selection or dynamic selection
-            if self.use_fixed_sfc_level:
-                # Use fixed layer indices - broadcast from [F, H, W] to [B, F, H, W]
-                B = x.size(0)
-                lowest_lev_idx = self.fixed_sfc_lowest_level.unsqueeze(0).expand(B, -1, -1, -1).to(x.device)
-            else:
-                # Disable gradients for finding lowest level above surface so that
-                # sfc hydrostatic error is not dependent on sfc pressure and lowest 
-                # level selection criteria
-                with torch.no_grad():
-                    # Get boolean mask of levels greater than min_sfc_layer_thickness (in m) 
-                    # above surface, assumes first z_channel is the highest altitude level
-                    above_surface_mask = (
-                        p_levs[:, :, :-1, ...] + self.min_sfc_layer_thickness <
-                        sfc_pressure.unsqueeze(2)
-                    )
-                    # Get index of lowest level above surface
-                    lowest_lev_idx = above_surface_mask.int().flip(dims=(2,)).argmax(dim=2)
-                    lowest_lev_idx = above_surface_mask.size(2) - 1 - lowest_lev_idx
+            # Disable gradients for finding lowest level above surface so that
+            # sfc hydrostatic error is not dependent on sfc pressure and lowest 
+            # level selection criteria
+            with torch.no_grad():
+                # Get boolean mask of levels greater than min_sfc_layer_thickness (in m) 
+                # above surface, assumes first z_channel is the highest altitude level
+                above_surface_mask = (
+                    p_levs[:, :, :-1, ...] + self.min_sfc_layer_thickness <
+                    sfc_pressure.unsqueeze(2)
+                )
+                # Get index of lowest level above surface
+                lowest_lev_idx = above_surface_mask.int().flip(dims=(2,)).argmax(dim=2)
+                lowest_lev_idx = above_surface_mask.size(2) - 1 - lowest_lev_idx
 
             # Compute average virtual temperature between lowest level and surface
             # from geopotential heights
@@ -365,10 +291,8 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         g0: float = 9.81,  # m s^{-2}
         topography_masking: bool = True,
         min_sfc_layer_thickness: float = 10.0, # in hPa
-        fixed_sfc_lowest_level_path: Optional[str] = None,
-        fixed_sfc_lowest_level_variable: str = "p_lev",
         detach_sfc_pressure: bool = False,
-        weight_surface_error_by_pressure: bool = True,
+        sfc_error_masking: bool = True,
     ):
         """
         Parameters
@@ -384,7 +308,8 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
         self.min_sfc_layer_thickness = min_sfc_layer_thickness
-        self.weight_surface_error_by_pressure = weight_surface_error_by_pressure
+        self.detach_sfc_pressure = detach_sfc_pressure
+        self.sfc_error_masking = sfc_error_masking
 
         if "surface" in hPa_levels:
             self.extend_to_surface = True
@@ -526,9 +451,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             self.g0,
             self.extend_to_surface,
             self.min_sfc_layer_thickness,
-            fixed_sfc_lowest_level_path,
-            fixed_sfc_lowest_level_variable,
-            detach_sfc_pressure,
+            self.detach_sfc_pressure,
         )
 
         self.num_z_levels = len(self.z_constraint_pressure_levels)
@@ -652,12 +575,11 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             Tv_error[:, :, :Tv_error.shape[2]-self.extend_to_surface][
                 x[:, :, 1 : self.num_z_levels-self.extend_to_surface, :, :] < self.topography
             ] = 0.0
-        # Weight surface level error by exp(p_s - mean_p_s) to reduce dominance of low-pressure regions
-        if self.extend_to_surface and self.weight_surface_error_by_pressure:
+       # Mask out low pressure regions above surface
+        if self.extend_to_surface and self.sfc_error_masking:
             sfc_pressure = x[:, :, -1, :, :]
             mean_p_s = sfc_pressure.mean(dim=(1, 2, 3), keepdim=True)
-            exponent = torch.clamp(sfc_pressure - mean_p_s, min=-5.0, max=0.)
-            Tv_error[:, :, -1, :, :] *= torch.exp(exponent)
+            Tv_error[:, :, -1, :, :][sfc_pressure < mean_p_s.detach()] = 0.0
 
         vlevels = Tv_error.shape[2]
         if accumulator is None:
@@ -705,12 +627,11 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             Tv_error[:, :, :Tv_error.shape[2]-self.extend_to_surface][
                 x[:, :, 1 : self.num_z_levels-self.extend_to_surface, :, :] < self.topography
             ] = 0.0
-        # Weight surface level error by exp(p_s - mean_p_s) to reduce dominance of low-pressure regions
-        if self.extend_to_surface and self.weight_surface_error_by_pressure:
+        # Mask out low pressure regions above surface
+        if self.extend_to_surface and self.sfc_error_masking:
             sfc_pressure = x[:, :, -1, :, :]
             mean_p_s = sfc_pressure.mean(dim=(1, 2, 3), keepdim=True)
-            exponent = torch.clamp(sfc_pressure - mean_p_s, min=-20.0, max=0.)
-            Tv_error[:, :, -1, :, :] *= torch.exp(exponent)
+            Tv_error[:, :, -1, :, :][sfc_pressure < mean_p_s.detach()] = 0.0
 
         return Tv_error
 
@@ -742,20 +663,18 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             # Scale to physical units and compute virtual temperature
             x = self.scale(prediction)
             Tv_avg, Tv_model_avg = self.constraint(x)
-            unweighted_Tv_error = Tv_avg - Tv_model_avg
-            if self.extend_to_surface and self.weight_surface_error_by_pressure:
-                sfc_pressure = x[:, :, -1, :, :]
-                mean_p_s = sfc_pressure.mean(dim=(1, 2, 3), keepdim=True)
-                # Clamp exponent so exp() does not overflow
-                exponent = torch.clamp(sfc_pressure - mean_p_s, min=-20.0, max=0.)
-                unweighted_Tv_error[:, :, -1, :, :] *= torch.exp(exponent)
-            Tv_error = (unweighted_Tv_error / self.alpha) ** 2
+            Tv_error = ((Tv_avg - Tv_model_avg) / self.alpha) ** 2
 
             # Mask out error in regions below the surface
             if self.topography_masking:
                 Tv_error[:, :, :Tv_error.shape[2]-self.extend_to_surface][
                     x[:, :, 1 : self.num_z_levels-self.extend_to_surface, :, :] < self.topography
                 ] = 0.0
+            # Mask out low pressure regions above surface
+            if self.extend_to_surface and self.sfc_error_masking:
+                sfc_pressure = x[:, :, -1, :, :]
+                mean_p_s = sfc_pressure.mean(dim=(1, 2, 3), keepdim=True)
+                Tv_error[:, :, -1, :, :][sfc_pressure < mean_p_s.detach()] = 0.0
            
             # Compute the error tolerant loss
             Tv_loss = (Tv_error / (1 + torch.exp(1 - Tv_error))).mean(dim=(0, 1, 3, 4))
