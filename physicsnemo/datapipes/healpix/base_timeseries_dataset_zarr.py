@@ -68,7 +68,7 @@ def _check_availability(path: str) -> None:  # pragma: no cover
     if _is_object_store_path(path):
         if not importlib.util.find_spec("fsspec"):
             raise ImportError(
-                f"fsspec is required to access dataset paths like '{path}'. "
+                f"fsspec is required to access object store paths like '{path}'. "
                 "Please install fsspec with: pip install fsspec"
             )
     elif not os.path.exists(path):

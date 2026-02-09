@@ -29,6 +29,7 @@ from physicsnemo.utils.insolation import insolation
 
 from . import couplers
 from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
+from .base_timeseries_dataset_zarr import _check_availability
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,7 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
 
         # We setup couplers first so superclass can properly initialize
         # and set the scaling
+        _check_availability(dataset_path)
         self.ds = zarr.open(dataset_path)
         self.couplings = [
             getattr(couplers, c["coupler"])(
