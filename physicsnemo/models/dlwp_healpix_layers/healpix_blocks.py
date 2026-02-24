@@ -19,10 +19,28 @@ from typing import Sequence, Tuple, Union, Callable
 import torch
 import torch as th
 from .healpix_layers import HEALPixLayer
-from .normalization import ConditionalLayerNorm
+from .normalization import ConditionalLayerNorm, AdaLNZero
 
 from hydra.utils import instantiate
 from omegaconf import DictConfig
+
+#
+# Helper: standard LayerNorm over channel dimension for (B, C, H, W)
+#
+
+
+class _LayerNormOverChannels(th.nn.Module):
+    """Applies nn.LayerNorm over the channel dimension for (B, C, H, W) tensors."""
+
+    def __init__(self, channel_depth: int, eps: float = 1e-5):
+        super().__init__()
+        self.norm = th.nn.LayerNorm(channel_depth, eps=eps)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
+        return x.permute(0, 3, 1, 2)
+
 
 #
 # RECURRENT BLOCKS
@@ -517,6 +535,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         batch_norm: bool = False,
         dropout: float = 0.0,
         conditional_layer_norm: Callable = None,
+        cln_once_per_block: bool = False,
     ):
         """
         Parameters
@@ -527,6 +546,9 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
             Callable for physicsnemo.models.dlwp_healpix_layers.normalization.ConditionalLayerNorm. 
             Callable can be passed in by setting _partial_ to True in hydra config. If None,
             conditional layer normalization is not applied.
+        cln_once_per_block: bool, optional
+            If True, use AdaLN-style (CLN once at block entry, LayerNorm in middle).
+            If False (default), keep current structure (3 CLN positions). Backward compatible.
         """
         super().__init__()
 
@@ -552,6 +574,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                     batch_norm=batch_norm,
                     dropout=dropout,
                     conditional_layer_norm=conditional_layer_norm if conditional_layer_norm is not None else None,
+                    cln_once_per_block=cln_once_per_block,
                 ),
             )
 
@@ -560,6 +583,144 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         for block in self.blocks:
             out = block(out, conditions_cln=conditions_cln)
         return out
+
+
+class InceptionDWConv2d(th.nn.Module):
+    """
+    Inception-style depthwise spatial mixer for HEALPix data.
+
+    Splits channels into four groups:
+      - Group 1: square_kernel_size x square_kernel_size convolution
+      - Group 2: 1 x band_kernel_size convolution (zonal / horizontal)
+      - Group 3: band_kernel_size x 1 convolution (meridional / vertical)
+      - Group 4: identity passthrough
+
+    All internal convolutions are wrapped by the provided geometry_layer.
+    """
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels: int = 3,
+        square_kernel_size: int = 3,
+        band_kernel_size: int = 11,
+        dilation: int = 1,
+        enable_nhwc: bool = False,
+        enable_healpixpad: bool = False,
+    ):
+        """
+        InceptionDWConv2d: Efficient depthwise convolution with channel splitting.
+        
+        Note: band_kernel_size should be chosen carefully. With HEALPixPadding, the padding
+        is calculated as (band_kernel_size - 1) // 2. This padding must be <= spatial dimensions
+        in all layers. For networks with downsampling, use smaller band_kernel_size (e.g., 7 or 5)
+        to avoid padding errors in deeper layers with smaller feature maps.
+        """
+        super().__init__()
+
+        self.in_channels = in_channels
+
+        # Compute channel splits: roughly quartered, identity branch takes the remainder.
+        g = max(in_channels // 4, 0)
+        c1 = g
+        c2 = g
+        c3 = g
+        c4 = in_channels - (c1 + c2 + c3)
+        self.splits = (c1, c2, c3, c4)
+
+        # Some branches may be empty for very small in_channels; guard accordingly.
+        convs = {}
+        if c1 > 0:
+            convs["square"] = geometry_layer(
+                layer=th.nn.Conv2d,
+                in_channels=c1,
+                out_channels=c1,
+                kernel_size=square_kernel_size,
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
+        if c2 > 0:
+            convs["horiz"] = geometry_layer(
+                layer=th.nn.Conv2d,
+                in_channels=c2,
+                out_channels=c2,
+                kernel_size=(1, band_kernel_size),
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
+        if c3 > 0:
+            convs["vert"] = geometry_layer(
+                layer=th.nn.Conv2d,
+                in_channels=c3,
+                out_channels=c3,
+                kernel_size=(band_kernel_size, 1),
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
+
+        self.square_conv = convs.get("square", None)
+        self.horiz_conv = convs.get("horiz", None)
+        self.vert_conv = convs.get("vert", None)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        c1, c2, c3, c4 = self.splits
+
+        # Fast path: no splitting needed
+        if c1 == 0 and c2 == 0 and c3 == 0:
+            return x
+
+        x_chunks = th.split(x, [c for c in self.splits if c > 0], dim=1)
+
+        idx = 0
+        y_chunks = []
+        
+        # Get target spatial dimensions from input (or from square conv output)
+        target_h, target_w = x.shape[-2], x.shape[-1]
+
+        # Group 1: square conv
+        if c1 > 0:
+            x1 = x_chunks[idx]
+            idx += 1
+            y1 = self.square_conv(x1) if self.square_conv is not None else x1
+            # Update target dimensions from square conv output (it should preserve spatial dims)
+            target_h, target_w = y1.shape[-2], y1.shape[-1]
+            y_chunks.append(y1)
+
+        # Group 2: horizontal band (1, band_kernel_size)
+        # Uniform padding pads both H and W, but conv only reduces W dimension
+        # So we need to crop the H dimension back to target_h
+        if c2 > 0:
+            x2 = x_chunks[idx]
+            idx += 1
+            y2 = self.horiz_conv(x2) if self.horiz_conv is not None else x2
+            # Crop H dimension if needed (remove extra padding from uniform padding)
+            if y2.shape[-2] != target_h:
+                pad_h = (y2.shape[-2] - target_h) // 2
+                y2 = y2[..., pad_h:pad_h + target_h, :]
+            y_chunks.append(y2)
+
+        # Group 3: vertical band (band_kernel_size, 1)
+        # Uniform padding pads both H and W, but conv only reduces H dimension
+        # So we need to crop the W dimension back to target_w
+        if c3 > 0:
+            x3 = x_chunks[idx]
+            idx += 1
+            y3 = self.vert_conv(x3) if self.vert_conv is not None else x3
+            # Crop W dimension if needed (remove extra padding from uniform padding)
+            if y3.shape[-1] != target_w:
+                pad_w = (y3.shape[-1] - target_w) // 2
+                y3 = y3[..., :, pad_w:pad_w + target_w]
+            y_chunks.append(y3)
+
+        # Group 4: identity
+        if c4 > 0:
+            x4 = x_chunks[idx]
+            y_chunks.append(x4)
+
+        return th.cat(y_chunks, dim=1)
 
 
 class SymmetricConvNeXtBlock(th.nn.Module):
@@ -585,6 +746,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         batch_norm: bool = False,
         dropout: float = 0.0,
         conditional_layer_norm: th.nn.Module = None,
+        cln_once_per_block: bool = False,
     ):
         """
         Parameters
@@ -618,6 +780,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         conditional_layer_norm: th.nn.Module, optional
             conditional layer normalization. If None,
             no conditional layer normalization is applied.
+        cln_once_per_block: bool, optional
+            If True, AdaLN-style: one CLN at block entry, LayerNorm in middle.
+            If False (default), current structure (3 CLN positions). Backward compatible.
         """
 
         super().__init__()
@@ -626,6 +791,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         self.activation = activation
         self.dropout = dropout > 0.0
         self.cln_enabled = conditional_layer_norm is not None
+        self.cln_once_per_block = cln_once_per_block
+        self.in_channels = in_channels
+        self.out_channels = out_channels
 
         if use_block_skip_connection:
             if in_channels == int(out_channels):
@@ -643,93 +811,185 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # Collect conv->norm->activation->dropout operations in list for sequential execution
         convblock = []
 
-        # 3x3: in → latent
-        convblock.append(
-            geometry_layer(
-                layer=th.nn.Conv2d,
-                in_channels=in_channels,
-                out_channels=int(latent_channels),
-                kernel_size=kernel_size,
-                dilation=dilation,
-                enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+        if cln_once_per_block:
+            # AdaLN-style: one norm at block entry (CLN or LayerNorm), then conv chain with LayerNorm in middle only
+            if conditional_layer_norm is not None:
+                # For AdaLNZero, gate should match output channels while normalization matches input channels
+                import functools
+                is_adaln_zero = False
+                if isinstance(conditional_layer_norm, functools.partial):
+                    # Check if the partial's function is AdaLNZero
+                    is_adaln_zero = conditional_layer_norm.func is AdaLNZero
+                
+                if is_adaln_zero and in_channels != out_channels:
+                    # Create AdaLNZero with separate gate channel depth
+                    new_kwargs = dict(conditional_layer_norm.keywords) if isinstance(conditional_layer_norm, functools.partial) else {}
+                    new_kwargs['channel_depth'] = in_channels
+                    new_kwargs['gate_channel_depth'] = out_channels
+                    if isinstance(conditional_layer_norm, functools.partial):
+                        self.entry_norm = conditional_layer_norm.func(**new_kwargs)
+                    else:
+                        self.entry_norm = conditional_layer_norm(channel_depth=in_channels, gate_channel_depth=out_channels)
+                else:
+                    self.entry_norm = conditional_layer_norm(channel_depth=in_channels)
+            else:
+                self.entry_norm = _LayerNormOverChannels(in_channels)
+            # Conv (3x3 in → latent), Act, [Dropout]
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=in_channels,
+                    out_channels=int(latent_channels),
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
             )
-        )
-        if batch_norm:
-            convblock.append(th.nn.BatchNorm2d(int(latent_channels), track_running_stats=False, affine=False))
-        # Conditional Layer Normalization
-        if conditional_layer_norm is not None:
-            # resolve context-dependent parameters (channel depth)
-            cln = conditional_layer_norm(channel_depth=int(latent_channels))
-            convblock.append(cln)
-        if activation is not None:
-            convblock.append(activation)
-        if dropout > 0.0:
-            convblock.append(th.nn.Dropout2d(p=dropout))
-
-        # 1x1: latent → latent * upscale
-        convblock.append(
-            geometry_layer(
-                layer=th.nn.Conv2d,
-                in_channels=int(latent_channels),
-                out_channels=int(latent_channels * upscale_factor),
-                kernel_size=1,
-                dilation=dilation,
-                enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+            # Conv (1x1 latent → upscale), LayerNorm, Act, [Dropout]
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=int(latent_channels),
+                    out_channels=int(latent_channels * upscale_factor),
+                    kernel_size=1,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
             )
-        )
-        if batch_norm:
-            convblock.append(th.nn.BatchNorm2d(int(latent_channels * upscale_factor), track_running_stats=False, affine=False))
-        if conditional_layer_norm is not None:
-            cln = conditional_layer_norm(channel_depth=int(latent_channels * upscale_factor))
-            convblock.append(cln)
-        if activation is not None:
-            convblock.append(activation)
-        if dropout > 0.0:
-            convblock.append(th.nn.Dropout2d(p=dropout))
-
-        
-        # 1x1: upscale → latent
-        convblock.append(
-            geometry_layer(
-                layer=th.nn.Conv2d,
-                in_channels=int(latent_channels * upscale_factor),
-                out_channels=int(latent_channels),
-                kernel_size=1,
-                dilation=dilation,
-                enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+            convblock.append(_LayerNormOverChannels(int(latent_channels * upscale_factor)))
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+            # Conv (1x1 upscale → latent), LayerNorm, Act, [Dropout]
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=int(latent_channels * upscale_factor),
+                    out_channels=int(latent_channels),
+                    kernel_size=1,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
             )
-        )
-        if batch_norm:
-            convblock.append(th.nn.BatchNorm2d(int(latent_channels), track_running_stats=False, affine=False))
-        if conditional_layer_norm is not None:
-            cln = conditional_layer_norm(channel_depth=int(latent_channels))
-            convblock.append(cln)
-        if activation is not None:
-            convblock.append(activation)
-        if dropout > 0.0:
-            convblock.append(th.nn.Dropout2d(p=dropout))
-
-        # 3x3: latent → out (no norm on this one, following convnext)
-        convblock.append(
-            geometry_layer(
-                layer=th.nn.Conv2d,
-                in_channels=int(latent_channels),
-                out_channels=out_channels,
-                kernel_size=kernel_size,
-                dilation=dilation,
-                enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+            convblock.append(_LayerNormOverChannels(int(latent_channels)))
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+            # Conv (3x3 latent → out), Act, [Dropout]
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=int(latent_channels),
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
             )
-        )
-        if activation is not None:
-            convblock.append(activation)
-        if dropout > 0.0:
-            convblock.append(th.nn.Dropout2d(p=dropout))
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+            self.convblock = th.nn.ModuleList(convblock)
+        else:
+            # Current structure: Conv -> [BN] -> [CLN] -> Act -> ... (3 CLN positions when conditional_layer_norm set)
+            # 3x3: in → latent
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=in_channels,
+                    out_channels=int(latent_channels),
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            if batch_norm:
+                convblock.append(th.nn.BatchNorm2d(int(latent_channels), track_running_stats=False, affine=False))
+            # Conditional Layer Normalization
+            if conditional_layer_norm is not None:
+                # resolve context-dependent parameters (channel depth)
+                cln = conditional_layer_norm(channel_depth=int(latent_channels))
+                convblock.append(cln)
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
 
-        self.convblock = th.nn.ModuleList(convblock)
+            # 1x1: latent → latent * upscale
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=int(latent_channels),
+                    out_channels=int(latent_channels * upscale_factor),
+                    kernel_size=1,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            if batch_norm:
+                convblock.append(th.nn.BatchNorm2d(int(latent_channels * upscale_factor), track_running_stats=False, affine=False))
+            if conditional_layer_norm is not None:
+                cln = conditional_layer_norm(channel_depth=int(latent_channels * upscale_factor))
+                convblock.append(cln)
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+
+            # 1x1: upscale → latent
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=int(latent_channels * upscale_factor),
+                    out_channels=int(latent_channels),
+                    kernel_size=1,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            if batch_norm:
+                convblock.append(th.nn.BatchNorm2d(int(latent_channels), track_running_stats=False, affine=False))
+            if conditional_layer_norm is not None:
+                cln = conditional_layer_norm(channel_depth=int(latent_channels))
+                convblock.append(cln)
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+
+            # 3x3: latent → out (no norm on this one, following convnext)
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=int(latent_channels),
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+
+            self.convblock = th.nn.ModuleList(convblock)
+            self.entry_norm = None  # no entry norm in current structure
 
 
     def forward(self, x, conditions_cln=None):
@@ -749,6 +1009,18 @@ class SymmetricConvNeXtBlock(th.nn.Module):
 
         # Save residual
         residual = self.skip_module(x) if self.use_block_skip_connection else 0
+        gate = None
+
+        # AdaLN-style: apply entry norm first (CLN or LayerNorm or AdaLNZero)
+        if self.entry_norm is not None:
+            if isinstance(self.entry_norm, AdaLNZero):
+                if conditions_cln is None:
+                    raise ValueError("AdaLNZero requires non-None conditions_cln.")
+                x, gate = self.entry_norm(x, conditions=conditions_cln)
+            elif isinstance(self.entry_norm, ConditionalLayerNorm):
+                x = self.entry_norm(x, conditions=conditions_cln)
+            else:
+                x = self.entry_norm(x)
 
         for layer in self.convblock:
             if isinstance(layer, ConditionalLayerNorm):
@@ -756,7 +1028,496 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             else:
                 x = layer(x)
 
+        if gate is not None:
+            x = x * gate
+
         return x + residual
+
+
+class InceptionNeXtBlock(th.nn.Module):
+    """
+    Classical ConvNeXt-style block with InceptionNeXt-inspired depthwise 7x7
+    spatial mixing followed by an inverted bottleneck MLP:
+
+        DwConv 7x7 -> LayerNorm -> 1x1 Conv (expand 4x) -> GELU -> 1x1 Conv (shrink)
+
+    Supports optional AdaLN-Zero / CLN applied once at block entry (cln_once_per_block).
+    """
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        n_layers: int = 1,  # unused, for hydra compatibility
+        mlp_ratio: int = 4,
+        activation: th.nn.Module = None,
+        enable_nhwc: bool = False,
+        enable_healpixpad: bool = False,
+        conditional_layer_norm: Callable = None,
+        cln_once_per_block: bool = False,
+    ):
+        super().__init__()
+
+        self.cln_enabled = conditional_layer_norm is not None
+        self.cln_once_per_block = cln_once_per_block
+        self.activation = activation if activation is not None else th.nn.GELU()
+
+        # Skip / projection
+        if in_channels == out_channels:
+            self.skip_module = lambda x: x
+        else:
+            self.skip_module = geometry_layer(
+                layer=th.nn.Conv2d,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=1,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
+
+        hidden_channels = in_channels * mlp_ratio
+
+        # Entry norm: can be AdaLNZero, ConditionalLayerNorm, or simple LayerNorm.
+        if cln_once_per_block:
+            if conditional_layer_norm is not None:
+                # For AdaLNZero, gate should match output channels while normalization matches input channels
+                import functools
+                is_adaln_zero = False
+                if isinstance(conditional_layer_norm, functools.partial):
+                    is_adaln_zero = conditional_layer_norm.func is AdaLNZero
+                
+                if is_adaln_zero and in_channels != out_channels:
+                    new_kwargs = dict(conditional_layer_norm.keywords) if isinstance(conditional_layer_norm, functools.partial) else {}
+                    new_kwargs['channel_depth'] = in_channels
+                    new_kwargs['gate_channel_depth'] = out_channels
+                    if isinstance(conditional_layer_norm, functools.partial):
+                        self.entry_norm = conditional_layer_norm.func(**new_kwargs)
+                    else:
+                        self.entry_norm = conditional_layer_norm(channel_depth=in_channels, gate_channel_depth=out_channels)
+                else:
+                    self.entry_norm = conditional_layer_norm(channel_depth=in_channels)
+            else:
+                self.entry_norm = _LayerNormOverChannels(in_channels)
+        else:
+            self.entry_norm = None
+
+        # Core ConvNeXt-style body: DwConv -> LN -> 1x1 expand -> GELU -> 1x1 shrink
+        self.dwconv = geometry_layer(
+            layer=th.nn.Conv2d,
+            in_channels=in_channels,
+            out_channels=in_channels,
+            kernel_size=7,
+            groups=in_channels,
+            enable_nhwc=enable_nhwc,
+            enable_healpixpad=enable_healpixpad,
+        )
+        self.mid_norm = _LayerNormOverChannels(in_channels)
+        self.pw_expand = geometry_layer(
+            layer=th.nn.Conv2d,
+            in_channels=in_channels,
+            out_channels=hidden_channels,
+            kernel_size=1,
+            enable_nhwc=enable_nhwc,
+            enable_healpixpad=enable_healpixpad,
+        )
+        self.pw_shrink = geometry_layer(
+            layer=th.nn.Conv2d,
+            in_channels=hidden_channels,
+            out_channels=out_channels,
+            kernel_size=1,
+            enable_nhwc=enable_nhwc,
+            enable_healpixpad=enable_healpixpad,
+        )
+
+    def forward(self, x: th.Tensor, conditions_cln: th.Tensor = None) -> th.Tensor:
+        residual = self.skip_module(x)
+        gate = None
+
+        if self.entry_norm is not None:
+            if isinstance(self.entry_norm, AdaLNZero):
+                if conditions_cln is None:
+                    raise ValueError("AdaLNZero requires non-None conditions_cln.")
+                x, gate = self.entry_norm(x, conditions=conditions_cln)
+            elif isinstance(self.entry_norm, ConditionalLayerNorm):
+                x = self.entry_norm(x, conditions=conditions_cln)
+            else:
+                x = self.entry_norm(x)
+
+        x = self.dwconv(x)
+        x = self.mid_norm(x)
+        x = self.pw_expand(x)
+        x = self.activation(x)
+        x = self.pw_shrink(x)
+
+        if gate is not None:
+            x = x * gate
+
+        return residual + x
+
+
+class SymmetricInceptionNeXtBlock(th.nn.Module):
+    """
+    Symmetric ConvNeXt-style block that replaces the initial 3x3 spatial mixer
+    with an Inception-style depthwise module (InceptionDWConv2d).
+
+    The overall structure mirrors SymmetricConvNeXtBlock:
+        [InceptionDW] -> [1x1 expand] -> [1x1 shrink] -> [3x3 out]
+
+    When cln_once_per_block=True, supports AdaLNZero / CLN entry norm plus
+    mid-block LayerNorms, and applies AdaLN gating to the block output.
+    """
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels: int = 3,
+        latent_channels: int = 1,
+        out_channels: int = 1,
+        kernel_size: int = 3,
+        dilation: int = 1,
+        n_layers: int = 1,  # unused, hydra compatibility
+        upscale_factor: int = 4,
+        activation: th.nn.Module = None,
+        enable_nhwc: bool = False,
+        use_block_skip_connection: bool = True,
+        enable_healpixpad: bool = False,
+        batch_norm: bool = False,
+        dropout: float = 0.0,
+        conditional_layer_norm: Callable = None,
+        cln_once_per_block: bool = False,
+        inception_kernel_size: int = 11,
+    ):
+        super().__init__()
+
+        self.use_block_skip_connection = use_block_skip_connection
+        self.activation = activation
+        self.dropout = dropout > 0.0
+        self.cln_enabled = conditional_layer_norm is not None
+        self.cln_once_per_block = cln_once_per_block
+
+        if use_block_skip_connection:
+            if in_channels == int(out_channels):
+                self.skip_module = lambda x: x
+            else:
+                self.skip_module = geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=1,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+
+        convblock = []
+
+        if cln_once_per_block:
+            # Entry norm (AdaLNZero, CLN, or LayerNorm)
+            if conditional_layer_norm is not None:
+                # For AdaLNZero, gate should match output channels while normalization matches input channels
+                import functools
+                is_adaln_zero = False
+                if isinstance(conditional_layer_norm, functools.partial):
+                    is_adaln_zero = conditional_layer_norm.func is AdaLNZero
+                
+                if is_adaln_zero and in_channels != out_channels:
+                    new_kwargs = dict(conditional_layer_norm.keywords) if isinstance(conditional_layer_norm, functools.partial) else {}
+                    new_kwargs['channel_depth'] = in_channels
+                    new_kwargs['gate_channel_depth'] = out_channels
+                    if isinstance(conditional_layer_norm, functools.partial):
+                        self.entry_norm = conditional_layer_norm.func(**new_kwargs)
+                    else:
+                        self.entry_norm = conditional_layer_norm(channel_depth=in_channels, gate_channel_depth=out_channels)
+                else:
+                    self.entry_norm = conditional_layer_norm(channel_depth=in_channels)
+            else:
+                self.entry_norm = _LayerNormOverChannels(in_channels)
+
+            # Inception depthwise mixer on input channels
+            convblock.append(
+                InceptionDWConv2d(
+                    geometry_layer=geometry_layer,
+                    in_channels=in_channels,
+                    square_kernel_size=kernel_size,
+                    band_kernel_size=inception_kernel_size,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            # 1x1 in_channels -> latent_channels
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=in_channels,
+                    out_channels=int(latent_channels),
+                    kernel_size=1,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+
+            # 1x1 latent -> latent * upscale, then LayerNorm + activation
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=int(latent_channels),
+                    out_channels=int(latent_channels * upscale_factor),
+                    kernel_size=1,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            convblock.append(_LayerNormOverChannels(int(latent_channels * upscale_factor)))
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+
+            # 1x1 upscale -> latent, LayerNorm, activation
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=int(latent_channels * upscale_factor),
+                    out_channels=int(latent_channels),
+                    kernel_size=1,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            convblock.append(_LayerNormOverChannels(int(latent_channels)))
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+
+            # Final 3x3 latent -> out
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=int(latent_channels),
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+
+            self.convblock = th.nn.ModuleList(convblock)
+        else:
+            # Non-AdaLN layout: preserve original SymmetricConvNeXtBlock ordering,
+            # simply replacing the first 3x3 conv with InceptionDWConv2d + 1x1 to latent.
+            self.entry_norm = None
+
+            # Inception mixer + 1x1 to latent
+            convblock.append(
+                InceptionDWConv2d(
+                    geometry_layer=geometry_layer,
+                    in_channels=in_channels,
+                    square_kernel_size=kernel_size,
+                    band_kernel_size=inception_kernel_size,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=in_channels,
+                    out_channels=int(latent_channels),
+                    kernel_size=1,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            if batch_norm:
+                convblock.append(
+                    th.nn.BatchNorm2d(
+                        int(latent_channels),
+                        track_running_stats=False,
+                        affine=False,
+                    )
+                )
+            if conditional_layer_norm is not None:
+                cln = conditional_layer_norm(channel_depth=int(latent_channels))
+                convblock.append(cln)
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+
+            # 1x1 latent -> latent * upscale
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=int(latent_channels),
+                    out_channels=int(latent_channels * upscale_factor),
+                    kernel_size=1,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            if batch_norm:
+                convblock.append(
+                    th.nn.BatchNorm2d(
+                        int(latent_channels * upscale_factor),
+                        track_running_stats=False,
+                        affine=False,
+                    )
+                )
+            if conditional_layer_norm is not None:
+                cln = conditional_layer_norm(channel_depth=int(latent_channels * upscale_factor))
+                convblock.append(cln)
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+
+            # 1x1 upscale -> latent
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=int(latent_channels * upscale_factor),
+                    out_channels=int(latent_channels),
+                    kernel_size=1,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            if batch_norm:
+                convblock.append(
+                    th.nn.BatchNorm2d(
+                        int(latent_channels),
+                        track_running_stats=False,
+                        affine=False,
+                    )
+                )
+            if conditional_layer_norm is not None:
+                cln = conditional_layer_norm(channel_depth=int(latent_channels))
+                convblock.append(cln)
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+
+            # 3x3 latent -> out
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=int(latent_channels),
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            if activation is not None:
+                convblock.append(activation)
+            if dropout > 0.0:
+                convblock.append(th.nn.Dropout2d(p=dropout))
+
+            self.convblock = th.nn.ModuleList(convblock)
+
+    def forward(self, x: th.Tensor, conditions_cln: th.Tensor = None) -> th.Tensor:
+        residual = self.skip_module(x) if self.use_block_skip_connection else 0
+        gate = None
+
+        if self.entry_norm is not None:
+            if isinstance(self.entry_norm, AdaLNZero):
+                if conditions_cln is None:
+                    raise ValueError("AdaLNZero requires non-None conditions_cln.")
+                x, gate = self.entry_norm(x, conditions=conditions_cln)
+            elif isinstance(self.entry_norm, ConditionalLayerNorm):
+                x = self.entry_norm(x, conditions=conditions_cln)
+            else:
+                x = self.entry_norm(x)
+
+        for layer in self.convblock:
+            if isinstance(layer, ConditionalLayerNorm):
+                x = layer(x, conditions=conditions_cln)
+            else:
+                x = layer(x)
+
+        if gate is not None:
+            x = x * gate
+
+        return residual + x
+
+
+class Multi_SymmetricInceptionNeXtBlock(th.nn.Module):
+    """
+    Wrapper for SymmetricInceptionNeXtBlock that allows serial linking of blocks,
+    mirroring Multi_SymmetricConvNeXtBlock.
+    """
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels: int = 3,
+        latent_channels: int = 1,
+        out_channels: int = 1,
+        kernel_size: int = 3,
+        dilation: int = 1,
+        upscale_factor: int = 4,
+        n_layers: int = 1,
+        activation: th.nn.Module = None,
+        enable_nhwc: bool = False,
+        enable_healpixpad: bool = False,
+        batch_norm: bool = False,
+        dropout: float = 0.0,
+        conditional_layer_norm: Callable = None,
+        cln_once_per_block: bool = False,
+        inception_kernel_size: int = 11,
+    ):
+        super().__init__()
+
+        self.blocks = th.nn.ModuleList()
+        self.cln_enabled = conditional_layer_norm is not None
+
+        for i in range(n_layers):
+            curr_in = in_channels if i == 0 else out_channels
+            self.blocks.append(
+                SymmetricInceptionNeXtBlock(
+                    geometry_layer=geometry_layer,
+                    in_channels=curr_in,
+                    latent_channels=latent_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    upscale_factor=upscale_factor,
+                    activation=activation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                    batch_norm=batch_norm,
+                    dropout=dropout,
+                    conditional_layer_norm=conditional_layer_norm if conditional_layer_norm is not None else None,
+                    cln_once_per_block=cln_once_per_block,
+                    inception_kernel_size=inception_kernel_size,
+                )
+            )
+
+    def forward(self, x: th.Tensor, conditions_cln: th.Tensor = None) -> th.Tensor:
+        out = x
+        for block in self.blocks:
+            out = block(out, conditions_cln=conditions_cln)
+        return out
 
 
 #
@@ -971,3 +1732,5 @@ class Interpolate(th.nn.Module):
             the interpolated values
         """
         return self.interp(inputs, scale_factor=self.scale_factor, mode=self.mode)
+
+

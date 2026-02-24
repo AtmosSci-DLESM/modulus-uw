@@ -17,6 +17,7 @@
 import logging
 from typing import Sequence
 
+import dask
 import numpy as np
 import pandas as pd
 import torch as th
@@ -256,7 +257,8 @@ class ConstantCoupler:
                 "std"
             ]
             # load before entering loop for efficiency
-            ds_index_range = ds.isel(time=index_range).load()
+            with dask.config.set(scheduler='synchronous'):
+                ds_index_range = ds.isel(time=index_range).load()
 
             # use static offsets to create integrated coupling array
             for b in range(bsize):
@@ -534,7 +536,8 @@ class TrailingAverageCoupler:
                 - self.coupled_scaling["mean"]
             ) / self.coupled_scaling["std"]
             # load before entering loop for efficiency
-            ds_index_range = ds.isel(time=index_range).load()
+            with dask.config.set(scheduler='synchronous'):
+                ds_index_range = ds.isel(time=index_range).load()
 
             # use static offsets to create integrated coupling array
             for b in range(bsize):

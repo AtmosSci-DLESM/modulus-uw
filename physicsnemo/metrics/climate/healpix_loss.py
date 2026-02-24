@@ -328,6 +328,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         open_dict: dict = {"engine": "zarr"},
         selection_dict: dict = {"channel_c": "land_sea_mask"},
         multiscale: float = 0.0,
+        masked_pool: bool = False,
+        temporal_dt: float = 0.0,
     ):
         """
         Parameters
@@ -350,6 +352,9 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             dictionary that store channel selection information
         multiscale: float, optional
             weight for the multiscale CRPS loss. Default is 0, no multiscale loss is applied.
+        masked_pool: bool, optional
+            if True, spatial pooling uses only ocean pixels (land ignored). When lsm_file is
+            provided, masked pooling is used automatically so land is always ignored in multiscale.
         """
         super().__init__()
         self.loss_weights = th.tensor(weights)
@@ -360,6 +365,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         self.device = None
         self.mean_penalty = mean_penalty
         self.multiscale = multiscale
+        self.masked_pool = masked_pool
+        self.temporal_dt = temporal_dt
         self.scales = [4, 16, 32]
 
         if lsm_file is not None:
@@ -395,6 +402,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
     def _2member_crps(self, prediction, target, lsm_tensor):
         diff_target = th.abs(prediction - target.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
         diff_ensemble = th.abs(prediction[0] - prediction[1]) # [B, F, T, C, H, W]
+        # multiply by 2 to account for the fact that we are using a 2-member ensemble
         crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
         crps *= lsm_tensor
         return crps
@@ -404,6 +412,78 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         h, w = shape[-2:]
         pooled = th.nn.functional.avg_pool2d(tensor.reshape(shape[0], -1, h, w), scale, scale)
         return pooled.reshape(*shape[:-2], h//scale, w//scale)
+    
+    def _masked_pool(self, tensor, mask, scale):
+        """
+        Pools a tensor while ignoring masked values (land).
+        Returns:
+            valid_avg: The average of only the VALID pixels in the window.
+            pooled_mask: The fraction of valid pixels in the window (used for weighting).
+        """
+        # 1. Zero out invalid (land) pixels so they don't corrupt the sum
+        masked_tensor = tensor * mask
+        
+        # 2. Pool the values (Calculate: Sum / Total_Pixels)
+        num = self._pool(masked_tensor, scale)
+        
+        # 3. Pool the mask (Calculate: Valid_Pixels / Total_Pixels)
+        denom = self._pool(mask, scale)
+        
+        # 4. Divide to get true average: Sum / Valid_Pixels
+        # We add epsilon to avoid division by zero in fully land blocks
+        valid_avg = num / (denom + 1e-6)
+        
+        return valid_avg, denom
+    
+    def _calculate_dt_loss(self, prediction, target, average_channels=True):
+        """
+        Calculates the CRPS of the temporal gradient (X_t+1 - X_t).
+        Expects prediction and target to be already weighted.
+        """
+        if target.shape[2] < 2:
+            return th.tensor(0.0, device=prediction.device)
+
+        # 1. Calculate gradients: X(t+1) - X(t)
+        # Slicing [1:2] keeps the T dim as 1 for broadcasting with lsm_tensor
+        pred_dt = prediction[:, :, :, 1:2, ...] - prediction[:, :, :, 0:1, ...] 
+        tar_dt = target[:, :, 1:2, ...] - target[:, :, 0:1, ...]
+
+        # 2. Calculate CRPS on the delta
+        # We pass self.lsm_tensor to mask land values in the gradient calculation
+        if self.n_members == 2:
+            crps_dt = self._2member_crps(pred_dt, tar_dt, self.lsm_tensor)
+            
+            if average_channels:
+                return crps_dt.mean()
+            else:
+                return crps_dt.mean(dim=(0, 1, 2, 4, 5))
+        
+        else:
+            # Fallback for N > 2 (Pairwise distance)
+            # We reuse the logic but applied to the difference tensors
+            b, f, t, c, h, w = tar_dt.shape
+            
+            if not average_channels:
+                # Permute to [C, N, B, F, T, H, W]
+                p_dt = pred_dt.permute(4, 0, 1, 2, 3, 5, 6).reshape(c, self.n_members, -1)
+                t_dt = tar_dt.permute(3, 0, 1, 2, 4, 5).unsqueeze(1).reshape(c, 1, -1)
+
+                diff = self.pdist(p_dt, t_dt) 
+                dist_matrix = self.pdist(p_dt.unsqueeze(1), p_dt.unsqueeze(2))
+                
+                diff_terms = self.diag_mask[None, ...] * (diff.unsqueeze(1) + diff.unsqueeze(2))
+                loss = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum(dim=(1,2))
+                return loss / (b * f * t * h * w)
+            else:
+                p_dt = pred_dt.reshape(self.n_members, -1)
+                t_dt = tar_dt.unsqueeze(0).reshape(1, -1)
+                
+                diff = self.pdist(p_dt, t_dt)
+                dist_matrix = self.pdist(p_dt.unsqueeze(1), p_dt.unsqueeze(0))
+
+                diff_terms = self.diag_mask * (diff.unsqueeze(0) + diff.unsqueeze(1))
+                loss = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum()
+                return loss / (b * f * c * t * h * w)
 
     def forward(self, prediction, target, average_channels=True):
         """
@@ -450,20 +530,33 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             else:
                 loss = crps.mean(dim=(0, 1, 2, 4, 5))
 
+            # Average Global Mean Bias Penalty (masked by lsm so land is ignored when weights are 0)
             if self.mean_penalty > 0:
-                ens_global_means = prediction.mean(dim=(0, 1, 2, 3, 5, 6)) # [C]
-                target_global_means = target.mean(dim=(0, 1, 2, 4, 5)) # [C]
+                lsm = self.lsm_tensor  # [1, 1, 1, 1, H, W] or all ones if no lsm_file
+                # Masked mean over ocean only: sum(x*lsm) / sum(lsm) over the reduced dims
+                n_ens, n_b, n_f, n_t = prediction.shape[0], prediction.shape[1], prediction.shape[2], prediction.shape[3]
+                ocean_count = n_ens * n_b * n_f * n_t * lsm.sum()
+                ens_global_means = (prediction * lsm).sum(dim=(0, 1, 2, 3, 5, 6)) / (ocean_count + 1e-8)  # [C]
+                target_ocean_count = n_b * n_f * n_t * lsm.sum()
+                target_global_means = (target * lsm).sum(dim=(0, 1, 2, 4, 5)) / (target_ocean_count + 1e-8)  # [C]
                 bias_penalty = self.mean_penalty * th.abs(ens_global_means - target_global_means)
                 if average_channels:
                     loss += bias_penalty.mean()
                 else:
                     loss += bias_penalty
 
+            # Spatial Pooling Loss
             if self.multiscale > 0.:
                 crps_scales = 0
                 for scale in self.scales:
-                    pred, tar, lsm = self._pool(prediction, scale), self._pool(target, scale), self._pool(self.lsm_tensor, scale)
-                    crps_scale = self._2member_crps(pred, tar, lsm)
+                    if self.masked_pool:
+                        pred, mask_pooled = self._masked_pool(prediction, self.lsm_tensor, scale)
+                        tar, _ = self._masked_pool(target, self.lsm_tensor, scale)
+                        crps_scale = self._2member_crps(pred, tar, mask_pooled)
+                    else:
+                        pred, tar, lsm = self._pool(prediction, scale), self._pool(target, scale), self._pool(self.lsm_tensor, scale)
+                        crps_scale = self._2member_crps(pred, tar, lsm)
+
                     if average_channels:
                         crps_scale = crps_scale.mean()
                     else:
@@ -472,6 +565,12 @@ class WeightedCRPSLoss(th.nn.MSELoss):
 
                 crps_scales = crps_scales / len(self.scales)
                 loss += self.multiscale * crps_scales
+            
+            # Temporal Dt Loss (Xt - Xt-1)
+            if self.temporal_dt > 0.:
+                dt_loss = self._calculate_dt_loss(prediction, target, average_channels)
+                loss += self.temporal_dt * dt_loss
+            
                 
             return loss
         else:

@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 
+import dask
 import numpy as np
 import pandas as pd
 import torch
@@ -191,12 +192,13 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         batch = {"time": slice(*time_index)}
         load_time = time.time()
 
-        input_array = (
-            self.ds["inputs"]
-            .sel(channel_in=self.input_variables)
-            .isel(**batch)
-            .values.copy()
-        )
+        with dask.config.set(scheduler='synchronous'):
+            input_array = (
+                self.ds["inputs"]
+                .sel(channel_in=self.input_variables)
+                .isel(**batch)
+                .values.copy()
+            )
         # retrieve coupled inputs
         if len(self.couplings) > 0:
             integrated_couplings = np.concatenate(
@@ -214,12 +216,13 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             # BAD NEWS: Indexing the array as commented out below causes unexpected behavior in target creation.
             #     leaving this in here as a warning
             # target_array = self.ds['targets'].isel(**batch).to_numpy()
-            target_array = (
-                self.ds["targets"]
-                .sel(channel_out=self.output_variables)
-                .isel(**batch)
-                .values.copy()
-            )
+            with dask.config.set(scheduler='synchronous'):
+                target_array = (
+                    self.ds["targets"]
+                    .sel(channel_out=self.output_variables)
+                    .isel(**batch)
+                    .values.copy()
+                )
             target_array = (
                 target_array - self.target_scaling["mean"]
             ) / self.target_scaling["std"]

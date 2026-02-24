@@ -19,7 +19,7 @@ from typing import Sequence
 import torch as th
 from hydra.utils import instantiate
 from omegaconf import DictConfig
-
+from torch.utils.checkpoint import checkpoint as ckpt_fn
 
 
 class UNetDecoder(th.nn.Module):
@@ -37,6 +37,8 @@ class UNetDecoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        cln_per_level: Sequence = None,
+        act_ckpt_levels: Sequence = None,
     ):
         """
         Parameters
@@ -62,9 +64,32 @@ class UNetDecoder(th.nn.Module):
             If channel last format should be used
         enable_healpixpad, bool, optional
             If the healpixpad library should be used if installed
+        cln_per_level: Sequence, optional
+            Per-level flag for conditional layer norm. If provided, length must equal
+            len(n_channels). Where cln_per_level[n] is False, that level gets
+            conditional_layer_norm=None. If None (default), all levels use conv_block as-is (backward compatible).
+        act_ckpt_levels: Sequence, optional
+            Per-level boolean flags for activation checkpointing. If provided,
+            length must equal len(n_channels). Levels marked True will have
+            their upsample+conv forward pass wrapped with
+            torch.utils.checkpoint to trade compute for memory. Recurrent
+            blocks are always run outside the checkpoint boundary to protect
+            hidden state. If None (default), no checkpointing is used.
         """
         super().__init__()
         self.channel_dim = 1  # 1 in previous layout
+
+        if act_ckpt_levels is not None and len(act_ckpt_levels) != len(n_channels):
+            raise ValueError(
+                f"act_ckpt_levels length ({len(act_ckpt_levels)}) must equal "
+                f"number of decoder levels ({len(n_channels)})"
+            )
+        self.act_ckpt_levels = act_ckpt_levels
+
+        if cln_per_level is not None and len(cln_per_level) != len(n_channels):
+            raise ValueError(
+                f"cln_per_level length ({len(cln_per_level)}) must equal number of decoder levels ({len(n_channels)})"
+            )
 
         if dilations is None:
             # Defaults to [1, 1, 1...] in accordance with the number of unet levels
@@ -88,18 +113,33 @@ class UNetDecoder(th.nn.Module):
                 n_channels[n + 1] if n < len(n_channels) - 1 else n_channels[-1]
             )
 
-            conv_module = instantiate(
-                config=conv_block,
-                in_channels=curr_channel * 2
-                if n > 0
-                else curr_channel,  # Considering skip connection
-                latent_channels=curr_channel,
-                out_channels=next_channel,
-                dilation=dilations[n],
-                n_layers=n_layers[n],
-                enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
-            )
+            if cln_per_level is not None and not cln_per_level[n]:
+                conv_module = instantiate(
+                    config=conv_block,
+                    in_channels=curr_channel * 2
+                    if n > 0
+                    else curr_channel,  # Considering skip connection
+                    latent_channels=curr_channel,
+                    out_channels=next_channel,
+                    dilation=dilations[n],
+                    n_layers=n_layers[n],
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                    conditional_layer_norm=None,
+                )
+            else:
+                conv_module = instantiate(
+                    config=conv_block,
+                    in_channels=curr_channel * 2
+                    if n > 0
+                    else curr_channel,  # Considering skip connection
+                    latent_channels=curr_channel,
+                    out_channels=next_channel,
+                    dilation=dilations[n],
+                    n_layers=n_layers[n],
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
 
             # Recurrent module
             if recurrent_block is not None:
@@ -132,6 +172,19 @@ class UNetDecoder(th.nn.Module):
             enable_healpixpad=enable_healpixpad,
         )
 
+    def _forward_level(self, layer, x, skip, conditions_cln):
+        """Run one decoder level (upsample + conv), excluding recurrent."""
+        if layer["upsamp"] is not None:
+            x = layer["upsamp"](x)
+            x = th.cat([x, skip], dim=self.channel_dim)
+        if hasattr(layer["conv"], "cln_enabled") and layer["conv"].cln_enabled:
+            if conditions_cln is None:
+                raise ValueError("Conditional inputs are required for layers with cln_enabled=True")
+            x = layer["conv"](x, conditions_cln=conditions_cln)
+        else:
+            x = layer["conv"](x)
+        return x
+
     def forward(self, inputs: Sequence, conditions_cln: Sequence = None) -> th.Tensor:
         """
         Forward pass of the HEALPix Unet decoder
@@ -149,18 +202,14 @@ class UNetDecoder(th.nn.Module):
         """
         x = inputs[-1]
         for n, layer in enumerate(self.decoder):
-            if layer["upsamp"] is not None:
-                up = layer["upsamp"](x)
-                x = th.cat([up, inputs[-1 - n]], dim=self.channel_dim)
-            # apply the conv block, check if the layer accepts conditional inputs
-            if conditions_cln is not None:
-                if hasattr(layer["conv"], "cln_enabled") and layer["conv"].cln_enabled:
-                    x = layer["conv"](x, conditions_cln=conditions_cln)
-                else:
-                    raise ValueError("Conditional input passed but conv block does not support conditional inputs.")
+            skip = inputs[-1 - n] if layer["upsamp"] is not None else None
+            if self.act_ckpt_levels is not None and self.act_ckpt_levels[n]:
+                x = ckpt_fn(
+                    self._forward_level, layer, x, skip, conditions_cln,
+                    use_reentrant=False,
+                )
             else:
-                x = layer["conv"](x)
-            # apply the recurrent block if it exists
+                x = self._forward_level(layer, x, skip, conditions_cln)
             if layer["recurrent"] is not None:
                 x = layer["recurrent"](x)
         return self.output_layer(x)

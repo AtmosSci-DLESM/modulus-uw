@@ -20,6 +20,14 @@ import os
 from termcolor import colored
 
 
+class FlushingFileHandler(logging.FileHandler):
+    """FileHandler that flushes after each record so logs appear immediately on disk."""
+
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+
 class PythonLogger:
     """Simple console logger for DL training
     This is a WIP
@@ -40,7 +48,7 @@ class PythonLogger:
             "[%(asctime)s - %(name)s - %(levelname)s] %(message)s",
             datefmt="%H:%M:%S",
         )
-        filehandler = logging.FileHandler(file_name)
+        filehandler = FlushingFileHandler(file_name)
         filehandler.setFormatter(formatter)
         filehandler.setLevel(logging.DEBUG)
         self.logger.addHandler(filehandler)

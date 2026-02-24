@@ -16,9 +16,11 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch as th
+
+from physicsnemo.utils.ocean_land_infill import infill_ocean_over_land
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
@@ -66,6 +68,7 @@ class HEALPixUNet(Module):
         couplings: list = [],
         residual_prediction: bool = False,
         constraints: list[DictConfig] = None,
+        ocean_land_infill: Optional[dict] = None,
     ):
         """
         Parameters
@@ -98,7 +101,8 @@ class HEALPixUNet(Module):
         couplings: list, optional
             sequence of dictionaries that describe coupling mechanisms
         residual_prediction: bool, optional
-            If the model should predict the residual between the input and the output. Default: False
+            If True, the model predicts residuals (deltas) from the last input state. Each output
+            time is last_input + delta_i, so all deltas share the same reference. Default: False
         """
         super().__init__()
 
@@ -154,6 +158,29 @@ class HEALPixUNet(Module):
 
         self.constraints = None
         self.set_constraints(constraints)
+
+        # Optional ocean-over-land infill (land pixels set to standardized -1)
+        # Config may contain full dict (land_mask, fill_standardized) or only options (infill_state, infill_coupling).
+        # When only options are in config (e.g. from Hydra), call set_ocean_land_infill_buffers() after init.
+        self._ocean_land_infill = ocean_land_infill
+        if ocean_land_infill is not None and "land_mask" in ocean_land_infill and "fill_standardized" in ocean_land_infill:
+            self.register_buffer("_infill_land_mask", ocean_land_infill["land_mask"])
+            self.register_buffer("_infill_fill_standardized", ocean_land_infill["fill_standardized"])
+            self._infill_state = ocean_land_infill.get("infill_state", False)
+            self._infill_coupling = ocean_land_infill.get("infill_coupling", False)
+        else:
+            self._infill_land_mask = None
+            self._infill_fill_standardized = None
+            self._infill_state = (ocean_land_infill or {}).get("infill_state", False)
+            self._infill_coupling = (ocean_land_infill or {}).get("infill_coupling", False)
+
+    def set_ocean_land_infill_buffers(self, land_mask: th.Tensor, fill_standardized: th.Tensor) -> None:
+        """Set land mask and fill tensors for ocean-over-land infill (e.g. from dataset constants after init)."""
+        for name in ("_infill_land_mask", "_infill_fill_standardized"):
+            if hasattr(self, name):
+                delattr(self, name)
+        self.register_buffer("_infill_land_mask", land_mask)
+        self.register_buffer("_infill_fill_standardized", fill_standardized)
 
     @property
     def integration_steps(self):
@@ -328,7 +355,8 @@ class HEALPixUNet(Module):
             List of hydra instantiable DictConfigs specifying constraints
         """
         if constraints is not None:
-            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
+            # self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
+            self.constraints = th.nn.ModuleList([instantiate(c) for c in constraints])
 
     def forward(self, inputs: Sequence, output_only_last=False, conditions_cln: Sequence=None) -> th.Tensor:
         """
@@ -352,6 +380,26 @@ class HEALPixUNet(Module):
         -------
         th.Tensor: Predicted outputs
         """
+        # Infill ocean variables over land at the start of every forward (every coupled step in inference)
+        if self._ocean_land_infill is not None and self._infill_land_mask is not None:
+            land_threshold = self._ocean_land_infill.get("land_threshold", 0.0)
+            if self._infill_state and len(inputs) > 0:
+                infill_ocean_over_land(
+                    inputs[0],
+                    self._infill_land_mask,
+                    self._infill_fill_standardized,
+                    channel_dim=3,
+                    land_threshold=land_threshold,
+                )
+            if self._infill_coupling and len(inputs) > 3:
+                infill_ocean_over_land(
+                    inputs[3],
+                    self._infill_land_mask,
+                    self._infill_fill_standardized,
+                    channel_dim=2,
+                    land_threshold=land_threshold,
+                )
+
         outputs = []
         for step in range(self.integration_steps):
             if step == 0:
@@ -381,7 +429,39 @@ class HEALPixUNet(Module):
             decodings = self.decoder(encodings, **kwargs)
 
             if self.residual_prediction:
-                prediction = input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
+                state_channels = self.input_channels * self.input_time_dim
+                
+                # Option 1: Same-index add. output_i = input_i + delta_i. Each delta is added to
+                # the input at the same time index. Can cause oscillatory forecasts (first output
+                # good, second bad) when input_time_dim > 1, since the base for each output is
+                # misaligned with the intended temporal advance.
+                # prediction = input_tensor[:, : state_channels] + decodings
+
+                # Option 2: Same reference. output_i = last_input + delta_i. All deltas are
+                # differences from the last input state. No loop; one broadcast + add.
+                last_input_slice = input_tensor[
+                    :, (self.input_time_dim - 1) * self.input_channels : state_channels
+                ]
+                last_input_expanded = last_input_slice.repeat(
+                    1, self.input_time_dim, 1, 1
+                )
+                prediction = decodings + last_input_expanded
+
+                # Option 3: Chained. output_0 = last_input + delta_0, then output_i = output_{i-1}
+                # + delta_i. Each output advances from the previous one (sequential dependency).
+                # Requires a for loop; no extra list/cat if written in-place (see below).
+                # prediction = th.empty_like(decodings)
+                # prediction[:, : self.output_channels] = (
+                #     last_input_slice + decodings[:, : self.output_channels]
+                # )
+                # for i in range(1, self.input_time_dim):
+                #     prev_slice = (i - 1) * self.output_channels
+                #     curr_slice = i * self.output_channels
+                #     next_slice = (i + 1) * self.output_channels
+                #     prediction[:, curr_slice:next_slice] = (
+                #         prediction[:, prev_slice:curr_slice]
+                #         + decodings[:, curr_slice:next_slice]
+                #     )
             else:
                 prediction = decodings
             
@@ -393,6 +473,17 @@ class HEALPixUNet(Module):
             if self.constraints is not None:
                 for constraint in self.constraints:
                     reshaped = constraint(reshaped)
+
+            # Ocean model: infill output over land so recycled state for next step is infilled
+            if self._infill_state and self._infill_land_mask is not None:
+                land_threshold = self._ocean_land_infill.get("land_threshold", 0.0)
+                infill_ocean_over_land(
+                    reshaped,
+                    self._infill_land_mask,
+                    self._infill_fill_standardized,
+                    channel_dim=3,  # reshaped is [B, F, T, C, H, W]
+                    land_threshold=land_threshold,
+                )
 
             outputs.append(reshaped)
 

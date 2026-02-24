@@ -584,14 +584,36 @@ class HEALPixLayer(th.nn.Module):
             enable_healpixpad = False
 
         # Define a HEALPixPadding layer if the given layer is a convolution layer
+        # Handle both int and tuple kernel_size values
+        kernel_size = kwargs.get("kernel_size", 3)
+        if isinstance(kernel_size, (tuple, list)):
+            needs_padding = any(ks > 1 for ks in kernel_size)
+            # For tuple kernel sizes, calculate padding for each dimension
+            # HEALPixPadding applies uniform padding, so we need to use the maximum
+            # padding required across all dimensions to preserve spatial dimensions
+            h_padding = ((kernel_size[0] - 1) // 2) if len(kernel_size) >= 1 else 0
+            w_padding = ((kernel_size[1] - 1) // 2) if len(kernel_size) >= 2 else h_padding
+            # Use max padding to ensure all dimensions are preserved
+            # This ensures uniform padding preserves spatial dimensions for asymmetric kernels
+            max_kernel_size = max(kernel_size)
+            padding = max(h_padding, w_padding)
+        else:
+            needs_padding = kernel_size > 1
+            max_kernel_size = kernel_size
+            padding = None  # Will be calculated below
+        
         if (
             layer.__bases__[0] is th.nn.modules.conv._ConvNd
-            and kwargs["kernel_size"] > 1
+            and needs_padding
         ):
             kwargs["padding"] = 0  # Disable native padding
-            kernel_size = 3 if "kernel_size" not in kwargs else kwargs["kernel_size"]
-            dilation = 1 if "dilation" not in kwargs else kwargs["dilation"]
-            padding = ((kernel_size - 1) // 2) * dilation
+            dilation = kwargs.get("dilation", 1)
+            # Calculate padding if not already calculated (for int kernel_size)
+            if padding is None:
+                padding = ((max_kernel_size - 1) // 2) * dilation
+            else:
+                # Apply dilation to the calculated padding
+                padding = padding * dilation
             if (
                 enable_healpixpad
                 and have_healpixpad
