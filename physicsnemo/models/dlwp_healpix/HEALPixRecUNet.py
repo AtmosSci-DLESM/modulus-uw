@@ -302,8 +302,10 @@ class HEALPixRecUNet(Module):
             ]
             res = th.cat(result, dim=self.channel_dim)
 
-        # fold faces into batch dim
+        # fold faces into batch dim (BF, C, H, W)
         res = self.fold(res)
+        if self.enable_nhwc:
+            res = res.to(memory_format=th.channels_last)
         return res
 
     def _reshape_outputs(self, outputs: th.Tensor) -> th.Tensor:
@@ -442,6 +444,7 @@ class HEALPixRecUNet(Module):
         self.reset()
         outputs = []
         for step in range(self.integration_steps):
+            th.cuda.nvtx.range_push(f"Integration step: {step}")
             # (Re-)initialize recurrent hidden states
             if (step * (self.delta_t * self.input_time_dim)) % self.reset_cycle == 0:
                 if conditions_cln is not None:
@@ -490,6 +493,7 @@ class HEALPixRecUNet(Module):
                         inputs=[outputs[-1]] + list(inputs[1:]),
                         step=step + self.presteps,
                     )
+            th.cuda.nvtx.range_pop()
 
             # Forward through model, with or without conditions
             if conditions_cln is not None:
@@ -497,16 +501,23 @@ class HEALPixRecUNet(Module):
             else:
                 kwargs = {}
 
+            th.cuda.nvtx.range_push("Encoder")
             encodings = self.encoder(input_tensor, **kwargs)
+            th.cuda.nvtx.range_pop()
+            th.cuda.nvtx.range_push("Dencoder")
             decodings = self.decoder(encodings, **kwargs)
+            th.cuda.nvtx.range_pop()
+
             # Residual prediction
             if self.residual_prediction:
                 prediction = input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
             else:
                 prediction = decodings
+            th.cuda.nvtx.range_push("Reshape outputs")
             reshaped = self._reshape_outputs(
                 prediction
             )
+            th.cuda.nvtx.range_pop()
 
             # Apply constraints
             if self.constraints is not None:
@@ -514,6 +525,7 @@ class HEALPixRecUNet(Module):
                     reshaped = constraint(reshaped)
 
             outputs.append(reshaped)
+            th.cuda.nvtx.range_pop()
 
         if output_only_last:
             return outputs[-1]

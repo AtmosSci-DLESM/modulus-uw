@@ -432,7 +432,11 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             raise ValueError(f"Shape of prediction should have ensemble dimension of size {self.n_members}, got {prediction.shape[0]}")
 
         n = self.n_members
-
+        
+        # Manual Cast
+        prediction = prediction.to(th.float32)
+        target = target.to(th.float32)
+        
         # Apply channel weights across channel dims
         prediction *= self.loss_weights[None, None, None, None, :, None, None]
         target *= self.loss_weights[None, None, None, :, None, None]
