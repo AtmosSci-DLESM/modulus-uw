@@ -208,9 +208,9 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
             )
 
         # for models with extra outputs
-        if "tp6" in self.ds["targets"].channel_out:
-            input_array = (input_array - self.input_scaling["mean"][:,:-1]) \
-                    / self.input_scaling["std"][:,:-1]
+        if len(self.ds["targets"].channel_out) != (len(self.ds["inputs"].channel_in)-len(self.couplings)):
+            input_array = (input_array - self.input_scaling["mean"][:,:-len(self.couplings)]) \
+                    / self.input_scaling["std"][:,:-len(self.couplings)]
         else:
             input_array = (input_array - self.input_scaling["mean"]) \
                     / self.input_scaling["std"]
