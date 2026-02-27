@@ -478,7 +478,6 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
     def forward(self, prediction, target, average_channels=True):
         """
         Forward pass of the WeightedMSE pass
-        #Tensors are expected to be in the shape [N, B, F, C, H, W]
         Tensors are expected to be in the shape [N, F, B, C, H, W]
 
         Parameters
@@ -497,7 +496,6 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             prediction = prediction.float()
             target = target.float()
 
-            # N, B, F, C, H, W = tuple(prediction.shape)
             N, F, B, C, H, W = tuple(prediction.shape)
 
             if not (prediction.ndim == 6 and target.ndim == 6):
@@ -657,7 +655,7 @@ class LossWithHydrostasy(torch.nn.MSELoss):
         # Get topography information
         ds = xr.open_zarr(f"{src_directory}{dataset_name}.zarr")
         self.topography = (
-            surface_geopotential_std * ds.constants[1, :, :, :].values
+            surface_geopotential_std * ds.constants.sel(channel_c='z').values
             + surface_geopotential_mean
         ) / self.g0
 
@@ -789,8 +787,7 @@ class LossWithHydrostasy(torch.nn.MSELoss):
 
     def forward(self, prediction, target, average_channels=True):
         """
-        Forward pass of the WeightedMSE pass
-        #Tensors are expected to be in the shape [N, B, F, C, H, W]
+        Forward pass of LossWithHydrostasy
         Tensors are expected to be in the shape [N, F, B, C, H, W]
 
         Parameters
@@ -808,9 +805,6 @@ class LossWithHydrostasy(torch.nn.MSELoss):
         with torch.cuda.amp.autocast(enabled=False):
             prediction = prediction.float()
             target = target.float()
-
-            # N, B, F, C, H, W = tuple(prediction.shape)
-            N, F, B, C, H, W = tuple(prediction.shape)
 
             if not (prediction.ndim == 6 and target.ndim == 6):
                 raise AssertionError("Expected predictions to have 6 dimensions")
