@@ -241,10 +241,10 @@ class TimeSeriesDataset(Dataset, Datapipe):
 
         # REMARK: we remove the xarray overhead from these
         try:
-            # we use channel_out instead of channel_in because
-            # the list of input channels may contain data fetched outside
-            # the datasets such as coupled fields
-            if "tp6" in self.ds["targets"].channel_out:
+            # 'if' statement used for cases where atmos model
+            # includes diagnostic variables like tp6 and msl.
+            # using 'channel_out' is still necessary for ocean models.
+            if len(self.ds.channel_out) != (len(self.ds.channel_in)-len(self.couplings)):
                 self.input_scaling = scaling_da.sel(
                     index=self.ds.channel_in.values
                 ).rename({"index": "channel_in"})
