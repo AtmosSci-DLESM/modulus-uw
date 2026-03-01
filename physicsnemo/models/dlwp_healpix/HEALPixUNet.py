@@ -69,6 +69,7 @@ class HEALPixUNet(Module):
         residual_prediction: bool = False,
         constraints: list[DictConfig] = None,
         ocean_land_infill: Optional[dict] = None,
+        hpx_padding_mode: str = "karlbauer",
     ):
         """
         Parameters
@@ -103,6 +104,9 @@ class HEALPixUNet(Module):
         residual_prediction: bool, optional
             If True, the model predicts residuals (deltas) from the last input state. Each output
             time is last_input + delta_i, so all deltas share the same reference. Default: False
+        hpx_padding_mode: str, optional
+            Method to use for padding HEALPix faces for convolutions. Options
+            are 'karlbauer' (default) and 'isolat' (isolatitude).
         """
         super().__init__()
 
@@ -130,6 +134,7 @@ class HEALPixUNet(Module):
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
         self.residual_prediction = residual_prediction
+        self.hpx_padding_mode = hpx_padding_mode
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -147,6 +152,7 @@ class HEALPixUNet(Module):
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
+            hpx_padding_mode=self.hpx_padding_mode,
         )
         self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
@@ -154,6 +160,7 @@ class HEALPixUNet(Module):
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
+            hpx_padding_mode=self.hpx_padding_mode,
         )
 
         self.constraints = None

@@ -60,6 +60,7 @@ class ConvGRUBlock(th.nn.Module):
         kernel_size: int = 1,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = "karlbauer",
     ):
         """
         Parameters
@@ -86,6 +87,7 @@ class ConvGRUBlock(th.nn.Module):
             padding="same",
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
         self.conv_can = geometry_layer(
             layer=torch.nn.Conv2d,
@@ -95,6 +97,7 @@ class ConvGRUBlock(th.nn.Module):
             padding="same",
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
         self.h = th.zeros(1, 1, 1, 1)
 
@@ -154,6 +157,7 @@ class BasicConvBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = "karlbauer",
     ):
         """
         Parameters
@@ -193,6 +197,7 @@ class BasicConvBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if activation is not None:
@@ -233,6 +238,7 @@ class ConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = "karlbauer",
     ):
         """
         Parameters
@@ -271,6 +277,7 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         # Convolution block
         convblock = []
@@ -284,6 +291,7 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -298,6 +306,7 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -311,6 +320,7 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         self.convblock = th.nn.Sequential(*convblock)
@@ -350,6 +360,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = "karlbauer",
     ):
         """
         Parameters:
@@ -389,6 +400,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         if out_channels == int(latent_channels):
             self.skip_module2 = (
@@ -402,6 +414,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
 
         # 1st ConvNeXt block, the output of this one remains internal
@@ -416,6 +429,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -430,6 +444,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -444,6 +459,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -462,6 +478,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -476,6 +493,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -490,6 +508,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -536,6 +555,8 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         dropout: float = 0.0,
         conditional_layer_norm: Callable = None,
         cln_once_per_block: bool = False,
+        use_initial_one_conv: bool = False,
+        hpx_padding_mode: str = "karlbauer",
     ):
         """
         Parameters
@@ -549,6 +570,9 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         cln_once_per_block: bool, optional
             If True, use AdaLN-style (CLN once at block entry, LayerNorm in middle).
             If False (default), keep current structure (3 CLN positions). Backward compatible.
+        use_initial_one_conv: bool, optional
+            If True, each block inserts an optional 1x1 conv before the first 3x3 conv
+            (independent of cln_once_per_block).
         """
         super().__init__()
 
@@ -575,6 +599,8 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                     dropout=dropout,
                     conditional_layer_norm=conditional_layer_norm if conditional_layer_norm is not None else None,
                     cln_once_per_block=cln_once_per_block,
+                    use_initial_one_conv=use_initial_one_conv,
+                    hpx_padding_mode=hpx_padding_mode,
                 ),
             )
 
@@ -607,6 +633,7 @@ class InceptionDWConv2d(th.nn.Module):
         dilation: int = 1,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = "karlbauer",
     ):
         """
         InceptionDWConv2d: Efficient depthwise convolution with channel splitting.
@@ -639,6 +666,7 @@ class InceptionDWConv2d(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         if c2 > 0:
             convs["horiz"] = geometry_layer(
@@ -649,6 +677,7 @@ class InceptionDWConv2d(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         if c3 > 0:
             convs["vert"] = geometry_layer(
@@ -659,6 +688,7 @@ class InceptionDWConv2d(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
 
         self.square_conv = convs.get("square", None)
@@ -747,6 +777,8 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         dropout: float = 0.0,
         conditional_layer_norm: th.nn.Module = None,
         cln_once_per_block: bool = False,
+        use_initial_one_conv: bool = False,
+        hpx_padding_mode: str = "karlbauer",
     ):
         """
         Parameters
@@ -783,6 +815,10 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         cln_once_per_block: bool, optional
             If True, AdaLN-style: one CLN at block entry, LayerNorm in middle.
             If False (default), current structure (3 CLN positions). Backward compatible.
+        use_initial_one_conv: bool, optional
+            If True, insert a 1x1 conv (in_channels → in_channels) before the first 3x3 conv.
+            When cln_once_per_block is True this is after entry norm; otherwise it is the first
+            layer in the main path. Independent of cln_once_per_block. Default False (current behavior).
         """
 
         super().__init__()
@@ -806,6 +842,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     kernel_size=1,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
 
         # Collect conv->norm->activation->dropout operations in list for sequential execution
@@ -834,6 +871,19 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     self.entry_norm = conditional_layer_norm(channel_depth=in_channels)
             else:
                 self.entry_norm = _LayerNormOverChannels(in_channels)
+            if use_initial_one_conv:
+                convblock.append(
+                    geometry_layer(
+                        layer=th.nn.Conv2d,
+                        in_channels=in_channels,
+                        out_channels=in_channels,
+                        kernel_size=1,
+                        dilation=dilation,
+                        enable_nhwc=enable_nhwc,
+                        enable_healpixpad=enable_healpixpad,
+                        hpx_padding_mode=hpx_padding_mode,
+                    )
+                )
             # Conv (3x3 in → latent), Act, [Dropout]
             convblock.append(
                 geometry_layer(
@@ -844,6 +894,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if activation is not None:
@@ -860,6 +911,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             convblock.append(_LayerNormOverChannels(int(latent_channels * upscale_factor)))
@@ -877,6 +929,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             convblock.append(_LayerNormOverChannels(int(latent_channels)))
@@ -894,6 +947,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if activation is not None:
@@ -903,6 +957,19 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             self.convblock = th.nn.ModuleList(convblock)
         else:
             # Current structure: Conv -> [BN] -> [CLN] -> Act -> ... (3 CLN positions when conditional_layer_norm set)
+            if use_initial_one_conv:
+                convblock.append(
+                    geometry_layer(
+                        layer=th.nn.Conv2d,
+                        in_channels=in_channels,
+                        out_channels=in_channels,
+                        kernel_size=1,
+                        dilation=dilation,
+                        enable_nhwc=enable_nhwc,
+                        enable_healpixpad=enable_healpixpad,
+                        hpx_padding_mode=hpx_padding_mode,
+                    )
+                )
             # 3x3: in → latent
             convblock.append(
                 geometry_layer(
@@ -913,6 +980,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if batch_norm:
@@ -937,6 +1005,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if batch_norm:
@@ -959,6 +1028,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if batch_norm:
@@ -981,6 +1051,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if activation is not None:
@@ -1056,6 +1127,7 @@ class InceptionNeXtBlock(th.nn.Module):
         enable_healpixpad: bool = False,
         conditional_layer_norm: Callable = None,
         cln_once_per_block: bool = False,
+        hpx_padding_mode: str = "karlbauer",
     ):
         super().__init__()
 
@@ -1074,6 +1146,7 @@ class InceptionNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
 
         hidden_channels = in_channels * mlp_ratio
@@ -1111,6 +1184,7 @@ class InceptionNeXtBlock(th.nn.Module):
             groups=in_channels,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
         self.mid_norm = _LayerNormOverChannels(in_channels)
         self.pw_expand = geometry_layer(
@@ -1120,6 +1194,7 @@ class InceptionNeXtBlock(th.nn.Module):
             kernel_size=1,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
         self.pw_shrink = geometry_layer(
             layer=th.nn.Conv2d,
@@ -1128,6 +1203,7 @@ class InceptionNeXtBlock(th.nn.Module):
             kernel_size=1,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
 
     def forward(self, x: th.Tensor, conditions_cln: th.Tensor = None) -> th.Tensor:
@@ -1187,6 +1263,7 @@ class SymmetricInceptionNeXtBlock(th.nn.Module):
         conditional_layer_norm: Callable = None,
         cln_once_per_block: bool = False,
         inception_kernel_size: int = 11,
+        hpx_padding_mode: str = "karlbauer",
     ):
         super().__init__()
 
@@ -1207,6 +1284,7 @@ class SymmetricInceptionNeXtBlock(th.nn.Module):
                     kernel_size=1,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
 
         convblock = []
@@ -1243,6 +1321,7 @@ class SymmetricInceptionNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             # 1x1 in_channels -> latent_channels
@@ -1255,6 +1334,7 @@ class SymmetricInceptionNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if activation is not None:
@@ -1272,6 +1352,7 @@ class SymmetricInceptionNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             convblock.append(_LayerNormOverChannels(int(latent_channels * upscale_factor)))
@@ -1290,6 +1371,7 @@ class SymmetricInceptionNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             convblock.append(_LayerNormOverChannels(int(latent_channels)))
@@ -1308,6 +1390,7 @@ class SymmetricInceptionNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if activation is not None:
@@ -1331,6 +1414,7 @@ class SymmetricInceptionNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             convblock.append(
@@ -1342,6 +1426,7 @@ class SymmetricInceptionNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if batch_norm:
@@ -1370,6 +1455,7 @@ class SymmetricInceptionNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if batch_norm:
@@ -1398,6 +1484,7 @@ class SymmetricInceptionNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if batch_norm:
@@ -1426,6 +1513,7 @@ class SymmetricInceptionNeXtBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
             if activation is not None:
@@ -1485,6 +1573,7 @@ class Multi_SymmetricInceptionNeXtBlock(th.nn.Module):
         conditional_layer_norm: Callable = None,
         cln_once_per_block: bool = False,
         inception_kernel_size: int = 11,
+        hpx_padding_mode: str = "karlbauer",
     ):
         super().__init__()
 
@@ -1510,6 +1599,7 @@ class Multi_SymmetricInceptionNeXtBlock(th.nn.Module):
                     conditional_layer_norm=conditional_layer_norm if conditional_layer_norm is not None else None,
                     cln_once_per_block=cln_once_per_block,
                     inception_kernel_size=inception_kernel_size,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             )
 
@@ -1536,6 +1626,7 @@ class MaxPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = "karlbauer",
     ):
         """
         Parameters
@@ -1555,6 +1646,7 @@ class MaxPool(th.nn.Module):
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
 
     def forward(self, x):
@@ -1584,6 +1676,7 @@ class AvgPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = "karlbauer",
     ):
         """
         Parameters
@@ -1603,6 +1696,7 @@ class AvgPool(th.nn.Module):
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
 
     def forward(self, x):
@@ -1640,6 +1734,7 @@ class TransposedConvUpsample(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = "karlbauer",
     ):
         """
         Parameters
@@ -1672,6 +1767,7 @@ class TransposedConvUpsample(th.nn.Module):
                 padding=0,
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
             )
         )
         if activation is not None:
@@ -1692,6 +1788,112 @@ class TransposedConvUpsample(th.nn.Module):
             The upsampled values
         """
         return self.upsampler(x)
+
+
+class SmoothedInterpolateConv(th.nn.Module):
+    """
+    Class for sequentially interpolating, applying a smoothing filter which
+    preserves zonally uniform signals, then applying a simple Conv2d on
+    HEALPix tensor data
+    """
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels = 3,
+        out_channels = 3,
+        kernel_size = 3,
+        dilation = 1,
+        scale_factor = 2,
+        mode = 'nearest',
+        activation: th.nn.Module = None,
+        enable_nhwc = False,
+        enable_healpixpad = True,
+        hpx_padding_mode: str = "karlbauer",
+    ):
+        """
+        Parameters
+        ----------
+        geometry_layer: torch.nn.Module, optional
+            The wrapper for the geometry of the tensor being bassed to this module
+        in_channels: int, optional
+            The number of input channels
+        out_channels: int, optional
+            The number of output channels
+        kernel_size: int, optional
+            Size of the convolutional kernel
+        dilation: int, optional
+            Spacing between kernel points, passed to torch.nn.Conv2d
+        scale_factor: int, optional
+            Multiplier for spatial size, passed to torch.nn.functional.interpolate
+        mode: str, optional
+            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
+        activation: torch.nn.Module, optional
+            Activation function used in upsampling
+        enable_nhwc: bool, optional
+            Enable nhwc format, passed to wrapper
+        enable_healpixpad: bool, optional
+            If HEALPixPadding should be enabled, passed to wrapper
+        """
+        super().__init__()
+
+        if dilation > 1:
+            raise Exception(
+                f"dilation > 1 is not currently supported for hpx resize \
+                convolutions, received dilation = {dilation}"
+            )
+
+        # We pad first before upsampling to prevent edge artifacts at seams
+        # between HPX faces. This means that our final upsampled signal will
+        # have extra padding which we need to trim before passing to conv. We
+        # only require padding=1 before upsampling, so only need to trim 1 row/
+        # column from each side of result.
+        trim_size = 1 
+
+        block = []
+        block += [
+            geometry_layer(
+                layer=SmoothedInterpolate,
+                in_channels=in_channels,
+                scale_factor=scale_factor,
+                mode=mode,
+                trim_size=trim_size,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+            ),
+            geometry_layer(
+                layer=torch.nn.Conv2d,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+            )
+        ]
+
+        if activation is not None:
+            block.append(activation)
+        self.block = th.nn.Sequential(*block)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """
+        Forward pass of the ResizeConv layer
+
+        Parameters
+        ----------
+        x: torch.Tensor
+            inputs to the forward pass
+
+        Returns
+        -------
+        torch.Tensor
+            result of the forward pass
+        """
+        x = self.block(x)
+        return x
 
 
 #
@@ -1732,5 +1934,70 @@ class Interpolate(th.nn.Module):
             the interpolated values
         """
         return self.interp(inputs, scale_factor=self.scale_factor, mode=self.mode)
+
+
+class SmoothedInterpolate(th.nn.Module):
+    """
+    Helper class for interpolating a HEALPix signal then applying a four point
+    smoother which preserves zonal uniformity if the upsampling mode is nearest
+    neighbor or bilinear.
+    """
+    
+    def __init__(
+        self,
+        in_channels: int = 3,
+        scale_factor: int = 2,
+        mode: str = 'nearest',
+        trim_size: int = 0,
+    ):
+        """
+        Parameters
+        ----------
+        in_channels: int, optional
+            The number of input channels
+        scale_factor: int, optional
+            Multiplier for spatial size, passed to torch.nn.functional.interpolate
+        mode: str, optional
+            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
+        trim_size: int, optional
+            Amount of padding to trim from final tensor, which is assumed to be
+            square
+        """
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.scale_factor = scale_factor
+        self.mode = mode
+        self.trim_size = trim_size
+        self.interp = th.nn.functional.interpolate
+
+        # Four point smoother specific to HPX grid. This smooths out the specific
+        # type of aliasing that nearest neighbor and bilinear upsampling introduce
+        # into zonally uniform signals
+        self.smoother_kernel = torch.tensor(
+            [[0.,1.,0.],
+             [1.,0.,1.],
+             [0.,1.,0.]]
+        )
+        self.smoother_kernel = self.smoother_kernel.unsqueeze(0).unsqueeze(0)  # shape (1,1,3,3)
+        self.smoother_kernel = self.smoother_kernel.repeat((in_channels,1,1,1))
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        self.smoother_kernel = self.smoother_kernel.to(device=x.device, dtype=x.dtype)
+
+        # Interpolate, smooth, trim in order
+        x = self.interp(x, scale_factor=self.scale_factor, mode=self.mode)
+
+        x = torch.nn.functional.conv2d(
+            x,
+            self.smoother_kernel,
+            padding=0,
+            groups=self.in_channels
+        ) / 4 # divide by 4 to take average of 4 neighbors
+
+        if self.trim_size > 0:
+            x = x[..., self.trim_size:-self.trim_size, self.trim_size:-self.trim_size]
+
+        return x
 
 

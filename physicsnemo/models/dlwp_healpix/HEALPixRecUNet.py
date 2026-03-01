@@ -71,6 +71,7 @@ class HEALPixRecUNet(Module):
         residual_prediction: bool = True,
         constraints: list[DictConfig] = None,
         ocean_land_infill: Optional[dict] = None,
+        hpx_padding_mode: str = "karlbauer",
     ):
         """
         Parameters
@@ -109,6 +110,9 @@ class HEALPixRecUNet(Module):
             sequence of dictionaries that describe coupling mechanisms
         residual_prediction: bool, optional
             If the model should predict the residual between the input and the output. Default: True
+        hpx_padding_mode: str, optional
+            Method to use for padding HEALPix faces for convolutions. Options
+            are 'karlbauer' (default) and 'isolat' (isolatitude).
         """
         super().__init__()
         self.channel_dim = 2  # Now 2 with [B, F, T*C, H, W]. Was 1 in old data format with [B, T*C, F, H, W]
@@ -144,6 +148,7 @@ class HEALPixRecUNet(Module):
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
         self.residual_prediction = residual_prediction
+        self.hpx_padding_mode = hpx_padding_mode
 
         # Optional ocean-over-land infill (land pixels set to standardized -1)
         # Config may contain full dict (land_mask, fill_standardized) or only options (infill_state, infill_coupling).
@@ -176,6 +181,7 @@ class HEALPixRecUNet(Module):
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
+            hpx_padding_mode=self.hpx_padding_mode,
         )
         self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
@@ -183,6 +189,7 @@ class HEALPixRecUNet(Module):
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
+            hpx_padding_mode=self.hpx_padding_mode,
         )
 
         self.constraints = None

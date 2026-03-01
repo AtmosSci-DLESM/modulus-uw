@@ -38,6 +38,7 @@ class UNetEncoder(th.nn.Module):
         enable_healpixpad: bool = False,
         cln_per_level: Sequence = None,
         act_ckpt_levels: Sequence = None,
+        hpx_padding_mode: str = "karlbauer",
     ):
         """
         Parameters
@@ -101,6 +102,7 @@ class UNetEncoder(th.nn.Module):
                         config=down_sampling_block,
                         enable_nhwc=enable_nhwc,
                         enable_healpixpad=enable_healpixpad,
+                        hpx_padding_mode=hpx_padding_mode,
                     )
                 )
             if cln_per_level is not None and not cln_per_level[n]:
@@ -115,6 +117,7 @@ class UNetEncoder(th.nn.Module):
                         enable_nhwc=enable_nhwc,
                         enable_healpixpad=enable_healpixpad,
                         conditional_layer_norm=None,
+                        hpx_padding_mode=hpx_padding_mode,
                     )
                 )
             else:
@@ -128,6 +131,7 @@ class UNetEncoder(th.nn.Module):
                         n_layers=n_layers[n],
                         enable_nhwc=enable_nhwc,
                         enable_healpixpad=enable_healpixpad,
+                        hpx_padding_mode=hpx_padding_mode,
                     )
                 )
             old_channels = curr_channel

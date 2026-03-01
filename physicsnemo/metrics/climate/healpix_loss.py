@@ -14,8 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence
+from typing import Sequence, Optional
 
+import math
 import numpy as np
 import torch as th
 import xarray as xr
@@ -327,6 +328,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         lsm_file: str = None,
         open_dict: dict = {"engine": "zarr"},
         selection_dict: dict = {"channel_c": "land_sea_mask"},
+        lsm_binary_mask: bool = False,
+        lsm_binary_threshold: float = 0.5,
         multiscale: float = 0.0,
         masked_pool: bool = False,
         temporal_dt: float = 0.0,
@@ -345,16 +348,25 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             weight for the penalty constraining the global mean of the ensemble to be close to the target mean
             if 0, no penalty is applied
         lsm_file: str
-            land-sea-mask file
+            land-sea-mask file. When provided, lsm_tensor weights the loss per grid cell.
         open_dict: dict, optional
             dictionary that store land-sea-mask file information
         selection_dict: dict, optional
             dictionary that store channel selection information
+        lsm_binary_mask: bool, optional
+            If False (default), lsm_tensor = 1 - land_fraction (continuous mask, loss weighted by ocean fraction).
+            If True, use a binary mask: land < lsm_binary_threshold → weight 1, land >= lsm_binary_threshold → weight 0.
+            With default threshold 0.5, matches infill logic in ocean_land_infill (land_mask >= 0.5 → land).
+        lsm_binary_threshold: float, optional
+            Float in [0, 1], default 0.5. When lsm_binary_mask is True, grid cells with land fraction
+            < lsm_binary_threshold contribute 1 to the loss; cells with land >= lsm_binary_threshold
+            contribute 0. Ignored when lsm_binary_mask is False.
         multiscale: float, optional
             weight for the multiscale CRPS loss. Default is 0, no multiscale loss is applied.
         masked_pool: bool, optional
-            if True, spatial pooling uses only ocean pixels (land ignored). When lsm_file is
-            provided, masked pooling is used automatically so land is always ignored in multiscale.
+            if True, spatial pooling uses only ocean pixels (land ignored). When using
+            land masking/infilling with multiscale, set masked_pool=True so land and
+            infilled values do not contribute to spatial averages.
         """
         super().__init__()
         self.loss_weights = th.tensor(weights)
@@ -371,7 +383,14 @@ class WeightedCRPSLoss(th.nn.MSELoss):
 
         if lsm_file is not None:
             self.lsm_ds = xr.open_dataset(lsm_file, **open_dict).constants.sel(selection_dict)
-            self.lsm_tensor = 1 - th.tensor(np.expand_dims(self.lsm_ds.values, (0, 2, 3)))
+            lsm_values = np.expand_dims(self.lsm_ds.values, (0, 2, 3))
+            if lsm_binary_mask:
+                # Binary mask: 1 where land < threshold (cell contributes to loss), 0 where land >= threshold
+                lsm_binary = (lsm_values < lsm_binary_threshold).astype(np.float32)
+                self.lsm_tensor = th.tensor(lsm_binary)
+            else:
+                # Continuous mask: 1 - land_fraction (ocean fraction), loss weighted by ocean
+                self.lsm_tensor = 1 - th.tensor(lsm_values.astype(np.float32))
         else:
             self.lsm_tensor = th.ones(1, 1, 1, 1, 1, 1) # Spoof the tensor dimensions for broadcasting
 
@@ -924,3 +943,321 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
             return loss
         
+
+class CosineAnnealedOceanCRPSLoss(th.nn.Module):
+    """
+    Hybrid loss that combines an ensemble-anchored weighted ocean MSE with a
+    probabilistic `WeightedCRPSLoss` using a cosine annealing schedule:
+
+        L_total(t) = alpha(t) * lambda_mse * L_MSE + (1 - alpha(t)) * L_CRPS
+
+    where alpha(t) decays smoothly from 1 -> 0 over a configured number of training steps.
+
+    Parameters
+    ----------
+    mse_weights : Sequence
+        Per-channel weights for the deterministic MSE anchor. Length must match the
+        number of output variables for the ocean model (i.e. `len(trainer.output_variables)`).
+    crps_weights : Sequence
+        Per-channel weights for the CRPS term, passed directly to `WeightedCRPSLoss`.
+        Length must also match `len(trainer.output_variables)`.
+    n_members : int, optional
+        Number of ensemble members in the model output. The batch dimension of
+        `prediction` is assumed to be `n_members * batch_size`.
+    alpha : float, optional
+        Fair-CRPS coefficient for `WeightedCRPSLoss` (as in the original class).
+        Values in (0, 1]; 1.0 recovers the fair CRPS formulation.
+    mean_penalty : float, optional
+        Weight for the global-mean bias penalty inside `WeightedCRPSLoss`. If 0.0,
+        no mean-bias penalty is applied.
+    lsm_file : str, optional
+        Path to the land–sea mask dataset. If given, both MSE and CRPS terms ignore
+        land points according to this mask.
+    open_dict : dict, optional
+        Keyword arguments passed to `xarray.open_dataset` when loading `lsm_file`
+        (e.g. `{"engine": "zarr"}`).
+    selection_dict : dict, optional
+        Selection dictionary used to extract the mask variable from `lsm_file`
+        (e.g. `{"channel_c": "land_sea_mask"}` or `{"channel_c": "lsm"}`).
+    lsm_binary_mask : bool, optional
+        If True, use a binary LSM in `WeightedCRPSLoss` (land < lsm_binary_threshold → 1, else 0).
+        If False (default), use continuous mask (1 - land_fraction). Passed to
+        `WeightedCRPSLoss`.
+    lsm_binary_threshold : float, optional
+        Float in [0, 1], default 0.5. When lsm_binary_mask is True, this is the land-fraction
+        threshold used for the binary mask. Passed to `WeightedCRPSLoss`.
+    multiscale : float, optional
+        Weight for the multiscale CRPS term in `WeightedCRPSLoss`. Zero disables
+        multiscale CRPS.
+    masked_pool : bool, optional
+        If True, spatial pooling in the multiscale CRPS term uses only ocean pixels
+        (land ignored). When `lsm_file` is provided, masked pooling is effectively
+        enabled for that path.
+    temporal_dt : float, optional
+        Weight for the temporal-gradient CRPS term (time-difference CRPS). Zero
+        disables this term.
+    mse_scale : float, optional
+        Static scaling factor for the MSE anchor. Used when `auto_calibrate_scale`
+        is False. Effective scale is applied as `lambda_mse * alpha(t) * L_MSE`.
+    auto_calibrate_scale : bool, optional
+        If True, ignore `mse_scale` initially and, on the first forward pass, set
+        `lambda_mse` to approximately match the magnitudes of CRPS and MSE on that
+        batch: `lambda_mse ≈ L_CRPS / (L_MSE + eps)`. The calibrated scale is then
+        held fixed for the remainder of training.
+    decay_steps : int, optional
+        Total number of global training steps over which to decay `alpha(t)` from
+        1 to 0. If None, this is inferred in `setup()` using
+        `decay_fraction * trainer.max_epochs * len(trainer.dataloader_train)`.
+    decay_fraction : float, optional
+        Fraction (0, 1] of the total nominal training steps to use when inferring
+        `decay_steps`. For example, `0.5` means the MSE anchor decays away over
+        the first half of training.
+    """
+
+    def __init__(
+        self,
+        mse_weights: Sequence,
+        crps_weights: Sequence,
+        n_members: int = 2,
+        alpha: float = 0.95,
+        mean_penalty: float = 0.0,
+        lsm_file: Optional[str] = None,
+        open_dict: dict = {"engine": "zarr"},
+        selection_dict: dict = {"channel_c": "land_sea_mask"},
+        lsm_binary_mask: bool = False,
+        lsm_binary_threshold: float = 0.5,
+        multiscale: float = 0.0,
+        masked_pool: bool = False,
+        temporal_dt: float = 0.0,
+        mse_scale: float = 1.0,
+        auto_calibrate_scale: bool = False,
+        decay_steps: Optional[int] = None,
+        decay_fraction: float = 0.5,
+    ):
+        super().__init__()
+
+        # Deterministic anchor configuration
+        self.mse_weights = th.tensor(mse_weights)
+        self.mse_scale = float(mse_scale)
+        self.auto_calibrate_scale = bool(auto_calibrate_scale)
+        self._mse_scale_eff: Optional[float] = None
+
+        # Probabilistic CRPS loss (handles LSM loading and most weighting options)
+        self.crps_loss = WeightedCRPSLoss(
+            weights=crps_weights,
+            n_members=n_members,
+            alpha=alpha,
+            mean_penalty=mean_penalty,
+            lsm_file=lsm_file,
+            open_dict=open_dict,
+            selection_dict=selection_dict,
+            lsm_binary_mask=lsm_binary_mask,
+            lsm_binary_threshold=lsm_binary_threshold,
+            multiscale=multiscale,
+            masked_pool=masked_pool,
+            temporal_dt=temporal_dt,
+        )
+
+        # Scheduling state
+        self.training_step: int = 0
+        self.decay_steps: Optional[int] = decay_steps
+        self.decay_fraction: float = float(decay_fraction)
+
+        # Cached LSM tensor (copied from inner CRPS loss in setup)
+        self.lsm_tensor: Optional[th.Tensor] = None
+
+        # Scalars for logging
+        self.last_mse: Optional[th.Tensor] = None
+        self.last_crps: Optional[th.Tensor] = None
+        self.last_total: Optional[th.Tensor] = None
+        self.last_alpha: Optional[th.Tensor] = None
+        self.last_mse_scale_eff: Optional[th.Tensor] = None
+
+    @property
+    def n_members(self) -> int:
+        return self.crps_loss.n_members
+
+    def setup(self, trainer):
+        """
+        Push constants to device and infer decay_steps if not explicitly provided.
+        Expects trainer to define `device`, `output_variables`, and optionally
+        `max_epochs` and `dataloader_train`.
+        """
+        # Validate channel alignment with trainer variables
+        if len(trainer.output_variables) != len(self.mse_weights):
+            raise ValueError("Length of outputs and mse_weights is not the same!")
+
+        # Move weights to device
+        self.mse_weights = self.mse_weights.to(device=trainer.device)
+
+        # Delegate to inner CRPS loss (this also moves its lsm_tensor to device)
+        self.crps_loss.setup(trainer)
+
+        # Share the land–sea mask from the CRPS loss for the MSE anchor
+        self.lsm_tensor = self.crps_loss.lsm_tensor
+
+        # Store total epochs and configure epoch-based decay horizon.
+        # If an explicit decay_steps was provided, interpret it as an
+        # override on the number of decay epochs.
+        self.max_epochs = getattr(trainer, "max_epochs", None)
+        if self.max_epochs is not None:
+            if self.decay_steps is not None:
+                # Treat user-provided decay_steps as decay_epochs for simplicity.
+                self.decay_epochs = max(1, int(self.decay_steps))
+            else:
+                self.decay_epochs = max(1, int(self.decay_fraction * self.max_epochs))
+        else:
+            self.decay_epochs = None
+        # #region agent log
+        try:
+            import json
+            import time
+            with open("/pscratch/sd/z/zespinos/.cursor/debug.log", "a") as _f:
+                _f.write(json.dumps({"hypothesisId": "H2", "location": "healpix_loss.py:setup", "message": "decay_config", "data": {"max_epochs": self.max_epochs, "decay_epochs": self.decay_epochs, "decay_fraction": self.decay_fraction}, "timestamp": int(time.time() * 1000)}) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        self.current_epoch = 0
+
+    def set_training_epoch(self, epoch: int) -> None:
+        """Set the current training epoch for the annealing schedule."""
+        # #region agent log
+        try:
+            import json
+            import time
+            with open("/pscratch/sd/z/zespinos/.cursor/debug.log", "a") as _f:
+                _f.write(json.dumps({"hypothesisId": "H1_H4", "location": "healpix_loss.py:set_training_epoch", "message": "epoch_set", "data": {"epoch_arg": epoch}, "timestamp": int(time.time() * 1000)}) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        self.current_epoch = max(0, int(epoch))
+
+    def set_training_step(self, step: int) -> None:
+        """
+        Backwards-compatible no-op for APIs that still call set_training_step.
+        Epoch-based scheduling is preferred; use set_training_epoch instead.
+        """
+        pass
+
+    def get_alpha(self) -> float:
+        return float(self._alpha())
+
+    def _alpha(self) -> float:
+        # If decay horizon is unknown, keep the MSE anchor fully on.
+        if self.decay_epochs is None or self.decay_epochs <= 0:
+            return 1.0
+        t = min(self.current_epoch, self.decay_epochs)
+        return 0.5 * (1.0 + math.cos(math.pi * float(t) / float(self.decay_epochs)))
+
+    def _compute_ensemble_mse(
+        self,
+        prediction: th.Tensor,
+        target: th.Tensor,
+        average_channels: bool = True,
+    ) -> th.Tensor:
+        """
+        Compute ensemble-anchored, ocean-masked, channel-weighted MSE:
+
+            L_MSE = (1/N) * sum_i (y_i - y_true)^2
+
+        where y_i are ensemble members and y_true is the deterministic target.
+
+        prediction: [Cond*B, F, T, C, H, W]
+        target:     [B, F, T, C, H, W]
+        """
+        b, f, t, c, h, w = target.shape
+        n = self.n_members
+
+        if prediction.ndim != 6 or target.ndim != 6:
+            raise ValueError(
+                f"Expected prediction and target to be 6D, got {prediction.shape} and {target.shape}"
+            )
+
+        if prediction.shape[0] != n * b:
+            raise ValueError(
+                f"Expected prediction first dim {n*b} (= n_members * batch), got {prediction.shape[0]}"
+            )
+
+        # [Cond, B, F, T, C, H, W]
+        pred_ens = prediction.view(n, b, f, t, c, h, w)
+        # Broadcast deterministic target across ensemble dimension
+        tar_ens = target.unsqueeze(0).expand(n, -1, -1, -1, -1, -1, -1)
+
+        # Squared error
+        se = (pred_ens - tar_ens) ** 2
+
+        # Apply per-channel weights
+        se = se * self.mse_weights[None, None, None, None, :, None, None]
+
+        # Apply ocean mask if available (matches CRPS lsm semantics)
+        if self.lsm_tensor is not None:
+            # WeightedCRPSLoss constructs lsm_tensor with shape [1, F, 1, 1, H, W].
+            # This is already broadcastable to [N, B, F, T, C, H, W] along the
+            # ensemble (N), batch (B), time (T), and channel (C) dimensions, so we
+            # simply rely on standard broadcasting here without reshaping.
+            se = se * self.lsm_tensor
+
+        if average_channels:
+            # Global average over all dims
+            return se.mean()
+        else:
+            # Keep per-channel, average over ensemble, batch, faces, time, and spatial dims
+            return se.mean(dim=(0, 1, 2, 3, 5, 6))
+
+    def forward(self, prediction: th.Tensor, target: th.Tensor, average_channels: bool = True) -> th.Tensor:
+        """
+        Forward pass computing both the ensemble-anchored ocean-weighted MSE and the
+        WeightedCRPSLoss, then blending them using the cosine schedule.
+
+        prediction: [Cond*B, F, T, C, H, W]
+        target:     [B, F, T, C, H, W]
+        """
+        # Compute component losses
+        mse_loss = self._compute_ensemble_mse(prediction, target, average_channels=average_channels)
+        crps_loss = self.crps_loss(prediction, target, average_channels=average_channels)
+
+        # Ensure CRPS is a tensor broadcastable with MSE (per-channel or scalar)
+        if not th.is_tensor(crps_loss):
+            crps_loss = th.tensor(crps_loss, device=prediction.device, dtype=mse_loss.dtype)
+
+        # Initialize / update effective MSE scale if auto-calibration is enabled
+        if self._mse_scale_eff is None:
+            if self.auto_calibrate_scale:
+                with th.no_grad():
+                    mse_scalar = mse_loss.mean() if mse_loss.ndim > 0 else mse_loss
+                    crps_scalar = crps_loss.mean() if isinstance(crps_loss, th.Tensor) and crps_loss.ndim > 0 else crps_loss
+                    eps = 1e-8
+                    ratio = (crps_scalar / (mse_scalar + eps)).detach()
+                    self._mse_scale_eff = float(ratio)
+            else:
+                self._mse_scale_eff = float(self.mse_scale)
+
+        mse_scale_eff = float(self._mse_scale_eff if self._mse_scale_eff is not None else self.mse_scale)
+
+        # Cosine schedule
+        alpha = self._alpha()
+        # #region agent log
+        try:
+            import json
+            import time
+            with open("/pscratch/sd/z/zespinos/.cursor/debug.log", "a") as _f:
+                _f.write(json.dumps({"hypothesisId": "H3_H5", "location": "healpix_loss.py:forward", "message": "alpha_computed", "data": {"current_epoch": getattr(self, "current_epoch", None), "decay_epochs": getattr(self, "decay_epochs", None), "alpha": alpha}, "timestamp": int(time.time() * 1000)}) + "\n")
+        except Exception:
+            pass
+        # #endregion
+
+        # Blend losses
+        total = mse_scale_eff * alpha * mse_loss + (1.0 - alpha) * crps_loss
+
+        # Cache logging scalars (detached)
+        mse_scalar = mse_loss.mean() if mse_loss.ndim > 0 else mse_loss
+        crps_scalar = crps_loss.mean() if isinstance(crps_loss, th.Tensor) and crps_loss.ndim > 0 else crps_loss
+        total_scalar = total.mean() if isinstance(total, th.Tensor) and total.ndim > 0 else total
+
+        self.last_mse = mse_scalar.detach()
+        self.last_crps = crps_scalar.detach()
+        self.last_total = total_scalar.detach()
+        self.last_alpha = th.tensor(alpha, device=prediction.device, dtype=total_scalar.dtype).detach()
+        self.last_mse_scale_eff = th.tensor(mse_scale_eff, device=prediction.device, dtype=total_scalar.dtype).detach()
+
+        return total

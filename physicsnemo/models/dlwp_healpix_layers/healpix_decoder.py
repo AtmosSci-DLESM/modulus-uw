@@ -39,6 +39,7 @@ class UNetDecoder(th.nn.Module):
         enable_healpixpad: bool = False,
         cln_per_level: Sequence = None,
         act_ckpt_levels: Sequence = None,
+        hpx_padding_mode: str = "karlbauer",
     ):
         """
         Parameters
@@ -107,6 +108,7 @@ class UNetDecoder(th.nn.Module):
                     out_channels=curr_channel,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
 
             next_channel = (
@@ -126,6 +128,7 @@ class UNetDecoder(th.nn.Module):
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
                     conditional_layer_norm=None,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             else:
                 conv_module = instantiate(
@@ -139,6 +142,7 @@ class UNetDecoder(th.nn.Module):
                     n_layers=n_layers[n],
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
 
             # Recurrent module
@@ -147,6 +151,7 @@ class UNetDecoder(th.nn.Module):
                     config=recurrent_block,
                     in_channels=next_channel,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                 )
             else:
                 rec_module = None
@@ -170,6 +175,7 @@ class UNetDecoder(th.nn.Module):
             dilation=dilations[-1],
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
         )
 
     def _forward_level(self, layer, x, skip, conditions_cln):
