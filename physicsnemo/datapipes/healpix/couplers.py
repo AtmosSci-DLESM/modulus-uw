@@ -81,7 +81,7 @@ class BaseCoupler(ABC):
         # extract important meta data from ds
         self.ds = dataset
         self.batch_size = batch_size
-        self.spatial_dims = self.ds.inputs.shape[2:]
+        self.spatial_dims = self.ds["inputs"].shape[2:]
         self.variables = variables
         self.presteps = presteps
         self.input_time_dim = input_time_dim
@@ -107,7 +107,7 @@ class BaseCoupler(ABC):
             self.use_zarr = True
             self.ds_variable_indices = [
                 i
-                for i, ic in enumerate(self.ds.channel_in)
+                for i, ic in enumerate(self.ds["channel_in"])
                 for v in self.variables
                 if ic == v
             ]
@@ -237,7 +237,7 @@ class BaseCoupler(ABC):
         if self.use_zarr:
             # Loading the contiguous time slice into memory and then pulling out the semi-random
             # variable indices is quicker than trying to do this all at once.
-            ds_index_range = self.ds.inputs[index_range]
+            ds_index_range = self.ds["inputs"][index_range]
             ds_index_range = ds_index_range[:, self.ds_variable_indices]
         else:
             ds_index_range = (

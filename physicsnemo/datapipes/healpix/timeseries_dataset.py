@@ -241,9 +241,17 @@ class TimeSeriesDataset(Dataset, Datapipe):
 
         # REMARK: we remove the xarray overhead from these
         try:
-            self.input_scaling = scaling_da.sel(
-                index=self.ds.channel_in.values
-            ).rename({"index": "channel_in"})
+            # 'if' statement used for cases where atmos model
+            # includes diagnostic variables like tp6 and msl.
+            # using 'channel_out' is still necessary for ocean models.
+            if len(self.ds.channel_out) != (len(self.ds.channel_in)-len(self.couplings[0].variables)):
+                self.input_scaling = scaling_da.sel(
+                    index=self.ds.channel_in.values
+                ).rename({"index": "channel_in"})
+            else:
+                self.input_scaling = scaling_da.sel(
+                    index=self.ds.channel_out.values
+                ).rename({"index": "channel_in"})
             self.input_scaling = {
                 "mean": np.expand_dims(
                     self.input_scaling["mean"].to_numpy(), (0, 2, 3, 4)

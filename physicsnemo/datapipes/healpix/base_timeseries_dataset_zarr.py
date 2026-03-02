@@ -68,7 +68,7 @@ def _check_availability(path: str) -> None:  # pragma: no cover
     if _is_object_store_path(path):
         if not importlib.util.find_spec("fsspec"):
             raise ImportError(
-                f"fsspec is required to access dataset paths like '{path}'. "
+                f"fsspec is required to access object store paths like '{path}'. "
                 "Please install fsspec with: pip install fsspec"
             )
     elif not os.path.exists(path):
@@ -193,7 +193,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
 
         # Validate channels exist
         channels = set(self.input_variables).union(self.output_variables)
-        missing_channels = channels - set(self.ds.channel_in[:])
+        missing_channels = channels - set(self.ds["channel_in"][:])
         if len(missing_channels) > 0:
             raise KeyError(
                 f"Requested Input, coupled, or output variables not found in dataset: {missing_channels}"
@@ -202,13 +202,13 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         self._get_time_da(self.dataset_path, start_date, end_date)
 
         self.all_variable_indices = [
-            int(np.where(self.ds.channel_in[:] == ch)[0][0])
+            int(np.where(self.ds["channel_in"][:] == ch)[0][0])
             for ch in self.all_variables
         ]
 
         # Validate constants exist
         if constant_variables:
-            missing_constants = set(constant_variables) - set(self.ds.channel_c[:])
+            missing_constants = set(constant_variables) - set(self.ds["channel_c"][:])
             if len(missing_constants) > 0:
                 raise KeyError(
                     f"Requested constants not found in dataset: {missing_constants}"
@@ -216,7 +216,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
 
         self.constant_variable_indices = (
             [
-                int(np.where(self.ds.channel_c[:] == ch)[0][0])
+                int(np.where(self.ds["channel_c"][:] == ch)[0][0])
                 for ch in self.constant_variables
             ]
             if self.constant_variables
@@ -262,14 +262,14 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         ]
 
         self.spatial_dims = (
-            self.ds.face.shape[0],
-            self.ds.height.shape[0],
-            self.ds.width.shape[0],
+            self.ds["face"].shape[0],
+            self.ds["height"].shape[0],
+            self.ds["width"].shape[0],
         )
 
         # Cached values
-        self.lat = np.asarray(self.ds.lat)
-        self.lon = np.asarray(self.ds.lon)
+        self.lat = np.asarray(self.ds["lat"])
+        self.lon = np.asarray(self.ds["lon"])
         self.input_scaling = None
         self.target_scaling = None
         self.constant_scaling = None
@@ -338,8 +338,11 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                 f"End date {end_date} is after last available date {ds.time[-1].values}"
             )
 
+        # used when we need all the dates to calculate things like offset indices
         self.time_da = ds.time.copy(deep=True)
-        self.total_samples = self.time_da.sel(time=slice(start_date, end_date)).shape[0]
+        # a list of dates that is available to fetch, used for things like inferencers
+        self.times = self.time_da.sel(time=slice(start_date, end_date))
+        self.total_samples = self.times.shape[0]
 
         if start_date:
             if isinstance(start_date, int):
@@ -508,7 +511,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         if self.constant_variables is None:
             return None
 
-        const = np.asarray(self.ds.constants[self.constant_variable_indices])
+        const = np.asarray(self.ds["constants"][self.constant_variable_indices])
 
         if self.constant_scaling:
             const = (const - self.constant_scaling["mean"]) / self.constant_scaling[

@@ -159,7 +159,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_staging_data")
         # data from the input and target arrays overlap, to avoid 2 seperate loads
         # we load both and then slice it later
-        staging_ds = self.ds.inputs[slice(*time_index)]
+        staging_ds = self.ds["inputs"][slice(*time_index)]
         staging_ds = staging_ds[:, self.all_variable_indices]
         torch.cuda.nvtx.range_pop()
 

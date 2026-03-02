@@ -879,6 +879,7 @@ class HEALPixLayer(th.nn.Module):
                 enable_healpixpad
                 and have_healpixpad
                 and th.cuda.is_available()
+                and not enable_nhwc
             ):  # pragma: no cover
                 if hpx_padding_mode != "karlbauer":
                     raise ValueError(

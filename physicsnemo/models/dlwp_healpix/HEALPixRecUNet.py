@@ -306,6 +306,7 @@ class HEALPixRecUNet(Module):
                     *tuple([inputs[0].shape[0]] + len(inputs[2].shape) * [-1])
                 ),  # constants
                 inputs[3].permute(0, 2, 1, 3, 4) if self.couplings_time_first else inputs[3],  # coupled inputs
+                inputs[3].permute(0, 2, 1, 3, 4) if self.couplings_time_first else inputs[3],  # coupled inputs
             ]
             res = th.cat(result, dim=self.channel_dim)
 
@@ -614,6 +615,7 @@ class HEALPixRecUNet(Module):
             else:
                 if len(self.couplings) > 0:
                     input_tensor = self._reshape_inputs(
+                        inputs=[outputs[-1][:, :, :, :self.input_channels]]
                         inputs=[outputs[-1][:, :, :, :self.input_channels]]
                         + list(inputs[1:3])
                         + [inputs[3][self.presteps + step]],
