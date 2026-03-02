@@ -304,8 +304,8 @@ class DifferentialHydrostaticBalanceConstraint(torch.nn.Module):
                 # sfc hydrostatic error is not dependent on sfc pressure and lowest 
                 # level selection criteria
                 with torch.no_grad():
-                    # Get boolean mask of levels greater than min_sfc_layer_thickness (in m) 
-                    # above surface, assumes first z_channel is the highest altitude level
+                    # Get boolean mask of levels at least min_sfc_layer_thickness (hPa) below
+                    # surface pressure; assumes first z_channel is the highest altitude level
                     above_surface_mask = (
                         p_levs[:, :, :-1, ...] + self.min_sfc_layer_thickness <
                         sfc_pressure.unsqueeze(2)
