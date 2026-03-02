@@ -1084,9 +1084,10 @@ class LossWithHydrostasy(torch.nn.MSELoss):
 
             # Compute data loss
             data_loss = self.data_loss(prediction, target, average_channels=average_channels)
+            d = torch.concatenate((data_loss, Tv_loss)) * self.loss_weights
 
             if average_channels:
-                return data_loss + torch.mean(Tv_loss)
+                return torch.mean(d)
             else:
                 return d
 
