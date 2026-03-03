@@ -20,6 +20,7 @@ import torch as th
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
+from torch_utils.checkpoint import checkpoint
 
 
 class UNetDecoder(th.nn.Module):
@@ -37,6 +38,8 @@ class UNetDecoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        per_level_cln: list[bool] = None,
+        per_level_checkpointing: list[bool] = None,
     ):
         """
         Parameters
@@ -62,9 +65,30 @@ class UNetDecoder(th.nn.Module):
             If channel last format should be used
         enable_healpixpad, bool, optional
             If the healpixpad library should be used if installed
+        per_level_cln: list[bool], optional
+            If the CLN should be applied to each level of the decoder
+            If None, the CLN will based on the conv_block.conditional_layer_norm attribute
+        per_level_checkpointing: list[bool], optional
+            If the checkpointing should be applied to each level of the decoder
+            If None, the checkpointing will not be applied
         """
         super().__init__()
         self.channel_dim = 1  # 1 in previous layout
+
+        if per_level_cln is not None and len(per_level_cln) == len(n_channels):
+            raise ValueError(
+                "per_level_cln must be a list of booleans of the same length as n_channels"
+                f"Got {len(per_level_cln)} for per_level_cln and {len(n_channels)} for n_channels"
+            )
+        per_level_cln = per_level_cln if per_level_cln is not None else [True] * len(n_channels)
+
+        if per_level_checkpointing is not None and len(per_level_checkpointing) == len(n_channels):
+            raise ValueError(
+                "per_level_checkpointing must be a list of booleans of the same length as n_channels"
+                f"Got {len(per_level_checkpointing)} for per_level_checkpointing and {len(n_channels)} for n_channels"
+            )
+        # Generate the per_level_checkpointing list, simplifies forward logic
+        self.per_level_checkpointing = per_level_checkpointing if per_level_checkpointing is not None else [False] * len(n_channels)
 
         if dilations is None:
             # Defaults to [1, 1, 1...] in accordance with the number of unet levels
@@ -88,6 +112,8 @@ class UNetDecoder(th.nn.Module):
                 n_channels[n + 1] if n < len(n_channels) - 1 else n_channels[-1]
             )
 
+            # apply conditional layer norm if enabled for this level
+            layer_cln = conv_block.conditional_layer_norm if self.per_level_cln[n] else None
             conv_module = instantiate(
                 config=conv_block,
                 in_channels=curr_channel * 2
@@ -99,6 +125,7 @@ class UNetDecoder(th.nn.Module):
                 n_layers=n_layers[n],
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
+                conditional_layer_norm=layer_cln,
             )
 
             # Recurrent module
@@ -132,6 +159,28 @@ class UNetDecoder(th.nn.Module):
             enable_healpixpad=enable_healpixpad,
         )
 
+    def _forward_layer_pass(self, layer_group: th.nn.Module, x: th.Tensor, skip_connection: th.Tensor=None, conditions_cln: th.Tensor=None) -> th.Tensor:
+        """
+        Forward pass of a single layer of the decoder
+        Handled seperately to allow for checkpointing of the layer
+        """
+        
+        if layer["upsamp"] is not None:
+            up = layer["upsamp"](x)
+            x = th.cat([up, skip_connection], dim=self.channel_dim)
+        # apply the conv block, check if the layer accepts conditional inputs
+        if conditions_cln is not None:
+            if hasattr(layer["conv"], "cln_enabled") and layer["conv"].cln_enabled:
+                x = layer["conv"](x, conditions_cln=conditions_cln)
+            else:
+                raise ValueError("Conditional input passed but conv block does not support conditional inputs.")
+        else:
+            x = layer["conv"](x)
+        # apply the recurrent block if it exists
+        if layer["recurrent"] is not None:
+            x = layer["recurrent"](x)
+
+        return x
     def forward(self, inputs: Sequence, conditions_cln: Sequence = None) -> th.Tensor:
         """
         Forward pass of the HEALPix Unet decoder
@@ -149,20 +198,12 @@ class UNetDecoder(th.nn.Module):
         """
         x = inputs[-1]
         for n, layer in enumerate(self.decoder):
-            if layer["upsamp"] is not None:
-                up = layer["upsamp"](x)
-                x = th.cat([up, inputs[-1 - n]], dim=self.channel_dim)
-            # apply the conv block, check if the layer accepts conditional inputs
-            if conditions_cln is not None:
-                if hasattr(layer["conv"], "cln_enabled") and layer["conv"].cln_enabled:
-                    x = layer["conv"](x, conditions_cln=conditions_cln)
-                else:
-                    raise ValueError("Conditional input passed but conv block does not support conditional inputs.")
+            skip_connection = inputs[-1 - n] if layer["upsamp"] is not None else None
+            if self.per_level_checkpointing[n]:
+                x = checkpoint(self._forward_layer_pass, layer, x, skip_connection, conditions_cln)
             else:
-                x = layer["conv"](x)
-            # apply the recurrent block if it exists
-            if layer["recurrent"] is not None:
-                x = layer["recurrent"](x)
+                x = self._forward_layer_pass(layer, x, skip_connection, conditions_cln)
+
         return self.output_layer(x)
 
     def reset(self):
