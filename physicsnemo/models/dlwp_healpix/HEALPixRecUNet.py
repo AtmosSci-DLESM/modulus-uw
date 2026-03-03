@@ -616,7 +616,6 @@ class HEALPixRecUNet(Module):
                 if len(self.couplings) > 0:
                     input_tensor = self._reshape_inputs(
                         inputs=[outputs[-1][:, :, :, :self.input_channels]]
-                        inputs=[outputs[-1][:, :, :, :self.input_channels]]
                         + list(inputs[1:3])
                         + [inputs[3][self.presteps + step]],
                         step=step + self.presteps,

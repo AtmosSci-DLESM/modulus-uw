@@ -66,7 +66,6 @@ class HEALPixUNet(Module):
         couplings: list = [],
         residual_prediction: bool = False,
         couplings_time_first: bool = True,
-        couplings_time_first: bool = True,
         constraints: list[DictConfig] = None,
         hpx_padding_mode: str = 'karlbauer',
         enforce_reflectional_equivariance: bool = False,
