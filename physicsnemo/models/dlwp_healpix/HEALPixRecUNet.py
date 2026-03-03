@@ -306,7 +306,6 @@ class HEALPixRecUNet(Module):
                     *tuple([inputs[0].shape[0]] + len(inputs[2].shape) * [-1])
                 ),  # constants
                 inputs[3].permute(0, 2, 1, 3, 4) if self.couplings_time_first else inputs[3],  # coupled inputs
-                inputs[3].permute(0, 2, 1, 3, 4) if self.couplings_time_first else inputs[3],  # coupled inputs
             ]
             res = th.cat(result, dim=self.channel_dim)
 
@@ -513,7 +512,6 @@ class HEALPixRecUNet(Module):
                     input_tensor = self._reshape_inputs(
                         inputs=[outputs[s - 1][:, :, :, :self.input_channels]] + list(inputs[1:]), step=s + 1
                     )
-            # Forward the data through the model to initialize hidden states
 
             # Save initial hidden states
             if self.enforce_reflectional_equivariance:
@@ -521,6 +519,7 @@ class HEALPixRecUNet(Module):
                     self.decoder.decoder[n].recurrent.h for n in range(len(self.decoder.decoder))
                 ]
             
+            # Forward the data through the model to initialize hidden states
             self.decoder(self.encoder(input_tensor, conditions_cln=conditions_cln), conditions_cln=conditions_cln)
 
             if self.enforce_reflectional_equivariance:
