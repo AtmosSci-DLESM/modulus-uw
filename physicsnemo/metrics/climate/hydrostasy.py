@@ -430,7 +430,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         # Combine N and B dimensions and return
         return x_scaled.reshape((-1, F, C_scaled, H, W))
 
-    def error_histogram(self, prediction, bins, accumulator=None):
+    def error_histogram(self, prediction, bins, accumulator=None, exclude_masked: bool = False):
         N, F, B, C, H, W = tuple(prediction.shape)
 
         if not (prediction.ndim == 6):
@@ -440,9 +440,16 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         x = self.scale(prediction)
         Tv_avg, Tv_model_avg = self.constraint(x)
         Tv_error = Tv_avg - Tv_model_avg
+
+        valid_mask = torch.ones_like(Tv_error, dtype=torch.bool, device=Tv_error.device)
         # Mask out error in regions below the surface
         if self.topography_masking:
-            Tv_error[x[:, :, 1 : self.num_z_levels, :, :] < self.topography] = 0.0
+            valid_mask[:, :, :Tv_error.shape[2]] = (
+                x[:, :, 1 : self.num_z_levels, :, :] >= self.topography
+            )
+            Tv_error[:, :, :Tv_error.shape[2]][
+                ~valid_mask[:, :, :Tv_error.shape[2]]
+            ] = 0.0
 
         vlevels = Tv_error.shape[2]
         if accumulator is None:
@@ -466,14 +473,36 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             bin_edges = bins
 
         for l in range(vlevels):
+            if exclude_masked:
+                values = torch.absolute(Tv_error[:, :, l, :, :][valid_mask[:, :, l, :, :]])
+            else:
+                values = torch.absolute(Tv_error[:, :, l, :, :])
             hist, be = torch.histogram(
-                torch.absolute(Tv_error[:, :, l, :, :]),
+                values,
                 bins=bins if isinstance(bins, int) else bin_edges[l, :],
             )
             accumulator[l, :] += hist
             bin_edges[l, :] = be
 
         return accumulator, bin_edges
+
+    def get_tv_error(self, prediction):
+        N, F, B, C, H, W = tuple(prediction.shape)
+
+        if not (prediction.ndim == 6):
+            raise AssertionError("Expected predictions to have 6 dimensions")
+
+        # Scale to physical units and compute virtual temperature
+        x = self.scale(prediction)
+        Tv_avg, Tv_model_avg = self.constraint(x)
+        Tv_error = Tv_avg - Tv_model_avg
+        # Mask out error in regions below the surface
+        if self.topography_masking:
+            Tv_error[:, :, :Tv_error.shape[2]][
+                x[:, :, 1 : self.num_z_levels, :, :] < self.topography
+            ] = 0.0
+
+        return Tv_error
 
     def forward(self, prediction, target, average_channels=True):
         """
@@ -655,7 +684,7 @@ class LossWithHydrostasy(torch.nn.MSELoss):
         # Get topography information
         ds = xr.open_zarr(f"{src_directory}{dataset_name}.zarr")
         self.topography = (
-            surface_geopotential_std * ds.constants.sel(channel_c='z').values
+            surface_geopotential_std * ds["constants"].sel(channel_c='z').values
             + surface_geopotential_mean
         ) / self.g0
 
