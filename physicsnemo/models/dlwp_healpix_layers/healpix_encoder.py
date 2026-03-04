@@ -19,7 +19,7 @@ from typing import Sequence
 import torch as th
 from hydra.utils import instantiate
 from omegaconf import DictConfig
-from torch_utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint
 
 
 class UNetEncoder(th.nn.Module):
@@ -36,8 +36,8 @@ class UNetEncoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        per_level_cln: bool = False,
-        per_level_checkpointing: bool = False,
+        per_level_cln: Sequence[bool] = None,
+        per_level_checkpointing: Sequence[bool] = None,
     ):
         """
         Parameters
@@ -71,14 +71,14 @@ class UNetEncoder(th.nn.Module):
         super().__init__()
         self.n_channels = n_channels
 
-        if per_level_cln is not None and len(per_level_cln) == len(n_channels):
+        if per_level_cln is not None and len(per_level_cln) != len(n_channels):
             raise ValueError(
                 "per_level_cln must be a list of booleans of the same length as n_channels"
                 f"Got {len(per_level_cln)} for per_level_cln and {len(n_channels)} for n_channels"
             )
         per_level_cln = per_level_cln if per_level_cln is not None else [True] * len(n_channels)
 
-        if per_level_checkpointing is not None and len(per_level_checkpointing) == len(n_channels):
+        if per_level_checkpointing is not None and len(per_level_checkpointing) != len(n_channels):
             raise ValueError(
                 "per_level_checkpointing must be a list of booleans of the same length as n_channels"
                 f"Got {len(per_level_checkpointing)} for per_level_checkpointing and {len(n_channels)} for n_channels"
@@ -105,7 +105,7 @@ class UNetEncoder(th.nn.Module):
                 )
 
             # apply conditional layer norm if enabled for this level
-            layer_cln = conv_block.conditional_layer_norm if self.per_level_cln[n] else None
+            layer_cln = conv_block.conditional_layer_norm if per_level_cln[n] else None
             modules.append(
                 instantiate(
                     config=conv_block,
@@ -174,7 +174,7 @@ class UNetEncoder(th.nn.Module):
         for n, layer_group in enumerate(self.encoder):
             interim_output = inputs
             if self.per_level_checkpointing[n]:
-                interim_output = checkpoint(self._forward_layer_pass, layer_group, interim_output, conditions_cln)
+                interim_output = checkpoint(self._forward_layer_pass, layer_group, interim_output, conditions_cln, use_reentrant=False)
             else:
                 interim_output = self._forward_layer_pass(layer_group, interim_output, conditions_cln)
             outputs.append(interim_output)

@@ -20,7 +20,7 @@ import torch as th
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
-from torch_utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint
 
 
 class UNetDecoder(th.nn.Module):
@@ -75,14 +75,14 @@ class UNetDecoder(th.nn.Module):
         super().__init__()
         self.channel_dim = 1  # 1 in previous layout
 
-        if per_level_cln is not None and len(per_level_cln) == len(n_channels):
+        if per_level_cln is not None and len(per_level_cln) != len(n_channels):
             raise ValueError(
                 "per_level_cln must be a list of booleans of the same length as n_channels"
                 f"Got {len(per_level_cln)} for per_level_cln and {len(n_channels)} for n_channels"
             )
         per_level_cln = per_level_cln if per_level_cln is not None else [True] * len(n_channels)
 
-        if per_level_checkpointing is not None and len(per_level_checkpointing) == len(n_channels):
+        if per_level_checkpointing is not None and len(per_level_checkpointing) != len(n_channels):
             raise ValueError(
                 "per_level_checkpointing must be a list of booleans of the same length as n_channels"
                 f"Got {len(per_level_checkpointing)} for per_level_checkpointing and {len(n_channels)} for n_channels"
@@ -113,7 +113,7 @@ class UNetDecoder(th.nn.Module):
             )
 
             # apply conditional layer norm if enabled for this level
-            layer_cln = conv_block.conditional_layer_norm if self.per_level_cln[n] else None
+            layer_cln = conv_block.conditional_layer_norm if per_level_cln[n] else None
             conv_module = instantiate(
                 config=conv_block,
                 in_channels=curr_channel * 2
@@ -159,7 +159,7 @@ class UNetDecoder(th.nn.Module):
             enable_healpixpad=enable_healpixpad,
         )
 
-    def _forward_layer_pass(self, layer_group: th.nn.Module, x: th.Tensor, skip_connection: th.Tensor=None, conditions_cln: th.Tensor=None) -> th.Tensor:
+    def _forward_layer_pass(self, layer: th.nn.Module, x: th.Tensor, skip_connection: th.Tensor=None, conditions_cln: th.Tensor=None) -> th.Tensor:
         """
         Forward pass of a single layer of the decoder
         Handled seperately to allow for checkpointing of the layer
@@ -169,16 +169,13 @@ class UNetDecoder(th.nn.Module):
             up = layer["upsamp"](x)
             x = th.cat([up, skip_connection], dim=self.channel_dim)
         # apply the conv block, check if the layer accepts conditional inputs
-        if conditions_cln is not None:
-            if hasattr(layer["conv"], "cln_enabled") and layer["conv"].cln_enabled:
+        if hasattr(layer["conv"], "cln_enabled") and layer["conv"].cln_enabled:
+            if conditions_cln is not None:
                 x = layer["conv"](x, conditions_cln=conditions_cln)
             else:
-                raise ValueError("Conditional input passed but conv block does not support conditional inputs.")
+                raise ValueError("Conditional inputs are required for layers with cln_enabled=True")
         else:
             x = layer["conv"](x)
-        # apply the recurrent block if it exists
-        if layer["recurrent"] is not None:
-            x = layer["recurrent"](x)
 
         return x
     def forward(self, inputs: Sequence, conditions_cln: Sequence = None) -> th.Tensor:
@@ -200,9 +197,15 @@ class UNetDecoder(th.nn.Module):
         for n, layer in enumerate(self.decoder):
             skip_connection = inputs[-1 - n] if layer["upsamp"] is not None else None
             if self.per_level_checkpointing[n]:
-                x = checkpoint(self._forward_layer_pass, layer, x, skip_connection, conditions_cln)
+                x = checkpoint(self._forward_layer_pass, layer, x, skip_connection, conditions_cln, use_reentrant=False)
             else:
                 x = self._forward_layer_pass(layer, x, skip_connection, conditions_cln)
+
+            # apply the recurrent block if it exists
+            # NOTE: this should be done after the checkpointing to avoid issues with
+            # the recurrent block changing during reinitialization
+            if layer["recurrent"] is not None:
+                x = layer["recurrent"](x)
 
         return self.output_layer(x)
 
