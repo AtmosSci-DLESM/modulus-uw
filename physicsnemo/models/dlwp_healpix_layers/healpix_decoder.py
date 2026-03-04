@@ -113,7 +113,11 @@ class UNetDecoder(th.nn.Module):
             )
 
             # apply conditional layer norm if enabled for this level
-            layer_cln = conv_block.conditional_layer_norm if per_level_cln[n] else None
+            block_config = conv_block.copy()
+            if "conditional_layer_norm" in block_config and block_config.conditional_layer_norm is not None:
+                if not per_level_cln[n]:
+                    block_config.conditional_layer_norm = None
+
             conv_module = instantiate(
                 config=conv_block,
                 in_channels=curr_channel * 2
@@ -125,7 +129,6 @@ class UNetDecoder(th.nn.Module):
                 n_layers=n_layers[n],
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                conditional_layer_norm=layer_cln,
             )
 
             # Recurrent module
