@@ -484,9 +484,9 @@ class TrailingAverageCoupler(BaseCoupler):
 
         if self.use_zarr:
             cf_dates = cftime.num2pydate(
-                self.ds.time[:],
-                units=self.ds.time.attrs["units"],
-                calendar=self.ds.time.attrs["calendar"],
+                self.ds["time"][:],
+                units=self.ds["time"].attrs["units"],
+                calendar=self.ds["time"].attrs["calendar"],
             )
             dates = [np.datetime64(date.isoformat()) for date in cf_dates]
             self.time_da = np.asarray(dates)
