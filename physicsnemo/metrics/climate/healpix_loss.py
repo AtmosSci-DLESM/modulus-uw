@@ -328,6 +328,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         open_dict: dict = {"engine": "zarr"},
         selection_dict: dict = {"channel_c": "land_sea_mask"},
         multiscale: float = 0.0,
+        masked_processing: bool = False,
     ):
         """
         Parameters
@@ -350,6 +351,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             dictionary that store channel selection information
         multiscale: float, optional
             weight for the multiscale CRPS loss. Default is 0, no multiscale loss is applied.
+        masked_processing: bool, optional
+            whether masked pixels should be excluded from the processing. Default is False, no masked processing is applied.
         """
         super().__init__()
         self.loss_weights = th.tensor(weights)
@@ -361,6 +364,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         self.mean_penalty = mean_penalty
         self.multiscale = multiscale
         self.scales = [4, 16, 32]
+        self.masked_processing = masked_processing
 
         if lsm_file is not None:
             self.lsm_ds = xr.open_dataset(lsm_file, **open_dict).constants.sel(selection_dict)
@@ -404,6 +408,38 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         h, w = shape[-2:]
         pooled = th.nn.functional.avg_pool2d(tensor.reshape(shape[0], -1, h, w), scale, scale)
         return pooled.reshape(*shape[:-2], h//scale, w//scale)
+
+    def _masked_pool(self, tensor, scale, mask):
+        """
+        Pools a tensor while excluding masked pixels
+        
+        Parameters
+        ----------
+        tensor: torch.Tensor
+            The tensor to pool
+        scale: int
+            The scale factor for the pooling
+        mask: torch.Tensor
+            The mask to apply to the tensor, masked should only contain 1s and 0s
+
+        Returns
+        -------
+        torch.Tensor
+            The pooled tensor
+        torch.Tensor
+            The pooled mask
+        """
+        # Apply the mask to the tensor
+        masked_values = tensor * mask
+
+        # Compute the non-masked values for the pooled tensor
+        pooled_values = self._pool(masked_values, scale)
+
+        # pool the mask to use as a weight for the pooled tensor
+        pooled_mask = self._pool(mask, scale)
+
+        pooled_tensor = pooled_values / (pooled_mask + 1e-8) # Avoid division by zero
+        return pooled_tensor, pooled_mask
 
     def forward(self, prediction, target, average_channels=True):
         """
@@ -451,19 +487,35 @@ class WeightedCRPSLoss(th.nn.MSELoss):
                 loss = crps.mean(dim=(0, 1, 2, 4, 5))
 
             if self.mean_penalty > 0:
-                ens_global_means = prediction.mean(dim=(0, 1, 2, 3, 5, 6)) # [C]
-                target_global_means = target.mean(dim=(0, 1, 2, 4, 5)) # [C]
+                # the fraction of valid pixels in land sea mask
+                if self.masked_processing and self.lsm_tensor.numel() > 1:
+                    valid_pixels = self.lsm_tensor.numel()
+                else:
+                    valid_pixels = f * h * w
+                
+                prediction_count = n * b * t * valid_pixels
+                target_count = b * t * valid_pixels
+                ens_global_means = (prediction * self.lsm_tensor).sum(dim=(0, 1, 2, 3, 5, 6)) / prediction_count
+                target_global_means = (target * self.lsm_tensor).sum(dim=(0, 1, 2, 4, 5)) / target_count
+
                 bias_penalty = self.mean_penalty * th.abs(ens_global_means - target_global_means)
                 if average_channels:
                     loss += bias_penalty.mean()
                 else:
                     loss += bias_penalty
 
+            # spatial multiscale loss
             if self.multiscale > 0.:
                 crps_scales = 0
                 for scale in self.scales:
-                    pred, tar, lsm = self._pool(prediction, scale), self._pool(target, scale), self._pool(self.lsm_tensor, scale)
-                    crps_scale = self._2member_crps(pred, tar, lsm)
+                    if self.masked_processing and self.lsm_tensor.numel() > 1:
+                        masked_pred, masked_lsm = self._masked_pool(prediction, scale, self.lsm_tensor)
+                        masked_tar, _ = self._masked_pool(target, scale, self.lsm_tensor)
+                        crps_scale = self._2member_crps(masked_pred, masked_tar, masked_lsm)
+                    else:
+                        pred, tar, lsm = self._pool(prediction, scale), self._pool(target, scale), self._pool(self.lsm_tensor, scale)
+                        crps_scale = self._2member_crps(pred, tar, lsm)
+
                     if average_channels:
                         crps_scale = crps_scale.mean()
                     else:
@@ -475,6 +527,14 @@ class WeightedCRPSLoss(th.nn.MSELoss):
                 
             return loss
         else:
+            # zero out land and determine number of valid pixels
+            if self.masked_processing and self.lsm_tensor.numel() > 1:
+                prediction = prediction * self.lsm_tensor
+                target = target * self.lsm_tensor
+                valid_pixels = b * t * self.lsm_tensor.sum()
+            else:
+                valid_pixels = b * f * t * h * w
+
             # Use pairwise distance method
             if not average_channels:
                 # Move channels to first dimension and exclude that dimension from the reductions           
@@ -488,7 +548,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
                 dist_matrix = self.pdist(prediction.unsqueeze(1), prediction.unsqueeze(2))  # [C, Cond, Cond]
                 
                 diff_terms = self.diag_mask[None, ...] * (diff.unsqueeze(1) + diff.unsqueeze(2)) # [C, Cond, Cond], diagonal elements zeroed out
-                crps = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum(dim=(1,2))/(b*f*t*h*w)
+                crps = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum(dim=(1,2))/valid_pixels
             else:
                 prediction = prediction.reshape(n, -1)
                 target = target.unsqueeze(0).reshape(1, -1) # [1, ...] (first dim will broadcast across ensemble)
@@ -496,7 +556,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
                 dist_matrix = self.pdist(prediction.unsqueeze(1), prediction.unsqueeze(0))  # [Cond, Cond] 
 
                 diff_terms = self.diag_mask * (diff.unsqueeze(0) + diff.unsqueeze(1)) # [Cond, Cond], diagonal elements zeroed out
-                crps = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum()/(b*f*c*t*h*w)
+                crps = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum()/valid_pixels
 
             return crps
 
