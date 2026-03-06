@@ -527,6 +527,24 @@ class WeightedCRPSLoss(th.nn.MSELoss):
                 
             return loss
         else:
+            # Do mean penalty
+            bias_penalty = 0
+            if self.mean_penalty > 0:
+                # the fraction of valid pixels in land sea mask
+                if self.masked_processing and self.lsm_tensor.numel() > 1:
+                    valid_pixels = self.lsm_tensor.numel()
+                else:
+                    valid_pixels = f * h * w
+                
+                prediction_count = n * b * t * valid_pixels
+                target_count = b * t * valid_pixels
+                ens_global_means = (prediction * self.lsm_tensor).sum(dim=(0, 1, 2, 3, 5, 6)) / prediction_count
+                target_global_means = (target * self.lsm_tensor).sum(dim=(0, 1, 2, 4, 5)) / target_count
+
+                bias_penalty = self.mean_penalty * th.abs(ens_global_means - target_global_means)
+                if average_channels:
+                    bias_penalty = bias_penalty.mean()
+
             # zero out land and determine number of valid pixels
             if self.masked_processing and self.lsm_tensor.numel() > 1:
                 prediction = prediction * self.lsm_tensor
@@ -558,7 +576,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
                 diff_terms = self.diag_mask * (diff.unsqueeze(0) + diff.unsqueeze(1)) # [Cond, Cond], diagonal elements zeroed out
                 crps = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum()/valid_pixels
 
-            return crps
+            return crps + bias_penalty
 
 
 class WeightedCRPSLossSpectral(th.nn.MSELoss):
