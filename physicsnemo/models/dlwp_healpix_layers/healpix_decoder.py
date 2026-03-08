@@ -14,12 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import torch as th
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 from torch.utils.checkpoint import checkpoint as ckpt_fn
+
+from .normalization import AdditiveSpatialNoise
 
 
 class UNetDecoder(th.nn.Module):
@@ -39,6 +41,12 @@ class UNetDecoder(th.nn.Module):
         enable_healpixpad: bool = False,
         cln_per_level: Sequence = None,
         act_ckpt_levels: Sequence = None,
+        asn_per_level: Sequence = None,
+        asn_spatial_sizes: Optional[Sequence[Tuple[int, int]]] = None,
+        asn_alpha: float = 0.1,
+        asn_noise_dim: int = 32,
+        asn_mlp_hidden_dims: Optional[Sequence[int]] = None,
+        asn_num_faces: int = 12,
         hpx_padding_mode: str = "karlbauer",
     ):
         """
@@ -76,6 +84,24 @@ class UNetDecoder(th.nn.Module):
             torch.utils.checkpoint to trade compute for memory. Recurrent
             blocks are always run outside the checkpoint boundary to protect
             hidden state. If None (default), no checkpointing is used.
+        asn_per_level: Sequence, optional
+            Per-level flag for AdditiveSpatialNoise (SDL) in pre-skip position (after
+            upsample, before skip concat). If provided, length must equal len(n_channels).
+            Where asn_per_level[n] is True (and n > 0), that level gets ASN (Z -> MLP -> S,
+            then Fout = Fin + alpha * R ⊙ S ⊙ M) applied before concatenating with skip.
+            Z is sampled per-batch (global style). If None (default), no ASN is used (backward compatible).
+        asn_spatial_sizes: Sequence[Tuple[int, int]], optional
+            Per-level (H, W) for ASN. Required when any asn_per_level is True. Length must equal
+            len(n_channels). asn_spatial_sizes[n] is the spatial size of the decoder feature map
+            at level n (after upsample for that level). Used to initialize M in __init__ (no lazy init).
+        asn_alpha: float, optional
+            Fixed scalar scaling the additive spatial noise magnitude. Default 0.1.
+        asn_noise_dim: int, optional
+            Dimension of latent Z for the SDL style vector. Default 32.
+        asn_mlp_hidden_dims: Sequence[int], optional
+            Hidden sizes for MLP mapping Z -> S. If None, defaults to [64, 64].
+        asn_num_faces: int, optional
+            Number of HEALPix faces for ASN unfold/refold (default 12). Must match fold convention.
         """
         super().__init__()
         self.channel_dim = 1  # 1 in previous layout
@@ -91,6 +117,16 @@ class UNetDecoder(th.nn.Module):
             raise ValueError(
                 f"cln_per_level length ({len(cln_per_level)}) must equal number of decoder levels ({len(n_channels)})"
             )
+
+        if asn_per_level is not None and len(asn_per_level) != len(n_channels):
+            raise ValueError(
+                f"asn_per_level length ({len(asn_per_level)}) must equal number of decoder levels ({len(n_channels)})"
+            )
+        if asn_per_level is not None and any(asn_per_level):
+            if asn_spatial_sizes is None or len(asn_spatial_sizes) != len(n_channels):
+                raise ValueError(
+                    "asn_spatial_sizes must be provided and have length len(n_channels) when any asn_per_level is True"
+                )
 
         if dilations is None:
             # Defaults to [1, 1, 1...] in accordance with the number of unet levels
@@ -156,15 +192,29 @@ class UNetDecoder(th.nn.Module):
             else:
                 rec_module = None
 
-            self.decoder.append(
-                th.nn.ModuleDict(
-                    {
-                        "upsamp": up_sample_module,
-                        "conv": conv_module,
-                        "recurrent": rec_module,
-                    }
+            layer_dict = {
+                "upsamp": up_sample_module,
+                "conv": conv_module,
+                "recurrent": rec_module,
+            }
+            # Pre-skip ASN / SDL (after upsample, before skip concat). No CLN; S from Z via MLP.
+            if asn_per_level is not None and n > 0 and asn_per_level[n]:
+                mlp_dims = (
+                    list(asn_mlp_hidden_dims)
+                    if asn_mlp_hidden_dims is not None
+                    else None
                 )
-            )
+                H_lvl, W_lvl = asn_spatial_sizes[n]
+                asn_module = AdditiveSpatialNoise(
+                    channel_depth=curr_channel,
+                    noise_dim=asn_noise_dim,
+                    spatial_size=(H_lvl, W_lvl),
+                    alpha=asn_alpha,
+                    mlp_hidden_dims=mlp_dims,
+                    num_faces=asn_num_faces,
+                )
+                layer_dict["pre_skip"] = th.nn.ModuleDict({"asn": asn_module})
+            self.decoder.append(th.nn.ModuleDict(layer_dict))
 
         self.decoder = th.nn.ModuleList(self.decoder)
         # (Linear) Output layer
@@ -182,6 +232,8 @@ class UNetDecoder(th.nn.Module):
         """Run one decoder level (upsample + conv), excluding recurrent."""
         if layer["upsamp"] is not None:
             x = layer["upsamp"](x)
+            if "pre_skip" in layer:
+                x = layer["pre_skip"]["asn"](x)
             x = th.cat([x, skip], dim=self.channel_dim)
         if hasattr(layer["conv"], "cln_enabled") and layer["conv"].cln_enabled:
             if conditions_cln is None:

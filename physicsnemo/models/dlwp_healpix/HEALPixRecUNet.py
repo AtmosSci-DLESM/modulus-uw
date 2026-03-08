@@ -195,6 +195,9 @@ class HEALPixRecUNet(Module):
         self.constraints = None
         self.set_constraints(constraints)
 
+        # When set, forward() runs only this many steps (for progressive AR training); None = use full integration_steps.
+        self._current_integration_steps = None
+
     def set_ocean_land_infill_buffers(self, land_mask: th.Tensor, fill_standardized: th.Tensor) -> None:
         """Set land mask and fill tensors for ocean-over-land infill (e.g. from dataset constants after init)."""
         for name in ("_infill_land_mask", "_infill_fill_standardized"):
@@ -459,11 +462,10 @@ class HEALPixRecUNet(Module):
         output_only_last: bool, optional
             If only the last dimension of the outputs should be returned
         conditions_cln: Sequence, optional
-            If the model is using conditional normalization, this is a sequence of tensors that will be used to condition the 
-            normalization layers. The shape of the tensors should be [Cond*B, N], where N is the size of the conditions, Cond is the 
-            number of conditions, and B is the batch size. It is expected that the inputs have a leading dimension of Cond*B (e.g., data
-            for different ensmble members/conditions has been duplicated along this dimension). The sequence should have length equal to
-            the model's `n_integration_steps` attribute.
+            If the model uses conditional normalization, a sequence of tensors (length equal to
+            the model's integration steps). For CLN/AdaLN: each element is 2D [Cond*B, N] where N
+            is the condition size. For SPADE: each element is 4D [Cond*B, C_cond, H, W]; H, W may
+            be a reference resolution (e.g. input grid)—SPADE will interpolate internally when needed.
 
         Returns
         -------
@@ -491,7 +493,12 @@ class HEALPixRecUNet(Module):
 
         self.reset()
         outputs = []
-        for step in range(self.integration_steps):
+        n_steps = (
+            self._current_integration_steps
+            if self._current_integration_steps is not None
+            else self.integration_steps
+        )
+        for step in range(n_steps):
             th.cuda.nvtx.range_push(f"Integration step: {step}")
             # (Re-)initialize recurrent hidden states
             if (step * (self.delta_t * self.input_time_dim)) % self.reset_cycle == 0:

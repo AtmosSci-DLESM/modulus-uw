@@ -166,6 +166,9 @@ class HEALPixUNet(Module):
         self.constraints = None
         self.set_constraints(constraints)
 
+        # When set, forward() runs only this many steps (for progressive AR training); None = use full integration_steps.
+        self._current_integration_steps = None
+
         # Optional ocean-over-land infill (land pixels set to standardized -1)
         # Config may contain full dict (land_mask, fill_standardized) or only options (infill_state, infill_coupling).
         # When only options are in config (e.g. from Hydra), call set_ocean_land_infill_buffers() after init.
@@ -378,11 +381,10 @@ class HEALPixUNet(Module):
         output_only_last: bool, optional
             If only the last dimension of the outputs should be returned. default: False
         conditions_cln: Sequence, optional
-            If the model is using conditional normalization, this is a sequence of tensors that will be used to condition the 
-            normalization layers. The shape of the tensors should be [Cond*B, N], where N is the size of the conditions, Cond is the 
-            number of conditions, and B is the batch size. It is expected that the inputs have a leading dimension of Cond*B (e.g., data
-            for different ensmble members/conditions has been duplicated along this dimension). The sequence should have length equal to
-            the model's `n_integration_steps` attribute.
+            If the model uses conditional normalization, a sequence of tensors (length equal to
+            the model's integration steps). For CLN/AdaLN: each element is 2D [Cond*B, N] where N
+            is the condition size. For SPADE: each element is 4D [Cond*B, C_cond, H, W]; H, W may
+            be a reference resolution (e.g. input grid)—SPADE will interpolate internally when needed.
         Returns
         -------
         th.Tensor: Predicted outputs
@@ -408,7 +410,12 @@ class HEALPixUNet(Module):
                 )
 
         outputs = []
-        for step in range(self.integration_steps):
+        n_steps = (
+            self._current_integration_steps
+            if self._current_integration_steps is not None
+            else self.integration_steps
+        )
+        for step in range(n_steps):
             if step == 0:
                 if len(self.couplings) > 0:
                     input_tensor = self._reshape_inputs(

@@ -15,6 +15,7 @@
 # limitations under the License.
 
 # System modules
+import copy
 import logging
 import os
 import time
@@ -32,7 +33,7 @@ import xarray as xr
 from dask.diagnostics import ProgressBar
 
 # External modules
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -1127,3 +1128,104 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
                 forecast_init_times=self.forecast_init_times,
                 couplings=self.couplings,
             )
+
+    def create_dataloaders_for_output_time_dim(
+        self,
+        output_time_dim: int,
+        num_shards: int = 1,
+        shard_id: int = 0,
+        num_workers: int = 0,
+    ):
+        """
+        Create new train and val dataloaders with the given output_time_dim.
+        Used for progressive AR-step training when reinitializing each stage.
+        Returns (train_loader, train_sampler, val_loader, val_sampler).
+        """
+        train_ds = self.train_dataset
+        # Build coupling configs with the new output_time_dim so couplers produce the right number of steps
+        updated_couplings = []
+        for c in self.couplings:
+            c_copy = copy.deepcopy(OmegaConf.to_object(DictConfig(c)) if OmegaConf.is_config(c) else copy.deepcopy(c))
+            c_copy["params"]["output_time_dim"] = output_time_dim
+            updated_couplings.append(c_copy)
+        # Base TimeSeriesDataset expects OmegaConf for scaling; existing dataset may have .scaling as plain dict
+        _scaling_train = train_ds.scaling
+        if _scaling_train is not None and not OmegaConf.is_config(_scaling_train):
+            _scaling_train = OmegaConf.create(_scaling_train)
+        new_train_ds = CoupledTimeSeriesDataset(
+            dataset=train_ds.ds,
+            scaling=_scaling_train,
+            input_variables=train_ds.input_variables,
+            output_variables=train_ds.output_variables,
+            input_time_dim=train_ds.input_time_dim,
+            output_time_dim=output_time_dim,
+            data_time_step=train_ds.data_time_step,
+            time_step=train_ds.time_step,
+            gap=train_ds.gap,
+            batch_size=train_ds.batch_size,
+            drop_last=train_ds.drop_last,
+            add_insolation=train_ds.add_insolation,
+            couplings=updated_couplings,
+            add_train_noise=train_ds.add_train_noise,
+            train_noise_params=getattr(train_ds, "train_noise_params", None),
+            train_noise_seed=getattr(train_ds, "train_noise_seed", 42),
+        )
+        val_ds = self.val_dataset
+        _scaling_val = val_ds.scaling
+        if _scaling_val is not None and not OmegaConf.is_config(_scaling_val):
+            _scaling_val = OmegaConf.create(_scaling_val)
+        new_val_ds = CoupledTimeSeriesDataset(
+            dataset=val_ds.ds,
+            scaling=_scaling_val,
+            input_variables=val_ds.input_variables,
+            output_variables=val_ds.output_variables,
+            input_time_dim=val_ds.input_time_dim,
+            output_time_dim=output_time_dim,
+            data_time_step=val_ds.data_time_step,
+            time_step=val_ds.time_step,
+            gap=val_ds.gap,
+            batch_size=val_ds.batch_size,
+            drop_last=val_ds.drop_last,
+            add_insolation=val_ds.add_insolation,
+            couplings=updated_couplings,
+        )
+        train_sampler = None
+        if num_shards > 1:
+            train_sampler = DistributedSampler(
+                new_train_ds,
+                num_replicas=num_shards,
+                rank=shard_id,
+                shuffle=self.shuffle,
+                drop_last=True,
+            )
+        val_sampler = None
+        if num_shards > 1:
+            val_sampler = DistributedSampler(
+                new_val_ds,
+                num_replicas=num_shards,
+                rank=shard_id,
+                shuffle=False,
+                drop_last=False,
+            )
+        batch_size = self.dataloader_batch_size
+        train_loader = DataLoader(
+            new_train_ds,
+            batch_size=batch_size,
+            shuffle=(train_sampler is None and self.shuffle),
+            sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=self.pin_memory,
+            collate_fn=self.collate_fn,
+            drop_last=False,
+        )
+        val_loader = DataLoader(
+            new_val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=num_workers,
+            pin_memory=self.pin_memory,
+            collate_fn=self.collate_fn,
+            drop_last=False,
+        )
+        return (train_loader, train_sampler, val_loader, val_sampler)

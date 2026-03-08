@@ -19,7 +19,7 @@ from typing import Sequence, Tuple, Union, Callable
 import torch
 import torch as th
 from .healpix_layers import HEALPixLayer
-from .normalization import ConditionalLayerNorm, AdaLNZero
+from .normalization import AdaLNZero, ConditionalLayerNorm, SPADE
 
 from hydra.utils import instantiate
 from omegaconf import DictConfig
@@ -1082,19 +1082,19 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         residual = self.skip_module(x) if self.use_block_skip_connection else 0
         gate = None
 
-        # AdaLN-style: apply entry norm first (CLN or LayerNorm or AdaLNZero)
+        # AdaLN-style: apply entry norm first (CLN or LayerNorm or AdaLNZero or SPADE)
         if self.entry_norm is not None:
             if isinstance(self.entry_norm, AdaLNZero):
                 if conditions_cln is None:
                     raise ValueError("AdaLNZero requires non-None conditions_cln.")
                 x, gate = self.entry_norm(x, conditions=conditions_cln)
-            elif isinstance(self.entry_norm, ConditionalLayerNorm):
+            elif isinstance(self.entry_norm, (ConditionalLayerNorm, SPADE)):
                 x = self.entry_norm(x, conditions=conditions_cln)
             else:
                 x = self.entry_norm(x)
 
         for layer in self.convblock:
-            if isinstance(layer, ConditionalLayerNorm):
+            if isinstance(layer, (ConditionalLayerNorm, SPADE)):
                 x = layer(x, conditions=conditions_cln)
             else:
                 x = layer(x)
@@ -1215,7 +1215,7 @@ class InceptionNeXtBlock(th.nn.Module):
                 if conditions_cln is None:
                     raise ValueError("AdaLNZero requires non-None conditions_cln.")
                 x, gate = self.entry_norm(x, conditions=conditions_cln)
-            elif isinstance(self.entry_norm, ConditionalLayerNorm):
+            elif isinstance(self.entry_norm, (ConditionalLayerNorm, SPADE)):
                 x = self.entry_norm(x, conditions=conditions_cln)
             else:
                 x = self.entry_norm(x)
@@ -1532,13 +1532,13 @@ class SymmetricInceptionNeXtBlock(th.nn.Module):
                 if conditions_cln is None:
                     raise ValueError("AdaLNZero requires non-None conditions_cln.")
                 x, gate = self.entry_norm(x, conditions=conditions_cln)
-            elif isinstance(self.entry_norm, ConditionalLayerNorm):
+            elif isinstance(self.entry_norm, (ConditionalLayerNorm, SPADE)):
                 x = self.entry_norm(x, conditions=conditions_cln)
             else:
                 x = self.entry_norm(x)
 
         for layer in self.convblock:
-            if isinstance(layer, ConditionalLayerNorm):
+            if isinstance(layer, (ConditionalLayerNorm, SPADE)):
                 x = layer(x, conditions=conditions_cln)
             else:
                 x = layer(x)
