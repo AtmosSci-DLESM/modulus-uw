@@ -47,6 +47,8 @@ class UNetDecoder(th.nn.Module):
         asn_noise_dim: int = 32,
         asn_mlp_hidden_dims: Optional[Sequence[int]] = None,
         asn_num_faces: int = 12,
+        asn_alpha_ramp_epochs: Optional[int] = 5,
+        asn_init_M_to_zero: bool = True,
         hpx_padding_mode: str = "karlbauer",
     ):
         """
@@ -102,6 +104,8 @@ class UNetDecoder(th.nn.Module):
             Hidden sizes for MLP mapping Z -> S. If None, defaults to [64, 64].
         asn_num_faces: int, optional
             Number of HEALPix faces for ASN unfold/refold (default 12). Must match fold convention.
+        asn_init_M_to_zero: bool, optional
+            If True (default), initialize the ASN modulation mask M to zeros; if False, initialize to ones.
         """
         super().__init__()
         self.channel_dim = 1  # 1 in previous layout
@@ -212,6 +216,8 @@ class UNetDecoder(th.nn.Module):
                     alpha=asn_alpha,
                     mlp_hidden_dims=mlp_dims,
                     num_faces=asn_num_faces,
+                    ramp_epochs=asn_alpha_ramp_epochs,
+                    init_M_to_zero=asn_init_M_to_zero,
                 )
                 layer_dict["pre_skip"] = th.nn.ModuleDict({"asn": asn_module})
             self.decoder.append(th.nn.ModuleDict(layer_dict))

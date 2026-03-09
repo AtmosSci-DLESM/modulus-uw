@@ -250,9 +250,10 @@ class OceanMSE(th.nn.MSELoss):
 
 class WeightedOceanMSE(th.nn.MSELoss):
     """
-    Ocean MSE class offers impementaion for MSE loss with:
-    1) weighted by a land-sea-mask field.
-    2) weighted by channel (e.g. sic more than sst)
+    Ocean MSE loss with:
+    1) Land-sea-mask weighting (optional binary or continuous mask).
+    2) Per-channel weights (e.g. sic more than sst).
+    3) Optional variogram and spectral terms for single-member (deterministic) predictions.
     """
 
     def __init__(
@@ -261,8 +262,17 @@ class WeightedOceanMSE(th.nn.MSELoss):
         open_dict: dict = {"engine": "zarr"},
         selection_dict: dict = {"channel_c": "lsm"},
         weights: Sequence = [],
+        lsm_binary_mask: bool = False,
+        lsm_binary_threshold: float = 0.5,
+        variogram: float = 0.0,
+        variogram_p: float = 0.5,
+        variogram_lags: Sequence[int] = (1, 2, 3),
+        spectral_weight: float = 0.0,
+        spectral_window: int = 32,
+        spectral_stride: int = 16,
+        spectral_min_ring: int = 32,
+        spectral_variables: Optional[Sequence[str]] = None,
     ):
-        """ """
         super().__init__()
         self.device = None
         self.lsm_file = lsm_file
@@ -274,45 +284,351 @@ class WeightedOceanMSE(th.nn.MSELoss):
         self.lsm_sum = None
         self.lsm_var_sum = None
         self.loss_weights = th.tensor(weights)
+        # Binary LSM: same semantics as WeightedCRPSLoss
+        self.lsm_binary_mask = lsm_binary_mask
+        self.lsm_binary_threshold = lsm_binary_threshold
+        # Variogram (single-member: no ensemble mean)
+        self.variogram = variogram
+        self.variogram_p = variogram_p
+        self.variogram_lags = list(variogram_lags)
+        # Spectral (ocean power-spectrum)
+        self.spectral_weight = float(spectral_weight)
+        self.spectral_window = int(spectral_window)
+        self.spectral_stride = int(spectral_stride)
+        self.spectral_min_ring = int(spectral_min_ring)
+        self.spectral_variables = list(spectral_variables) if spectral_variables is not None else None
+        self._spectral_channel_idx = None
+        self._spectral_lookup = None
+        self._spectral_hann = None
+        self._spectral_nside = None
+        self._spectral_first_forward_done = False
+        self.last_variogram = None
+        self.last_spectral = None
 
     def setup(self, trainer):
         """
-        reshape lsm and put on device
-        pushes weights to cuda device
+        Load LSM (binary or continuous), move to device, init spectral swaths if needed.
         """
-        ### 1. OCEAN PREP ###
+        ### 1. OCEAN LSM ###
         self.lsm_ds = xr.open_dataset(self.lsm_file, **self.open_dict).constants.sel(
             self.selection_dict
         )
-        # 1-lsm gives the percentage of pixel that has ocean
-        self.lsm_tensor = 1 - th.tensor(
-            np.expand_dims(self.lsm_ds.values, (0, 2, 3))
-        ).to(trainer.device)
+        lsm_values = np.expand_dims(self.lsm_ds.values, (0, 2, 3))
+        if self.lsm_binary_mask:
+            lsm_binary = (lsm_values < self.lsm_binary_threshold).astype(np.float32)
+            self.lsm_tensor = th.tensor(lsm_binary)
+        else:
+            self.lsm_tensor = 1 - th.tensor(lsm_values.astype(np.float32))
+        self.lsm_tensor = self.lsm_tensor.to(device=trainer.device)
 
-        ### 2. WEIGHTS PREP ###
-
+        ### 2. WEIGHTS ###
         if not len(trainer.output_variables) == len(self.loss_weights):
             raise ValueError("Length of outputs and loss_weights is not the same!")
-
         self.loss_weights = self.loss_weights.to(device=trainer.device)
 
-    def forward(self, prediction, target, average_channels=True):
+        ### 3. SPECTRAL SWATHS (if spectral term enabled) ###
+        if self.spectral_weight > 0:
+            self._init_spectral_swaths(trainer)
 
+    def _init_spectral_swaths(self, trainer):
+        """Precompute ocean swath lookup and Hann window for spectral loss (6D single-member)."""
+        log = logging.getLogger(__name__)
+        out_vars = list(trainer.output_variables)
+        n_c = len(out_vars)
+        if self.spectral_variables is None:
+            self._spectral_channel_idx = list(range(n_c))
+        else:
+            name_to_idx = {v: i for i, v in enumerate(out_vars)}
+            self._spectral_channel_idx = []
+            for name in self.spectral_variables:
+                if name not in name_to_idx:
+                    raise ValueError(
+                        f"spectral_variables entry '{name}' not in trainer.output_variables {out_vars}"
+                    )
+                self._spectral_channel_idx.append(name_to_idx[name])
+        mask_spatial = self.lsm_tensor[0, :, 0, 0]
+        f, h, w = mask_spatial.shape
+        if f != 12 or h != w:
+            raise ValueError(
+                f"Expected HEALPix grid 12 x nside x nside, got F={f} H={h} W={w}"
+            )
+        nside = int(h)
+        self._spectral_nside = nside
+        npix = 12 * nside * nside
+        device = trainer.device
+        mask_np = mask_spatial.cpu().numpy()
+        window_len = self.spectral_window
+        stride = self.spectral_stride
+        min_row_len = self.spectral_min_ring
+        all_windows = []
+        n_rows_with_swaths = 0
+        spectral_ocean_threshold = 0.5
+        for face in range(12):
+            for row in range(nside):
+                row_mask = mask_np[face, row, :]
+                if row_mask.size < window_len:
+                    continue
+                if self.lsm_binary_mask:
+                    ocean = row_mask > spectral_ocean_threshold
+                else:
+                    ocean = row_mask >= spectral_ocean_threshold
+                run_starts = np.where(np.diff(np.concatenate([[False], ocean, [False]]).astype(np.int8)) == 1)[0]
+                run_ends = np.where(np.diff(np.concatenate([[False], ocean, [False]]).astype(np.int8)) == -1)[0]
+                row_contributed = False
+                for rs, re in zip(run_starts, run_ends):
+                    run_len = re - rs
+                    if run_len < window_len:
+                        continue
+                    for j in range(0, run_len - window_len + 1, stride):
+                        win_slice = row_mask[rs + j : rs + j + window_len]
+                        if self.lsm_binary_mask:
+                            if not np.all(win_slice > spectral_ocean_threshold):
+                                continue
+                        else:
+                            if not np.all(win_slice >= spectral_ocean_threshold):
+                                continue
+                        base = face * (nside * nside) + row * nside + rs + j
+                        global_indices = base + np.arange(window_len, dtype=np.int64)
+                        all_windows.append(global_indices)
+                        row_contributed = True
+                if row_contributed:
+                    n_rows_with_swaths += 1
+        n_swaths = len(all_windows)
+        if n_swaths == 0:
+            log.warning(
+                "spectral_loss: no valid ocean swaths found (n_swaths=0). "
+                "Spectral term disabled. Check land-sea mask and spectral_window."
+            )
+            self._spectral_lookup = None
+            self._spectral_hann = None
+            return
+        idx_windows = np.stack(all_windows, axis=0).astype(np.int64)
+        self._spectral_lookup = th.from_numpy(idx_windows).to(device)
+        self._spectral_hann = th.hann_window(
+            window_len, periodic=True, device=device, dtype=th.float32
+        )
+        log.info(
+            "spectral_loss: n_swaths=%d, n_rows_with_swaths=%d, lsm_binary_mask=%s (PAD_XY, no regrid)",
+            n_swaths,
+            n_rows_with_swaths,
+            self.lsm_binary_mask,
+        )
+
+    def _to_flat_pad_xy(self, x: th.Tensor, face_dim: int) -> th.Tensor:
+        """Flatten HEALPix PAD_XY (face) layout to 1D [..., F*H*W].
+        Moves face_dim to the end; accepts trailing (12, nside, nside) or (nside, nside, 12)
+        and normalizes to (12, nside, nside) so flatten order is face-major (PAD_XY).
+        """
+        x = th.movedim(x, face_dim, -1)
+        trailing = x.shape[-3:]
+        nside = self._spectral_nside
+        # #region agent log
+        try:
+            import json
+            with open("/pscratch/sd/z/zespinos/.cursor/debug.log", "a") as _f:
+                _f.write(json.dumps({"hypothesisId": "B", "location": "healpix_loss.py:_to_flat_pad_xy", "message": "after movedim", "data": {"face_dim": face_dim, "trailing": list(trailing), "nside": nside, "x_shape_before": list(x.shape)}, "timestamp": __import__("time").time()}) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        if trailing == (12, nside, nside):
+            pass
+        elif trailing == (nside, nside, 12):
+            x = x.permute(*range(x.ndim - 3), -1, -3, -2)
+        else:
+            raise ValueError(
+                f"Expected trailing (12, nside, nside) or (nside, nside, 12), got {trailing}"
+            )
+        return x.contiguous().reshape(*x.shape[:-3], -1)
+
+    def _calculate_variogram_loss_single(self, prediction, target, average_channels=True):
+        """
+        Single-member variogram loss: compare prediction vs target p-th order absolute
+        differences at lags. prediction/target 6D [N, B, F, C, H, W]; no ensemble mean.
+        """
+        p = self.variogram_p
+        has_real_mask = self.lsm_tensor.shape[-1] > 1
+
+        total_vs_sum = 0
+        total_mask_sum = 0
+
+        # 6D [N, 12, T, C, H, W]: valid_h.sum() already includes the 12 faces; do not multiply by face dim again
+        n_c = target.shape[3]
+        n_batch_no_face = target.shape[0] * target.shape[2]  # N * T (denominator count excluding faces and C)
+        n_batch_no_face_times_c = n_batch_no_face * n_c    # N * T * C for average_channels
+
+        for lag in self.variogram_lags:
+            # Horizontal lags (shift along W)
+            pred_h1, pred_h2 = prediction[..., :, :-lag], prediction[..., :, lag:]
+            tar_h1, tar_h2 = target[..., :, :-lag], target[..., :, lag:]
+
+            if has_real_mask:
+                valid_h = self.lsm_tensor[..., :, :-lag] * self.lsm_tensor[..., :, lag:]
+            else:
+                valid_h = self.lsm_tensor
+
+            exp_pred_h = th.abs(pred_h1 - pred_h2).clamp(min=1e-6).pow(p)
+            tar_diff_h = th.abs(tar_h1 - tar_h2).clamp(min=1e-6).pow(p)
+            vs_h = ((exp_pred_h - tar_diff_h) ** 2) * valid_h
+
+            # Vertical lags (shift along H)
+            pred_v1, pred_v2 = prediction[..., :-lag, :], prediction[..., lag:, :]
+            tar_v1, tar_v2 = target[..., :-lag, :], target[..., lag:, :]
+
+            if has_real_mask:
+                valid_v = self.lsm_tensor[..., :-lag, :] * self.lsm_tensor[..., lag:, :]
+            else:
+                valid_v = self.lsm_tensor
+
+            exp_pred_v = th.abs(pred_v1 - pred_v2).clamp(min=1e-6).pow(p)
+            tar_diff_v = th.abs(tar_v1 - tar_v2).clamp(min=1e-6).pow(p)
+            vs_v = ((exp_pred_v - tar_diff_v) ** 2) * valid_v
+
+            if average_channels:
+                total_vs_sum += vs_h.sum() + vs_v.sum()
+                if has_real_mask:
+                    total_mask_sum += (valid_h.sum() + valid_v.sum()) * n_batch_no_face_times_c
+                else:
+                    total_mask_sum += vs_h.numel() + vs_v.numel()
+            else:
+                total_vs_sum += vs_h.sum(dim=(0, 1, 2, 4, 5)) + vs_v.sum(dim=(0, 1, 2, 4, 5))
+                if has_real_mask:
+                    total_mask_sum += (valid_h.sum() + valid_v.sum()) * n_batch_no_face
+                else:
+                    total_mask_sum += (vs_h.numel() + vs_v.numel()) // n_c
+
+        return total_vs_sum / (total_mask_sum + 1e-8)
+
+    def _compute_power_spectrum_loss_single(self, prediction, target, average_channels=True):
+        """
+        Log-spectral MSE between prediction and target over ocean swaths.
+        prediction/target 6D: [N, B, F, T, C, H, W] with F=12 (faces), T=time, or
+        [N, B, F, C, H, W] with F=12. Single-member, no ensemble.
+
+        The ocean swath lookup and flat 1D layout are in HEALPix PAD_XY order (12 faces).
+        Model output is always [..., 12, T, C, H, W] (face at dim 1) regardless of
+        enable_healpixpad; we detect 12 faces at dim 1 or 2 and flatten accordingly.
+        """
+        if self._spectral_lookup is None:
+            return th.tensor(0.0, device=prediction.device, dtype=prediction.dtype)
+        idx = self._spectral_channel_idx
+        # 6D [N, 12, T, C, H, W]: face at index 1, channels at 3
+        # 7D [N, B, 12, T, C, H, W]: face at index 2, channels at 4
+        if prediction.ndim == 6:
+            if prediction.shape[1] != 12:
+                return th.tensor(0.0, device=prediction.device, dtype=prediction.dtype)
+            if (prediction.shape[4] != self._spectral_nside or prediction.shape[5] != self._spectral_nside):
+                return th.tensor(0.0, device=prediction.device, dtype=prediction.dtype)
+            pred_spec = prediction[:, :, :, idx, :, :]
+            tar_spec = target[:, :, :, idx, :, :]
+            face_dim_flat = 1
+        elif prediction.ndim == 7:
+            if prediction.shape[2] != 12:
+                return th.tensor(0.0, device=prediction.device, dtype=prediction.dtype)
+            if (prediction.shape[5] != self._spectral_nside or prediction.shape[6] != self._spectral_nside):
+                return th.tensor(0.0, device=prediction.device, dtype=prediction.dtype)
+            pred_spec = prediction[:, :, :, :, idx, :, :]
+            tar_spec = target[:, :, :, :, idx, :, :]
+            face_dim_flat = 2
+        else:
+            return th.tensor(0.0, device=prediction.device, dtype=prediction.dtype)
+        # pred_spec: 6D (n, 12, t, c_spec, h, w) or 7D (n, b, 12, t, c_spec, h, w)
+        # After _to_flat_pad_xy(face_dim) the face dim is folded into npix
+        if pred_spec.ndim == 6:
+            n, b, t, c_spec, h, w = pred_spec.shape
+            n_btc = n * t * c_spec
+        else:
+            n, b, f, t, c_spec, h, w = pred_spec.shape
+            n_btc = n * b * t * c_spec
+        npix = 12 * self._spectral_nside ** 2
+        with th.cuda.amp.autocast(enabled=False):
+            pred_f = pred_spec.float()
+            tar_f = tar_spec.float()
+            pred_flat = self._to_flat_pad_xy(pred_f, face_dim_flat)
+            tar_flat = self._to_flat_pad_xy(tar_f, face_dim_flat)
+            pred_ring = pred_flat.reshape(n_btc, npix)
+            tar_ring = tar_flat.reshape(n_btc, npix)
+            lookup = self._spectral_lookup
+            n_swaths, window_len = lookup.shape
+            pred_swaths = pred_ring[:, lookup]
+            tar_swaths = tar_ring[:, lookup]
+            pred_swaths = pred_swaths.reshape(n_btc, n_swaths, window_len)
+            tar_swaths = tar_swaths.reshape(n_btc, n_swaths, window_len)
+            hann = self._spectral_hann
+            pred_tapered = pred_swaths * hann[None, None, :]
+            tar_tapered = tar_swaths * hann[None, None, :]
+            pred_fft = th.fft.rfft(pred_tapered, dim=-1)
+            tar_fft = th.fft.rfft(tar_tapered, dim=-1)
+            pred_power = (pred_fft.real ** 2 + pred_fft.imag ** 2)[..., 1:]
+            tar_power = (tar_fft.real ** 2 + tar_fft.imag ** 2)[..., 1:]
+            n_freq = pred_power.shape[-1]
+            pred_power_mean_swath = pred_power.mean(dim=1)
+            tar_power_mean_swath = tar_power.mean(dim=1)
+            if pred_spec.ndim == 6:
+                pred_power_mean_swath = pred_power_mean_swath.reshape(n, t, c_spec, n_freq)
+                tar_power_mean_swath = tar_power_mean_swath.reshape(n, t, c_spec, n_freq)
+            else:
+                pred_power_mean_swath = pred_power_mean_swath.reshape(n, b, t, c_spec, n_freq)
+                tar_power_mean_swath = tar_power_mean_swath.reshape(n, b, t, c_spec, n_freq)
+            eps = 1e-8
+            log_pred = th.log(pred_power_mean_swath + eps)
+            log_tar = th.log(tar_power_mean_swath + eps)
+            mse_per_sample = ((log_pred - log_tar) ** 2).mean(dim=-1)
+            spec_weights = self.loss_weights[idx]
+            if average_channels:
+                if pred_spec.ndim == 6:
+                    weighted = mse_per_sample * spec_weights.view(1, 1, -1)
+                    c_total = prediction.shape[3]
+                    spec_loss = weighted.sum() / (n * t * c_total)
+                else:
+                    weighted = mse_per_sample * spec_weights.view(1, 1, 1, -1)
+                    c_total = prediction.shape[4]
+                    spec_loss = weighted.sum() / (n * b * t * c_total)
+            else:
+                if pred_spec.ndim == 6:
+                    weighted = mse_per_sample * spec_weights.view(1, 1, -1)
+                    spec_loss = weighted.mean(dim=(0, 1))
+                else:
+                    weighted = mse_per_sample * spec_weights.view(1, 1, 1, -1)
+                    spec_loss = weighted.mean(dim=(0, 1, 2))
+        return spec_loss
+
+    def forward(self, prediction, target, average_channels=True):
         if not self.lsm_sum_calculated:
             self.lsm_sum = th.broadcast_to(self.lsm_tensor, target.shape).sum()
             self.lsm_var_sum = th.broadcast_to(self.lsm_tensor, target.shape).sum(
                 dim=(0, 1, 2, 4, 5)
             )
             self.lsm_sum_calculated = True
-        # average weighted
+
         ocean_err = ((target - prediction) ** 2) * self.lsm_tensor
         ocean_mean_err = ocean_err.sum(dim=(0, 1, 2, 4, 5))
         ocean_mean_err = ocean_mean_err * self.loss_weights
 
         if average_channels:
-            return th.sum(ocean_mean_err) / self.lsm_sum
+            loss = th.sum(ocean_mean_err) / self.lsm_sum
         else:
-            return ocean_mean_err / self.lsm_var_sum
+            loss = ocean_mean_err / self.lsm_var_sum
+
+        self.last_variogram = None
+        self.last_spectral = None
+
+        if self.variogram > 0.0:
+            vs_loss = self._calculate_variogram_loss_single(prediction, target, average_channels)
+            loss = loss + self.variogram * vs_loss
+            self.last_variogram = (self.variogram * vs_loss).mean().detach() if th.is_tensor(vs_loss) else None
+
+        if self.spectral_weight > 0.0 and self._spectral_lookup is not None:
+            spec_loss = self._compute_power_spectrum_loss_single(prediction, target, average_channels)
+            if spec_loss is not None and th.is_tensor(spec_loss):
+                if average_channels:
+                    loss = loss + self.spectral_weight * spec_loss
+                else:
+                    spectral_contrib = th.zeros_like(loss)
+                    spectral_contrib[self._spectral_channel_idx] = self.spectral_weight * spec_loss
+                    loss = loss + spectral_contrib
+                self.last_spectral = (self.spectral_weight * spec_loss).mean().detach() if spec_loss.ndim > 0 else (self.spectral_weight * spec_loss).detach()
+
+        return loss
 
 class WeightedCRPSLoss(th.nn.MSELoss):
 
@@ -460,6 +776,10 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         self.last_temporal_dt = None
         self.last_variogram = None
         self.last_spectral = None
+        # Cached ensemble-diagnostics (spread/skill/SSR) for TensorBoard
+        self.last_spread = None
+        self.last_skill = None
+        self.last_spread_skill_score = None
 
     def setup(self, trainer):
         """
@@ -478,6 +798,59 @@ class WeightedCRPSLoss(th.nn.MSELoss):
 
         if self.spectral_weight > 0:
             self._init_spectral_swaths(trainer)
+
+    def _compute_spread_skill_ssr(
+        self,
+        prediction: th.Tensor,
+        target: th.Tensor,
+    ):
+        """
+        Compute domain-averaged spread, skill, and spread-skill ratio (SSR)
+        from the unweighted ensemble prediction and target.
+
+        prediction: [Cond, B, F, T, C, H, W]
+        target:     [B, F, T, C, H, W]
+        """
+        if prediction.ndim != 7 or target.ndim != 6:
+            raise ValueError(
+                f"_compute_spread_skill_ssr expects prediction [Cond, B, F, T, C, H, W] and target [B, F, T, C, H, W], "
+                f"got {prediction.shape} and {target.shape}"
+            )
+
+        n = self.n_members
+        if n < 2:
+            raise ValueError("Spread/skill diagnostics require at least 2 ensemble members")
+
+        # Ensemble mean at each grid point
+        mu = prediction.mean(dim=0)  # [B, F, T, C, H, W]
+
+        # Local ensemble variance with Bessel's correction (N-1 in denominator)
+        diff = prediction - mu.unsqueeze(0)  # [Cond, B, F, T, C, H, W]
+        sigma2 = (diff * diff).sum(dim=0) / float(max(n - 1, 1))  # [B, F, T, C, H, W]
+
+        # Local squared error of ensemble mean
+        se = (mu - target) ** 2  # [B, F, T, C, H, W]
+
+        # Apply land–sea mask as weight; mask is [1, F, 1, 1, H, W] or all ones
+        # Broadcasting in the products below yields [B, F, T, C, H, W].
+        weighted_sigma2 = sigma2 * self.lsm_tensor  # [B, F, T, C, H, W]
+        weighted_se = se * self.lsm_tensor          # [B, F, T, C, H, W]
+
+        eps = 1e-8
+        # Effective count of masked pixels (same for every channel since mask has no C dim)
+        m_eff = self.lsm_tensor.sum()
+
+        # Reduce over batch, faces, time, H, W – keep channels separate
+        # -> per-channel variance and MSE
+        spread_var_c = weighted_sigma2.sum(dim=(0, 1, 2, 4, 5)) / (m_eff + eps)  # [C]
+        skill_mse_c = weighted_se.sum(dim=(0, 1, 2, 4, 5)) / (m_eff + eps)       # [C]
+
+        spread_c = th.sqrt(spread_var_c + eps)  # [C]
+        skill_c = th.sqrt(skill_mse_c + eps)    # [C]
+        ssr_c = spread_c / (skill_c + eps)      # [C]
+
+        # Return per-channel diagnostics; caller can aggregate as needed
+        return spread_c.detach(), skill_c.detach(), ssr_c.detach()
 
     def _init_spectral_swaths(self, trainer):
         """Precompute ocean swath lookup table and Hann window for spectral loss (run once in setup)."""
@@ -838,6 +1211,19 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         # Manual Cast
         prediction = prediction.to(th.float32)
         target = target.to(th.float32)
+
+        # Ensemble spread/skill diagnostics on unweighted fields (before channel weights)
+        try:
+            spread, skill, ssr = self._compute_spread_skill_ssr(prediction, target)
+            # Per-channel diagnostics returned from helper; log channel-averaged scalars
+            self.last_spread = spread.mean()
+            self.last_skill = skill.mean()
+            self.last_spread_skill_score = ssr.mean()
+        except Exception:
+            # Do not let diagnostic failures affect training loss
+            self.last_spread = None
+            self.last_skill = None
+            self.last_spread_skill_score = None
 
         # Spectral term on unweighted fields (before channel weights)
         spec_loss = None
@@ -1618,7 +2004,17 @@ class CosineAnnealedOceanCRPSLoss(th.nn.Module):
         self.last_mse_scale_eff = th.tensor(mse_scale_eff, device=prediction.device, dtype=total_scalar.dtype).detach()
 
         # Forward CRPS sub-component scalars so the trainer can find them on the outer criterion
-        for attr in ("last_crps_base", "last_mean_penalty", "last_multiscale", "last_temporal_dt", "last_variogram", "last_spectral"):
+        for attr in (
+            "last_crps_base",
+            "last_mean_penalty",
+            "last_multiscale",
+            "last_temporal_dt",
+            "last_variogram",
+            "last_spectral",
+            "last_spread",
+            "last_skill",
+            "last_spread_skill_score",
+        ):
             setattr(self, attr, getattr(self.crps_loss, attr, None))
 
         return total

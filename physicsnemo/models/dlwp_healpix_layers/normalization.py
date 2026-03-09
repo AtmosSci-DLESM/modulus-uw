@@ -39,9 +39,30 @@ class ConditionalLayerNorm(th.nn.Module):
         norm_op:str = "torch",
         init_cln_to_zero: bool = False,
         scale_center: float = 0.0,
+        ramp_epochs: Optional[int] = None,
+        initial_lambda: Optional[float] = None,
     ):
         """
         Conditional LayerNorm with MLP-based conditioning.
+
+        Let
+            X       : raw features, shape (B, C, H, W)
+            X_hat   : channel-wise normalized features = LayerNorm(X)
+            Z       : condition vector, shape (B*n_cond, cond_dim)
+            c       : scale_center (e.g., 0.0 or 1.0)
+            λ       : ramp factor in [0, 1] controlled by set_epoch().
+
+        The conditioning is
+            Δγ_raw(Z) = MLP_γ(Z)
+            β_raw(Z)  = MLP_β(Z)
+            Δγ_ramped = λ · Δγ_raw
+            β_ramped  = λ · β_raw
+            γ         = c + Δγ_ramped
+            Y         = γ ⊙ X_hat + β_ramped
+
+        When λ = 0, Δγ_ramped = 0 and β_ramped = 0 so γ = c and
+            Y = c ⊙ X_hat
+        which is a purely deterministic LayerNorm-style normalization.
 
         Parameters
         ----------
@@ -77,6 +98,13 @@ class ConditionalLayerNorm(th.nn.Module):
         self.n_faces = n_faces
         self.scale_center = scale_center
 
+        # Scheduling metadata for ramping the conditioning strength lambda.
+        # _lambda is the current effective ramp factor used in forward; it is
+        # 1.0 by default for backward-compatible behavior when ramping is disabled.
+        self._lambda: float = 1.0
+        self._max_lambda: float = float(initial_lambda) if initial_lambda is not None else 1.0
+        self._ramp_epochs: Optional[int] = ramp_epochs
+
         if init_cln_to_zero:
             self.gamma_mlp[-1].weight.data.zero_()
             self.beta_mlp[-1].weight.data.zero_()
@@ -89,6 +117,24 @@ class ConditionalLayerNorm(th.nn.Module):
             if not _APEX_AVAILABLE:
                 raise ImportError("Apex FusedLayerNorm requested but apex is not available, please install it from https://github.com/NVIDIA/apex")
             self.norm = FusedLayerNorm(channel_depth, elementwise_affine=False)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Update effective lambda using a linear ramp over self._ramp_epochs epochs.
+
+        Lambda starts at 0 for epoch <= 0 and increases linearly to self._max_lambda
+        by epoch >= self._ramp_epochs, then stays constant. If ramping is disabled
+        (self._ramp_epochs is None or <= 0), lambda is fixed to self._max_lambda
+        (default 1.0) for backward-compatible behavior.
+        """
+        if self._ramp_epochs is None or self._ramp_epochs <= 0:
+            self._lambda = self._max_lambda
+            return
+        t = float(epoch) / float(self._ramp_epochs)
+        if t < 0.0:
+            t = 0.0
+        elif t > 1.0:
+            t = 1.0
+        self._lambda = self._max_lambda * t
 
     def _make_mlp(self, in_dim: int, hidden_dims: List[int], out_dim: int, activation: th.nn.Module) -> th.nn.Sequential:
 
@@ -120,10 +166,19 @@ class ConditionalLayerNorm(th.nn.Module):
         # normal layer norm without default scale, bias applied (permute to channels_last)
         x = x.permute(0, 2, 3, 1)
         x_norm = self.norm(x)
-    
-        # Compute gamma and beta from conditions
-        gamma = self.scale_center + self.gamma_mlp(conditions)[:, None, None, :] # (B*n_cond, 1, 1, C)
-        beta = self.beta_mlp(conditions)[:, None, None, :] # (B*n_cond, 1, 1, C)
+
+        # Compute raw gamma and beta from conditions (before ramping).
+        delta_gamma = self.gamma_mlp(conditions)[:, None, None, :]  # (B*n_cond, 1, 1, C)
+        beta_raw = self.beta_mlp(conditions)[:, None, None, :]      # (B*n_cond, 1, 1, C)
+
+        # Apply ramping factor lambda to the raw MLP outputs.
+        lambda_eff = getattr(self, "_lambda", 1.0)
+        delta_gamma_ramped = lambda_eff * delta_gamma
+        beta_ramped = lambda_eff * beta_raw
+
+        # Apply scale center after ramping.
+        gamma = self.scale_center + delta_gamma_ramped
+        beta = beta_ramped
 
         # Repeat for the number of faces(which has been folded into the batch dimension)
         gamma = gamma.repeat_interleave(self.n_faces, dim=0)
@@ -269,6 +324,36 @@ class SPADE(th.nn.Module):
     learnable per-face embedding so gamma/beta can differ per HEALPix face (no single
     map forced to generalize across all faces). Zero-initialized for identity at init.
 
+    Let
+        X       : raw features, shape (N, C, H, W) with N = B * n_faces
+        X_hat   : channel-wise normalized features = LayerNorm(X)
+        Z       : spatial condition map (B or N batch), channels condition_shape
+        S       : shared hidden features = act(Conv_shared(Z + E_face))
+        λ       : ramp factor in [0, 1] controlled by set_epoch()
+        c       : scale_center
+        ε       : epsilon_bound (optional).
+
+    Raw logits:
+        Δγ_raw(S) = Conv_γ(S)
+        β_raw(S)  = Conv_β(S)
+
+    Ramped logits:
+        Δγ_ramped = λ · Δγ_raw
+        β_ramped  = λ · β_raw
+
+    Gamma with optional epsilon bound:
+        if ε is not None:
+            γ = c + ε · tanh(Δγ_ramped)
+        else:
+            γ = c + Δγ_ramped
+
+    Output:
+        Y = γ ⊙ X_hat + β_ramped
+
+    When λ = 0, Δγ_ramped = 0 and β_ramped = 0 so γ = c and
+        Y = c ⊙ X_hat
+    and the effect of both the spatial convolutions and face embedding is silenced.
+
     Per-face modulation: face_embed (1, F, C_cond, 1, 1) is added to Z (after broadcast
     if Z is per-batch) so the conv sees different input per face and produces different
     gamma/beta per face. face_embed is initialized to zero so at init behavior is unchanged.
@@ -294,6 +379,8 @@ class SPADE(th.nn.Module):
         epsilon_bound: Optional[float] = None,
         conv_hidden_channels: Optional[int] = None,
         init_spade_to_zero: bool = True,
+        ramp_epochs: Optional[int] = None,
+        initial_lambda: Optional[float] = None,
     ):
         """
         Parameters
@@ -340,6 +427,13 @@ class SPADE(th.nn.Module):
         self.scale_center = scale_center
         self.epsilon_bound = epsilon_bound
 
+        # Scheduling metadata for ramping the conditioning strength lambda.
+        # _lambda is the current effective ramp factor used in forward; it is
+        # 1.0 by default for backward-compatible behavior when ramping is disabled.
+        self._lambda: float = 1.0
+        self._max_lambda: float = float(initial_lambda) if initial_lambda is not None else 1.0
+        self._ramp_epochs: Optional[int] = ramp_epochs
+
         self.shared_conv = th.nn.Conv2d(
             condition_shape, hidden_channels, kernel_size=3, padding=1
         )
@@ -377,6 +471,24 @@ class SPADE(th.nn.Module):
         self.face_embed = th.nn.Parameter(
             th.zeros(1, n_faces, condition_shape, 1, 1)
         )
+
+    def set_epoch(self, epoch: int) -> None:
+        """Update effective lambda using a linear ramp over self._ramp_epochs epochs.
+
+        Lambda starts at 0 for epoch <= 0 and increases linearly to self._max_lambda
+        by epoch >= self._ramp_epochs, then stays constant. If ramping is disabled
+        (self._ramp_epochs is None or <= 0), lambda is fixed to self._max_lambda
+        (default 1.0) for backward-compatible behavior.
+        """
+        if self._ramp_epochs is None or self._ramp_epochs <= 0:
+            self._lambda = self._max_lambda
+            return
+        t = float(epoch) / float(self._ramp_epochs)
+        if t < 0.0:
+            t = 0.0
+        elif t > 1.0:
+            t = 1.0
+        self._lambda = self._max_lambda * t
 
     def forward(self, x: th.Tensor, conditions: th.Tensor) -> th.Tensor:
         """
@@ -423,14 +535,19 @@ class SPADE(th.nn.Module):
 
         shared = self.activation(self.shared_conv(Z))
         gamma_raw = self.gamma_conv(shared)
-        beta = self.beta_conv(shared)
+        beta_raw = self.beta_conv(shared)
+
+        # Apply ramping factor lambda to the raw conv outputs before any bounds.
+        lambda_eff = getattr(self, "_lambda", 1.0)
+        delta_gamma_ramped = lambda_eff * gamma_raw
+        beta_ramped = lambda_eff * beta_raw
 
         if self.epsilon_bound is not None:
-            gamma = self.scale_center + self.epsilon_bound * th.tanh(gamma_raw)
+            gamma = self.scale_center + self.epsilon_bound * th.tanh(delta_gamma_ramped)
         else:
-            gamma = self.scale_center + gamma_raw
+            gamma = self.scale_center + delta_gamma_ramped
 
-        return gamma * x_norm + beta
+        return gamma * x_norm + beta_ramped
 
 
 class AdditiveSpatialNoise(th.nn.Module):
@@ -472,6 +589,9 @@ class AdditiveSpatialNoise(th.nn.Module):
         mlp_hidden_dims: Optional[List[int]] = None,
         num_faces: int = 12,
         seed: Optional[int] = None,
+        ramp_epochs: Optional[int] = 5,
+        initial_alpha: Optional[float] = None,
+        init_M_to_zero: bool = True,
     ):
         """
         Parameters
@@ -495,17 +615,31 @@ class AdditiveSpatialNoise(th.nn.Module):
         super().__init__()
         self.channel_depth = channel_depth
         self.noise_dim = noise_dim
+        # Current effective alpha used in forward. Initialized exactly as before
+        # for backward-compatible behavior when no scheduler is used.
         self.alpha = alpha
         self.num_faces = num_faces
         self._seed = seed
         self._generator = None
 
+        # Scheduling metadata (used only if a trainer calls set_epoch).
+        # _max_alpha is the target alpha after ramp-up; defaults to the
+        # constructor alpha for backward compatibility.
+        self._max_alpha = float(initial_alpha) if initial_alpha is not None else float(alpha)
+        self._ramp_epochs = ramp_epochs
+
         H, W = spatial_size
         if mlp_hidden_dims is None:
             mlp_hidden_dims = [64, 64]
         self.mlp = self._make_mlp(noise_dim, mlp_hidden_dims, channel_depth)
-        # M: (1, F, C, H, W) fixed at init so optimizer and DDP keep a valid reference
-        self.M = th.nn.Parameter(th.zeros(1, num_faces, channel_depth, H, W))
+        # M: (1, F, C, H, W) fixed at init so optimizer and DDP keep a valid reference.
+        # By default we initialize to zeros for stability; set init_M_to_zero=False
+        # to start from ones instead.
+        if init_M_to_zero:
+            M_init = th.zeros(1, num_faces, channel_depth, H, W)
+        else:
+            M_init = th.ones(1, num_faces, channel_depth, H, W)
+        self.M = th.nn.Parameter(M_init)
 
     def _make_mlp(
         self, in_dim: int, hidden_dims: List[int], out_dim: int
@@ -530,6 +664,23 @@ class AdditiveSpatialNoise(th.nn.Module):
             self._generator = th.Generator(device=device)
             self._generator.manual_seed(seed)
         return self._generator
+
+    def set_epoch(self, epoch: int) -> None:
+        """Update effective alpha using a linear ramp over self._ramp_epochs epochs.
+
+        Alpha starts at 0 for epoch <= 0 and increases linearly to self._max_alpha
+        by epoch >= self._ramp_epochs, then stays constant. If ramping is disabled
+        (self._ramp_epochs is None or <= 0), this is a no-op.
+        """
+        if self._ramp_epochs is None or self._ramp_epochs <= 0:
+            return
+        # Compute clamped fractional progress in [0, 1].
+        t = float(epoch) / float(self._ramp_epochs)
+        if t < 0.0:
+            t = 0.0
+        elif t > 1.0:
+            t = 1.0
+        self.alpha = self._max_alpha * t
 
     def forward(self, x: th.Tensor) -> th.Tensor:
         """
@@ -560,3 +711,17 @@ class AdditiveSpatialNoise(th.nn.Module):
         out_unf = x_unf + self.alpha * (R * S * M)
         # Refold: (B, n_f, C, H, W) -> (N, C, H, W) (view only)
         return out_unf.view(N, C, H, W)
+
+
+def update_additive_spatial_noise_alpha(model: th.nn.Module, epoch: int) -> None:
+    """Update alpha for all AdditiveSpatialNoise modules in a model for the given epoch."""
+    for module in model.modules():
+        if isinstance(module, AdditiveSpatialNoise):
+            module.set_epoch(epoch)
+
+
+def update_conditional_norm_lambda(model: th.nn.Module, epoch: int) -> None:
+    """Update lambda for all ConditionalLayerNorm and SPADE modules in a model for the given epoch."""
+    for module in model.modules():
+        if isinstance(module, (ConditionalLayerNorm, SPADE)) and hasattr(module, "set_epoch"):
+            module.set_epoch(epoch)
