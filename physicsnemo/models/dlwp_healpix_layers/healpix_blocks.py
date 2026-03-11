@@ -350,7 +350,6 @@ class DoubleConvNeXtBlock(th.nn.Module):
         enable_healpixpad: bool = False,
         conditional_layer_norm: Callable = None,
         conditional_layer_norm_once: bool = False,
-        batch_norm: bool = False,
         dropout: float = 0.0,
     ):
         """
@@ -408,14 +407,19 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_healpixpad=enable_healpixpad,
             )
 
+        # check if we're applying a layer norm at the beginning 
+        # we've got two ConvNeXt equivalent blocks in the layer, so have two entry points
         if conditional_layer_norm_once:
             if conditional_layer_norm is not None:
+                # Conditional norm at the beginning of the block
                 self.entry_norm1 = conditional_layer_norm(channel_depth=in_channels)
                 self.entry_norm2 = conditional_layer_norm(channel_depth=latent_channels)
             else:
+                # Regular layer normalization at the beginning of the block
                 self.entry_norm1 = _LayerNormOverChannels(channel_depth=in_channels)
                 self.entry_norm2 = _LayerNormOverChannels(channel_depth=latent_channels)
         else:
+            # No normalization at the beginning
             self.entry_norm1 = None
             self.entry_norm2 = None
 
@@ -435,12 +439,9 @@ class DoubleConvNeXtBlock(th.nn.Module):
         )
 
         # Apply batch norm and conditional layer norm if needed
-        if not conditional_layer_norm_once:
-            if batch_norm:
-                convblock1.append(th.nn.BatchNorm2d(int(latent_channels), track_running_stats=False, affine=False))
-            if conditional_layer_norm is not None:
-                cln = conditional_layer_norm(channel_depth=int(latent_channels))
-                convblock1.append(cln)
+        if conditional_layer_norm is not None and not conditional_layer_norm_once:
+            cln = conditional_layer_norm(channel_depth=int(latent_channels))
+            convblock1.append(cln)
 
         if activation is not None:
             convblock1.append(activation)
@@ -460,15 +461,12 @@ class DoubleConvNeXtBlock(th.nn.Module):
             )
         )
 
-        # Apply batch norm and conditional layer norm if needed
-        if not conditional_layer_norm_once:
-            if batch_norm:
-                convblock1.append(th.nn.BatchNorm2d(int(latent_channels * upscale_factor), track_running_stats=False, affine=False))
-            if conditional_layer_norm is not None:
-                cln = conditional_layer_norm(channel_depth=int(latent_channels * upscale_factor))
-                convblock1.append(cln)
-        else:
+        # Apply layer norm if needed
+        if conditional_layer_norm_once:
             convblock1.append(_LayerNormOverChannels(channel_depth=int(latent_channels * upscale_factor)))
+        elif conditional_layer_norm is not None:
+            cln = conditional_layer_norm(channel_depth=int(latent_channels * upscale_factor))
+            convblock1.append(cln)
 
         if activation is not None:
             convblock1.append(activation)
@@ -508,12 +506,9 @@ class DoubleConvNeXtBlock(th.nn.Module):
             )
         )
         # Apply batch norm and conditional layer norm if needed
-        if not conditional_layer_norm_once:
-            if batch_norm:
-                convblock2.append(th.nn.BatchNorm2d(int(latent_channels), track_running_stats=False, affine=False))
-            if conditional_layer_norm is not None:
-                cln = conditional_layer_norm(channel_depth=int(latent_channels))
-                convblock2.append(cln)
+        if conditional_layer_norm is not None and not conditional_layer_norm_once:
+            cln = conditional_layer_norm(channel_depth=int(latent_channels))
+            convblock2.append(cln)
     
         if activation is not None:
             convblock2.append(activation)
@@ -532,15 +527,12 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_healpixpad=enable_healpixpad,
             )
         )
-        # Apply batch norm and conditional layer norm if needed
-        if not conditional_layer_norm_once:
-            if batch_norm:
-                convblock2.append(th.nn.BatchNorm2d(int(latent_channels * upscale_factor), track_running_stats=False, affine=False))
-            if conditional_layer_norm is not None:
-                cln = conditional_layer_norm(channel_depth=int(latent_channels * upscale_factor))
-                convblock2.append(cln)
-        else:
+        # Apply layer norm if needed
+        if conditional_layer_norm_once:
             convblock2.append(_LayerNormOverChannels(channel_depth=int(latent_channels * upscale_factor)))
+        elif conditional_layer_norm is not None:
+            cln = conditional_layer_norm(channel_depth=int(latent_channels * upscale_factor))
+            convblock2.append(cln)
 
         if activation is not None:
             convblock2.append(activation)
@@ -580,6 +572,9 @@ class DoubleConvNeXtBlock(th.nn.Module):
         conditions_cln: torch.Tensor, optional
             conditions for the conditional layer normalization
         """
+
+        # TODO: performance of skip connectioni hasn't been compared
+        # check  cln(x) vs. cln(x1_residual + x) in the future
         # save residual for the first block
         x1_residual = self.skip_module1(x)
 
@@ -708,7 +703,6 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         enable_nhwc: bool = False,
         use_block_skip_connection: bool = True,
         enable_healpixpad: bool = False,
-        batch_norm: bool = False,
         dropout: float = 0.0,
         conditional_layer_norm: th.nn.Module = None,
         conditional_layer_norm_once: bool = False,
@@ -738,8 +732,6 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         use_block_skip_connection: bool, optional
             Whether or not to use block-level skip connection
-        batch_norm: bool, optional
-            Whether or not to use batch normalization after the first convolution
         dropout: float, optional
             Dropout probability to apply after the first convolution
         conditional_layer_norm: th.nn.Module, optional
@@ -771,12 +763,16 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     enable_healpixpad=enable_healpixpad,
                 )
 
+        # check if we're applying a layer norm at the beginning 
         if conditional_layer_norm_once:
             if conditional_layer_norm is not None:
+                # Conditional norm at the beginning of the block
                 self.entry_norm = conditional_layer_norm(channel_depth=in_channels)
             else:
+                # Regular layer normalization at the beginning of the block
                 self.entry_norm = _LayerNormOverChannels(channel_depth=in_channels)
         else:
+            # No normalization at the beginning
             self.entry_norm = None
 
         # Collect conv->norm->activation->dropout operations in list for sequential execution
@@ -794,15 +790,10 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 enable_healpixpad=enable_healpixpad,
             )
         )
-        # Apply batch norm and conditional layer norm if needed
-        if not conditional_layer_norm_once:
-            if batch_norm:
-                convblock.append(th.nn.BatchNorm2d(int(latent_channels), track_running_stats=False, affine=False))
-            # Conditional Layer Normalization
-            if conditional_layer_norm is not None:
-                # resolve context-dependent parameters (channel depth)
-                cln = conditional_layer_norm(channel_depth=int(latent_channels))
-                convblock.append(cln)
+        # Apply layer norm if needed
+        if conditional_layer_norm is not None and not conditional_layer_norm_once:
+            cln = conditional_layer_norm(channel_depth=int(latent_channels))
+            convblock.append(cln)
 
         if activation is not None:
             convblock.append(activation)
@@ -822,14 +813,10 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             )
         )
 
-        # Apply batch norm and conditional layer norm if needed
+        # Apply layer norm if needed
         if conditional_layer_norm_once:
             convblock.append(_LayerNormOverChannels(channel_depth=int(latent_channels * upscale_factor)))
-        else:
-            if batch_norm:
-                convblock.append(th.nn.BatchNorm2d(int(latent_channels * upscale_factor), track_running_stats=False, affine=False))
-            if conditional_layer_norm is not None:
-                # resolve context-dependent parameters (channel depth)
+        elif conditional_layer_norm is not None:
                 cln = conditional_layer_norm(channel_depth=int(latent_channels * upscale_factor))
                 convblock.append(cln)
 
@@ -852,16 +839,12 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             )
         )
 
-        # Apply batch norm and conditional layer norm if needed
+        # Apply layer norm if needed
         if conditional_layer_norm_once:
             convblock.append(_LayerNormOverChannels(channel_depth=int(latent_channels)))
-        else:
-            if batch_norm:
-                convblock.append(th.nn.BatchNorm2d(int(latent_channels), track_running_stats=False, affine=False))
-            if conditional_layer_norm is not None:
-                # resolve context-dependent parameters (channel depth)
-                cln = conditional_layer_norm(channel_depth=int(latent_channels))
-                convblock.append(cln)
+        elif conditional_layer_norm is not None:
+            cln = conditional_layer_norm(channel_depth=int(latent_channels))
+            convblock.append(cln)
 
         if activation is not None:
             convblock.append(activation)
@@ -903,6 +886,8 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             result of the forward pass
         """
 
+        # TODO: performance of skip connectioni hasn't been compared
+        # check  cln(x) vs. cln(x1_residual + x) in the future
         # Save residual
         residual = self.skip_module(x) if self.use_block_skip_connection else 0
 
