@@ -409,6 +409,9 @@ class DoubleConvNeXtBlock(th.nn.Module):
 
         # check if we're applying a layer norm at the beginning 
         # we've got two ConvNeXt equivalent blocks in the layer, so have two entry points
+        # TODO: conditional layer norm once is doing two things, it's applying a norm on block entry
+        # and switch from conditional to non-conditional layer norm. This is not ideal and should be fixed once we determine
+        # what works best.
         if conditional_layer_norm_once:
             if conditional_layer_norm is not None:
                 # Conditional norm at the beginning of the block
@@ -761,7 +764,10 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     enable_healpixpad=enable_healpixpad,
                 )
 
-        # check if we're applying a layer norm at the beginning 
+        # check if we're applying a layer norm at the beginning
+        # TODO: conditional layer norm once is doing two things, it's applying a norm on block entry
+        # and switch from conditional to non-conditional layer norm. This is not ideal and should be fixed once we determine
+        # what works best.
         if conditional_layer_norm_once:
             if conditional_layer_norm is not None:
                 # Conditional norm at the beginning of the block
