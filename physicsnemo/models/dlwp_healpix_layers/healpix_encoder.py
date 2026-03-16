@@ -19,6 +19,7 @@ from typing import Sequence
 import torch as th
 from hydra.utils import instantiate
 from omegaconf import DictConfig
+from torch.utils.checkpoint import checkpoint
 
 
 class UNetEncoder(th.nn.Module):
@@ -35,6 +36,8 @@ class UNetEncoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        per_level_cln: Sequence[bool] = None,
+        per_level_checkpointing: Sequence[bool] = None,
         hpx_padding_mode: str = 'karlbauer',
     ):
         """
@@ -59,9 +62,30 @@ class UNetEncoder(th.nn.Module):
             If channel last format should be used
         enable_healpixpad, bool, optional
             If the healpixpad library should be used (if installed)
+        per_level_cln: list[bool] | None, optional
+            If the CLN should be applied to each level of the encoder
+            If None, the CLN will based on the conv_block.conditional_layer_norm attribute
+        per_level_checkpointing: list[bool] | None, optional
+            If the checkpointing should be applied to each level of the encoder
+            If None, the checkpointing will not be applied
         """
         super().__init__()
         self.n_channels = n_channels
+
+        if per_level_cln is not None and len(per_level_cln) != len(n_channels):
+            raise ValueError(
+                "per_level_cln must be a list of booleans of the same length as n_channels"
+                f"Got {len(per_level_cln)} for per_level_cln and {len(n_channels)} for n_channels"
+            )
+        per_level_cln = per_level_cln if per_level_cln is not None else [True] * len(n_channels)
+
+        if per_level_checkpointing is not None and len(per_level_checkpointing) != len(n_channels):
+            raise ValueError(
+                "per_level_checkpointing must be a list of booleans of the same length as n_channels"
+                f"Got {len(per_level_checkpointing)} for per_level_checkpointing and {len(n_channels)} for n_channels"
+            )
+        # Generate the per_level_checkpointing list, simplifies forward logic
+        self.per_level_checkpointing = per_level_checkpointing if per_level_checkpointing is not None else [False] * len(n_channels)
 
         if dilations is None:
             # Defaults to [1, 1, 1...] in accordance with the number of unet levels
@@ -81,9 +105,16 @@ class UNetEncoder(th.nn.Module):
                         hpx_padding_mode=hpx_padding_mode,
                     )
                 )
+
+            # apply conditional layer norm if enabled for this level
+            block_config = conv_block.copy()
+            if "conditional_layer_norm" in block_config and block_config.conditional_layer_norm is not None:
+                if not per_level_cln[n]:
+                    block_config.conditional_layer_norm = None
+
             modules.append(
                 instantiate(
-                    config=conv_block,
+                    config=block_config,
                     in_channels=old_channels,
                     latent_channels=curr_channel,
                     out_channels=curr_channel,
@@ -99,6 +130,36 @@ class UNetEncoder(th.nn.Module):
             self.encoder.append(th.nn.Sequential(*modules))
 
         self.encoder = th.nn.ModuleList(self.encoder)
+
+
+    def _forward_layer_pass(self, layer_group: th.nn.Module, inp: th.Tensor, conditions_cln: th.Tensor=None) -> th.Tensor:
+        """
+        Forward pass of single layer of the encoder
+        Handled seperately to allow for checkpointing of the layer
+
+        Parameters
+        ----------
+        inputs: Sequence
+            The inputs to encode
+        conditions_cln: th.Tensor: optional
+            The conditional inputs for the normalization layers.
+
+        Returns
+        -------
+        Sequence: The encoded values
+        """
+        interim_output = inp
+        for layer in layer_group:
+            # check if class accepts cln inputs
+            if getattr(layer, 'cln_enabled', False):
+                if conditions_cln is None:
+                    raise ValueError("Conditional inputs are required for layers with cln_enabled=True")
+                interim_output = layer(interim_output, conditions_cln=conditions_cln)
+            else:
+                interim_output = layer(interim_output)
+            
+        # Return the outputs of the last layer
+        return interim_output
 
     def forward(self, inputs: Sequence, conditions_cln: th.Tensor=None) -> Sequence:
         """
@@ -116,16 +177,12 @@ class UNetEncoder(th.nn.Module):
         Sequence: The encoded values
         """
         outputs = []
-        for layer_group in self.encoder:
+        for n, layer_group in enumerate(self.encoder):
             interim_output = inputs
-            for layer in layer_group:
-                # check if class accepts cln inputs
-                if getattr(layer, 'cln_enabled', False):
-                    if conditions_cln is None:
-                        raise ValueError("Conditional inputs are required for layers with cln_enabled=True")
-                    interim_output = layer(interim_output, conditions_cln=conditions_cln)
-                else:
-                    interim_output = layer(interim_output)
+            if self.per_level_checkpointing[n]:
+                interim_output = checkpoint(self._forward_layer_pass, layer_group, interim_output, conditions_cln, use_reentrant=False)
+            else:
+                interim_output = self._forward_layer_pass(layer_group, interim_output, conditions_cln)
             outputs.append(interim_output)
             inputs = outputs[-1]
         # Return the outputs of the last layer
