@@ -111,6 +111,10 @@ class BaseCoupler(ABC):
                 for v in self.variables
                 if ic == v
             ]
+            # Check if any of the requested variables are not in the dataset
+            missing_variables = set(self.variables) - set(list(self.ds["channel_in"][:]))
+            if len(missing_variables) > 0:
+                raise ValueError(f"Missing variables in dataset for coupling: {missing_variables}")
         else:
             raise TypeError(
                 f"Coupler only supports xarray Datasets or zarr Groups, got {type(self.ds)}"
@@ -241,7 +245,7 @@ class BaseCoupler(ABC):
             ds_index_range = ds_index_range[:, self.ds_variable_indices]
         else:
             ds_index_range = (
-                self.ds.inputs.sel(channel_in=self.variables)
+                self.ds["inputs"].sel(channel_in=self.variables)
                 .isel(time=index_range)
                 .compute()
             )
@@ -491,7 +495,7 @@ class TrailingAverageCoupler(BaseCoupler):
             dates = [np.datetime64(date.isoformat()) for date in cf_dates]
             self.time_da = np.asarray(dates)
         else:
-            self.time_da = self.ds.time.values
+            self.time_da = self.ds["time"].values
         self._set_time_increments()
 
     def compute_coupled_indices(self, interval, data_time_step):
