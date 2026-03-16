@@ -691,8 +691,8 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                     enable_healpixpad=enable_healpixpad,
                     dropout=dropout,
                     conditional_layer_norm=conditional_layer_norm if conditional_layer_norm is not None else None,
-                    hpx_padding_mode=hpx_padding_mode,
                     conditional_layer_norm_once=conditional_layer_norm_once,
+                    hpx_padding_mode=hpx_padding_mode,
                 ),
             )
 
