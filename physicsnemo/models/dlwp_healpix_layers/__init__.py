@@ -18,6 +18,8 @@ from .healpix_blocks import (
     AvgPool,
     BasicConvBlock,
     ConvGRUBlock,
+    CoupledEmbedding,
+    CrossAttention2D,
     ConvNeXtBlock,
     DoubleConvNeXtBlock,
     Interpolate,
@@ -26,8 +28,8 @@ from .healpix_blocks import (
     SymmetricConvNeXtBlock,
     TransposedConvUpsample,
 )
-from .healpix_decoder import UNetDecoder
-from .healpix_encoder import UNetEncoder
+from .healpix_decoder import UNetDecoder, UNetDecoderWithCrossAttention
+from .healpix_encoder import UNetEncoder, UNetEncoderWithCrossAttention
 from .healpix_layers import (
     HEALPixFoldFaces,
     HEALPixLayer,

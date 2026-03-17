@@ -971,3 +971,167 @@ class Interpolate(th.nn.Module):
             the interpolated values
         """
         return self.interp(inputs, scale_factor=self.scale_factor, mode=self.mode)
+
+
+#
+# Cross-Attention for Coupled Variables
+#
+
+
+class CrossAttention2D(th.nn.Module):
+    """
+    Within-face cross-attention: modulates main features (x) by attending to
+    context (coupled embedding). Operates per face; sequence length is H*W.
+    Optionally runs tokenized cross-face self-attention on context first
+    (patch_size > 1: H/patch_size x W/patch_size patches, sequence F*n_patches).
+    """
+
+    def __init__(
+        self,
+        query_channels: int,
+        context_channels: int,
+        num_heads: int = 4,
+        dropout: float = 0.0,
+        num_faces: int = 12,
+        cross_face_patch_size: int = None,
+        cross_face_heads: int = 4,
+        cross_face_dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = context_channels // num_heads
+        if self.head_dim * num_heads != context_channels:
+            raise ValueError("context_channels must be divisible by num_heads")
+        self.scale = self.head_dim ** (-0.5)
+        self.num_faces = num_faces
+        self.cross_face_patch_size = cross_face_patch_size or 0
+
+        self.to_q = th.nn.Conv2d(query_channels, num_heads * self.head_dim, 1)
+        self.to_k = th.nn.Conv2d(context_channels, num_heads * self.head_dim, 1)
+        self.to_v = th.nn.Conv2d(context_channels, num_heads * self.head_dim, 1)
+        self.to_out = th.nn.Conv2d(num_heads * self.head_dim, query_channels, 1)
+        self.dropout = th.nn.Dropout(dropout)
+
+        # init output projection near zero so residual dominates at start
+        th.nn.init.zeros_(self.to_out.weight)
+        th.nn.init.zeros_(self.to_out.bias)
+
+        if self.cross_face_patch_size > 1:
+            p = self.cross_face_patch_size
+            self.cross_face_patch_embed = th.nn.Linear(
+                context_channels * p * p, context_channels
+            )
+            self.cross_face_attn = th.nn.MultiheadAttention(
+                embed_dim=context_channels,
+                num_heads=cross_face_heads,
+                dropout=cross_face_dropout,
+                batch_first=True,
+            )
+            self.cross_face_patch_unembed = th.nn.Linear(
+                context_channels, context_channels * p * p
+            )
+
+    def _tokenized_cross_face_context(self, context: th.Tensor) -> th.Tensor:
+        """Run tokenized cross-face self-attention on context [Bf, C, H, W]."""
+        Bf, C, H, W = context.shape
+        B = Bf // self.num_faces
+        F = self.num_faces
+        p = self.cross_face_patch_size
+        if H % p != 0 or W % p != 0:
+            raise ValueError(
+                f"H, W ({H}, {W}) must be divisible by cross_face_patch_size ({p})"
+            )
+        n_ph, n_pw = H // p, W // p
+        # [Bf, C, H, W] -> [B, F, C, H, W]
+        ctx = context.view(B, F, C, H, W)
+        # [B, F, C, n_ph, p, n_pw, p] -> [B, F, n_ph, n_pw, C*p*p]
+        ctx = ctx.view(B, F, C, n_ph, p, n_pw, p)
+        ctx = ctx.permute(0, 1, 3, 5, 2, 4, 6).reshape(B, F * n_ph * n_pw, C * p * p)
+        tokens = self.cross_face_patch_embed(ctx)
+        tokens, _ = self.cross_face_attn(tokens, tokens, tokens)
+        tokens = self.cross_face_patch_unembed(tokens)
+        tokens = tokens.view(B, F, n_ph, n_pw, C, p, p)
+        ctx = tokens.permute(0, 1, 4, 2, 5, 3, 6).reshape(B, F, C, H, W)
+        return ctx.view(Bf, C, H, W)
+
+    def forward(self, x: th.Tensor, context: th.Tensor) -> th.Tensor:
+        """
+        x: [BF, C_x, H, W], context: [BF, embed_dim, H, W]
+        """
+        if self.cross_face_patch_size > 1:
+            context = self._tokenized_cross_face_context(context)
+        B, C, H, W = x.shape
+        N = H * W
+        # [BF, heads, head_dim, N]
+        q = self.to_q(x).view(B, self.num_heads, self.head_dim, N)
+        k = self.to_k(context).view(B, self.num_heads, self.head_dim, N)
+        v = self.to_v(context).view(B, self.num_heads, self.head_dim, N)
+        # [BF, heads, N, head_dim]
+        q = q.permute(0, 1, 3, 2)
+        k = k.permute(0, 1, 3, 2)
+        v = v.permute(0, 1, 3, 2)
+        # [BF, heads, N, N]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        # [BF, heads, N, head_dim]
+        out = attn @ v
+        # [BF, heads, N, head_dim] -> [BF, heads*head_dim, N]
+        out = out.permute(0, 1, 3, 2).reshape(B, self.num_heads * self.head_dim, N)
+        # [BF, C, H, W]
+        out = out.view(B, self.num_heads * self.head_dim, H, W)
+        out = self.to_out(out)
+        return x + out
+
+
+class CoupledEmbedding(th.nn.Module):
+    """
+    Per-face CNN. Produces coupled embeddings at requested levels for
+    within-face cross-attention. Cross-face mixing is handled in CrossAttention2D.
+    """
+
+    def __init__(
+        self,
+        coupled_channels: int,
+        embed_dim: int,
+        attention_levels: Sequence[int],
+        num_faces: int = 12,
+    ):
+        super().__init__()
+        self.coupled_channels = coupled_channels
+        self.embed_dim = embed_dim
+        self.attention_levels = sorted(attention_levels)
+        self.num_faces = num_faces
+
+        # Per-face CNN: shared across faces, applied to [B*F, C_coupled, H, W]
+        self.per_face_cnn = th.nn.Sequential(
+            th.nn.Conv2d(coupled_channels, embed_dim * 2, 3, padding=1),
+            th.nn.GELU(),
+            th.nn.Conv2d(embed_dim * 2, embed_dim, 3, padding=1),
+        )
+        self.pool = th.nn.AvgPool2d(2)
+
+    def forward(self, coupled: th.Tensor) -> dict:
+        """
+        coupled: [BF, C_coupled, H, W]
+        Returns dict {level: tensor} with tensor shape [BF, embed_dim, H', W'].
+        """
+        Bf, C, H, W = coupled.shape
+        B = Bf // self.num_faces
+        F = self.num_faces
+        # Per-face CNN: [B*F, C_coupled, H, W] -> [B*F, embed_dim, H, W]
+        x = self.per_face_cnn(coupled)
+        # [B, F, embed_dim, H, W]
+        x = x.view(B, F, self.embed_dim, H, W)
+        out_by_level = {}
+        for level in self.attention_levels:
+            hw = x
+            for _ in range(level):
+                # Pool per face: [B, F, C, H, W] -> pool last two dims
+                hw = hw.reshape(B * F, self.embed_dim, hw.shape[3], hw.shape[4])
+                hw = self.pool(hw)
+                hw = hw.view(B, F, self.embed_dim, hw.shape[2], hw.shape[3])
+            # Fold: [B, F, embed_dim, H', W'] -> [BF, embed_dim, H', W']
+            hw_flat = hw.view(B * F, self.embed_dim, hw.shape[3], hw.shape[4])
+            out_by_level[level] = hw_flat
+        return out_by_level

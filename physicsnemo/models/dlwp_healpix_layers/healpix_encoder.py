@@ -14,11 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence
+from typing import List, Optional, Sequence
 
 import torch as th
 from hydra.utils import instantiate
 from omegaconf import DictConfig
+
+from .healpix_blocks import CrossAttention2D
 
 
 class UNetEncoder(th.nn.Module):
@@ -130,4 +132,107 @@ class UNetEncoder(th.nn.Module):
 
     def reset(self):
         """Resets the state of the decoder layers"""
+        pass
+
+
+class UNetEncoderWithCrossAttention(th.nn.Module):
+    """
+    UNet encoder with optional cross-attention after each conv block at
+    configured levels. Used for coupled-variable conditioning.
+    """
+
+    def __init__(
+        self,
+        conv_block: DictConfig,
+        down_sampling_block: DictConfig,
+        recurrent_block: DictConfig = None,
+        input_channels: int = 3,
+        n_channels: Sequence = (16, 32, 64),
+        n_layers: Sequence = (2, 2, 1),
+        dilations: list = None,
+        enable_nhwc: bool = False,
+        enable_healpixpad: bool = False,
+        encoder_attention_levels: Optional[List[int]] = None,
+        coupled_embed_dim: int = 64,
+        cross_attention_heads: int = 4,
+        cross_attention_dropout: float = 0.0,
+        num_faces: int = 12,
+        cross_face_patch_size: Optional[int] = None,
+        cross_face_heads: int = 4,
+        cross_face_dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.n_channels = list(n_channels)
+        self.encoder_attention_levels = encoder_attention_levels or []
+
+        if dilations is None:
+            dilations = [1 for _ in range(len(n_channels))]
+
+        old_channels = input_channels
+        self.encoder = []
+        self.cross_attns = th.nn.ModuleDict()
+        for n, curr_channel in enumerate(n_channels):
+            modules = list()
+            if n > 0:
+                modules.append(
+                    instantiate(
+                        config=down_sampling_block,
+                        enable_nhwc=enable_nhwc,
+                        enable_healpixpad=enable_healpixpad,
+                    )
+                )
+            modules.append(
+                instantiate(
+                    config=conv_block,
+                    in_channels=old_channels,
+                    latent_channels=curr_channel,
+                    out_channels=curr_channel,
+                    dilation=dilations[n],
+                    n_layers=n_layers[n],
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+            old_channels = curr_channel
+            self.encoder.append(th.nn.Sequential(*modules))
+
+            if n in self.encoder_attention_levels:
+                self.cross_attns[str(n)] = CrossAttention2D(
+                    query_channels=curr_channel,
+                    context_channels=coupled_embed_dim,
+                    num_heads=cross_attention_heads,
+                    dropout=cross_attention_dropout,
+                    num_faces=num_faces,
+                    cross_face_patch_size=cross_face_patch_size,
+                    cross_face_heads=cross_face_heads,
+                    cross_face_dropout=cross_face_dropout,
+                )
+
+        self.encoder = th.nn.ModuleList(self.encoder)
+
+    def forward(
+        self,
+        inputs: th.Tensor,
+        conditions_cln: Optional[th.Tensor] = None,
+        coupled_embedding: Optional[dict] = None,
+    ) -> Sequence:
+        outputs = []
+        for n, layer_group in enumerate(self.encoder):
+            interim_output = inputs
+            for layer in layer_group:
+                if getattr(layer, "cln_enabled", False):
+                    if conditions_cln is None:
+                        raise ValueError(
+                            "Conditional inputs are required for layers with cln_enabled=True"
+                        )
+                    interim_output = layer(interim_output, conditions_cln=conditions_cln)
+                else:
+                    interim_output = layer(interim_output)
+            if str(n) in self.cross_attns and coupled_embedding is not None and n in coupled_embedding:
+                interim_output = self.cross_attns[str(n)](interim_output, coupled_embedding[n])
+            outputs.append(interim_output)
+            inputs = outputs[-1]
+        return outputs
+
+    def reset(self):
         pass

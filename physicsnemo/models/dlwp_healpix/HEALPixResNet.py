@@ -65,6 +65,7 @@ class HEALPixResNet(Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         couplings: list = [],
+        constraints: list[DictConfig] = None,
     ):
         """
         Parameters
@@ -178,6 +179,9 @@ class HEALPixResNet(Module):
         self.resnet.append(self.output_layer)
 
         self.resnet = th.nn.ModuleList(self.resnet)
+
+        self.constraints = None
+        self.set_constraints(constraints)
 
     @property
     def integration_steps(self):
@@ -360,6 +364,18 @@ is not available at this time."
 
         return res
 
+    def set_constraints(self, constraints: list[DictConfig] = None):
+        """
+        Sets constraints (e.g., non-negative) to be applied to the model outputs
+
+        Parameters
+        ----------
+        constraints: list[DictConfig]
+            List of hydra instantiable DictConfigs specifying constraints
+        """
+        if constraints is not None:
+            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
+
     def forward(self, inputs: Sequence, output_only_last=False) -> th.Tensor:
         """
         Forward pass of the HEALPixUnet
@@ -408,6 +424,11 @@ is not available at this time."
             res = outputs[-1]
         else:
             res = th.cat(outputs, dim=self.channel_dim)
+
+        # Apply constraints
+        if self.constraints is not None:
+            for constraint in self.constraints:
+                res = constraint(res)
 
         return res
 

@@ -14,11 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence
+from typing import List, Optional, Sequence
 
 import torch as th
 from hydra.utils import instantiate
 from omegaconf import DictConfig
+
+from .healpix_blocks import CrossAttention2D
 
 
 
@@ -167,6 +169,160 @@ class UNetDecoder(th.nn.Module):
 
     def reset(self):
         """Resets the state of the decoder layers"""
+        for layer in self.decoder:
+            if layer["recurrent"] is not None:
+                layer["recurrent"].reset()
+
+
+class UNetDecoderWithCrossAttention(th.nn.Module):
+    """
+    UNet decoder with optional cross-attention at each level. Placement
+    is configurable: before_conv (after concat skip) or after_recurrent.
+    """
+
+    def __init__(
+        self,
+        conv_block: DictConfig,
+        up_sampling_block: DictConfig,
+        output_layer: DictConfig,
+        recurrent_block: DictConfig = None,
+        n_channels: Sequence = (64, 32, 16),
+        n_layers: Sequence = (1, 2, 2),
+        output_channels: int = 1,
+        dilations: list = None,
+        enable_nhwc: bool = False,
+        enable_healpixpad: bool = False,
+        decoder_attention_levels: Optional[List[int]] = None,
+        decoder_attention_position: str = "after_recurrent",
+        coupled_embed_dim: int = 64,
+        cross_attention_heads: int = 4,
+        cross_attention_dropout: float = 0.0,
+        num_faces: int = 12,
+        cross_face_patch_size: Optional[int] = None,
+        cross_face_heads: int = 4,
+        cross_face_dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.channel_dim = 1
+        self.decoder_attention_levels = decoder_attention_levels or []
+        self.decoder_attention_position = decoder_attention_position
+        self.n_levels = len(n_channels)
+
+        if dilations is None:
+            dilations = [1 for _ in range(len(n_channels))]
+
+        self.decoder = []
+        self.cross_attns = th.nn.ModuleDict()
+        for n, curr_channel in enumerate(n_channels):
+            if n == 0:
+                up_sample_module = None
+            else:
+                up_sample_module = instantiate(
+                    config=up_sampling_block,
+                    in_channels=curr_channel,
+                    out_channels=curr_channel,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+
+            next_channel = (
+                n_channels[n + 1] if n < len(n_channels) - 1 else n_channels[-1]
+            )
+
+            conv_module = instantiate(
+                config=conv_block,
+                in_channels=curr_channel * 2 if n > 0 else curr_channel,
+                latent_channels=curr_channel,
+                out_channels=next_channel,
+                dilation=dilations[n],
+                n_layers=n_layers[n],
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
+
+            if recurrent_block is not None:
+                rec_module = instantiate(
+                    config=recurrent_block,
+                    in_channels=next_channel,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            else:
+                rec_module = None
+
+            self.decoder.append(
+                th.nn.ModuleDict(
+                    {
+                        "upsamp": up_sample_module,
+                        "conv": conv_module,
+                        "recurrent": rec_module,
+                    }
+                )
+            )
+
+            if n in self.decoder_attention_levels:
+                self.cross_attns[str(n)] = CrossAttention2D(
+                    query_channels=next_channel,
+                    context_channels=coupled_embed_dim,
+                    num_heads=cross_attention_heads,
+                    dropout=cross_attention_dropout,
+                    num_faces=num_faces,
+                    cross_face_patch_size=cross_face_patch_size,
+                    cross_face_heads=cross_face_heads,
+                    cross_face_dropout=cross_face_dropout,
+                )
+
+        self.decoder = th.nn.ModuleList(self.decoder)
+        self.output_layer = instantiate(
+            config=output_layer,
+            in_channels=curr_channel,
+            out_channels=output_channels,
+            dilation=dilations[-1],
+            enable_nhwc=enable_nhwc,
+            enable_healpixpad=enable_healpixpad,
+        )
+
+    def _embedding_level_for_decoder_level(self, n: int) -> int:
+        """Decoder level n (bottleneck=0) uses embedding at level (n_levels-1)-n."""
+        return self.n_levels - 1 - n
+
+    def forward(
+        self,
+        inputs: Sequence,
+        conditions_cln: Optional[th.Tensor] = None,
+        coupled_embedding: Optional[dict] = None,
+    ) -> th.Tensor:
+        x = inputs[-1]
+        for n, layer in enumerate(self.decoder):
+            if layer["upsamp"] is not None:
+                up = layer["upsamp"](x)
+                x = th.cat([up, inputs[-1 - n]], dim=self.channel_dim)
+
+            if self.decoder_attention_position == "before_conv" and str(n) in self.cross_attns:
+                emb_level = self._embedding_level_for_decoder_level(n)
+                if coupled_embedding is not None and emb_level in coupled_embedding:
+                    x = self.cross_attns[str(n)](x, coupled_embedding[emb_level])
+
+            if conditions_cln is not None:
+                if hasattr(layer["conv"], "cln_enabled") and layer["conv"].cln_enabled:
+                    x = layer["conv"](x, conditions_cln=conditions_cln)
+                else:
+                    raise ValueError(
+                        "Conditional input passed but conv block does not support conditional inputs."
+                    )
+            else:
+                x = layer["conv"](x)
+
+            if layer["recurrent"] is not None:
+                x = layer["recurrent"](x)
+
+            if self.decoder_attention_position == "after_recurrent" and str(n) in self.cross_attns:
+                emb_level = self._embedding_level_for_decoder_level(n)
+                if coupled_embedding is not None and emb_level in coupled_embedding:
+                    x = self.cross_attns[str(n)](x, coupled_embedding[emb_level])
+
+        return self.output_layer(x)
+
+    def reset(self):
         for layer in self.decoder:
             if layer["recurrent"] is not None:
                 layer["recurrent"].reset()
