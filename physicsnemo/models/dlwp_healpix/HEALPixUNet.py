@@ -65,6 +65,7 @@ class HEALPixUNet(Module):
         enable_healpixpad: bool = False,
         couplings: list = [],
         residual_prediction: bool = False,
+        couplings_time_first: bool = True,
         constraints: list[DictConfig] = None,
         hpx_padding_mode: str = 'karlbauer',
     ):
@@ -100,6 +101,8 @@ class HEALPixUNet(Module):
             sequence of dictionaries that describe coupling mechanisms
         residual_prediction: bool, optional
             If the model should predict the residual between the input and the output. Default: False
+        couplings_time_first: bool, optional
+            Whether coupled data is in [T, B, C, F, H, W] rather than [B, F, T, C, H, W] format
         constraints: list[DictConfig], optional
             List of hydra instantiable DictConfigs specifying constraints 
             (e.g., nonnegativity) to be applied to the model outputs
@@ -133,6 +136,7 @@ class HEALPixUNet(Module):
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
         self.residual_prediction = residual_prediction
+        self.couplings_time_first = couplings_time_first
         self.hpx_padding_mode = hpx_padding_mode
 
         # Number of passes through the model, or a diagnostic model with only one output time
@@ -224,7 +228,7 @@ class HEALPixUNet(Module):
                 inputs[2].expand(
                     *tuple([inputs[0].shape[0]] + len(inputs[2].shape) * [-1])
                 ),  # constants
-                inputs[3].permute(0, 2, 1, 3, 4),  # coupled inputs
+                inputs[3].permute(0, 2, 1, 3, 4) if self.couplings_time_first else inputs[3],  # coupled inputs
             ]
             res = th.cat(result, dim=self.channel_dim)
 
