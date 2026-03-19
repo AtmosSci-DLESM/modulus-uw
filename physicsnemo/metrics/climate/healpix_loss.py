@@ -23,7 +23,7 @@ import xarray as xr
 import earth2grid
 from cuhpx import SHTCUDA, iSHTCUDA
 from earth2grid.healpix import HEALPIX_PAD_XY, PixelOrder
-from physicsnemo.models.dlwp_healpix_layers.healpix_layers import HEALPixPadding
+from physicsnemo.models.dlwp_healpix_layers.healpix_layers import HEALPixPadding, HEALPixPaddingv2
 
 """
 Custom dlwp compatible loss classes that allow for more sophisticated training optimization.
@@ -925,6 +925,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         selection_dict: dict = {"channel_c": "land_sea_mask"},
         patch_size: int = 3,
         hpx_padding_mode: str = "karlbauer",
+        use_earth2grid_padding: bool = False,
         patch_weight_sigma: float = None,
     ):
         """
@@ -949,6 +950,9 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         self.patch_size = patch_size
         self.patch_radius = (patch_size - 1) // 2
         self.hpx_padding_mode = hpx_padding_mode
+        self.use_earth2grid_padding = use_earth2grid_padding
+        if self.hpx_padding_mode != "karlbauer" and self.use_earth2grid_padding:
+            raise ValueError("Earth2grid padding is only supported for karlbauer padding mode")
 
         # Gaussian weights for patch positions (row-major, center-weighted, sum=1)
         if patch_weight_sigma is not None and patch_weight_sigma > 0:
@@ -975,11 +979,14 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         self.diag_mask = th.ones(self.n_members, self.n_members) - th.eye(self.n_members)
         # HEALPix padding module (expects [..., F, H, W])
         if self.patch_radius > 0:
-            self.hpx_pad = HEALPixPadding(
-                padding=self.patch_radius,
-                enable_nhwc=False,
-                hpx_padding_mode=self.hpx_padding_mode,
-            )
+            if self.use_earth2grid_padding:
+                self.hpx_pad = HEALPixPaddingv2(padding=self.patch_radius)
+            else:
+                self.hpx_pad = HEALPixPadding(
+                    padding=self.patch_radius,
+                    enable_nhwc=False,
+                    hpx_padding_mode=self.hpx_padding_mode,
+                )
         else:
             self.hpx_pad = None
 
