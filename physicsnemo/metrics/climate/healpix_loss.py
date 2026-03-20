@@ -924,13 +924,30 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         open_dict: dict = {"engine": "zarr"},
         selection_dict: dict = {"channel_c": "land_sea_mask"},
         patch_size: int = 3,
-        hpx_padding_mode: str = "karlbauer",
-        use_earth2grid_padding: bool = False,
+        use_earth2grid_padding: bool = True,
+        enable_nhwc: bool = True,
         patch_weight_sigma: float = None,
     ):
         """
         Parameters
         ----------
+        weights: Sequence
+            list of floats that determine weighting of variable loss, assumed to be
+            in order consistent with order of model output channels
+        n_members: int
+            number of ensemble members in the model output
+        lsm_file: str
+            path to the lsm file. Default is None, no lsm is applied.
+        open_dict: dict
+            dictionary of keyword arguments for xarray.open_dataset. Default is {"engine": "zarr"}.
+        selection_dict: dict
+            dictionary of keyword arguments for xarray.open_dataset. Default is {"channel_c": "land_sea_mask"}.
+        patch_size: int
+            size of the patch. Default is 3.
+        use_earth2grid_padding: bool
+            whether to use earth2grid hpx padding. Default is False.
+        enable_nhwc: bool
+            whether to enable nhwc for the hpx padding. Default is False.
         patch_weight_sigma : float, optional
             If provided, patch-vector norms are weighted by a Gaussian in
             distance from the patch center (weights sum to 1, center gets highest weight).
@@ -949,10 +966,8 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             raise ValueError("patch_size must be a positive odd integer")
         self.patch_size = patch_size
         self.patch_radius = (patch_size - 1) // 2
-        self.hpx_padding_mode = hpx_padding_mode
         self.use_earth2grid_padding = use_earth2grid_padding
-        if self.hpx_padding_mode != "karlbauer" and self.use_earth2grid_padding:
-            raise ValueError("Earth2grid padding is only supported for karlbauer padding mode")
+        self.enable_nhwc = enable_nhwc
 
         # Gaussian weights for patch positions (row-major, center-weighted, sum=1)
         if patch_weight_sigma is not None and patch_weight_sigma > 0:
@@ -984,8 +999,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             else:
                 self.hpx_pad = HEALPixPadding(
                     padding=self.patch_radius,
-                    enable_nhwc=False,
-                    hpx_padding_mode=self.hpx_padding_mode,
+                    enable_nhwc=self.enable_nhwc,
                 )
         else:
             self.hpx_pad = None

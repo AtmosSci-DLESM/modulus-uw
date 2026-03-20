@@ -449,16 +449,23 @@ def test_WeightedOceanMSE(
     )
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
-@pytest.mark.parametrize("hpx_mode", ["karlbauer", "isolat"])
+@pytest.mark.parametrize("patch_size", [3, 5])
+@pytest.mark.parametrize("use_earth2grid_padding", [True, False])
+@pytest.mark.parametrize("enable_nhwc", [True, False])
 @pytest.mark.parametrize("patch_weight_sigma", [None, 1.0])
-def test_PatchedEnergyScoreLoss_two_members_zero_and_symmetry(device, hpx_mode, patch_weight_sigma):
+def test_PatchedEnergyScoreLoss_two_members_zero_and_symmetry(device, patch_size, use_earth2grid_padding, enable_nhwc, patch_weight_sigma):
     # Small toy data: B=1,F=1,T=1,C=2,H=4,W=4
     b, f, t, c, h, w = 2, 12, 4, 4, 64, 64
     n_members = 2
     weights = [1.0] * c
 
     loss_fn = PatchedEnergyScoreLoss(
-        weights=weights, n_members=n_members, patch_size=3, hpx_padding_mode=hpx_mode, patch_weight_sigma=patch_weight_sigma
+        weights=weights,
+        n_members=n_members,
+        patch_size=patch_size,
+        use_earth2grid_padding=use_earth2grid_padding,
+        enable_nhwc=enable_nhwc,
+        patch_weight_sigma=patch_weight_sigma,
     )
     trainer = trainer_helper(output_variables=[f"var{i}" for i in range(c)], device=device)
     loss_fn.setup(trainer)
@@ -477,16 +484,23 @@ def test_PatchedEnergyScoreLoss_two_members_zero_and_symmetry(device, hpx_mode, 
 
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
-@pytest.mark.parametrize("hpx_mode", ["karlbauer", "isolat"])
+@pytest.mark.parametrize("patch_size", [3, 5])
+@pytest.mark.parametrize("use_earth2grid_padding", [True, False])
+@pytest.mark.parametrize("enable_nhwc", [True, False])
 @pytest.mark.parametrize("patch_weight_sigma", [None, 1.0])
-def test_PatchedEnergyScoreLoss_three_members_zero(device, hpx_mode, patch_weight_sigma):
+def test_PatchedEnergyScoreLoss_three_members_zero(device, patch_size, use_earth2grid_padding, enable_nhwc, patch_weight_sigma):
     # Ensure n_members>2 path executes and yields ~0 for perfect forecasts
     b, f, t, c, h, w = 2, 12, 4, 4, 64, 64
     n_members = 3
     weights = [1.0] * c
 
     loss_fn = PatchedEnergyScoreLoss(
-        weights=weights, n_members=n_members, patch_size=1, hpx_padding_mode=hpx_mode, patch_weight_sigma=patch_weight_sigma
+        weights=weights,
+        n_members=n_members,
+        patch_size=patch_size,
+        use_earth2grid_padding=use_earth2grid_padding,
+        enable_nhwc=enable_nhwc,
+        patch_weight_sigma=patch_weight_sigma,
     )
     trainer = trainer_helper(output_variables=[f'var{i}' for i in range(c)], device=device)
     loss_fn.setup(trainer)
