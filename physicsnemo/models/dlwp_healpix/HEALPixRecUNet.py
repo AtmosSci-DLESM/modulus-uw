@@ -180,6 +180,10 @@ class HEALPixRecUNet(Module):
         """Number of integration steps"""
         return max(self.output_time_dim // self.input_time_dim, 1)
 
+    @integration_steps.setter
+    def integration_steps(self, value: int):
+        self._integration_steps = value
+
     def _compute_input_channels(self) -> int:
         """Calculate total number of input channels in the model"""
         return (

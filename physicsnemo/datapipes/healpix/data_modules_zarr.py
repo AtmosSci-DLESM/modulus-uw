@@ -15,6 +15,7 @@
 # limitations under the License.
 
 # System modules
+import copy
 import logging
 import warnings
 from pathlib import Path
@@ -356,7 +357,9 @@ class TimeSeriesDataModuleZarr:
             drop_last=True,
         )
 
-    def val_dataloader(self, num_shards=1, shard_id=0) -> DataLoader:
+    def val_dataloader(
+        self, num_shards=1, shard_id=0, output_time_dim: Optional[int] = None
+    ):
         """Setup the validation dataloader
 
         Parameters
@@ -366,11 +369,57 @@ class TimeSeriesDataModuleZarr:
             default is 1 meaning distributed validation is not being used
         shard_id: int, optional
             The shard number of this instance of the dataloader, default 0
+        output_time_dim: int, optional
+            If set, build a validation dataset with this output time dimension
+            instead of the module's default. Requires train/val/test splits
+            (val_dataset must exist). While building that dataset, any
+            ``couplings`` entry with a top-level ``output_time_dim`` or with
+            ``params["output_time_dim"]`` has that value temporarily set to this
+            ``output_time_dim``; ``self.couplings`` is deep-copied first and
+            restored afterward.
 
         Returns
         -------
-        DataLoader: The validation dataloader
+        tuple of (DataLoader, optional Sampler)
         """
+        if output_time_dim is not None:
+            if self.val_dataset is None:
+                raise ValueError(
+                    "Validation with a different output_time_dim requires "
+                    "train/val/test splits (forecast_init_times-only mode has no val dataset)."
+                )
+            couplings_backup = None
+            if getattr(self, "couplings", None) is not None:
+                couplings_backup = copy.deepcopy(self.couplings)
+                for coupling in self.couplings:
+                    if coupling is None or not hasattr(coupling, "get"):
+                        continue
+                    if "output_time_dim" in coupling:
+                        coupling["output_time_dim"] = output_time_dim
+                    params = coupling.get("params")
+                    if params is not None and "output_time_dim" in params:
+                        params["output_time_dim"] = output_time_dim
+
+            try:
+                common = self._get_common_dataset_kwargs()
+                common["output_time_dim"] = output_time_dim
+                dataset_class = self._get_dataset_class()
+                val_dataset = dataset_class(
+                    start_date=self.splits["val_date_start"],
+                    end_date=self.splits["val_date_end"],
+                    drop_last=self.drop_last,
+                    **common,
+                )
+                return self._base_dataloader(
+                    dataset=val_dataset,
+                    num_shards=num_shards,
+                    shard_id=shard_id,
+                    shuffle=False,
+                    drop_last=True,
+                )
+            finally:
+                if couplings_backup is not None:
+                    self.couplings = couplings_backup
         return self._base_dataloader(
             dataset=self.val_dataset,
             num_shards=num_shards,
