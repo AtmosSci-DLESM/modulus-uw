@@ -36,9 +36,9 @@ class UNetEncoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
         per_level_cln: Sequence[bool] = None,
         per_level_checkpointing: Sequence[bool] = None,
-        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters

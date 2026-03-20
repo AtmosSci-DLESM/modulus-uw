@@ -649,9 +649,9 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
         dropout: float = 0.0,
         conditional_layer_norm: Callable = None,
-        hpx_padding_mode: str = 'karlbauer',
         conditional_layer_norm_once: bool = False,
     ):
         """
@@ -689,10 +689,10 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                     activation=activation,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
                     dropout=dropout,
                     conditional_layer_norm=conditional_layer_norm if conditional_layer_norm is not None else None,
                     conditional_layer_norm_once=conditional_layer_norm_once,
-                    hpx_padding_mode=hpx_padding_mode,
                 ),
             )
 
@@ -723,10 +723,10 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         enable_nhwc: bool = False,
         use_block_skip_connection: bool = True,
         enable_healpixpad: bool = False,
+        hpx_padding_mode: str = 'karlbauer',
         dropout: float = 0.0,
         conditional_layer_norm: th.nn.Module = None,
         conditional_layer_norm_once: bool = False,
-        hpx_padding_mode: str = 'karlbauer',
     ):
         """
         Parameters

@@ -234,7 +234,7 @@ class HEALPixPadding(th.nn.Module):
             self.br = self.br_isolat
         else:
             raise ValueError(
-                f"Invalid value for 'mode', expected one of ['karlbauer', 'isolat'] but received {hpx_padding_mode}"
+                f"Invalid value for hpx_padding_mode, expected one of ['karlbauer', 'isolat'] but received {hpx_padding_mode}"
             )
 
     def forward(self, data: th.Tensor) -> th.Tensor:
