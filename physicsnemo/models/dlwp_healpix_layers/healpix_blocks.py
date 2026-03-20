@@ -436,25 +436,6 @@ class DoubleConvNeXtBlock(th.nn.Module):
             self.entry_norm1 = None
             self.entry_norm2 = None
 
-        # check if we're applying a layer norm at the beginning 
-        # we've got two ConvNeXt equivalent blocks in the layer, so have two entry points
-        # TODO: conditional layer norm once is doing two things, it's applying a norm on block entry
-        # and switch from conditional to non-conditional layer norm. This is not ideal and should be fixed once we determine
-        # what works best.
-        if conditional_layer_norm_once:
-            if conditional_layer_norm is not None:
-                # Conditional norm at the beginning of the block
-                self.entry_norm1 = conditional_layer_norm(channel_depth=in_channels)
-                self.entry_norm2 = conditional_layer_norm(channel_depth=latent_channels)
-            else:
-                # Regular layer normalization at the beginning of the block
-                self.entry_norm1 = _LayerNormOverChannels(channel_depth=in_channels)
-                self.entry_norm2 = _LayerNormOverChannels(channel_depth=latent_channels)
-        else:
-            # No normalization at the beginning
-            self.entry_norm1 = None
-            self.entry_norm2 = None
-
         # 1st ConvNeXt block, the output of this one remains internal
         convblock1 = []
         # 3x3 convolution establishing latent channels channels
@@ -802,21 +783,6 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     enable_healpixpad=enable_healpixpad,
                     hpx_padding_mode=hpx_padding_mode,
                 )
-
-        # check if we're applying a layer norm at the beginning
-        # TODO: conditional layer norm once is doing two things, it's applying a norm on block entry
-        # and switch from conditional to non-conditional layer norm. This is not ideal and should be fixed once we determine
-        # what works best.
-        if conditional_layer_norm_once:
-            if conditional_layer_norm is not None:
-                # Conditional norm at the beginning of the block
-                self.entry_norm = conditional_layer_norm(channel_depth=in_channels)
-            else:
-                # Regular layer normalization at the beginning of the block
-                self.entry_norm = _LayerNormOverChannels(channel_depth=in_channels)
-        else:
-            # No normalization at the beginning
-            self.entry_norm = None
 
         # check if we're applying a layer norm at the beginning
         # TODO: conditional layer norm once is doing two things, it's applying a norm on block entry
