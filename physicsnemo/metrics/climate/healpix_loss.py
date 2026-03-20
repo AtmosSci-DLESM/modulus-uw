@@ -903,3 +903,91 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
             return loss
         
+
+class SpreadSkillRatioLoss(th.nn.MSELoss):
+    """
+    Ensemble spread-skill ratio loss with optional channel weighting.
+    Spread is the ensemble standard deviation and skill is RMSE of the
+    ensemble mean against the target.
+    """
+
+    def __init__(
+        self,
+        weights: Sequence = [],
+        eps: float = 1e-6,
+        return_components: bool = False,
+    ):
+        super().__init__()
+        self.loss_weights = th.tensor(weights)
+        self.eps = eps
+        self.return_components = return_components
+        self.device = None
+
+    def setup(self, trainer):
+        """
+        Pushes channel weights to model device.
+        """
+        if len(trainer.output_variables) != len(self.loss_weights):
+            raise ValueError("Length of outputs and loss_weights is not the same!")
+        self.loss_weights = self.loss_weights.to(device=trainer.device)
+
+    def forward(self, prediction, target, average_channels=True):
+        """
+        Forward pass of the SpreadSkillRatioLoss.
+
+        Parameters
+        ----------
+        prediction: torch.Tensor
+            Prediction tensor with shape [Cond*B, F, T, C, H, W], where Cond is ensemble size.
+        target: torch.Tensor
+            Target tensor with shape [B, F, T, C, H, W].
+        average_channels: bool, optional
+            Whether to return mean across channels (scalar) or per-channel values.
+        """
+        b, f, t, c, h, w = target.shape
+        if prediction.shape[0] % b != 0:
+            raise ValueError(
+                f"Leading prediction dimension must be divisible by batch size. "
+                f"Got prediction.shape[0]={prediction.shape[0]} and batch={b}"
+            )
+        n_members = prediction.shape[0] // b
+        if n_members < 2:
+            raise ValueError(
+                f"Inferred ensemble size must be at least 2 for spread-skill ratio loss, got {n_members}"
+            )
+        prediction = prediction.view(n_members, b, f, t, c, h, w)
+
+        if prediction.shape[1:] != target.shape:
+            raise ValueError(
+                f"Shape of prediction should match shape of target along non-ensemble dimensions, "
+                f"got {prediction.shape} and {target.shape}"
+            )
+
+        prediction = prediction.to(th.float32)
+        target = target.to(th.float32)
+
+        # Apply channel weights before computing spread and skill.
+        prediction *= self.loss_weights[None, None, None, None, :, None, None]
+        target *= self.loss_weights[None, None, None, :, None, None]
+
+        spread_field = prediction.std(dim=0)
+        spread = spread_field.mean(dim=(0, 1, 2, 4, 5))
+
+        ens_mean = prediction.mean(dim=0)
+        rmse_field = (ens_mean - target) ** 2
+        skill = th.sqrt(rmse_field.mean(dim=(0, 1, 2, 4, 5)))
+
+        ratio = spread / (skill + self.eps)
+
+        if average_channels:
+            ratio_out = ratio.mean()
+            spread_out = spread.mean()
+            skill_out = skill.mean()
+        else:
+            ratio_out = ratio
+            spread_out = spread
+            skill_out = skill
+
+        if self.return_components:
+            return ratio_out, spread_out, skill_out
+        return ratio_out
