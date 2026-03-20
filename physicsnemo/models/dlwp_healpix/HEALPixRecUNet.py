@@ -398,14 +398,14 @@ class HEALPixRecUNet(Module):
                 s = step - self.presteps + prestep
                 if len(self.couplings) > 0:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[s - 1]]
+                        inputs=[outputs[s - 1][:, :, :, :self.input_channels]]
                         + list(inputs[1:3])
                         + [inputs[3][step - (prestep - self.presteps)]],
                         step=s + 1,
                     )
                 else:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[s - 1]] + list(inputs[1:]), step=s + 1
+                        inputs=[outputs[s - 1][:, :, :, :self.input_channels]] + list(inputs[1:]), step=s + 1
                     )
             # Forward the data through the model to initialize hidden states
             self.decoder(self.encoder(input_tensor, conditions_cln=conditions_cln), conditions_cln=conditions_cln)
@@ -479,14 +479,14 @@ class HEALPixRecUNet(Module):
             else:
                 if len(self.couplings) > 0:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[-1]]
+                        inputs=[outputs[-1][:, :, :, :self.input_channels]]
                         + list(inputs[1:3])
                         + [inputs[3][self.presteps + step]],
                         step=step + self.presteps,
                     )
                 else:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[-1]] + list(inputs[1:]),
+                        inputs=[outputs[-1][:, :, :, :self.input_channels]] + list(inputs[1:]),
                         step=step + self.presteps,
                     )
             th.cuda.nvtx.range_pop()
@@ -504,24 +504,26 @@ class HEALPixRecUNet(Module):
             decodings = self.decoder(encodings, **kwargs)
             th.cuda.nvtx.range_pop()
 
+            # Reshape from [B*F, T*C, H, W] to [B, F, T, C, H, W]
+            combined = self._reshape_outputs(decodings)
+            prognostics = combined[:, :, :, :self.input_channels]
+            diagnostics = combined[:, :, :, self.input_channels:]
+
             # Residual prediction
-            if self.residual_prediction:
-                prediction = input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
-            else:
-                prediction = decodings
-            th.cuda.nvtx.range_push("Reshape outputs")
-            reshaped = self._reshape_outputs(
-                prediction
+            orig_input = self._reshape_outputs(
+                input_tensor[:, :self.input_channels * self.input_time_dim]
             )
-            th.cuda.nvtx.range_pop()
+            if self.residual_prediction:
+                prognostics += orig_input
+            # Concat along channel dim, shape is [B, F, T, C, H, W]
+            out = th.cat([prognostics, diagnostics], dim=3)
 
             # Apply constraints
             if self.constraints is not None:
                 for constraint in self.constraints:
-                    reshaped = constraint(reshaped)
-
-            outputs.append(reshaped)
-            th.cuda.nvtx.range_pop()
+                    out = constraint(out, orig_input)
+                    
+            outputs.append(out)
 
         if output_only_last:
             return outputs[-1]

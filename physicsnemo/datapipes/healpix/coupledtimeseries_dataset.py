@@ -207,9 +207,11 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
                 axis=2,
             )
 
-        input_array = (input_array - self.input_scaling["mean"]) / self.input_scaling[
-            "std"
-        ]
+        # sum of all variables in all couplings
+        coupled_channels = sum([len(c.variables) for c in self.couplings])
+        input_array = (input_array - self.input_scaling["mean"][:,:-coupled_channels]) \
+            / self.input_scaling["std"][:,:-coupled_channels]
+
         if not self.forecast_mode:
             # BAD NEWS: Indexing the array as commented out below causes unexpected behavior in target creation.
             #     leaving this in here as a warning
