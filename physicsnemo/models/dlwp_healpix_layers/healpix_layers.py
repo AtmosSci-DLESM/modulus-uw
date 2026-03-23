@@ -39,7 +39,6 @@ Details on the HEALPix can be found at https://iopscience.iop.org/article/10.108
 
 import logging
 import torch as th
-from typing import Any, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -839,10 +838,7 @@ class HEALPixLayer(th.nn.Module):
         layer: torch.nn.Module
             Any torch layer function, e.g., th.nn.Conv2d
         kwargs:
-            The arguments that are passed to the torch layer function, e.g., kernel_size.
-            Additionally: ``enable_nhwc``, ``enable_healpixpad``, ``compile_padding``,
-            and ``compile_padding_kwargs`` (optional ``dict`` forwarded to ``torch.compile``
-            for HEALPix padding only).
+            The arguments that are passed to the torch layer function, e.g., kernel_size
         """
         super().__init__()
         layers = []
@@ -858,20 +854,6 @@ class HEALPixLayer(th.nn.Module):
             del kwargs["enable_healpixpad"]
         else:
             enable_healpixpad = False
-
-        if "compile_padding" in kwargs:
-            compile_padding = kwargs["compile_padding"]
-            del kwargs["compile_padding"]
-        else:
-            compile_padding = False
-
-        if "compile_padding_kwargs" in kwargs:
-            compile_padding_kwargs: Optional[Mapping[str, Any]] = kwargs[
-                "compile_padding_kwargs"
-            ]
-            del kwargs["compile_padding_kwargs"]
-        else:
-            compile_padding_kwargs = None
 
         # Define a HEALPixPadding layer if the given layer is a convolution or
         # interpolation layer
@@ -914,19 +896,6 @@ class HEALPixLayer(th.nn.Module):
                 )
 
         layers.append(layer(**kwargs))
-
-        if compile_padding:
-            if len(layers) >= 1 and isinstance(
-                layers[0], HEALPixPadding
-            ):
-                if not hasattr(th, "compile"):
-                    raise RuntimeError(
-                        "compile_padding=True but torch.compile is not available in "
-                        "this PyTorch build"
-                    )
-                pad_kw = dict(compile_padding_kwargs) if compile_padding_kwargs else {}
-                layers[0] = th.compile(layers[0], **pad_kw)
-
         self.layers = th.nn.Sequential(*layers)
 
         if enable_nhwc:

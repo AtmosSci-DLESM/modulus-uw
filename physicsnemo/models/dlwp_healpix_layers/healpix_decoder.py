@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Mapping, Optional, Sequence
+from typing import Sequence
 
 import torch as th
 from hydra.utils import instantiate
@@ -38,8 +38,6 @@ class UNetDecoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
-        compile_padding: bool = False,
-        compile_padding_kwargs: Optional[Mapping[str, Any]] = None,
         hpx_padding_mode: str = 'karlbauer',
         per_level_cln: list[bool] = None,
         per_level_checkpointing: list[bool] = None,
@@ -68,10 +66,6 @@ class UNetDecoder(th.nn.Module):
             If channel last format should be used
         enable_healpixpad, bool, optional
             If the healpixpad library should be used if installed
-        compile_padding: bool, optional
-            If True, wrap HEALPix face padding in ``torch.compile`` (see ``HEALPixLayer``).
-        compile_padding_kwargs: Mapping[str, Any] | None, optional
-            Extra keyword arguments passed to ``torch.compile`` for padding only.
         per_level_cln: list[bool], optional
             If the CLN should be applied to each level of the decoder
             If None, the CLN will based on the conv_block.conditional_layer_norm attribute
@@ -113,8 +107,6 @@ class UNetDecoder(th.nn.Module):
                     out_channels=curr_channel,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
-                    compile_padding=compile_padding,
-                    compile_padding_kwargs=compile_padding_kwargs,
                     hpx_padding_mode=hpx_padding_mode,
                 )
 
@@ -139,8 +131,6 @@ class UNetDecoder(th.nn.Module):
                 n_layers=n_layers[n],
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
-                compile_padding=compile_padding,
-                compile_padding_kwargs=compile_padding_kwargs,
                 hpx_padding_mode=hpx_padding_mode,
             )
 
@@ -151,8 +141,6 @@ class UNetDecoder(th.nn.Module):
                     in_channels=next_channel,
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
-                    compile_padding=compile_padding,
-                    compile_padding_kwargs=compile_padding_kwargs,
                     hpx_padding_mode=hpx_padding_mode,
                 )
             else:
@@ -177,8 +165,6 @@ class UNetDecoder(th.nn.Module):
             dilation=dilations[-1],
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
-            compile_padding=compile_padding,
-            compile_padding_kwargs=compile_padding_kwargs,
             hpx_padding_mode=hpx_padding_mode,
         )
 
