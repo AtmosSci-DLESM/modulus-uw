@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence, Tuple, Union, Callable
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 import torch as th
@@ -58,6 +58,8 @@ class ConvGRUBlock(th.nn.Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         hpx_padding_mode: str = 'karlbauer',
+        compile_padding: bool = False,
+        compile_padding_kwargs: Optional[Mapping[str, Any]] = None,
     ):
         """
         Parameters
@@ -72,6 +74,10 @@ class ConvGRUBlock(th.nn.Module):
             Enable nhwc format, passed to wrapper
         enable_healpixpad: bool, optional
             If HEALPixPadding should be enabled, passed to wrapper
+        compile_padding: bool, optional
+            If True, compile HEALPix padding via ``torch.compile`` (passed to ``HEALPixLayer``).
+        compile_padding_kwargs: Mapping[str, Any] | None, optional
+            Extra keyword arguments for ``torch.compile`` on padding only.
         """
         super().__init__()
 
@@ -85,6 +91,8 @@ class ConvGRUBlock(th.nn.Module):
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
             hpx_padding_mode=hpx_padding_mode,
+            compile_padding=compile_padding,
+            compile_padding_kwargs=compile_padding_kwargs,
         )
         self.conv_can = geometry_layer(
             layer=torch.nn.Conv2d,
@@ -95,6 +103,8 @@ class ConvGRUBlock(th.nn.Module):
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
             hpx_padding_mode=hpx_padding_mode,
+            compile_padding=compile_padding,
+            compile_padding_kwargs=compile_padding_kwargs,
         )
         self.h = th.zeros(1, 1, 1, 1)
 
@@ -153,6 +163,8 @@ class BasicConvBlock(th.nn.Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         hpx_padding_mode: str = 'karlbauer',
+        compile_padding: bool = False,
+        compile_padding_kwargs: Optional[Mapping[str, Any]] = None,
     ):
         """
         Parameters
@@ -177,6 +189,10 @@ class BasicConvBlock(th.nn.Module):
             Enable nhwc format, passed to wrapper
         enable_healpixpad: bool, optional
             If HEALPixPadding should be enabled, passed to wrapper
+        compile_padding: bool, optional
+            If True, compile HEALPix padding via ``torch.compile`` (passed to ``HEALPixLayer``).
+        compile_padding_kwargs: Mapping[str, Any] | None, optional
+            Extra keyword arguments for ``torch.compile`` on padding only.
         """
         super().__init__()
 
@@ -194,6 +210,8 @@ class BasicConvBlock(th.nn.Module):
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
                     hpx_padding_mode=hpx_padding_mode,
+                    compile_padding=compile_padding,
+                    compile_padding_kwargs=compile_padding_kwargs,
                 )
             )
             if activation is not None:
@@ -234,6 +252,8 @@ class ConvNeXtBlock(th.nn.Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         hpx_padding_mode: str = 'karlbauer',
+        compile_padding: bool = False,
+        compile_padding_kwargs: Optional[Mapping[str, Any]] = None,
     ):
         """
         Parameters
@@ -258,6 +278,10 @@ class ConvNeXtBlock(th.nn.Module):
             Enable nhwc format, passed to wrapper
         enable_healpixpad: bool, optional
             If HEALPixPadding should be enabled, passed to wrapper
+        compile_padding: bool, optional
+            If True, compile HEALPix padding via ``torch.compile`` (passed to ``HEALPixLayer``).
+        compile_padding_kwargs: Mapping[str, Any] | None, optional
+            Extra keyword arguments for ``torch.compile`` on padding only.
         """
         super().__init__()
 
@@ -273,6 +297,8 @@ class ConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         # Convolution block
         convblock = []
@@ -287,6 +313,8 @@ class ConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         )
         if activation is not None:
@@ -302,6 +330,8 @@ class ConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         )
         if activation is not None:
@@ -316,6 +346,8 @@ class ConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         )
         self.convblock = th.nn.Sequential(*convblock)
@@ -356,6 +388,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         hpx_padding_mode: str = 'karlbauer',
+        compile_padding: bool = False,
+        compile_padding_kwargs: Optional[Mapping[str, Any]] = None,
         conditional_layer_norm: Callable = None,
         conditional_layer_norm_once: bool = False,
         dropout: float = 0.0,
@@ -383,6 +417,10 @@ class DoubleConvNeXtBlock(th.nn.Module):
             Enable nhwc format, passed to wrapper
         enable_healpixpad: bool, optional
             If HEALPixPadding should be enabled, passed to wrapper
+        compile_padding: bool, optional
+            If True, compile HEALPix padding via ``torch.compile`` (passed to ``HEALPixLayer``).
+        compile_padding_kwargs: Mapping[str, Any] | None, optional
+            Extra keyword arguments for ``torch.compile`` on padding only.
         """
         super().__init__()
 
@@ -401,6 +439,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         if out_channels == int(latent_channels):
             self.skip_module2 = (
@@ -415,6 +455,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
 
         # check if we're applying a layer norm at the beginning 
@@ -449,6 +491,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         )
 
@@ -473,6 +517,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         )
 
@@ -499,6 +545,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         )
         if activation is not None:
@@ -520,6 +568,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         )
         # Apply batch norm and conditional layer norm if needed
@@ -543,6 +593,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         )
         # Apply layer norm if needed
@@ -568,6 +620,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         )
         if activation is not None:
@@ -649,6 +703,8 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         hpx_padding_mode: str = 'karlbauer',
+        compile_padding: bool = False,
+        compile_padding_kwargs: Optional[Mapping[str, Any]] = None,
         dropout: float = 0.0,
         conditional_layer_norm: Callable = None,
         conditional_layer_norm_once: bool = False,
@@ -666,6 +722,10 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
             Whether or not to apply conditional layer normalization only once. If True,
             the conditional layer normalization is applied only once, otherwise it is applied
             for each block.
+        compile_padding: bool, optional
+            If True, compile HEALPix padding via ``torch.compile`` (passed to ``HEALPixLayer``).
+        compile_padding_kwargs: Mapping[str, Any] | None, optional
+            Extra keyword arguments for ``torch.compile`` on padding only.
         """
         super().__init__()
 
@@ -689,6 +749,8 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
                     hpx_padding_mode=hpx_padding_mode,
+                    compile_padding=compile_padding,
+                    compile_padding_kwargs=compile_padding_kwargs,
                     dropout=dropout,
                     conditional_layer_norm=conditional_layer_norm if conditional_layer_norm is not None else None,
                     conditional_layer_norm_once=conditional_layer_norm_once,
@@ -723,6 +785,8 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         use_block_skip_connection: bool = True,
         enable_healpixpad: bool = False,
         hpx_padding_mode: str = 'karlbauer',
+        compile_padding: bool = False,
+        compile_padding_kwargs: Optional[Mapping[str, Any]] = None,
         dropout: float = 0.0,
         conditional_layer_norm: th.nn.Module = None,
         conditional_layer_norm_once: bool = False,
@@ -750,6 +814,10 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             Enable nhwc format, passed to wrapper
         enable_healpixpad: bool, optional
             If HEALPixPadding should be enabled, passed to wrapper
+        compile_padding: bool, optional
+            If True, compile HEALPix padding via ``torch.compile`` (passed to ``HEALPixLayer``).
+        compile_padding_kwargs: Mapping[str, Any] | None, optional
+            Extra keyword arguments for ``torch.compile`` on padding only.
         use_block_skip_connection: bool, optional
             Whether or not to use block-level skip connection
         dropout: float, optional
@@ -782,6 +850,8 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     enable_nhwc=enable_nhwc,
                     enable_healpixpad=enable_healpixpad,
                     hpx_padding_mode=hpx_padding_mode,
+                    compile_padding=compile_padding,
+                    compile_padding_kwargs=compile_padding_kwargs,
                 )
 
         # check if we're applying a layer norm at the beginning
@@ -813,6 +883,8 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         )
         # Apply layer norm if needed
@@ -836,6 +908,8 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         )
 
@@ -863,6 +937,8 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         )
 
@@ -889,6 +965,8 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         )
         if activation is not None:
@@ -949,6 +1027,8 @@ class MaxPool(th.nn.Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         hpx_padding_mode: str = 'karlbauer',
+        compile_padding: bool = False,
+        compile_padding_kwargs: Optional[Mapping[str, Any]] = None,
     ):
         """
         Parameters
@@ -961,6 +1041,10 @@ class MaxPool(th.nn.Module):
             Enable nhwc format, passed to wrapper
         enable_healpixpad: bool, optional
             If HEALPixPadding should be enabled, passed to wrapper
+        compile_padding: bool, optional
+            If True, compile HEALPix padding via ``torch.compile`` (passed to ``HEALPixLayer``).
+        compile_padding_kwargs: Mapping[str, Any] | None, optional
+            Extra keyword arguments for ``torch.compile`` on padding only.
         """
         super().__init__()
         self.maxpool = geometry_layer(
@@ -969,6 +1053,8 @@ class MaxPool(th.nn.Module):
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
             hpx_padding_mode=hpx_padding_mode,
+            compile_padding=compile_padding,
+            compile_padding_kwargs=compile_padding_kwargs,
         )
 
     def forward(self, x):
@@ -999,6 +1085,8 @@ class AvgPool(th.nn.Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         hpx_padding_mode: str = 'karlbauer',
+        compile_padding: bool = False,
+        compile_padding_kwargs: Optional[Mapping[str, Any]] = None,
     ):
         """
         Parameters
@@ -1011,6 +1099,10 @@ class AvgPool(th.nn.Module):
             Enable nhwc format, passed to wrapper
         enable_healpixpad: bool, optional
             If HEALPixPadding should be enabled, passed to wrapper
+        compile_padding: bool, optional
+            If True, compile HEALPix padding via ``torch.compile`` (passed to ``HEALPixLayer``).
+        compile_padding_kwargs: Mapping[str, Any] | None, optional
+            Extra keyword arguments for ``torch.compile`` on padding only.
         """
         super().__init__()
 
@@ -1020,6 +1112,8 @@ class AvgPool(th.nn.Module):
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
             hpx_padding_mode=hpx_padding_mode,
+            compile_padding=compile_padding,
+            compile_padding_kwargs=compile_padding_kwargs,
         )
 
     def forward(self, x):
@@ -1056,6 +1150,8 @@ class TransposedConvUpsample(th.nn.Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         hpx_padding_mode: str = 'karlbauer',
+        compile_padding: bool = False,
+        compile_padding_kwargs: Optional[Mapping[str, Any]] = None,
     ):
         """
         Parameters
@@ -1074,6 +1170,10 @@ class TransposedConvUpsample(th.nn.Module):
             Enable nhwc format, passed to wrapper
         enable_healpixpad: bool, optional
             If HEALPixPadding should be enabled, passed to wrapper
+        compile_padding: bool, optional
+            If True, compile HEALPix padding via ``torch.compile`` (passed to ``HEALPixLayer``).
+        compile_padding_kwargs: Mapping[str, Any] | None, optional
+            Extra keyword arguments for ``torch.compile`` on padding only.
         """
         super().__init__()
                      
@@ -1090,6 +1190,8 @@ class TransposedConvUpsample(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 enable_healpixpad=enable_healpixpad,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                compile_padding_kwargs=compile_padding_kwargs,
             )
         )
         if activation is not None:

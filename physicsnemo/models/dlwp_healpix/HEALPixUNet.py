@@ -16,7 +16,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import torch as th
 from hydra.utils import instantiate
@@ -63,6 +63,8 @@ class HEALPixUNet(Module):
         presteps: int = 0,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
+        compile_padding: bool = False,
+        compile_padding_kwargs: Optional[Mapping[str, Any]] = None,
         couplings: list = [],
         residual_prediction: bool = False,
         couplings_time_first: bool = True,
@@ -97,6 +99,10 @@ class HEALPixUNet(Module):
             Model with [N, H, W, C] instead of [N, C, H, W]. default: False
         enable_healpixpad: bool, optional
             Enable CUDA HEALPixPadding if installed. default: False
+        compile_padding: bool, optional
+            If True, compile HEALPix face padding with ``torch.compile`` (see ``HEALPixLayer``).
+        compile_padding_kwargs: Mapping[str, Any] | None, optional
+            Extra keyword arguments passed to ``torch.compile`` for padding only.
         couplings: list, optional
             sequence of dictionaries that describe coupling mechanisms
         residual_prediction: bool, optional
@@ -155,6 +161,8 @@ class HEALPixUNet(Module):
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
+            compile_padding=compile_padding,
+            compile_padding_kwargs=compile_padding_kwargs,
             hpx_padding_mode=self.hpx_padding_mode,
         )
         self.encoder_depth = len(self.encoder.n_channels)
@@ -163,6 +171,8 @@ class HEALPixUNet(Module):
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
+            compile_padding=compile_padding,
+            compile_padding_kwargs=compile_padding_kwargs,
             hpx_padding_mode=self.hpx_padding_mode,
         )
 
