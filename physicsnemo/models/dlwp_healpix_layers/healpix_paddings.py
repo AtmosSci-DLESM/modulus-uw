@@ -43,6 +43,12 @@ import torch as th
 
 logger = logging.getLogger(__name__)
 
+try:
+    _dynamo_disable = th._dynamo.disable
+except AttributeError:  # pragma: no cover
+    def _dynamo_disable(fn):
+        return fn
+
 # True if ``from earth2grid.healpix import pad`` succeeded; ``HEALPixPaddingv2`` and
 # ``HEALPixLayer(..., hpx_padding_mode='earth2grid')`` require this.
 have_earth2grid = True
@@ -867,6 +873,7 @@ def decode_two_channel_identity_to_linear_indices(
     return a, b
 
 
+@_dynamo_disable
 def build_isolatitude_gather_index_cpu(
     p: int, H: int
 ) -> tuple[th.Tensor, th.Tensor]:
@@ -1002,9 +1009,15 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             self.register_buffer("_valid", th.empty(0, 0, dtype=th.bool), persistent=False)
             self._H: int | None = None
 
+    @_dynamo_disable
     def _ensure_buffers(self, H: int, device: th.device) -> None:
         """(Re)build ``_index`` and ``_valid`` on ``device`` when face size changes."""
-        if self._buffers_ready and self._H == H:
+        if (
+            self._buffers_ready
+            and self._H == H
+            and self._index.device == device
+            and self._valid.device == device
+        ):
             return
         idx, valid = build_isolatitude_gather_index_cpu(self.p, H)
         self.register_buffer("_index", idx.to(device), persistent=False)
@@ -1030,7 +1043,13 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
         H = data.shape[-1]
         if H != data.shape[-2]:
             raise ValueError("HEALPix faces must be square (H == W)")
-        self._ensure_buffers(H, data.device)
+        if (
+            (not self._buffers_ready)
+            or (self._H != H)
+            or (self._index.device != data.device)
+            or (self._valid.device != data.device)
+        ):
+            self._ensure_buffers(H, data.device)
 
         B12, C, _, _ = data.shape
         B = B12 // 12

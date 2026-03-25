@@ -22,6 +22,7 @@ then the user-supplied base layer (e.g. ``Conv2d``). Inputs are face tensors wit
 12 HEALPix faces; see ``healpix_paddings`` for face ordering and padding modes.
 """
 
+import copy
 import torch as th
 
 from .healpix_paddings import (
@@ -32,6 +33,38 @@ from .healpix_paddings import (
     have_earth2grid,
     pop_deprecated_enable_healpixpad_from_kwargs,
 )
+
+
+class _CompiledPaddingFixedDType(th.nn.Module):
+    """Keep compiled padding on a single compute dtype."""
+
+    def __init__(self, module: th.nn.Module, compute_dtype: th.dtype = th.float32):
+        super().__init__()
+        self.module = module
+        self.compute_dtype = compute_dtype
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        in_dtype = x.dtype
+        if x.dtype != self.compute_dtype:
+            x = x.to(dtype=self.compute_dtype)
+        y = self.module(x)
+        if y.dtype != in_dtype:
+            y = y.to(dtype=in_dtype)
+        return y
+
+
+class _CompiledPaddingPerGradMode(th.nn.Module):
+    """Dispatch to separate compiled modules for train/eval grad modes."""
+
+    def __init__(self, train_module: th.nn.Module, eval_module: th.nn.Module):
+        super().__init__()
+        self.train_module = train_module
+        self.eval_module = eval_module
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        if th.is_grad_enabled():
+            return self.train_module(x)
+        return self.eval_module(x)
 
 
 class HEALPixLayer(th.nn.Module):
@@ -157,13 +190,24 @@ class HEALPixLayer(th.nn.Module):
                     )
                 )
             elif hpx_padding_mode == "isolatitude":
-                layers.append(
-                    HEALPixPaddingIsolatitude(
-                        padding=padding,
-                        enable_nhwc=enable_nhwc,
-                        healpix_face_size=nside,
-                    )
+                base_padding = HEALPixPaddingIsolatitude(
+                    padding=padding,
+                    enable_nhwc=enable_nhwc,
+                    healpix_face_size=nside,
                 )
+                compiled_train_padding = th.compile(base_padding, dynamic=False)
+                compiled_eval_padding = th.compile(copy.deepcopy(base_padding), dynamic=False)
+                compiled_padding = _CompiledPaddingPerGradMode(
+                    train_module=_CompiledPaddingFixedDType(
+                        module=compiled_train_padding,
+                        compute_dtype=th.float16,
+                    ),
+                    eval_module=_CompiledPaddingFixedDType(
+                        module=compiled_eval_padding,
+                        compute_dtype=th.float16,
+                    ),
+                )
+                layers.append(compiled_padding)
             else:
                 raise ValueError(
                     f"Unsupported hpx_padding_mode={hpx_padding_mode!r}."
