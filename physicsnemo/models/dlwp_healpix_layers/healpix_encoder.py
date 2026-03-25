@@ -21,6 +21,8 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 from torch.utils.checkpoint import checkpoint
 
+from .healpix_paddings import warn_deprecated_enable_healpixpad
+
 
 class UNetEncoder(th.nn.Module):
     """Generic UNetEncoder that can be applied to arbitrary meshes."""
@@ -35,8 +37,9 @@ class UNetEncoder(th.nn.Module):
         n_layers: Sequence = (2, 2, 1),
         dilations: list = None,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
-        hpx_padding_mode: str = 'karlbauer',
+        hpx_padding_mode: str = 'earth2grid',
+        enable_healpixpad: bool | None = None,
+        nside: int = 64,
         per_level_cln: Sequence[bool] = None,
         per_level_checkpointing: Sequence[bool] = None,
     ):
@@ -60,8 +63,13 @@ class UNetEncoder(th.nn.Module):
             List of dialtions to use for the the convolutional blocks
         enable_nhwc: bool, optional
             If channel last format should be used
-        enable_healpixpad, bool, optional
-            If the healpixpad library should be used (if installed)
+        hpx_padding_mode: str, optional
+            Passed through to HEALPix blocks (e.g. ``earth2grid`` for fast CUDA padding).
+        enable_healpixpad: bool, optional
+            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
+        nside: int, optional
+            Native HEALPix face height/width (``H == W``). Passed to blocks for
+            ``HEALPixPaddingIsolatitude`` index precomputation. Default 64.
         per_level_cln: list[bool] | None, optional
             If the CLN should be applied to each level of the encoder
             If None, the CLN will based on the conv_block.conditional_layer_norm attribute
@@ -70,6 +78,7 @@ class UNetEncoder(th.nn.Module):
             If None, the checkpointing will not be applied
         """
         super().__init__()
+        warn_deprecated_enable_healpixpad(enable_healpixpad)
         self.n_channels = n_channels
 
         if per_level_cln is not None and len(per_level_cln) != len(n_channels):
@@ -101,8 +110,8 @@ class UNetEncoder(th.nn.Module):
                     instantiate(
                         config=down_sampling_block,
                         enable_nhwc=enable_nhwc,
-                        enable_healpixpad=enable_healpixpad,
                         hpx_padding_mode=hpx_padding_mode,
+                        nside=nside,
                     )
                 )
 
@@ -121,8 +130,8 @@ class UNetEncoder(th.nn.Module):
                     dilation=dilations[n],
                     n_layers=n_layers[n],
                     enable_nhwc=enable_nhwc,
-                    enable_healpixpad=enable_healpixpad,
                     hpx_padding_mode=hpx_padding_mode,
+                    nside=nside,
                 )
             )
             old_channels = curr_channel

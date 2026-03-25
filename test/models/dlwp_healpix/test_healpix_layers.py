@@ -208,12 +208,12 @@ def test_HEALPixLayer_forward(device, multiplier, pytestconfig):
 
     layer = HEALPixLayer(
         layer=torch.nn.Conv2d,
+        hpx_padding_mode="karlbauer",
         in_channels=in_channels,
         out_channels=out_channels,
         kernel_size=kernel_size,
         device=device,
         dilation=dilation,
-        enable_healpixpad=True,
         enable_nhwc=True,
     )
 

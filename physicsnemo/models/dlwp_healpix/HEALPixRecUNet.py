@@ -23,7 +23,11 @@ import torch as th
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
-from physicsnemo.models.dlwp_healpix_layers import HEALPixFoldFaces, HEALPixUnfoldFaces
+from physicsnemo.models.dlwp_healpix_layers import (
+    HEALPixFoldFaces,
+    HEALPixUnfoldFaces,
+    warn_deprecated_enable_healpixpad,
+)
 from physicsnemo.models.meta import ModelMetaData
 from physicsnemo.models.module import Module
 
@@ -65,12 +69,13 @@ class HEALPixRecUNet(Module):
         reset_cycle: str = "24h",
         presteps: int = 1,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
         couplings: list = [],
         residual_prediction: bool = True,
         couplings_time_first: bool = True,
         constraints: list[DictConfig] = None,
-        hpx_padding_mode: str = 'karlbauer',
+        hpx_padding_mode: str = 'earth2grid',
+        enable_healpixpad: bool | None = None,
+        nside: int = 64,
     ):
         """
         Parameters
@@ -103,8 +108,6 @@ class HEALPixRecUNet(Module):
             number of model steps to initialize recurrent states.
         enable_nhwc: bool, optional
             Model with [N, H, W, C] instead of [N, C, H, W]
-        enable_healpixpad: bool, optional
-            Enable CUDA HEALPixPadding if installed
         couplings: list, optional
             sequence of dictionaries that describe coupling mechanisms
         residual_prediction: bool, optional
@@ -115,10 +118,17 @@ class HEALPixRecUNet(Module):
             List of hydra instantiable DictConfigs specifying constraints 
             (e.g., nonnegativity) to be applied to the model outputs
         hpx_padding_mode: str, optional
-            Method to use for padding HEALPix faces for convolutions. Options
-            are 'karlbauer' (default) and 'isolatitude'.
+            Padding strategy: ``earth2grid`` (default; fast path on CUDA), ``karlbauer``,
+            ``isolatitude`` (optimized), or ``isolatitude_reference``. Legacy ``isolat``
+            maps to ``isolatitude_reference``.
+        enable_healpixpad: bool, optional
+            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
+        nside: int, optional
+            Native HEALPix face height/width. Passed to encoder/decoder for isolatitude
+            gather index precomputation. Default 64.
         """
         super().__init__()
+        warn_deprecated_enable_healpixpad(enable_healpixpad)
         self.channel_dim = 2  # Now 2 with [B, F, T*C, H, W]. Was 1 in old data format with [B, T*C, F, H, W]
 
         self.input_channels = input_channels
@@ -153,11 +163,11 @@ class HEALPixRecUNet(Module):
             self.reset_cycle = int(pd.Timedelta(reset_cycle).total_seconds() // 3600)
         self.presteps = presteps
         self.enable_nhwc = enable_nhwc
-        self.enable_healpixpad = enable_healpixpad
         self.residual_prediction = residual_prediction
         self.couplings_time_first = couplings_time_first
         self.hpx_padding_mode = hpx_padding_mode
-        
+        self.nside = nside
+
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
         if not self.is_diagnostic and (self.output_time_dim % self.input_time_dim != 0):
@@ -173,16 +183,16 @@ class HEALPixRecUNet(Module):
             config=encoder,
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
-            enable_healpixpad=self.enable_healpixpad,
             hpx_padding_mode=self.hpx_padding_mode,
+            nside=self.nside,
         )
         self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
             config=decoder,
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
-            enable_healpixpad=self.enable_healpixpad,
             hpx_padding_mode=self.hpx_padding_mode,
+            nside=self.nside,
         )
 
         self.constraints = None

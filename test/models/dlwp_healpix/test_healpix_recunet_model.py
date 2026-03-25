@@ -332,6 +332,8 @@ def test_HEALPixRecUNet_reset(
     constants = constant_data(channels=n_constants, img_size=size, device=device)
     inputs = [x, decoder_inputs, constants]
 
+    hpx_pad = "earth2grid" if device.type == "cuda" else "karlbauer"
+
     model = HEALPixRecUNet(
         encoder=encoder_dict,
         decoder=decoder_dict,
@@ -341,7 +343,7 @@ def test_HEALPixRecUNet_reset(
         decoder_input_channels=decoder_input_channels,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
-        enable_healpixpad=True,
+        hpx_padding_mode=hpx_pad,
         delta_time="6h",
     ).to(device)
 
@@ -392,6 +394,8 @@ def test_HEALPixRecUNet_forward(
     constants = constant_data(channels=n_constants, img_size=size, device=device)
     inputs = [x, decoder_inputs, constants]
 
+    hpx_pad = "earth2grid" if device.type == "cuda" else "karlbauer"
+
     model = HEALPixRecUNet(
         encoder=encoder_dict,
         decoder=decoder_dict,
@@ -401,7 +405,7 @@ def test_HEALPixRecUNet_forward(
         decoder_input_channels=decoder_input_channels,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
-        enable_healpixpad=True,
+        hpx_padding_mode=hpx_pad,
         delta_time="6h",
         reset_cycle="6h",
     ).to(device)
@@ -434,7 +438,7 @@ def test_HEALPixRecUNet_forward(
         decoder_input_channels=0,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
-        enable_healpixpad=True,
+        hpx_padding_mode=hpx_pad,
         delta_time="6h",
     ).to(device)
 
@@ -459,7 +463,7 @@ def test_HEALPixRecUNet_forward(
         decoder_input_channels=decoder_input_channels,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
-        enable_healpixpad=True,
+        hpx_padding_mode=hpx_pad,
         delta_time="6h",
     ).to(device)
 

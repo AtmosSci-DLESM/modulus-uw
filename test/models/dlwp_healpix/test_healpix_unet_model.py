@@ -292,6 +292,9 @@ def test_HEALPixUNet_forward(
     constants = constant_data(channels=n_constants, img_size=size, device=device)
     inputs = [x, decoder_inputs, constants]
 
+    # earth2grid fast path requires CUDA; on CPU match legacy karlbauer torch pad
+    hpx_pad = "earth2grid" if device.type == "cuda" else "karlbauer"
+
     model = HEALPixUNet(
         encoder=unet_encoder_dict,
         decoder=unet_decoder_dict,
@@ -301,7 +304,7 @@ def test_HEALPixUNet_forward(
         decoder_input_channels=decoder_input_channels,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
-        enable_healpixpad=True,
+        hpx_padding_mode=hpx_pad,
     ).to(device)
 
     # one forward step to initialize recurrent states
@@ -325,7 +328,7 @@ def test_HEALPixUNet_forward(
         decoder_input_channels=0,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
-        enable_healpixpad=True,
+        hpx_padding_mode=hpx_pad,
     ).to(device)
 
     # one forward step to initialize recurrent states
@@ -349,7 +352,7 @@ def test_HEALPixUNet_forward(
         decoder_input_channels=decoder_input_channels,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
-        enable_healpixpad=True,
+        hpx_padding_mode=hpx_pad,
     ).to(device)
 
     # one forward step to initialize recurrent states
@@ -373,7 +376,7 @@ def test_HEALPixUNet_forward(
         decoder_input_channels=0,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
-        enable_healpixpad=True,
+        hpx_padding_mode=hpx_pad,
     ).to(device)
 
     # one forward step to initialize recurrent states
