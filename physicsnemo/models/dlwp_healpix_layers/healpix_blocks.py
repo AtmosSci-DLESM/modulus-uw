@@ -58,6 +58,7 @@ class ConvGRUBlock(th.nn.Module):
         kernel_size: int = 1,
         enable_nhwc: bool = False,
         hpx_padding_mode: str = 'earth2grid',
+        earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
         nside: int = 64,
     ):
@@ -89,6 +90,7 @@ class ConvGRUBlock(th.nn.Module):
             padding="same",
             enable_nhwc=enable_nhwc,
             hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
             nside=nside,
         )
         self.conv_can = geometry_layer(
@@ -99,6 +101,7 @@ class ConvGRUBlock(th.nn.Module):
             padding="same",
             enable_nhwc=enable_nhwc,
             hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
             nside=nside,
         )
         self.h = th.zeros(1, 1, 1, 1)
@@ -157,6 +160,7 @@ class BasicConvBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         hpx_padding_mode: str = 'earth2grid',
+        earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
         nside: int = 64,
     ):
@@ -202,6 +206,7 @@ class BasicConvBlock(th.nn.Module):
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
                     hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                     nside=nside,
                 )
             )
@@ -242,6 +247,7 @@ class ConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         hpx_padding_mode: str = 'earth2grid',
+        earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
         nside: int = 64,
     ):
@@ -285,6 +291,7 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         # Convolution block
@@ -299,6 +306,7 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         )
@@ -314,6 +322,7 @@ class ConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         )
@@ -328,6 +337,7 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         )
@@ -368,6 +378,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         hpx_padding_mode: str = 'earth2grid',
+        earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
         nside: int = 64,
         conditional_layer_norm: Callable = None,
@@ -417,6 +428,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         if out_channels == int(latent_channels):
@@ -431,6 +443,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
 
@@ -465,6 +478,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         )
@@ -489,6 +503,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         )
@@ -515,6 +530,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         )
@@ -536,6 +552,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         )
@@ -559,6 +576,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         )
@@ -584,6 +602,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         )
@@ -665,6 +684,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         hpx_padding_mode: str = 'earth2grid',
+        earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
         nside: int = 64,
         dropout: float = 0.0,
@@ -711,6 +731,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                     activation=activation,
                     enable_nhwc=enable_nhwc,
                     hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                     nside=nside,
                     dropout=dropout,
                     conditional_layer_norm=conditional_layer_norm if conditional_layer_norm is not None else None,
@@ -745,6 +766,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         enable_nhwc: bool = False,
         use_block_skip_connection: bool = True,
         hpx_padding_mode: str = 'earth2grid',
+        earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
         nside: int = 64,
         dropout: float = 0.0,
@@ -808,6 +830,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     kernel_size=1,
                     enable_nhwc=enable_nhwc,
                     hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                     nside=nside,
                 )
 
@@ -839,6 +862,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         )
@@ -862,6 +886,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         )
@@ -889,6 +914,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         )
@@ -915,6 +941,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         )
@@ -975,6 +1002,7 @@ class MaxPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         hpx_padding_mode: str = 'earth2grid',
+        earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
         nside: int = 64,
     ):
@@ -999,6 +1027,7 @@ class MaxPool(th.nn.Module):
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
             nside=nside,
         )
 
@@ -1029,6 +1058,7 @@ class AvgPool(th.nn.Module):
         pooling: int = 2,
         enable_nhwc: bool = False,
         hpx_padding_mode: str = 'earth2grid',
+        earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
         nside: int = 64,
     ):
@@ -1054,6 +1084,7 @@ class AvgPool(th.nn.Module):
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
             hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
             nside=nside,
         )
 
@@ -1090,6 +1121,7 @@ class TransposedConvUpsample(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         hpx_padding_mode: str = 'earth2grid',
+        earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
         nside: int = 64,
     ):
@@ -1128,6 +1160,7 @@ class TransposedConvUpsample(th.nn.Module):
                 padding=0,
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                 nside=nside,
             )
         )

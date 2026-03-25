@@ -74,6 +74,7 @@ class HEALPixRecUNet(Module):
         couplings_time_first: bool = True,
         constraints: list[DictConfig] = None,
         hpx_padding_mode: str = 'earth2grid',
+        earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
         nside: int = 64,
     ):
@@ -121,6 +122,10 @@ class HEALPixRecUNet(Module):
             Padding strategy: ``earth2grid`` (default; fast path on CUDA), ``karlbauer``,
             ``isolatitude`` (optimized), or ``isolatitude_reference``. Legacy ``isolat``
             maps to ``isolatitude_reference``.
+        earth2grid_padding_backend: str, optional
+            Earth2Grid backend when ``hpx_padding_mode='earth2grid'``. Supported:
+            ``'cuda'``, ``'indexing'``, and ``'zephyr'``. Default ``None`` maps to
+            ``'cuda'``.
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         nside: int, optional
@@ -166,6 +171,7 @@ class HEALPixRecUNet(Module):
         self.residual_prediction = residual_prediction
         self.couplings_time_first = couplings_time_first
         self.hpx_padding_mode = hpx_padding_mode
+        self.earth2grid_padding_backend = earth2grid_padding_backend
         self.nside = nside
 
         # Number of passes through the model, or a diagnostic model with only one output time
@@ -184,6 +190,7 @@ class HEALPixRecUNet(Module):
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
             hpx_padding_mode=self.hpx_padding_mode,
+            earth2grid_padding_backend=self.earth2grid_padding_backend,
             nside=self.nside,
         )
         self.encoder_depth = len(self.encoder.n_channels)
@@ -192,6 +199,7 @@ class HEALPixRecUNet(Module):
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
             hpx_padding_mode=self.hpx_padding_mode,
+            earth2grid_padding_backend=self.earth2grid_padding_backend,
             nside=self.nside,
         )
 

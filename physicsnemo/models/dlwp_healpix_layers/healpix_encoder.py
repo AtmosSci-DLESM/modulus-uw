@@ -38,6 +38,7 @@ class UNetEncoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         hpx_padding_mode: str = 'earth2grid',
+        earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
         nside: int = 64,
         per_level_cln: Sequence[bool] = None,
@@ -111,6 +112,7 @@ class UNetEncoder(th.nn.Module):
                         config=down_sampling_block,
                         enable_nhwc=enable_nhwc,
                         hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                         nside=nside,
                     )
                 )
@@ -131,6 +133,7 @@ class UNetEncoder(th.nn.Module):
                     n_layers=n_layers[n],
                     enable_nhwc=enable_nhwc,
                     hpx_padding_mode=hpx_padding_mode,
+                    earth2grid_padding_backend=earth2grid_padding_backend,
                     nside=nside,
                 )
             )

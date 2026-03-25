@@ -52,7 +52,14 @@ class HEALPixLayer(th.nn.Module):
     set ``hpx_padding_mode`` to ``karlbauer`` or an isolatitude mode.
     """
 
-    def __init__(self, layer, hpx_padding_mode="earth2grid", nside: int = 64, **kwargs):
+    def __init__(
+        self,
+        layer,
+        hpx_padding_mode="earth2grid",
+        earth2grid_padding_backend: str | None = None,
+        nside: int = 64,
+        **kwargs,
+    ):
         """
         Parameters
         ----------
@@ -66,6 +73,10 @@ class HEALPixLayer(th.nn.Module):
             - ``"karlbauer"`` — Karlbauer et al. (2024) face stitching.
             - ``"isolatitude_reference"`` — isolatitude rules, reference implementation.
             - ``"isolatitude"`` — same numerics as reference, gather-based forward.
+        earth2grid_padding_backend : str, optional
+            Backend name for ``hpx_padding_mode='earth2grid'``. Valid values are
+            ``'cuda'``, ``'indexing'``, and ``'zephyr'``. Default ``None`` maps to
+            ``'cuda'``.
         nside : int, optional
             Native resolution of each HEALPix face (height = width = ``nside``). Passed
             as ``healpix_face_size`` to ``HEALPixPaddingIsolatitude`` so gather indices
@@ -89,6 +100,11 @@ class HEALPixLayer(th.nn.Module):
             del kwargs["enable_nhwc"]
         else:
             enable_nhwc = False
+
+        if hpx_padding_mode != "earth2grid" and earth2grid_padding_backend is not None:
+            raise ValueError(
+                "earth2grid_padding_backend is only valid when hpx_padding_mode='earth2grid'."
+            )
 
         # Define a HEALPixPadding layer if the given layer is a convolution or
         # interpolation layer
@@ -115,7 +131,16 @@ class HEALPixLayer(th.nn.Module):
                     and th.cuda.is_available()
                     and not enable_nhwc
                 ):  # pragma: no cover
-                    layers.append(HEALPixPaddingv2(padding=padding))
+                    layers.append(
+                        HEALPixPaddingv2(
+                            padding=padding,
+                            earth2grid_padding_backend=(
+                                "cuda"
+                                if earth2grid_padding_backend is None
+                                else earth2grid_padding_backend
+                            ),
+                        )
+                    )
                 else:
                     raise ValueError(
                         "hpx_padding_mode='earth2grid' requires earth2grid healpix pad import, "

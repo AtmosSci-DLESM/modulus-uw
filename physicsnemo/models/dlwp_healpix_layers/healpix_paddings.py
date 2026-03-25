@@ -47,7 +47,11 @@ logger = logging.getLogger(__name__)
 # ``HEALPixLayer(..., hpx_padding_mode='earth2grid')`` require this.
 have_earth2grid = True
 try:
-    from earth2grid.healpix import pad as healpix_pad
+    from earth2grid.healpix import (
+        PaddingBackends as Earth2GridPaddingBackends,
+        pad as healpix_pad,
+        pad_backend as earth2grid_pad_backend,
+    )
 except ImportError:
     logger.warning("Could not import pad from earth2grid.healpix.")
     have_earth2grid = False
@@ -157,7 +161,7 @@ class HEALPixPaddingv2(th.nn.Module):
     fold/unfold (no ``enable_nhwc`` on the helpers).
     """
 
-    def __init__(self, padding: int):  # pragma: no cover
+    def __init__(self, padding: int, earth2grid_padding_backend: str = "cuda"):  # pragma: no cover
         """
         Parameters
         ----------
@@ -169,6 +173,14 @@ class HEALPixPaddingv2(th.nn.Module):
         self.unfold = HEALPixUnfoldFaces(num_faces=12)
         self.fold = HEALPixFoldFaces()
         self.padding = padding
+        backend_name = str(earth2grid_padding_backend).lower()
+        try:
+            self._backend = Earth2GridPaddingBackends[backend_name]
+        except Exception as e:  # pragma: no cover
+            raise ValueError(
+                "Invalid earth2grid_padding_backend="
+                f"{earth2grid_padding_backend!r}; expected one of: 'cuda', 'indexing', 'zephyr'."
+            ) from e
 
     def forward(self, x):  # pragma: no cover
         """
@@ -186,7 +198,8 @@ class HEALPixPaddingv2(th.nn.Module):
         """
 
         x = self.unfold(x)
-        x = healpix_pad(x, self.padding)
+        with earth2grid_pad_backend(self._backend):
+            x = healpix_pad(x, self.padding)
         x = self.fold(x)
 
         return x
@@ -697,10 +710,10 @@ def _tl_isolat(p: int, d: tuple[int, int], top: th.Tensor, lft: th.Tensor) -> th
         raise ValueError(
             f"Padding {p} must not exceed half the face height/width {top.shape[-1]}"
         )
-    diag_nums = th.arange(p - 1, -(p - 1) - 1, -1)
+    diag_nums = range(p - 1, -p, -1)
     for i in range(n):
         fill_val = 0.5 * (top[..., -i - 2, 0] + lft[..., 0, -i - 2])
-        diag_indices = kth_diag_indices(p, int(diag_nums[i].item()))
+        diag_indices = kth_diag_indices(p, diag_nums[i])
         for j in range(len(diag_indices[0])):
             ret[..., diag_indices[0][j], diag_indices[1][j]] = fill_val
     return th.rot90(ret, k=-1, dims=d)
@@ -718,10 +731,10 @@ def _br_isolat(p: int, d: tuple[int, int], b: th.Tensor, r: th.Tensor) -> th.Ten
         raise ValueError(
             f"Padding {p} must not exceed half the face height/width {b.shape[-1]}"
         )
-    diag_nums = th.arange(p - 1, -(p - 1) - 1, -1)
+    diag_nums = range(p - 1, -p, -1)
     for i in range(n):
         fill_val = 0.5 * (b[..., i + 1, -1] + r[..., -1, i + 1])
-        diag_indices = kth_diag_indices(p, int(diag_nums[i].item()))
+        diag_indices = kth_diag_indices(p, diag_nums[i])
         for j in range(len(diag_indices[0])):
             ret[..., diag_indices[0][j], diag_indices[1][j]] = fill_val
     return th.rot90(ret, k=1, dims=d)
