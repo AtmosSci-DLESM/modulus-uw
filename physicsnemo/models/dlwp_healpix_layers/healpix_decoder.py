@@ -42,7 +42,7 @@ class UNetDecoder(th.nn.Module):
         hpx_padding_mode: str = 'earth2grid',
         earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
-        nside: int = 64,
+        nside: Sequence[int] = (64, 32, 16),
         per_level_cln: list[bool] = None,
         per_level_checkpointing: list[bool] = None,
     ):
@@ -72,9 +72,10 @@ class UNetDecoder(th.nn.Module):
             Passed through to HEALPix blocks (e.g. ``earth2grid`` for fast CUDA padding).
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
-        nside: int, optional
-            Native HEALPix face height/width. Passed to blocks for isolatitude padding.
-            Default 64.
+        nside: Sequence[int], optional
+            Per-level face size from full resolution (``nside[0]``) to deepest (``nside[-1]``),
+            same convention as the encoder. ``len(nside)`` must equal ``len(n_channels)``.
+            Default ``(64, 32, 16)`` for the default three-level decoder.
         per_level_cln: list[bool], optional
             If the CLN should be applied to each level of the decoder
             If None, the CLN will based on the conv_block.conditional_layer_norm attribute
@@ -85,6 +86,13 @@ class UNetDecoder(th.nn.Module):
         super().__init__()
         warn_deprecated_enable_healpixpad(enable_healpixpad)
         self.channel_dim = 1  # 1 in previous layout
+        nside_levels = tuple(int(x) for x in nside)
+        if len(nside_levels) != len(n_channels):
+            raise ValueError(
+                f"nside must have the same length as n_channels ({len(n_channels)}), "
+                f"got {len(nside_levels)}: {nside_levels!r}"
+            )
+        L = len(n_channels)
 
         if per_level_cln is not None and len(per_level_cln) != len(n_channels):
             raise ValueError(
@@ -118,7 +126,7 @@ class UNetDecoder(th.nn.Module):
                     enable_nhwc=enable_nhwc,
                     hpx_padding_mode=hpx_padding_mode,
                     earth2grid_padding_backend=earth2grid_padding_backend,
-                    nside=nside,
+                    nside=nside_levels[L - n],
                 )
 
             next_channel = (
@@ -143,7 +151,7 @@ class UNetDecoder(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
                     earth2grid_padding_backend=earth2grid_padding_backend,
-                nside=nside,
+                nside=nside_levels[L - 1 - n],
             )
 
             # Recurrent module
@@ -154,7 +162,7 @@ class UNetDecoder(th.nn.Module):
                     enable_nhwc=enable_nhwc,
                     hpx_padding_mode=hpx_padding_mode,
                     earth2grid_padding_backend=earth2grid_padding_backend,
-                    nside=nside,
+                    nside=nside_levels[L - 1 - n],
                 )
             else:
                 rec_module = None
@@ -179,7 +187,7 @@ class UNetDecoder(th.nn.Module):
             enable_nhwc=enable_nhwc,
             hpx_padding_mode=hpx_padding_mode,
                     earth2grid_padding_backend=earth2grid_padding_backend,
-            nside=nside,
+            nside=nside_levels[0],
         )
 
     def _forward_layer_pass(self, layer: th.nn.Module, x: th.Tensor, skip_connection: th.Tensor=None, conditions_cln: th.Tensor=None) -> th.Tensor:

@@ -34,6 +34,56 @@ from .healpix_paddings import (
 )
 
 
+class _CompilePaddingWrapper(th.nn.Module):
+    """
+    A wrapper around HEALPix padding modules that ensures padding is always applied with a fixed dtype.
+
+    This is useful for cases where the model may use mixed-precision training (e.g., float16/bfloat16),
+    but the padding operation requires a specific dtype (like float32 or float16). The input tensor is 
+    casted to the required dtype, the padding is applied, and the result is casted back to the original 
+    dtype if necessary.
+
+    Parameters
+    ----------
+    padding : int
+        Amount of padding to apply to the spatial dimensions.
+    healpix_face_size : int
+        The size (height/width) of each HEALPix face.
+    enable_nhwc : bool
+        Whether to use channels-last (NHWC) format.
+    pad_dtype : torch.dtype
+        The dtype to use for the padding operation.
+    compile_inner : bool, optional
+        Whether to use torch.compile on the inner padding module (default: True).
+    """
+
+    def __init__(
+        self,
+        padding: int,
+        healpix_face_size: int,
+        enable_nhwc: bool,
+        compile_inner: bool = True,
+        fixed_pad_dtype: th.dtype = th.float32,
+    ):
+        super().__init__()
+        inner = HEALPixPaddingIsolatitude(
+            padding=padding,
+            enable_nhwc=enable_nhwc,
+            healpix_face_size=healpix_face_size,
+        )
+        self.inner = th.compile(inner) if compile_inner else inner
+        self.fixed_pad_dtype = fixed_pad_dtype
+
+    def forward(self, data: th.Tensor) -> th.Tensor:
+        orig_dtype = data.dtype
+        if data.dtype != self.fixed_pad_dtype:
+            data = data.to(dtype=self.fixed_pad_dtype)
+        out = self.inner(data)
+        if out.dtype != orig_dtype:
+            out = out.to(dtype=orig_dtype)
+        return out
+
+
 class HEALPixLayer(th.nn.Module):
     """
     Apply a base ``torch.nn.Module`` on data laid out as HEALPix faces.
@@ -143,7 +193,7 @@ class HEALPixLayer(th.nn.Module):
                     )
                 else:
                     raise ValueError(
-                        "hpx_padding_mode='earth2grid' requires earth2grid healpix pad import, "
+                        "hpx_padding_mode=earth2grid requires earth2grid import, "
                         "CUDA, and enable_nhwc=False."
                     )
             elif hpx_padding_mode == "karlbauer":
@@ -158,10 +208,12 @@ class HEALPixLayer(th.nn.Module):
                 )
             elif hpx_padding_mode == "isolatitude":
                 layers.append(
-                    HEALPixPaddingIsolatitude(
+                    _CompilePaddingWrapper(
                         padding=padding,
-                        enable_nhwc=enable_nhwc,
                         healpix_face_size=nside,
+                        enable_nhwc=enable_nhwc,
+                        compile_inner=True,
+                        fixed_pad_dtype=th.float32,
                     )
                 )
             else:

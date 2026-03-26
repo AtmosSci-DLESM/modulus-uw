@@ -178,6 +178,7 @@ def test_HEALPixUNet_initialize(
         decoder_input_channels=decoder_input_channels,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
+        nside=(16, 8, 4),
     ).to(device)
     assert isinstance(model, HEALPixUNet)
 
@@ -194,6 +195,7 @@ def test_HEALPixUNet_initialize(
             decoder_input_channels=decoder_input_channels,
             input_time_dim=2,
             output_time_dim=3,
+            nside=(16, 8, 4),
         ).to(device)
 
     # test fail case for couplings with no constants
@@ -211,6 +213,7 @@ def test_HEALPixUNet_initialize(
             decoder_input_channels=2,
             n_constants=0,
             couplings=["t2m", "v10m"],
+            nside=(16, 8, 4),
         ).to(device)
 
     # test fail case for couplings with no decoder input channels
@@ -228,6 +231,7 @@ def test_HEALPixUNet_initialize(
             decoder_input_channels=0,
             n_constants=2,
             couplings=["t2m", "v10m"],
+            nside=(16, 8, 4),
         ).to(device)
 
     del model
@@ -255,6 +259,7 @@ def test_HEALPixUNet_integration_steps(
         decoder_input_channels=decoder_input_channels,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
+        nside=(16, 8, 4),
     ).to(device)
 
     assert model.integration_steps == output_time_dim // input_time_dim
@@ -305,6 +310,7 @@ def test_HEALPixUNet_forward(
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
         hpx_padding_mode=hpx_pad,
+        nside=(16, 8, 4),
     ).to(device)
 
     # one forward step to initialize recurrent states
@@ -329,6 +335,7 @@ def test_HEALPixUNet_forward(
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
         hpx_padding_mode=hpx_pad,
+        nside=(16, 8, 4),
     ).to(device)
 
     # one forward step to initialize recurrent states
@@ -353,6 +360,7 @@ def test_HEALPixUNet_forward(
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
         hpx_padding_mode=hpx_pad,
+        nside=(16, 8, 4),
     ).to(device)
 
     # one forward step to initialize recurrent states
@@ -377,6 +385,7 @@ def test_HEALPixUNet_forward(
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
         hpx_padding_mode=hpx_pad,
+        nside=(16, 8, 4),
     ).to(device)
 
     # one forward step to initialize recurrent states

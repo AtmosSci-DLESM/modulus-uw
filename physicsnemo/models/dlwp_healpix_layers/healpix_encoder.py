@@ -40,7 +40,7 @@ class UNetEncoder(th.nn.Module):
         hpx_padding_mode: str = 'earth2grid',
         earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
-        nside: int = 64,
+        nside: Sequence[int] = (64, 32, 16),
         per_level_cln: Sequence[bool] = None,
         per_level_checkpointing: Sequence[bool] = None,
     ):
@@ -68,9 +68,11 @@ class UNetEncoder(th.nn.Module):
             Passed through to HEALPix blocks (e.g. ``earth2grid`` for fast CUDA padding).
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
-        nside: int, optional
-            Native HEALPix face height/width (``H == W``). Passed to blocks for
-            ``HEALPixPaddingIsolatitude`` index precomputation. Default 64.
+        nside: Sequence[int], optional
+            Native HEALPix face height/width (``H == W``) per encoder level, shallowest
+            (full resolution) to deepest. ``len(nside)`` must equal ``len(n_channels)``.
+            Passed to blocks for isolatitude gather index precomputation.
+            Default ``(64, 32, 16)`` for the default three-level encoder.
         per_level_cln: list[bool] | None, optional
             If the CLN should be applied to each level of the encoder
             If None, the CLN will based on the conv_block.conditional_layer_norm attribute
@@ -81,6 +83,12 @@ class UNetEncoder(th.nn.Module):
         super().__init__()
         warn_deprecated_enable_healpixpad(enable_healpixpad)
         self.n_channels = n_channels
+        nside_levels = tuple(int(x) for x in nside)
+        if len(nside_levels) != len(n_channels):
+            raise ValueError(
+                f"nside must have the same length as n_channels ({len(n_channels)}), "
+                f"got {len(nside_levels)}: {nside_levels!r}"
+            )
 
         if per_level_cln is not None and len(per_level_cln) != len(n_channels):
             raise ValueError(
@@ -113,7 +121,7 @@ class UNetEncoder(th.nn.Module):
                         enable_nhwc=enable_nhwc,
                         hpx_padding_mode=hpx_padding_mode,
                     earth2grid_padding_backend=earth2grid_padding_backend,
-                        nside=nside,
+                        nside=nside_levels[n - 1],
                     )
                 )
 
@@ -134,7 +142,7 @@ class UNetEncoder(th.nn.Module):
                     enable_nhwc=enable_nhwc,
                     hpx_padding_mode=hpx_padding_mode,
                     earth2grid_padding_backend=earth2grid_padding_backend,
-                    nside=nside,
+                    nside=nside_levels[n],
                 )
             )
             old_channels = curr_channel

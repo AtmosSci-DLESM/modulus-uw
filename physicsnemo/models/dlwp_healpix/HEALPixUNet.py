@@ -73,7 +73,8 @@ class HEALPixUNet(Module):
         hpx_padding_mode: str = 'earth2grid',
         earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
-        nside: int = 64,
+        *,
+        nside: Sequence[int] = (64, 32, 16),
     ):
         """
         Parameters
@@ -120,10 +121,10 @@ class HEALPixUNet(Module):
             ``'cuda'``.
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
-        nside: int, optional
-            Native HEALPix face height/width (``H == W``). Passed to encoder/decoder
-            for ``HEALPixPaddingIsolatitude`` buffer precomputation when using
-            ``hpx_padding_mode='isolatitude'``. Default 64.
+        nside : Sequence[int], optional
+            Keyword-only. Face height/width per UNet level (shallowest to deepest).
+            Length must match the encoder ``n_channels`` list length. Used for isolatitude padding
+            when ``hpx_padding_mode='isolatitude'``. Default ``(64, 32, 16)``.
         """
         super().__init__()
         warn_deprecated_enable_healpixpad(enable_healpixpad)
@@ -154,7 +155,22 @@ class HEALPixUNet(Module):
         self.couplings_time_first = couplings_time_first
         self.hpx_padding_mode = hpx_padding_mode
         self.earth2grid_padding_backend = earth2grid_padding_backend
-        self.nside = nside
+
+        # Hydra may pass nested encoder/decoder as dict or DictConfig; use subscript access.
+        enc_levels = len(encoder["n_channels"])
+        dec_levels = len(decoder["n_channels"])
+        if enc_levels != dec_levels:
+            raise ValueError(
+                "encoder and decoder must have the same number of UNet levels "
+                f"(len(n_channels)); got {enc_levels} and {dec_levels}."
+            )
+        nside_t = tuple(int(x) for x in nside)
+        if len(nside_t) != enc_levels:
+            raise ValueError(
+                f"nside must have length {enc_levels} (len(encoder['n_channels'])), "
+                f"got {len(nside_t)}: {nside_t!r}"
+            )
+        self.nside = nside_t
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1

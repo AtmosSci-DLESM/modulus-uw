@@ -867,7 +867,7 @@ def decode_two_channel_identity_to_linear_indices(
     return a, b
 
 
-def build_isolatitude_gather_index_cpu(
+def build_isolatitude_gather_index(
     p: int, H: int
 ) -> tuple[th.Tensor, th.Tensor]:
     """
@@ -969,48 +969,35 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
     def __init__(
         self,
         padding: int,
+        healpix_face_size: int,
         enable_nhwc: bool = False,
-        healpix_face_size: int | None = None,
     ):
         """
         Parameters
         ----------
         padding : int
             Pad width ``p >= 1``.
+        healpix_face_size : int
+            Native face height/width ``H`` (square faces). Gather indices are built for
+            this size at init; ``forward`` rejects other ``H``.
         enable_nhwc : bool, optional
             Channels-last output when True.
-        healpix_face_size : int, optional
-            If set, buffers are built immediately on CPU and moved to the module device.
-            If None, buffers are allocated on the first forward once ``H`` is known.
         """
         super().__init__()
         self.p = padding
         self.enable_nhwc = enable_nhwc
+        if not isinstance(healpix_face_size, int) or healpix_face_size < 1:
+            raise ValueError(
+                f"healpix_face_size must be a positive int, got {healpix_face_size!r}"
+            )
         self._healpix_face_size = healpix_face_size
         if not isinstance(padding, int) or padding < 1:
             raise ValueError(
                 f"invalid value for 'padding', expected int > 0 but got {padding}"
             )
-        self._buffers_ready = healpix_face_size is not None
-        if healpix_face_size is not None:
-            idx, valid = build_isolatitude_gather_index_cpu(padding, healpix_face_size)
-            self.register_buffer("_index", idx, persistent=False)
-            self.register_buffer("_valid", valid, persistent=False)
-            self._H = healpix_face_size
-        else:
-            self.register_buffer("_index", th.empty(0, 0, dtype=th.int64), persistent=False)
-            self.register_buffer("_valid", th.empty(0, 0, dtype=th.bool), persistent=False)
-            self._H: int | None = None
-
-    def _ensure_buffers(self, H: int, device: th.device) -> None:
-        """(Re)build ``_index`` and ``_valid`` on ``device`` when face size changes."""
-        if self._buffers_ready and self._H == H:
-            return
-        idx, valid = build_isolatitude_gather_index_cpu(self.p, H)
-        self.register_buffer("_index", idx.to(device), persistent=False)
-        self.register_buffer("_valid", valid.to(device), persistent=False)
-        self._H = H
-        self._buffers_ready = True
+        idx, valid = build_isolatitude_gather_index(padding, healpix_face_size)
+        self.register_buffer("_index", idx, persistent=False)
+        self.register_buffer("_valid", valid, persistent=False)
 
     def forward(self, data: th.Tensor) -> th.Tensor:
         """
@@ -1027,17 +1014,22 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             ``[N * 12, C, H + 2*p, W + 2*p]``; numerically aligned with the reference
             module for the same ``padding`` and ``H``.
         """
-        H = data.shape[-1]
-        if H != data.shape[-2]:
+        H, W = data.shape[-2:]
+        if H != W:
             raise ValueError("HEALPix faces must be square (H == W)")
-        self._ensure_buffers(H, data.device)
+        if H != self._healpix_face_size:
+            raise ValueError(
+                f"HEALPixPaddingIsolatitude expected face size H={self._healpix_face_size} "
+                f"(from init), but input has H={H}. Check nside for this UNet level."
+            )
 
-        B12, C, _, _ = data.shape
-        B = B12 // 12
-        x = data.reshape(B, 12, C, H, H)
-        flat = x.permute(0, 2, 1, 3, 4).reshape(B, C, 12 * H * H)
+        BF, C, _, _ = data.shape
+        F = 12
+        B = BF // F
+        x = data.reshape(B, F, C, H, W)
+        flat = x.permute(0, 2, 1, 3, 4).reshape(B, C, F * H * W)
 
-        idx = self._index
+        idx = self._index.to(device=flat.device)
         valid = self._valid.to(device=flat.device)
         v0 = valid[0].reshape(1, 1, -1).expand(B, C, -1)
         v1 = valid[1].reshape(1, 1, -1).expand(B, C, -1)
@@ -1048,9 +1040,9 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
         denom = (v0.to(flat.dtype) + v1.to(flat.dtype)).clamp_min(1e-12)
         out_flat = (g0 + g1) / denom
 
-        Hp = H + 2 * self.p
-        out = out_flat.reshape(B, C, 12, Hp, Hp).permute(0, 2, 1, 3, 4).reshape(
-            B12, C, Hp, Hp
+        Hp, Wp = H + 2 * self.p, W + 2 * self.p
+        out = out_flat.reshape(B, C, F, Hp, Wp).permute(0, 2, 1, 3, 4).reshape(
+            BF, C, Hp, Wp
         )
         if self.enable_nhwc:
             out = out.to(memory_format=th.channels_last)
