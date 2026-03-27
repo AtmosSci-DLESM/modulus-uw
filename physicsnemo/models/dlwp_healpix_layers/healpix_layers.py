@@ -212,8 +212,6 @@ class HEALPixLayer(th.nn.Module):
                         padding=padding,
                         healpix_face_size=nside,
                         enable_nhwc=enable_nhwc,
-                        compile_inner=True,
-                        fixed_pad_dtype=th.float32,
                     )
                 )
             else:
