@@ -161,7 +161,7 @@ class HEALPixPaddingv2(th.nn.Module):
     fold/unfold (no ``enable_nhwc`` on the helpers).
     """
 
-    def __init__(self, padding: int, earth2grid_padding_backend: str = "cuda"):  # pragma: no cover
+    def __init__(self, padding: int):  # pragma: no cover
         """
         Parameters
         ----------
@@ -173,14 +173,7 @@ class HEALPixPaddingv2(th.nn.Module):
         self.unfold = HEALPixUnfoldFaces(num_faces=12)
         self.fold = HEALPixFoldFaces()
         self.padding = padding
-        backend_name = str(earth2grid_padding_backend).lower()
-        try:
-            self._backend = Earth2GridPaddingBackends[backend_name]
-        except Exception as e:  # pragma: no cover
-            raise ValueError(
-                "Invalid earth2grid_padding_backend="
-                f"{earth2grid_padding_backend!r}; expected one of: 'cuda', 'indexing', 'zephyr'."
-            ) from e
+        self._backend = Earth2GridPaddingBackends["cuda"]
 
     def forward(self, x):  # pragma: no cover
         """

@@ -38,7 +38,6 @@ class UNetEncoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         hpx_padding_mode: str = 'earth2grid',
-        earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
         nside: Sequence[int] = (64, 32, 16),
         per_level_cln: Sequence[bool] = None,
@@ -82,12 +81,10 @@ class UNetEncoder(th.nn.Module):
         """
         super().__init__()
         warn_deprecated_enable_healpixpad(enable_healpixpad)
-        self.n_channels = n_channels
-        nside_levels = tuple(int(x) for x in nside)
-        if len(nside_levels) != len(n_channels):
+        if len(nside) != len(n_channels):
             raise ValueError(
                 f"nside must have the same length as n_channels ({len(n_channels)}), "
-                f"got {len(nside_levels)}: {nside_levels!r}"
+                f"got {len(nside)}: {nside!r}"
             )
 
         if per_level_cln is not None and len(per_level_cln) != len(n_channels):
@@ -120,8 +117,7 @@ class UNetEncoder(th.nn.Module):
                         config=down_sampling_block,
                         enable_nhwc=enable_nhwc,
                         hpx_padding_mode=hpx_padding_mode,
-                    earth2grid_padding_backend=earth2grid_padding_backend,
-                        nside=nside_levels[n - 1],
+                        nside=nside[n - 1],
                     )
                 )
 
@@ -141,8 +137,7 @@ class UNetEncoder(th.nn.Module):
                     n_layers=n_layers[n],
                     enable_nhwc=enable_nhwc,
                     hpx_padding_mode=hpx_padding_mode,
-                    earth2grid_padding_backend=earth2grid_padding_backend,
-                    nside=nside_levels[n],
+                    nside=nside[n],
                 )
             )
             old_channels = curr_channel

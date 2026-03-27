@@ -71,9 +71,7 @@ class HEALPixUNet(Module):
         couplings_time_first: bool = True,
         constraints: list[DictConfig] = None,
         hpx_padding_mode: str = 'earth2grid',
-        earth2grid_padding_backend: str | None = None,
         enable_healpixpad: bool | None = None,
-        *,
         nside: Sequence[int] = (64, 32, 16),
     ):
         """
@@ -115,10 +113,6 @@ class HEALPixUNet(Module):
             Padding strategy: ``earth2grid`` (default; fast path via earth2grid on CUDA),
             ``karlbauer``, ``isolatitude`` (optimized), or ``isolatitude_reference``.
             Legacy alias ``isolat`` maps to ``isolatitude_reference``.
-        earth2grid_padding_backend: str, optional
-            Earth2Grid backend when ``hpx_padding_mode='earth2grid'``. Supported:
-            ``'cuda'``, ``'indexing'``, and ``'zephyr'``. Default ``None`` maps to
-            ``'cuda'``.
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         nside : Sequence[int], optional
@@ -154,23 +148,18 @@ class HEALPixUNet(Module):
         self.residual_prediction = residual_prediction
         self.couplings_time_first = couplings_time_first
         self.hpx_padding_mode = hpx_padding_mode
-        self.earth2grid_padding_backend = earth2grid_padding_backend
+        self.nside = nside
 
-        # Hydra may pass nested encoder/decoder as dict or DictConfig; use subscript access.
-        enc_levels = len(encoder["n_channels"])
-        dec_levels = len(decoder["n_channels"])
-        if enc_levels != dec_levels:
+        if len(encoder["n_channels"]) != len(decoder["n_channels"]):
             raise ValueError(
-                "encoder and decoder must have the same number of UNet levels "
-                f"(len(n_channels)); got {enc_levels} and {dec_levels}."
+                "encoder and decoder must have the same number of UNet levels; "
+                f"got {len(encoder['n_channels'])} for encoder and {len(decoder['n_channels'])} for decoder"
             )
-        nside_t = tuple(int(x) for x in nside)
-        if len(nside_t) != enc_levels:
+        if len(self.nside) != len(encoder["n_channels"]):
             raise ValueError(
-                f"nside must have length {enc_levels} (len(encoder['n_channels'])), "
-                f"got {len(nside_t)}: {nside_t!r}"
+                f"nside must have same length as n_channels; got {len(self.nside)} "
+                f"for nside and {len(encoder['n_channels'])} for n_channels"
             )
-        self.nside = nside_t
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -188,7 +177,6 @@ class HEALPixUNet(Module):
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
             hpx_padding_mode=self.hpx_padding_mode,
-            earth2grid_padding_backend=self.earth2grid_padding_backend,
             nside=self.nside,
         )
         self.encoder_depth = len(self.encoder.n_channels)
@@ -197,7 +185,6 @@ class HEALPixUNet(Module):
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
             hpx_padding_mode=self.hpx_padding_mode,
-            earth2grid_padding_backend=self.earth2grid_padding_backend,
             nside=self.nside,
         )
 
