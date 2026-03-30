@@ -62,20 +62,30 @@ _ENABLE_HEALPIXPAD_DEPRECATION_MSG = (
 )
 
 
-def warn_deprecated_enable_healpixpad(enable_healpixpad: bool | None) -> None:
+def warn_deprecated_enable_healpixpad(
+    enable_healpixpad: bool | None, hpx_padding_mode: str | None = None
+) -> None:
     """
     Emit ``DeprecationWarning`` when ``enable_healpixpad`` was explicitly set in a config
     or call (any value other than the default ``None``).
     """
     if enable_healpixpad is not None:
-        logger.warning(f"WARNING: {_ENABLE_HEALPIXPAD_DEPRECATION_MSG}")
+        msg = _ENABLE_HEALPIXPAD_DEPRECATION_MSG
+        if hpx_padding_mode is not None:
+            msg = f"{msg} Current hpx_padding_mode={hpx_padding_mode!r}."
+        logger.warning(f"WARNING: {msg}")
 
 
-def pop_deprecated_enable_healpixpad_from_kwargs(kwargs: dict) -> None:
+def pop_deprecated_enable_healpixpad_from_kwargs(
+    kwargs: dict, hpx_padding_mode: str | None = None
+) -> None:
     """Remove ``enable_healpixpad`` from ``kwargs`` (e.g. before ``Conv2d``) and warn if present."""
     if "enable_healpixpad" in kwargs:
         kwargs.pop("enable_healpixpad")
-        logger.warning(f"WARNING: {_ENABLE_HEALPIXPAD_DEPRECATION_MSG}")
+        msg = _ENABLE_HEALPIXPAD_DEPRECATION_MSG
+        if hpx_padding_mode is not None:
+            msg = f"{msg} Current hpx_padding_mode={hpx_padding_mode!r}."
+        logger.warning(f"WARNING: {msg}")
 
 
 class HEALPixFoldFaces(th.nn.Module):
@@ -574,8 +584,98 @@ class HEALPixPadding(th.nn.Module):
         return ret
 
 
-# --- Isolatitude (shared free functions + reference + optimized) ----------------
+class HEALPixPaddingIsolatitude(th.nn.Module):
+    """
+    Isolatitude HEALPix padding via **precomputed gather** indices.
 
+    Indices are derived once from ``isolatitude_pad_folded``, then each forward is a small
+    number of ``gather`` and average steps.
+    """
+
+    def __init__(
+        self,
+        padding: int,
+        nside: int,
+        enable_nhwc: bool = False,
+    ):
+        """
+        Parameters
+        ----------
+        padding : int
+            Pad width ``p >= 1``.
+        nside : int
+            Native face height/width ``H`` (square faces). Gather indices are built for
+            this size at init; ``forward`` rejects other ``H``.
+        enable_nhwc : bool, optional
+            Channels-last output when True.
+        """
+        super().__init__()
+        self.p = padding
+        self.enable_nhwc = enable_nhwc
+        if not isinstance(nside, int) or nside < 1:
+            raise ValueError(
+                f"nside must be a positive int, got {nside!r}"
+            )
+        self._nside = nside
+        if not isinstance(padding, int) or padding < 1:
+            raise ValueError(
+                f"invalid value for 'padding', expected int > 0 but got {padding}"
+            )
+        idx, valid = build_isolatitude_gather_index(padding, nside)
+        self.register_buffer("_index", idx, persistent=False)
+        self.register_buffer("_valid", valid, persistent=False)
+
+    def forward(self, data: th.Tensor) -> th.Tensor:
+        """
+        Gather-based isolatitude pad on folded input.
+
+        Parameters
+        ----------
+        data : torch.Tensor
+            ``[N * 12, C, H, W]`` with ``H == W``.
+
+        Returns
+        -------
+        torch.Tensor
+            ``[N * 12, C, H + 2*p, W + 2*p]``; numerically aligned with the reference
+            module for the same ``padding`` and ``H``.
+        """
+        H, W = data.shape[-2:]
+        if H != W:
+            raise ValueError("HEALPix faces must be square (H == W)")
+        if H != self._nside:
+            raise ValueError(
+                f"HEALPixPaddingIsolatitude expected face size H={self._nside} "
+                f"(from init), but input has H={H}. Check nside for this UNet level."
+            )
+
+        BF, C, _, _ = data.shape
+        F = 12
+        B = BF // F
+        x = data.reshape(B, F, C, H, W)
+        flat = x.permute(0, 2, 1, 3, 4).reshape(B, C, F * H * W)
+
+        idx = self._index.to(device=flat.device)
+        valid = self._valid.to(device=flat.device)
+        v0 = valid[0].reshape(1, 1, -1).expand(B, C, -1)
+        v1 = valid[1].reshape(1, 1, -1).expand(B, C, -1)
+        i0 = idx[0].clamp_min(0)
+        i1 = idx[1].clamp_min(0)
+        g0 = flat.gather(dim=2, index=i0.view(1, 1, -1).expand(B, C, -1)) * v0
+        g1 = flat.gather(dim=2, index=i1.view(1, 1, -1).expand(B, C, -1)) * v1
+        denom = (v0.to(flat.dtype) + v1.to(flat.dtype)).clamp_min(1e-12)
+        out_flat = (g0 + g1) / denom
+
+        Hp, Wp = H + 2 * self.p, W + 2 * self.p
+        out = out_flat.reshape(B, C, F, Hp, Wp).permute(0, 2, 1, 3, 4).reshape(
+            BF, C, Hp, Wp
+        )
+        if self.enable_nhwc:
+            out = out.to(memory_format=th.channels_last)
+        return out
+
+
+# --- Isolatitude padding helper functions ----------------
 
 def kth_diag_indices(n: int, k: int) -> tuple[th.Tensor, th.Tensor]:
     """
@@ -829,7 +929,6 @@ def isolatitude_pad_folded(data: th.Tensor, p: int, enable_nhwc: bool) -> th.Ten
         res = res.to(memory_format=th.channels_last)
     return res
 
-
 def decode_two_channel_identity_to_linear_indices(
     y0: th.Tensor, y1: th.Tensor
 ) -> tuple[th.Tensor, th.Tensor]:
@@ -867,8 +966,7 @@ def build_isolatitude_gather_index(
     Precompute gather indices that reproduce ``isolatitude_pad_folded`` on flat data.
 
     Runs the reference padding on a tensor of identity pairs per pixel, then decodes
-    which input linear indices contribute to each output pixel. Runs on CPU with
-    ``torch.no_grad()``; safe to call at init or lazily on first forward.
+    which input linear indices contribute to each output pixel.
 
     Parameters
     ----------
@@ -893,8 +991,7 @@ def build_isolatitude_gather_index(
     ch1 = ids * ids
     x_folded = th.stack((ch0, ch1), dim=1).unsqueeze(0).reshape(12, 2, H, H)
 
-    with th.no_grad():
-        y_folded = isolatitude_pad_folded(x_folded, p, False)
+    y_folded = isolatitude_pad_folded(x_folded, p, False)
     y = y_folded.reshape(1, 12, 2, Hpad, Hpad)
     y0 = y[:, :, 0].reshape(-1)
     y1 = y[:, :, 1].reshape(-1)
@@ -908,135 +1005,3 @@ def build_isolatitude_gather_index(
     index[1] = th.where(same, th.tensor(-1, dtype=th.int64), index[1])
     valid[1] = ~same
     return index, valid
-
-
-class HEALPixPaddingIsolatitudeReference(th.nn.Module):
-    """
-    Isolatitude HEALPix padding (reference implementation).
-
-    Matches the numerics of the historical ``hpx_padding_mode='isolat'`` path: explicit
-    face stitching via ``isolatitude_pad_folded`` on each forward pass.
-    """
-
-    def __init__(self, padding: int, enable_nhwc: bool = False):
-        """
-        Parameters
-        ----------
-        padding : int
-            Symmetric pad size ``p >= 1``; output size ``H + 2*p`` per face edge.
-        enable_nhwc : bool, optional
-            If True, forward returns channels-last tensors.
-        """
-        super().__init__()
-        self.p = padding
-        self.enable_nhwc = enable_nhwc
-        if not isinstance(padding, int) or padding < 1:
-            raise ValueError(
-                f"invalid value for 'padding', expected int > 0 but got {padding}"
-            )
-
-    def forward(self, data: th.Tensor) -> th.Tensor:
-        """
-        Parameters
-        ----------
-        data : torch.Tensor
-            ``[N * 12, C, H, W]`` folded layout.
-
-        Returns
-        -------
-        torch.Tensor
-            ``[N * 12, C, H + 2*p, W + 2*p]``.
-        """
-        return isolatitude_pad_folded(data, self.p, self.enable_nhwc)
-
-
-class HEALPixPaddingIsolatitude(th.nn.Module):
-    """
-    Isolatitude HEALPix padding via **precomputed gather** indices.
-
-    Indices are derived once (per face size) from the same ``isolatitude_pad_folded``
-    transform as ``HEALPixPaddingIsolatitudeReference``, then each forward is a small
-    number of ``gather`` and average steps—useful when the reference is too slow.
-    """
-
-    def __init__(
-        self,
-        padding: int,
-        healpix_face_size: int,
-        enable_nhwc: bool = False,
-    ):
-        """
-        Parameters
-        ----------
-        padding : int
-            Pad width ``p >= 1``.
-        healpix_face_size : int
-            Native face height/width ``H`` (square faces). Gather indices are built for
-            this size at init; ``forward`` rejects other ``H``.
-        enable_nhwc : bool, optional
-            Channels-last output when True.
-        """
-        super().__init__()
-        self.p = padding
-        self.enable_nhwc = enable_nhwc
-        if not isinstance(healpix_face_size, int) or healpix_face_size < 1:
-            raise ValueError(
-                f"healpix_face_size must be a positive int, got {healpix_face_size!r}"
-            )
-        self._healpix_face_size = healpix_face_size
-        if not isinstance(padding, int) or padding < 1:
-            raise ValueError(
-                f"invalid value for 'padding', expected int > 0 but got {padding}"
-            )
-        idx, valid = build_isolatitude_gather_index(padding, healpix_face_size)
-        self.register_buffer("_index", idx, persistent=False)
-        self.register_buffer("_valid", valid, persistent=False)
-
-    def forward(self, data: th.Tensor) -> th.Tensor:
-        """
-        Gather-based isolatitude pad on folded input.
-
-        Parameters
-        ----------
-        data : torch.Tensor
-            ``[N * 12, C, H, W]`` with ``H == W``.
-
-        Returns
-        -------
-        torch.Tensor
-            ``[N * 12, C, H + 2*p, W + 2*p]``; numerically aligned with the reference
-            module for the same ``padding`` and ``H``.
-        """
-        H, W = data.shape[-2:]
-        if H != W:
-            raise ValueError("HEALPix faces must be square (H == W)")
-        if H != self._healpix_face_size:
-            raise ValueError(
-                f"HEALPixPaddingIsolatitude expected face size H={self._healpix_face_size} "
-                f"(from init), but input has H={H}. Check nside for this UNet level."
-            )
-
-        BF, C, _, _ = data.shape
-        F = 12
-        B = BF // F
-        x = data.reshape(B, F, C, H, W)
-        flat = x.permute(0, 2, 1, 3, 4).reshape(B, C, F * H * W)
-
-        idx = self._index.to(device=flat.device)
-        valid = self._valid.to(device=flat.device)
-        v0 = valid[0].reshape(1, 1, -1).expand(B, C, -1)
-        v1 = valid[1].reshape(1, 1, -1).expand(B, C, -1)
-        i0 = idx[0].clamp_min(0)
-        i1 = idx[1].clamp_min(0)
-        g0 = flat.gather(dim=2, index=i0.view(1, 1, -1).expand(B, C, -1)) * v0
-        g1 = flat.gather(dim=2, index=i1.view(1, 1, -1).expand(B, C, -1)) * v1
-        denom = (v0.to(flat.dtype) + v1.to(flat.dtype)).clamp_min(1e-12)
-        out_flat = (g0 + g1) / denom
-
-        Hp, Wp = H + 2 * self.p, W + 2 * self.p
-        out = out_flat.reshape(B, C, F, Hp, Wp).permute(0, 2, 1, 3, 4).reshape(
-            BF, C, Hp, Wp
-        )
-        if self.enable_nhwc:
-            out = out.to(memory_format=th.channels_last)
-        return out

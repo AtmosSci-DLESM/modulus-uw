@@ -94,7 +94,7 @@ def main() -> None:
 
     opt = HEALPixPaddingIsolatitude(
         padding=p,
-        healpix_face_size=H,
+        nside=H,
         enable_nhwc=False,
     ).to(device)
 

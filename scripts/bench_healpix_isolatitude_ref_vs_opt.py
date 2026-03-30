@@ -44,7 +44,7 @@ def main() -> None:
     x = torch.randn(b * 12, c, nside, nside, device=device, dtype=torch.float32)
 
     ref = HEALPixPaddingIsolatitudeReference(padding=p).to(device)
-    opt = HEALPixPaddingIsolatitude(padding=p, healpix_face_size=nside).to(device)
+    opt = HEALPixPaddingIsolatitude(padding=p, nside=nside).to(device)
 
     y_ref = ref(x)
     y_opt = opt(x)

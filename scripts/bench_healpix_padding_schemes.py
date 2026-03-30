@@ -114,7 +114,7 @@ def main() -> None:
     )
     mod_iso = HEALPixPaddingIsolatitude(
         padding=p,
-        healpix_face_size=H,
+        nside=H,
         enable_nhwc=False,
     ).to(device)
 

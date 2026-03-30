@@ -27,7 +27,6 @@ import torch as th
 from .healpix_paddings import (
     HEALPixPadding,
     HEALPixPaddingIsolatitude,
-    HEALPixPaddingIsolatitudeReference,
     HEALPixPaddingv2,
     have_earth2grid,
     pop_deprecated_enable_healpixpad_from_kwargs,
@@ -36,18 +35,17 @@ from .healpix_paddings import (
 
 class _CompilePaddingWrapper(th.nn.Module):
     """
-    A wrapper around HEALPix padding modules that ensures padding is always applied with a fixed dtype.
-
-    This is useful for cases where the model may use mixed-precision training (e.g., float16/bfloat16),
-    but the padding operation requires a specific dtype (like float32 or float16). The input tensor is 
-    casted to the required dtype, the padding is applied, and the result is casted back to the original 
-    dtype if necessary.
+    A wrapper around HEALPix padding modules that compiles it and ensure that it works with
+    the NV-dlesm trainer. Notably, the dtype of the padding operation must be fixed to avoid
+    recompilation errors related to dtype mismatches that come from mixed-precision training.
+    For reasons unknown at the moment, fixing the padding dtype to float32 is much faster
+    than float16 when the trainer amp_mode is float16 or bfloat16.
 
     Parameters
     ----------
     padding : int
         Amount of padding to apply to the spatial dimensions.
-    healpix_face_size : int
+    nside : int
         The size (height/width) of each HEALPix face.
     enable_nhwc : bool
         Whether to use channels-last (NHWC) format.
@@ -60,7 +58,7 @@ class _CompilePaddingWrapper(th.nn.Module):
     def __init__(
         self,
         padding: int,
-        healpix_face_size: int,
+        nside: int,
         enable_nhwc: bool,
         compile_inner: bool = True,
         fixed_pad_dtype: th.dtype = th.float32,
@@ -69,7 +67,7 @@ class _CompilePaddingWrapper(th.nn.Module):
         inner = HEALPixPaddingIsolatitude(
             padding=padding,
             enable_nhwc=enable_nhwc,
-            healpix_face_size=healpix_face_size,
+            nside=nside,
         )
         self.inner = th.compile(inner) if compile_inner else inner
         self.fixed_pad_dtype = fixed_pad_dtype
@@ -93,13 +91,6 @@ class HEALPixLayer(th.nn.Module):
     is a convolution with ``kernel_size > 1`` or an interpolation layer, native
     ``padding`` is disabled for convolutions and a HEALPix padding module is inserted
     so boundary values come from the correct neighboring faces.
-
-    Notes
-    -----
-    Pass ``enable_nhwc`` in ``kwargs`` to use channels-last memory format for the
-    padding path and the instantiated layer. The default ``earth2grid`` mode requires
-    ``earth2grid``, a CUDA device, and ``enable_nhwc=False``. For CPU-only execution,
-    set ``hpx_padding_mode`` to ``karlbauer`` or an isolatitude mode.
     """
 
     def __init__(
@@ -107,6 +98,7 @@ class HEALPixLayer(th.nn.Module):
         layer,
         hpx_padding_mode="earth2grid",
         nside: int = 64,
+        compile_padding: bool = False,
         **kwargs,
     ):
         """
@@ -124,21 +116,31 @@ class HEALPixLayer(th.nn.Module):
             - ``"isolatitude"`` — same numerics as reference, gather-based forward.
         nside : int, optional
             Native resolution of each HEALPix face (height = width = ``nside``). Passed
-            as ``healpix_face_size`` to ``HEALPixPaddingIsolatitude`` so gather indices
+            as ``nside`` to ``HEALPixPaddingIsolatitude`` so gather indices
             are built at module init. Ignored for other padding modes.
+        compile_padding : bool, optional
+            Whether to wrap isolatitude padding in ``_CompilePaddingWrapper``. Only
+            supported when ``hpx_padding_mode="isolatitude"``.
         **kwargs
             Forwarded to ``layer`` after removing ``enable_nhwc`` and deprecated
             ``enable_healpixpad`` (e.g. ``in_channels``, ``out_channels``, ``kernel_size``,
-            ``dilation``, ``enable_nhwc``). If ``nside`` appears here (e.g. Hydra), it is
-            consumed and overrides the ``nside`` argument.
+            ``dilation``, ``enable_nhwc``). If ``nside`` or ``compile_padding`` appears
+            here (e.g. Hydra), it is consumed and overrides the corresponding argument.
         """
         super().__init__()
         layers = []
 
-        pop_deprecated_enable_healpixpad_from_kwargs(kwargs)
+        pop_deprecated_enable_healpixpad_from_kwargs(kwargs, hpx_padding_mode=hpx_padding_mode)
 
         if "nside" in kwargs:
             nside = int(kwargs.pop("nside"))
+        if "compile_padding" in kwargs:
+            compile_padding = bool(kwargs.pop("compile_padding"))
+        if compile_padding and hpx_padding_mode != "isolatitude":
+            raise ValueError(
+                "compile_padding=True is only supported when "
+                f"hpx_padding_mode='isolatitude', got {hpx_padding_mode!r}."
+            )
 
         if "enable_nhwc" in kwargs:
             enable_nhwc = kwargs["enable_nhwc"]
@@ -185,20 +187,23 @@ class HEALPixLayer(th.nn.Module):
                 layers.append(
                     HEALPixPadding(padding=padding, enable_nhwc=enable_nhwc)
                 )
-            elif hpx_padding_mode == "isolatitude_reference":
-                layers.append(
-                    HEALPixPaddingIsolatitudeReference(
-                        padding=padding, enable_nhwc=enable_nhwc
-                    )
-                )
             elif hpx_padding_mode == "isolatitude":
-                layers.append(
-                    _CompilePaddingWrapper(
-                        padding=padding,
-                        healpix_face_size=nside,
-                        enable_nhwc=enable_nhwc,
+                if compile_padding:
+                    layers.append(
+                        _CompilePaddingWrapper(
+                            padding=padding,
+                            nside=nside,
+                            enable_nhwc=enable_nhwc,
+                        )
                     )
-                )
+                else:
+                    layers.append(
+                        HEALPixPaddingIsolatitude(
+                            padding=padding,
+                            nside=nside,
+                            enable_nhwc=enable_nhwc,
+                        )
+                    )
             else:
                 raise ValueError(
                     f"Unsupported hpx_padding_mode={hpx_padding_mode!r}."

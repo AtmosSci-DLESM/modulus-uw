@@ -74,8 +74,9 @@ class HEALPixRecUNet(Module):
         couplings_time_first: bool = True,
         constraints: list[DictConfig] = None,
         hpx_padding_mode: str = 'earth2grid',
-        enable_healpixpad: bool | None = None,
+        compile_padding: bool = False,
         nside: Sequence[int] = (64, 32, 16),
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -119,18 +120,20 @@ class HEALPixRecUNet(Module):
             (e.g., nonnegativity) to be applied to the model outputs
         hpx_padding_mode: str, optional
             Padding strategy: ``earth2grid`` (default; fast path on CUDA), ``karlbauer``,
-            ``isolatitude`` (optimized), or ``isolatitude_reference``. Legacy ``isolat``
-            maps to ``isolatitude_reference``.
+            or ``isolatitude``
+        compile_padding: bool, optional
+            If True, apply compiled padding; only supported with
+            ``hpx_padding_mode='isolatitude'``.
+        nside : Sequence[int], optional
+            Face height/width per UNet level (shallowest to deepest).
+            Length must match the encoder/decoder ``n_channels`` list length.
+            Required if ``hpx_padding_mode='isolatitude'``.
+            Default ``(64, 32, 16)``.
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
-        nside : Sequence[int], optional
-            Keyword-only. Face height/width per UNet level (shallowest to deepest).
-            Length must match the encoder/decoder ``n_channels`` list length.
-            Passed to the encoder and decoder for isolatitude gather indices.
-            Default ``(64, 32, 16)``.
         """
         super().__init__()
-        warn_deprecated_enable_healpixpad(enable_healpixpad)
+        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.channel_dim = 2  # Now 2 with [B, F, T*C, H, W]. Was 1 in old data format with [B, T*C, F, H, W]
 
         self.input_channels = input_channels
@@ -168,6 +171,7 @@ class HEALPixRecUNet(Module):
         self.residual_prediction = residual_prediction
         self.couplings_time_first = couplings_time_first
         self.hpx_padding_mode = hpx_padding_mode
+        self.compile_padding = compile_padding
         self.nside = nside
 
         if len(encoder["n_channels"]) != len(decoder["n_channels"]):
@@ -197,14 +201,15 @@ class HEALPixRecUNet(Module):
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
             hpx_padding_mode=self.hpx_padding_mode,
+            compile_padding=self.compile_padding,
             nside=self.nside,
         )
-        self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
             config=decoder,
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
             hpx_padding_mode=self.hpx_padding_mode,
+            compile_padding=self.compile_padding,
             nside=self.nside,
         )
 

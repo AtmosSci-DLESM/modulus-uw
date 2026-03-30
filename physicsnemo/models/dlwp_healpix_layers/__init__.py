@@ -33,7 +33,6 @@ from .healpix_paddings import (
     HEALPixFoldFaces,
     HEALPixPadding,
     HEALPixPaddingIsolatitude,
-    HEALPixPaddingIsolatitudeReference,
     HEALPixPaddingv2,
     HEALPixUnfoldFaces,
     have_earth2grid,

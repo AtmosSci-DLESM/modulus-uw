@@ -104,7 +104,7 @@ def main() -> None:
     x_cpu = torch.randn(B * 12, C, H, H, dtype=torch.float32)
 
     ref = HEALPixPaddingIsolatitudeReference(padding=p)
-    opt = HEALPixPaddingIsolatitude(padding=p, healpix_face_size=H)
+    opt = HEALPixPaddingIsolatitude(padding=p, nside=H)
 
     if not args.skip_numerics_check:
         with torch.no_grad():
@@ -126,7 +126,7 @@ def main() -> None:
         ("isolatitude_reference", HEALPixPaddingIsolatitudeReference(padding=p)),
         (
             "isolatitude (gather)",
-            HEALPixPaddingIsolatitude(padding=p, healpix_face_size=H),
+            HEALPixPaddingIsolatitude(padding=p, nside=H),
         ),
     ]
 

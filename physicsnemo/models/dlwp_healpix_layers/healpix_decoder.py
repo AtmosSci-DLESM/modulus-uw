@@ -40,10 +40,11 @@ class UNetDecoder(th.nn.Module):
         dilations: list = None,
         enable_nhwc: bool = False,
         hpx_padding_mode: str = 'earth2grid',
-        enable_healpixpad: bool | None = None,
+        compile_padding: bool = False,
         nside: Sequence[int] = (64, 32, 16),
         per_level_cln: list[bool] = None,
         per_level_checkpointing: list[bool] = None,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -69,8 +70,9 @@ class UNetDecoder(th.nn.Module):
             If channel last format should be used
         hpx_padding_mode: str, optional
             Passed through to HEALPix blocks (e.g. ``earth2grid`` for fast CUDA padding).
-        enable_healpixpad: bool, optional
-            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
+        compile_padding: bool, optional
+            If True, apply compiled isolatitude padding; only supported with
+            ``hpx_padding_mode='isolatitude'``.
         nside: Sequence[int], optional
             Per-level face size from full resolution (``nside[0]``) to deepest (``nside[-1]``),
             same convention as the encoder. ``len(nside)`` must equal ``len(n_channels)``.
@@ -81,9 +83,11 @@ class UNetDecoder(th.nn.Module):
         per_level_checkpointing: list[bool], optional
             If the checkpointing should be applied to each level of the decoder
             If None, the checkpointing will not be applied
+        enable_healpixpad: bool, optional
+            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         """
         super().__init__()
-        warn_deprecated_enable_healpixpad(enable_healpixpad)
+        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.channel_dim = 1  # 1 in previous layout
         if len(nside) != len(n_channels):
             raise ValueError(
@@ -122,6 +126,7 @@ class UNetDecoder(th.nn.Module):
                     out_channels=curr_channel,
                     enable_nhwc=enable_nhwc,
                     hpx_padding_mode=hpx_padding_mode,
+                    compile_padding=compile_padding,
                     nside=nside[len(n_channels) - n],
                 )
 
@@ -146,6 +151,7 @@ class UNetDecoder(th.nn.Module):
                 n_layers=n_layers[n],
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
                 nside=nside[len(n_channels) - 1 - n],
             )
 
@@ -156,6 +162,7 @@ class UNetDecoder(th.nn.Module):
                     in_channels=next_channel,
                     enable_nhwc=enable_nhwc,
                     hpx_padding_mode=hpx_padding_mode,
+                    compile_padding=compile_padding,
                     nside=nside[len(n_channels) - 1 - n],
                 )
             else:
@@ -180,6 +187,7 @@ class UNetDecoder(th.nn.Module):
             dilation=dilations[-1],
             enable_nhwc=enable_nhwc,
             hpx_padding_mode=hpx_padding_mode,
+            compile_padding=compile_padding,
             nside=nside[0],
         )
 
