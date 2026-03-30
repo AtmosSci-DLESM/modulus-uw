@@ -485,7 +485,7 @@ class HEALPixRecUNet(Module):
         self.reset()
         outputs = []
         for step in range(self.integration_steps):
-            th.cuda.nvtx.range_push(f"Integration step: {step}")
+            # th.cuda.nvtx.range_push(f"Integration step: {step}")
             # (Re-)initialize recurrent hidden states
             if (step * (self.delta_t * self.input_time_dim)) % self.reset_cycle == 0:
                 if conditions_cln is not None:
@@ -534,7 +534,7 @@ class HEALPixRecUNet(Module):
                         inputs=[outputs[-1][:, :, :, :self.input_channels]] + list(inputs[1:]),
                         step=step + self.presteps,
                     )
-            th.cuda.nvtx.range_pop()
+            # th.cuda.nvtx.range_pop()
 
             # Forward through model, with or without conditions
             if conditions_cln is not None:
@@ -542,12 +542,12 @@ class HEALPixRecUNet(Module):
             else:
                 kwargs = {}
 
-            th.cuda.nvtx.range_push("Encoder")
+            # th.cuda.nvtx.range_push("Encoder")
             encodings = self.encoder(input_tensor, **kwargs)
-            th.cuda.nvtx.range_pop()
-            th.cuda.nvtx.range_push("Dencoder")
+            # th.cuda.nvtx.range_pop()
+            # th.cuda.nvtx.range_push("Dencoder")
             decodings = self.decoder(encodings, **kwargs)
-            th.cuda.nvtx.range_pop()
+            # th.cuda.nvtx.range_pop()
 
             # Residual prediction
             combined = self._reshape_outputs(decodings)
@@ -565,7 +565,7 @@ class HEALPixRecUNet(Module):
                     out = constraint(out)
 
             outputs.append(out)
-            th.cuda.nvtx.range_pop()
+            # th.cuda.nvtx.range_pop()
 
         if output_only_last:
             return outputs[-1]
