@@ -40,11 +40,11 @@ class HEALPixLayer(th.nn.Module):
     """
     Apply a base ``torch.nn.Module`` on data laid out as HEALPix faces.
 
-    Expected layout includes 12 HEALPix faces, typically ``[N, 12, C, H, W]`` (any
-    leading batch dimensions are allowed). When the base layer
-    is a convolution with ``kernel_size > 1`` or an interpolation layer, native
-    ``padding`` is disabled for convolutions and a HEALPix padding module is inserted
-    so boundary values come from the correct neighboring faces.
+    Expected layout includes 12 HEALPix faces, typically ``[N, 12, C, H, W]`` 
+    (any leading batch dimensions are allowed). When the base layer is a 
+    convolution with ``kernel_size > 1`` or an interpolation layer, native
+    ``padding`` is disabled for convolutions and a HEALPix padding module is 
+    inserted so boundary values come from the correct neighboring faces.
     """
 
     def __init__(
@@ -63,15 +63,11 @@ class HEALPixLayer(th.nn.Module):
             detection logic for convolution vs interpolation vs other.
         hpx_padding_mode : str, optional
             Which padding implementation to use:
-
-            - ``"earth2grid"`` — ``earth2grid.healpix.pad`` (CUDA, non-NHWC; default).
-            - ``"karlbauer"`` — Karlbauer et al. (2024) face stitching.
-            - ``"isolatitude_reference"`` — isolatitude rules, reference implementation.
-            - ``"isolatitude"`` — same numerics as reference, gather-based forward.
+            - ``"earth2grid"`` — ``earth2grid.healpix.pad`` (default).
+            - ``"karlbauer"`` — Karlbauer et al. (2024) face stitching, same result as earth2grid but slower.
+            - ``"isolatitude"`` — alternate padding scheme which preserves isolatitude signals.
         nside : int, optional
-            Native resolution of each HEALPix face (height = width = ``nside``). Passed
-            as ``nside`` to ``HEALPixPaddingIsolatitude`` so gather indices
-            are built at module init. Ignored for other padding modes.
+            Native resolution of each HEALPix face (height = width = ``nside``).
         compile_padding : bool, optional
             Whether to wrap isolatitude padding in ``_CompilePaddingWrapper``. Only
             supported when ``hpx_padding_mode="isolatitude"``.
@@ -90,16 +86,6 @@ class HEALPixLayer(th.nn.Module):
             nside = int(kwargs.pop("nside"))
         if "compile_padding" in kwargs:
             compile_padding = bool(kwargs.pop("compile_padding"))
-        if compile_padding and hpx_padding_mode != "isolatitude":
-            raise ValueError(
-                "compile_padding=True is only supported when "
-                f"hpx_padding_mode='isolatitude', got {hpx_padding_mode!r}."
-            )
-        if hpx_padding_mode == "isolatitude" and not compile_padding:
-            logger.warning(
-                "hpx_padding_mode='isolatitude' but compile_padding=False, "
-                "this configuration is slow. Consider setting compile_padding=True."
-            )
 
         if "enable_nhwc" in kwargs:
             enable_nhwc = kwargs["enable_nhwc"]
@@ -158,6 +144,7 @@ class HEALPixLayer(th.nn.Module):
             if compile_padding:
                 padding_layer = th.compile(padding_layer)
             layers.append(padding_layer)
+
         layers.append(layer(**kwargs))
         self.layers = th.nn.Sequential(*layers)
 

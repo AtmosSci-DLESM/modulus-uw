@@ -118,8 +118,8 @@ class HEALPixUNet(Module):
             ``hpx_padding_mode='isolatitude'``.
         nside : Sequence[int], optional
             Face height/width per UNet level (shallowest to deepest).
-            Length must match the encoder ``n_channels`` list length. Required if 
-            ``hpx_padding_mode='isolatitude'``. Default ``(64, 32, 16)``.
+            Length must match the encoder ``n_channels`` list length.
+            Default ``(64, 32, 16)``.
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         """

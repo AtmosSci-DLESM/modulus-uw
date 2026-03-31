@@ -653,7 +653,8 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
         if H != self._nside:
             raise ValueError(
                 f"HEALPixPaddingIsolatitude expected face size H={self._nside} "
-                f"(from init), but input has H={H}. Check nside for this UNet level."
+                f"(from init), but input has H={H}. Make sure that nside was set correctly "
+                f"in the model config."
             )
 
         BF, C, _, _ = data.shape

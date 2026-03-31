@@ -67,12 +67,10 @@ class UNetEncoder(th.nn.Module):
         hpx_padding_mode: str, optional
             Passed through to HEALPix blocks (e.g. ``earth2grid`` for fast CUDA padding).
         compile_padding: bool, optional
-            If True, apply compiled isolatitude padding; only supported with
-            ``hpx_padding_mode='isolatitude'``.
+            If True, apply torch compile to the padding module.
         nside: Sequence[int], optional
             Native HEALPix face height/width (``H == W``) per encoder level, shallowest
             (full resolution) to deepest. ``len(nside)`` must equal ``len(n_channels)``.
-            Passed to blocks for isolatitude gather index precomputation.
             Default ``(64, 32, 16)`` for the default three-level encoder.
         per_level_cln: list[bool] | None, optional
             If the CLN should be applied to each level of the encoder

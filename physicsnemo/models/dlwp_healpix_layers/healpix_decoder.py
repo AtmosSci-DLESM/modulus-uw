@@ -71,8 +71,7 @@ class UNetDecoder(th.nn.Module):
         hpx_padding_mode: str, optional
             Passed through to HEALPix blocks (e.g. ``earth2grid`` for fast CUDA padding).
         compile_padding: bool, optional
-            If True, apply compiled isolatitude padding; only supported with
-            ``hpx_padding_mode='isolatitude'``.
+            If True, apply torch compile to the padding module.
         nside: Sequence[int], optional
             Per-level face size from full resolution (``nside[0]``) to deepest (``nside[-1]``),
             same convention as the encoder. ``len(nside)`` must equal ``len(n_channels)``.
