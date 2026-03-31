@@ -23,6 +23,7 @@ import xarray as xr
 import earth2grid
 from cuhpx import SHTCUDA, iSHTCUDA
 from earth2grid.healpix import HEALPIX_PAD_XY, PixelOrder
+from physicsnemo.models.dlwp_healpix_layers.healpix_layers import HEALPixPadding, HEALPixPaddingv2
 
 """
 Custom dlwp compatible loss classes that allow for more sophisticated training optimization.
@@ -991,3 +992,251 @@ class SpreadSkillRatioLoss(th.nn.MSELoss):
         if self.return_components:
             return ratio_out, spread_out, skill_out
         return ratio_out
+
+class PatchedEnergyScoreLoss(th.nn.MSELoss):
+
+    """
+    Patched multivariate energy score loss on HEALPix grids.
+    Uses N×N local spatial neighborhoods as vectors for the energy score,
+    with almost-fair ensemble weighting, optional land–sea masking, and
+    channel-wise weights. Optionally weights patch-vector components by
+    a Gaussian in distance from the patch center (weights sum to one).
+    """
+
+    def __init__(
+        self,
+        weights: Sequence = [],
+        n_members: int = 2,
+        alpha: float = 0.95,
+        lsm_file: str = None,
+        open_dict: dict = {"engine": "zarr"},
+        selection_dict: dict = {"channel_c": "land_sea_mask"},
+        patch_size: int = 3,
+        use_earth2grid_padding: bool = True,
+        enable_nhwc: bool = True,
+        patch_weight_sigma: float = None,
+    ):
+        """
+        Parameters
+        ----------
+        weights: Sequence
+            list of floats that determine weighting of variable loss, assumed to be
+            in order consistent with order of model output channels
+        n_members: int
+            number of ensemble members in the model output
+        lsm_file: str
+            path to the lsm file. Default is None, no lsm is applied.
+        open_dict: dict
+            dictionary of keyword arguments for xarray.open_dataset. Default is {"engine": "zarr"}.
+        selection_dict: dict
+            dictionary of keyword arguments for xarray.open_dataset. Default is {"channel_c": "land_sea_mask"}.
+        patch_size: int
+            size of the patch. Default is 3.
+        use_earth2grid_padding: bool
+            whether to use earth2grid hpx padding. Default is False.
+        enable_nhwc: bool
+            whether to enable nhwc for the hpx padding. Default is False.
+        patch_weight_sigma : float, optional
+            If provided, patch-vector norms are weighted by a Gaussian in
+            distance from the patch center (weights sum to 1, center gets highest weight).
+            Patch_weight_sigma is the standard deviation of the Gaussian.
+            Patch_weight_sigma = 1 for standard normal distribution.
+            If None, no spatial weighting within the patch (default).
+        """
+        super().__init__()
+        if n_members < 2:
+            raise ValueError("n_members must be at least 2 for energy score to be defined")
+        self.n_members = n_members
+        self.loss_weights = th.tensor(weights)
+        self.device = None
+
+        if patch_size < 1 or patch_size % 2 != 1:
+            raise ValueError("patch_size must be a positive odd integer")
+        self.patch_size = patch_size
+        self.patch_radius = (patch_size - 1) // 2
+        self.use_earth2grid_padding = use_earth2grid_padding
+        self.enable_nhwc = enable_nhwc
+
+        # Gaussian weights for patch positions (row-major, center-weighted, sum=1)
+        if patch_weight_sigma is not None and patch_weight_sigma > 0:
+            D = patch_size ** 2
+            c = float(self.patch_radius)
+            ri = th.arange(patch_size, dtype=th.float32).unsqueeze(1).expand(-1, patch_size).reshape(-1)
+            ci = th.arange(patch_size, dtype=th.float32).unsqueeze(0).expand(patch_size, -1).reshape(-1)
+            d_sq = (ri - c) ** 2 + (ci - c) ** 2
+            w = th.exp(-d_sq / (2.0 * patch_weight_sigma ** 2))
+            self.patch_weights = (w / w.sum()).reshape(1, -1)
+        else:
+            self.patch_weights = None
+
+        # Parameters for almost fair energy score
+        self.coeff_eps = 1 - ((1 - alpha) / n_members)
+        self.averaging_coeff = 1 / (2 * n_members * (n_members - 1))
+
+        if lsm_file is not None:
+            self.lsm_ds = xr.open_dataset(lsm_file, **open_dict).constants.sel(selection_dict)
+            self.lsm_tensor = 1 - th.tensor(np.expand_dims(self.lsm_ds.values, (0, 2, 3)))
+        else:
+            self.lsm_tensor = th.ones(1, 1, 1, 1, 1, 1)
+
+        self.diag_mask = th.ones(self.n_members, self.n_members) - th.eye(self.n_members)
+        # HEALPix padding module (expects [..., F, H, W])
+        if self.patch_radius > 0:
+            if self.use_earth2grid_padding:
+                self.hpx_pad = HEALPixPaddingv2(padding=self.patch_radius)
+            else:
+                self.hpx_pad = HEALPixPadding(
+                    padding=self.patch_radius,
+                    enable_nhwc=self.enable_nhwc,
+                )
+        else:
+            self.hpx_pad = None
+
+    def setup(self, trainer):
+        if len(trainer.output_variables) != len(self.loss_weights):
+            raise ValueError(f"Length of outputs {len(trainer.output_variables)} and loss_weights {len(self.loss_weights)} is not the same!")
+
+        self.loss_weights = self.loss_weights.to(device=trainer.device)
+        self.averaging_coeff = th.tensor(self.averaging_coeff, device=trainer.device)
+        self.coeff_eps = th.tensor(self.coeff_eps, device=trainer.device)
+        self.diag_mask = self.diag_mask.to(device=trainer.device)
+        self.lsm_tensor = self.lsm_tensor.to(device=trainer.device)
+        if self.hpx_pad is not None:
+            self.hpx_pad = self.hpx_pad.to(device=trainer.device)
+        if self.patch_weights is not None:
+            self.patch_weights = self.patch_weights.to(device=trainer.device)
+
+    def _weighted_patch_norm(self, diff_vec: th.Tensor) -> th.Tensor:
+        """
+        Weighted L2 norm over the patch dimension: sqrt(sum_k w_k * v_k^2).
+        If patch_weights is None, returns the usual vector_norm(diff_vec, dim=-1).
+        """
+        if self.patch_weights is None:
+            return th.linalg.vector_norm(diff_vec, dim=-1)
+        weighted_sq = diff_vec ** 2 * self.patch_weights
+        return th.sqrt((weighted_sq).sum(dim=-1).clamp(min=0.0))
+
+    def _extract_patches_prediction(self, prediction: th.Tensor) -> th.Tensor:
+        """
+        Extract N×N patches for predictions.
+        prediction: [Cond, B, F, T, C, H, W]
+        returns: [Cond, B, F, T, C, H, W, D]
+        """
+        n, b, f, t, c, h, w = prediction.shape
+        # Move faces to last spatial block and fold leading dims
+        x = prediction.permute(0, 1, 3, 2, 4, 5, 6)  # [Cond, B, T, F, C, H, W]
+        x = x.reshape(n * b * t * f, c, h, w)  # [Cond*B*T*F, C, H, W]
+
+        # Apply HEALPix padding across faces if requested
+        if self.hpx_pad is not None:
+            x = self.hpx_pad(x)  # [Cond*B*T*F, C, H_pad, W_pad]
+            _, _, h_pad, w_pad = x.shape
+        else:
+            h_pad, w_pad = h, w
+
+        # Unfold patches over H/W for each face independently, then stack
+        unfold = th.nn.Unfold(kernel_size=self.patch_size, padding=0, stride=1)
+        # Treat F as extra batch dim: combine Nflat and F, unfold over H/W
+        x_unfold = x.reshape(n * b * t * f * c, 1, h_pad, w_pad)
+        patches = unfold(x_unfold)  # [Cond*B*T*F*C, D, H*W]
+
+        d = self.patch_size ** 2
+        patches = patches.reshape(n, b, t, f, c, d, h, w)
+        patches = patches.permute(0, 1, 3, 2, 4, 6, 7, 5)  # [Cond, B, F, T, C, H, W, D]
+        return patches
+
+    def _extract_patches_target(self, target: th.Tensor) -> th.Tensor:
+        """
+        Extract N×N patches for targets.
+        target: [B, F, T, C, H, W]
+        returns: [B, F, T, C, H, W, D]
+        """
+        b, f, t, c, h, w = target.shape
+        x = target.permute(0, 2, 1, 3, 4, 5)  # [B, T, F, C, H, W]
+        x = x.reshape(b * t * f, c, h, w)  # [B*T*F, C, H, W]
+
+        if self.hpx_pad is not None:
+            x = self.hpx_pad(x)  # [B*T*F, C, H_pad, W_pad]
+            _, _, h_pad, w_pad = x.shape
+        else:
+            h_pad, w_pad = h, w
+
+        unfold = th.nn.Unfold(kernel_size=self.patch_size, padding=0, stride=1)
+        x_unfold = x.reshape(b * t * f * c, 1, h_pad, w_pad)
+        patches = unfold(x_unfold)  # [B*T*F*C, D, H*W]
+
+        d = self.patch_size ** 2
+        patches = patches.reshape(b, t, f, c, d, h, w)
+        patches = patches.permute(0, 2, 1, 3, 5, 6, 4)  # [B, F, T, C, H, W, D]
+        return patches
+
+    def forward(self, prediction, target, average_channels: bool = True):
+        """
+        Forward pass of the patched energy score loss.
+
+        prediction: [Cond*B, F, T, C, H, W]
+        target: [B, F, T, C, H, W]
+        """
+        b, f, t, c, h, w = target.shape
+        prediction = prediction.view(self.n_members, b, f, t, c, h, w)
+
+        if prediction.shape[1:] != target.shape:
+            raise ValueError(
+                f"Shape of prediction should match shape of target along non-ensemble dimensions, "
+                f"got {prediction.shape} and {target.shape}"
+            )
+
+        if prediction.shape[0] != self.n_members:
+            raise ValueError(
+                f"Shape of prediction should have ensemble dimension of size {self.n_members}, "
+                f"got {prediction.shape[0]}"
+            )
+
+        n = self.n_members
+
+        prediction = prediction.to(th.float32)
+        target = target.to(th.float32)
+
+        # Extract patches (HEALPix-aware)
+        pred_patches = self._extract_patches_prediction(prediction)  # [Cond,B,F,T,C,H,W,D]
+        tar_patches = self._extract_patches_target(target)  # [B,F,T,C,H,W,D]
+
+        # Compute per-member distances to target (weighted patch norm if enabled)
+        diff_to_target = self._weighted_patch_norm(
+            pred_patches - tar_patches.unsqueeze(0)
+        )  # [Cond,B,F,T,C,H,W]
+
+        if n == 2:
+            diff_target = diff_to_target.sum(dim=0)  # [B,F,T,C,H,W]
+            diff_ensemble = self._weighted_patch_norm(
+                pred_patches[0] - pred_patches[1]
+            )  # [B,F,T,C,H,W]
+            es = self.averaging_coeff * (diff_target - self.coeff_eps * diff_ensemble)
+        else:
+            diff_i = diff_to_target  # [Cond,B,F,T,C,H,W]
+            diff_i_i = diff_i.unsqueeze(0)  # [1,Cond,B,F,T,C,H,W]
+            diff_j_i = diff_i.unsqueeze(1)  # [Cond,1,B,F,T,C,H,W]
+
+            pred_i = pred_patches.unsqueeze(1)  # [Cond,1,B,F,T,C,H,W,D]
+            pred_j = pred_patches.unsqueeze(0)  # [1,Cond,B,F,T,C,H,W,D]
+            dist_ensemble = self._weighted_patch_norm(pred_i - pred_j)  # [Cond,Cond,B,F,T,C,H,W]
+
+            mask = self.diag_mask[:, :, None, None, None, None, None, None]
+            diff_terms = mask * (diff_i_i + diff_j_i)
+            dist_terms = mask * dist_ensemble
+
+            es = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_terms).sum(
+                dim=(0, 1)
+            )  # [B,F,T,C,H,W]
+
+        es *= self.lsm_tensor
+
+        # Apply channel weights (per-variable scaling)
+        es *= self.loss_weights[None, None, None, :, None, None]
+
+        if average_channels:
+            loss = es.mean()
+        else:
+            loss = es.mean(dim=(0, 1, 2, 4, 5))
+
+        return loss
