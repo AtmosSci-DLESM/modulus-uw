@@ -47,11 +47,7 @@ logger = logging.getLogger(__name__)
 # ``HEALPixLayer(..., hpx_padding_mode='earth2grid')`` require this.
 have_earth2grid = True
 try:
-    from earth2grid.healpix import (
-        PaddingBackends as Earth2GridPaddingBackends,
-        pad as healpix_pad,
-        pad_backend as earth2grid_pad_backend,
-    )
+    from earth2grid.healpix import pad as healpix_pad
 except ImportError:
     logger.warning("Could not import pad from earth2grid.healpix.")
     have_earth2grid = False
@@ -186,7 +182,7 @@ class HEALPixPaddingv2(th.nn.Module):
         super().__init__()
         self.unfold = HEALPixUnfoldFaces(num_faces=12)
         self.fold = HEALPixFoldFaces()
-        self.padding = HEALPixPad(padding=padding)
+        self.padding = lambda x: healpix_pad(x, padding=padding)
 
     def forward(self, x):  # pragma: no cover
         """
@@ -643,8 +639,13 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             ``[N * 12, C, H + 2*p, W + 2*p]``; numerically aligned with the reference
             module for the same ``padding`` and ``H``.
         """
-        # orig_dtype = data.dtype
-        # data = data.to(dtype=th.float16)
+        # Forces fp32 internal computation and cast output back to original dtype.
+        # Profiling revealed that in both eager and compiled modes, this padding
+        # was faster with fp32 internal computation, regardless of the amp mode.
+        # This was mostly due to kernels related to scatter/gather operations being
+        # slower in non-fp32 dtypes.
+        orig_dtype = data.dtype
+        data = data.to(dtype=th.float32)
 
         H, W = data.shape[-2:]
         if H != W:
@@ -669,7 +670,7 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
         i1 = idx[1].clamp_min(0)
         g0 = flat.gather(dim=2, index=i0.view(1, 1, -1).expand(B, C, -1)) * v0
         g1 = flat.gather(dim=2, index=i1.view(1, 1, -1).expand(B, C, -1)) * v1
-        denom = v0.to(data.dtype) + v1.to(data.dtype)
+        denom = (v0 + v1).to(data.dtype)
         out_flat = (g0 + g1) / denom
 
         Hp, Wp = H + 2 * self.p, W + 2 * self.p
@@ -679,8 +680,8 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
         if self.enable_nhwc:
             out = out.to(memory_format=th.channels_last)
 
-        # if out.dtype != orig_dtype:
-        #     out = out.to(dtype=orig_dtype)
+        if out.dtype != orig_dtype:
+            out = out.to(dtype=orig_dtype)
 
         return out
 
@@ -1007,11 +1008,11 @@ def build_isolatitude_gather_index(
     y1 = y[:, :, 1].reshape(-1)
     a_flat, b_flat = decode_two_channel_identity_to_linear_indices(y0, y1)
     n_out = a_flat.numel()
-    index = th.empty(2, n_out, dtype=th.int64)
+    index = th.empty(2, n_out, dtype=th.int)
     index[0] = a_flat
     index[1] = b_flat
     valid = th.ones(2, n_out, dtype=th.bool)
     same = a_flat == b_flat
-    index[1] = th.where(same, th.tensor(-1, dtype=th.int64), index[1])
+    index[1] = th.where(same, th.tensor(-1, dtype=th.int), index[1])
     valid[1] = ~same
     return index, valid

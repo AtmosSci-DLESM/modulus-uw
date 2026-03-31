@@ -157,10 +157,6 @@ class HEALPixLayer(th.nn.Module):
         if padding_layer is not None:
             if compile_padding:
                 padding_layer = th.compile(padding_layer)
-                # padding_layer = _CompilePaddingWrapper(
-                #     padding_layer=padding_layer,
-                #     fixed_pad_dtype=th.float32,
-                # )
             layers.append(padding_layer)
         layers.append(layer(**kwargs))
         self.layers = th.nn.Sequential(*layers)
