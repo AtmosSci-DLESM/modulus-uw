@@ -328,6 +328,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         open_dict: dict = {"engine": "zarr"},
         selection_dict: dict = {"channel_c": "land_sea_mask"},
         multiscale: float = 0.0,
+        masked_processing: bool = False,
     ):
         """
         Parameters
@@ -350,6 +351,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             dictionary that store channel selection information
         multiscale: float, optional
             weight for the multiscale CRPS loss. Default is 0, no multiscale loss is applied.
+        masked_processing: bool, optional
+            whether masked pixels should be excluded from the processing. Default is False, no masked processing is applied.
         """
         super().__init__()
         self.loss_weights = th.tensor(weights)
@@ -361,6 +364,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         self.mean_penalty = mean_penalty
         self.multiscale = multiscale
         self.scales = [4, 16, 32]
+        self.masked_processing = masked_processing
 
         if lsm_file is not None:
             self.lsm_ds = xr.open_dataset(lsm_file, **open_dict).constants.sel(selection_dict)
@@ -405,6 +409,38 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         pooled = th.nn.functional.avg_pool2d(tensor.reshape(shape[0], -1, h, w), scale, scale)
         return pooled.reshape(*shape[:-2], h//scale, w//scale)
 
+    def _masked_pool(self, tensor, scale, mask):
+        """
+        Pools a tensor while excluding masked pixels
+        
+        Parameters
+        ----------
+        tensor: torch.Tensor
+            The tensor to pool
+        scale: int
+            The scale factor for the pooling
+        mask: torch.Tensor
+            The mask to apply to the tensor, masked should only contain 1s and 0s
+
+        Returns
+        -------
+        torch.Tensor
+            The pooled tensor
+        torch.Tensor
+            The pooled mask
+        """
+        # Apply the mask to the tensor
+        masked_values = tensor * mask
+
+        # Compute the non-masked values for the pooled tensor
+        pooled_values = self._pool(masked_values, scale)
+
+        # pool the mask to use as a weight for the pooled tensor
+        pooled_mask = self._pool(mask, scale)
+
+        pooled_tensor = pooled_values / (pooled_mask + 1e-8) # Avoid division by zero
+        return pooled_tensor, pooled_mask
+
     def forward(self, prediction, target, average_channels=True):
         """
         Forward pass of the WeightedCRPSLoss 
@@ -432,7 +468,11 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             raise ValueError(f"Shape of prediction should have ensemble dimension of size {self.n_members}, got {prediction.shape[0]}")
 
         n = self.n_members
-
+        
+        # Manual Cast
+        prediction = prediction.to(th.float32)
+        target = target.to(th.float32)
+        
         # Apply channel weights across channel dims
         prediction *= self.loss_weights[None, None, None, None, :, None, None]
         target *= self.loss_weights[None, None, None, :, None, None]
@@ -447,19 +487,35 @@ class WeightedCRPSLoss(th.nn.MSELoss):
                 loss = crps.mean(dim=(0, 1, 2, 4, 5))
 
             if self.mean_penalty > 0:
-                ens_global_means = prediction.mean(dim=(0, 1, 2, 3, 5, 6)) # [C]
-                target_global_means = target.mean(dim=(0, 1, 2, 4, 5)) # [C]
+                # the fraction of valid pixels in land sea mask
+                if self.masked_processing and self.lsm_tensor.numel() > 1:
+                    valid_pixels = self.lsm_tensor.numel()
+                else:
+                    valid_pixels = f * h * w
+                
+                prediction_count = n * b * t * valid_pixels
+                target_count = b * t * valid_pixels
+                ens_global_means = (prediction * self.lsm_tensor).sum(dim=(0, 1, 2, 3, 5, 6)) / prediction_count
+                target_global_means = (target * self.lsm_tensor).sum(dim=(0, 1, 2, 4, 5)) / target_count
+
                 bias_penalty = self.mean_penalty * th.abs(ens_global_means - target_global_means)
                 if average_channels:
                     loss += bias_penalty.mean()
                 else:
                     loss += bias_penalty
 
+            # spatial multiscale loss
             if self.multiscale > 0.:
                 crps_scales = 0
                 for scale in self.scales:
-                    pred, tar, lsm = self._pool(prediction, scale), self._pool(target, scale), self._pool(self.lsm_tensor, scale)
-                    crps_scale = self._2member_crps(pred, tar, lsm)
+                    if self.masked_processing and self.lsm_tensor.numel() > 1:
+                        masked_pred, masked_lsm = self._masked_pool(prediction, scale, self.lsm_tensor)
+                        masked_tar, _ = self._masked_pool(target, scale, self.lsm_tensor)
+                        crps_scale = self._2member_crps(masked_pred, masked_tar, masked_lsm)
+                    else:
+                        pred, tar, lsm = self._pool(prediction, scale), self._pool(target, scale), self._pool(self.lsm_tensor, scale)
+                        crps_scale = self._2member_crps(pred, tar, lsm)
+
                     if average_channels:
                         crps_scale = crps_scale.mean()
                     else:
@@ -471,6 +527,32 @@ class WeightedCRPSLoss(th.nn.MSELoss):
                 
             return loss
         else:
+            # Do mean penalty
+            bias_penalty = 0
+            if self.mean_penalty > 0:
+                # the fraction of valid pixels in land sea mask
+                if self.masked_processing and self.lsm_tensor.numel() > 1:
+                    valid_pixels = self.lsm_tensor.numel()
+                else:
+                    valid_pixels = f * h * w
+                
+                prediction_count = n * b * t * valid_pixels
+                target_count = b * t * valid_pixels
+                ens_global_means = (prediction * self.lsm_tensor).sum(dim=(0, 1, 2, 3, 5, 6)) / prediction_count
+                target_global_means = (target * self.lsm_tensor).sum(dim=(0, 1, 2, 4, 5)) / target_count
+
+                bias_penalty = self.mean_penalty * th.abs(ens_global_means - target_global_means)
+                if average_channels:
+                    bias_penalty = bias_penalty.mean()
+
+            # zero out land and determine number of valid pixels
+            if self.masked_processing and self.lsm_tensor.numel() > 1:
+                prediction = prediction * self.lsm_tensor
+                target = target * self.lsm_tensor
+                valid_pixels = b * t * self.lsm_tensor.sum()
+            else:
+                valid_pixels = b * f * t * h * w
+
             # Use pairwise distance method
             if not average_channels:
                 # Move channels to first dimension and exclude that dimension from the reductions           
@@ -484,7 +566,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
                 dist_matrix = self.pdist(prediction.unsqueeze(1), prediction.unsqueeze(2))  # [C, Cond, Cond]
                 
                 diff_terms = self.diag_mask[None, ...] * (diff.unsqueeze(1) + diff.unsqueeze(2)) # [C, Cond, Cond], diagonal elements zeroed out
-                crps = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum(dim=(1,2))/(b*f*t*h*w)
+                crps = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum(dim=(1,2))/valid_pixels
             else:
                 prediction = prediction.reshape(n, -1)
                 target = target.unsqueeze(0).reshape(1, -1) # [1, ...] (first dim will broadcast across ensemble)
@@ -492,9 +574,9 @@ class WeightedCRPSLoss(th.nn.MSELoss):
                 dist_matrix = self.pdist(prediction.unsqueeze(1), prediction.unsqueeze(0))  # [Cond, Cond] 
 
                 diff_terms = self.diag_mask * (diff.unsqueeze(0) + diff.unsqueeze(1)) # [Cond, Cond], diagonal elements zeroed out
-                crps = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum()/(b*f*c*t*h*w)
+                crps = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum()/valid_pixels
 
-            return crps
+            return crps + bias_penalty
 
 
 class WeightedCRPSLossSpectral(th.nn.MSELoss):
@@ -821,3 +903,91 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
             return loss
         
+
+class SpreadSkillRatioLoss(th.nn.MSELoss):
+    """
+    Ensemble spread-skill ratio loss with optional channel weighting.
+    Spread is the ensemble standard deviation and skill is RMSE of the
+    ensemble mean against the target.
+    """
+
+    def __init__(
+        self,
+        weights: Sequence = [],
+        eps: float = 1e-6,
+        return_components: bool = False,
+    ):
+        super().__init__()
+        self.loss_weights = th.tensor(weights)
+        self.eps = eps
+        self.return_components = return_components
+        self.device = None
+
+    def setup(self, trainer):
+        """
+        Pushes channel weights to model device.
+        """
+        if len(trainer.output_variables) != len(self.loss_weights):
+            raise ValueError("Length of outputs and loss_weights is not the same!")
+        self.loss_weights = self.loss_weights.to(device=trainer.device)
+
+    def forward(self, prediction, target, average_channels=True):
+        """
+        Forward pass of the SpreadSkillRatioLoss.
+
+        Parameters
+        ----------
+        prediction: torch.Tensor
+            Prediction tensor with shape [Cond*B, F, T, C, H, W], where Cond is ensemble size.
+        target: torch.Tensor
+            Target tensor with shape [B, F, T, C, H, W].
+        average_channels: bool, optional
+            Whether to return mean across channels (scalar) or per-channel values.
+        """
+        b, f, t, c, h, w = target.shape
+        if prediction.shape[0] % b != 0:
+            raise ValueError(
+                f"Leading prediction dimension must be divisible by batch size. "
+                f"Got prediction.shape[0]={prediction.shape[0]} and batch={b}"
+            )
+        n_members = prediction.shape[0] // b
+        if n_members < 2:
+            raise ValueError(
+                f"Inferred ensemble size must be at least 2 for spread-skill ratio loss, got {n_members}"
+            )
+        prediction = prediction.view(n_members, b, f, t, c, h, w)
+
+        if prediction.shape[1:] != target.shape:
+            raise ValueError(
+                f"Shape of prediction should match shape of target along non-ensemble dimensions, "
+                f"got {prediction.shape} and {target.shape}"
+            )
+
+        prediction = prediction.to(th.float32)
+        target = target.to(th.float32)
+
+        # Apply channel weights before computing spread and skill.
+        prediction *= self.loss_weights[None, None, None, None, :, None, None]
+        target *= self.loss_weights[None, None, None, :, None, None]
+
+        spread_field = prediction.std(dim=0)
+        spread = spread_field.mean(dim=(0, 1, 2, 4, 5))
+
+        ens_mean = prediction.mean(dim=0)
+        rmse_field = (ens_mean - target) ** 2
+        skill = th.sqrt(rmse_field.mean(dim=(0, 1, 2, 4, 5)))
+
+        ratio = spread / (skill + self.eps)
+
+        if average_channels:
+            ratio_out = ratio.mean()
+            spread_out = spread.mean()
+            skill_out = skill.mean()
+        else:
+            ratio_out = ratio
+            spread_out = spread
+            skill_out = skill
+
+        if self.return_components:
+            return ratio_out, spread_out, skill_out
+        return ratio_out

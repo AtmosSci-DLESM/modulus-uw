@@ -65,6 +65,8 @@ class HEALPixUNet(Module):
         enable_healpixpad: bool = False,
         couplings: list = [],
         residual_prediction: bool = False,
+        couplings_time_first: bool = True,
+        constraints: list[DictConfig] = None,
     ):
         """
         Parameters
@@ -98,6 +100,8 @@ class HEALPixUNet(Module):
             sequence of dictionaries that describe coupling mechanisms
         residual_prediction: bool, optional
             If the model should predict the residual between the input and the output. Default: False
+        couplings_time_first: bool, optional
+            Whether coupled data is in [T, B, C, F, H, W] rather than [B, F, T, C, H, W] format
         """
         super().__init__()
 
@@ -125,6 +129,7 @@ class HEALPixUNet(Module):
         self.enable_nhwc = enable_nhwc
         self.enable_healpixpad = enable_healpixpad
         self.residual_prediction = residual_prediction
+        self.couplings_time_first = couplings_time_first
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -150,6 +155,9 @@ class HEALPixUNet(Module):
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
         )
+
+        self.constraints = None
+        self.set_constraints(constraints)
 
     @property
     def integration_steps(self):
@@ -210,7 +218,7 @@ class HEALPixUNet(Module):
                 inputs[2].expand(
                     *tuple([inputs[0].shape[0]] + len(inputs[2].shape) * [-1])
                 ),  # constants
-                inputs[3].permute(0, 2, 1, 3, 4),  # coupled inputs
+                inputs[3].permute(0, 2, 1, 3, 4) if self.couplings_time_first else inputs[3],  # coupled inputs
             ]
             res = th.cat(result, dim=self.channel_dim)
 
@@ -315,6 +323,17 @@ class HEALPixUNet(Module):
 
         return res
 
+    def set_constraints(self, constraints: list[DictConfig] = None):
+        """
+        Sets constraints (e.g., non-negative) to be applied to the model outputs
+        Parameters
+        ----------
+        constraints: list[DictConfig]
+            List of hydra instantiable DictConfigs specifying constraints
+        """
+        if constraints is not None:
+            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
+
     def forward(self, inputs: Sequence, output_only_last=False, conditions_cln: Sequence=None) -> th.Tensor:
         """
         Forward pass of the HEALPixUnet
@@ -373,6 +392,12 @@ class HEALPixUNet(Module):
             reshaped = self._reshape_outputs(
                 prediction
             )
+
+            # Apply constraints
+            if self.constraints is not None:
+                for constraint in self.constraints:
+                    reshaped = constraint(reshaped)
+
             outputs.append(reshaped)
 
         if output_only_last:

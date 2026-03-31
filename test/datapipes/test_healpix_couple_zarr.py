@@ -15,7 +15,6 @@
 # limitations under the License.
 
 import random
-import shutil
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,21 +35,62 @@ zarr = pytest.importorskip("zarr")
 
 
 @pytest.fixture
-def data_dir():
-    path = "/data/nfs/modulus-data/datasets/healpix/"
+def dataset_path():
+    data_dir = "/data/nfs/modulus-data/datasets/healpix/"
+    dataset_name = "healpix.zarr"
+    path = Path(data_dir, dataset_name)
     return path
 
 
 @pytest.fixture
-def dataset_name():
-    name = "healpix"
-    return name
+def splits():
+    split_dict = {
+        "train_date_start": "1979-01-01",
+        "train_date_end": "1979-01-01T21:00",
+        "val_date_start": "1979-01-02",
+        "val_date_end": "1979-01-02T09:00",
+        "test_date_start": "1979-01-02T12:00",
+        "test_date_end": "1979-01-02T18:00",
+    }
+    return split_dict
 
 
 @pytest.fixture
-def create_path():
-    path = "/data/nfs/modulus-data/datasets/healpix/merge"
-    return path
+def constant_coupler_config():
+    constant_coupler = [
+        {
+            "coupler": "ConstantCoupler",
+            "params": {
+                "batch_size": 1,
+                "variables": ["z250"],
+                "input_times": ["0h"],
+                "input_time_dim": 1,
+                "output_time_dim": 1,
+                "presteps": 0,
+                "prepared_coupled_data": True,
+            },
+        }
+    ]
+    return constant_coupler
+
+
+@pytest.fixture
+def average_coupler_config():
+    average_coupler = [
+        {
+            "coupler": "ConstantCoupler",
+            "params": {
+                "batch_size": 1,
+                "variables": ["z250"],
+                "input_times": ["0h"],
+                "input_time_dim": 1,
+                "output_time_dim": 1,
+                "presteps": 0,
+                "prepared_coupled_data": True,
+            },
+        }
+    ]
+    return average_coupler
 
 
 @dataclass
@@ -61,13 +101,6 @@ class coupler_helper:
     time_step: str
 
 
-def delete_dataset(create_path, dataset_name):
-    """Helper that deletes a requested dataset at the specified location"""
-    dataset_path = f"{create_path}/{dataset_name}.zarr"
-    if Path(dataset_path).exists():
-        shutil.rmtree(dataset_path)
-
-
 @pytest.fixture
 def scaling_dict():
     scaling = {
@@ -76,6 +109,7 @@ def scaling_dict():
         "tau300-700": {"mean": 61902.72265625, "std": 2559.8408203125},
         "tcwv0": {"mean": 24.034976959228516, "std": 16.411935806274414},
         "z1000": {"mean": 952.1435546875, "std": 895.7516479492188},
+        "z1000-12h": {"mean": 952.1435546875, "std": 895.7516479492188},
         "z250": {"mean": 101186.28125, "std": 5551.77978515625},
         "z500": {"mean": 55625.9609375, "std": 2681.712890625},
         "lsm": {"mean": 0, "std": 1},
@@ -94,6 +128,7 @@ def scaling_double_dict():
         "tau300-700": {"mean": 0, "std": 2},
         "tcwv0": {"mean": 0, "std": 2},
         "z1000": {"mean": 0, "std": 2},
+        "z1000-12h": {"mean": 0, "std": 2},
         "z250": {"mean": 0, "std": 2},
         "z500": {"mean": 0, "std": 2},
         "lsm": {"mean": 0, "std": 2},
@@ -109,7 +144,7 @@ def scaling_double_dict():
 @import_or_fail("pandas")
 @import_or_fail("xarray")
 @nfsdata_or_fail
-def test_ConstantCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
+def test_ConstantCoupler(dataset_path, scaling_dict, pytestconfig):
 
     from physicsnemo.datapipes.healpix.couplers import (
         ConstantCoupler,
@@ -124,8 +159,10 @@ def test_ConstantCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
     batch = {"time": slice(0, 2)}
 
     # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    zarr_ds = xr.open_zarr(ds_path)
+    zarr_ds = zarr.open(dataset_path)
+    input_indices = [
+        int(np.where(zarr_ds.channel_in[:] == ch)[0][0]) for ch in variables
+    ]
 
     # test fail initialization
     with pytest.raises(
@@ -155,9 +192,13 @@ def test_ConstantCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
 
     # check setting coupled variable indices
     mock_coupled_module = coupler_helper(
-        output_variables=["z500", "z1000"],
+        output_variables=["not_coupled", "z500"],
         time_step="0h",
     )
+    with pytest.raises(ValueError, match=("Missing variables in coupled module")):
+        coupler.setup_coupling(mock_coupled_module)
+
+    mock_coupled_module.output_variables = ["z500", "z1000"]
     coupler.setup_coupling(mock_coupled_module)
     assert coupler.coupled_channel_indices == [0, 1]
 
@@ -183,9 +224,6 @@ def test_ConstantCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
     assert np.array_equal(expected, coupler.coupled_scaling["mean"])
     expected = np.expand_dims(coupled_scaling["std"].to_numpy(), (0, 2, 3, 4))
     assert np.array_equal(expected, coupler.coupled_scaling["std"])
-
-    # test incorrect batch size
-    # coupler.coupled_channel_indices = [0, 1]
 
     coupled_fields_batch_size = batch_size
     coupled_fields_timedim = 4
@@ -215,7 +253,17 @@ def test_ConstantCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
     expected = expected.repeat(
         coupler.coupled_integration_dim, 1, coupled_fields_batch_size, 1, 1, 1
     )
+    result = coupler.construct_integrated_couplings()
     assert th.equal(expected, coupler.construct_integrated_couplings())
+
+    # verify that dimensions aren't reordered when time_first is false
+    coupler.time_first = False
+    coupler.set_coupled_fields(coupled_fields)
+    # [T, B, C, F, H, W]
+    expected = expected.permute(1, 3, 0, 2, 4, 5)
+    result = coupler.construct_integrated_couplings()
+    assert th.equal(expected, result)
+    coupler.time_first = True
 
     # test coupler reset
     coupler.reset_coupler()
@@ -226,14 +274,13 @@ def test_ConstantCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
         "mean": np.expand_dims(coupled_scaling["mean"].to_numpy(), (0, 2, 3, 4)),
         "std": np.expand_dims(coupled_scaling["std"].to_numpy(), (0, 2, 3, 4)),
     }
-    expected = zarr_ds.sel(channel_in=variables).inputs[:2].values
+    expected = zarr_ds.inputs[:2][:, input_indices]
     expected = (expected - coupled_scaling["mean"]) / coupled_scaling["std"]
     coupled_field = coupler.construct_integrated_couplings(
         batch=batch, bsize=batch_size
     )
     assert np.array_equal(expected, coupled_field[0])
 
-    zarr_ds.close()
     DistributedManager.cleanup()
 
 
@@ -242,13 +289,13 @@ def test_ConstantCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
 @import_or_fail("pandas")
 @import_or_fail("xarray")
 @nfsdata_or_fail
-def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
+def test_TrailingAverageCoupler(dataset_path, scaling_dict, pytestconfig):
 
     from physicsnemo.datapipes.healpix.couplers import (
         TrailingAverageCoupler,
     )
 
-    variables = ["z500", "z1000"]
+    variables = ["z500", "z1000-12h"]
     input_times = ["6h", "12h"]
     input_time_dim = 2
     output_time_dim = 2
@@ -256,8 +303,7 @@ def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconf
     batch_size = 2
     averaging_window = "6h"
     # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    zarr_ds = xr.open_zarr(ds_path)
+    zarr_ds = zarr.open(dataset_path)
 
     # test fail initialization when trying to prepare data
     with pytest.raises(
@@ -300,9 +346,8 @@ def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconf
     )
     assert isinstance(coupler, TrailingAverageCoupler)
 
-    # check for missing variables in coupled module
     mock_coupled_module = coupler_helper(
-        output_variables=["z500"],
+        output_variables=["not_coupled", "z500"],
         time_step="3h",
     )
     with pytest.raises(ValueError, match=("Missing variables in coupled module")):
@@ -310,7 +355,7 @@ def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconf
 
     # veryify averaging slices computed correctly
     mock_coupled_module = coupler_helper(
-        output_variables=["not_coupled", "z500", "z1000"],
+        output_variables=["z500", "z1000"],
         time_step="3h",
     )
     coupler.setup_coupling(mock_coupled_module)
@@ -394,7 +439,6 @@ def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconf
     coupler.reset_coupler()
     assert coupler.coupled_mode is False
 
-    zarr_ds.close()
     DistributedManager.cleanup()
 
 
@@ -402,42 +446,46 @@ def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconf
 @import_or_fail("netCDF4")
 @import_or_fail("xarray")
 @nfsdata_or_fail
-def test_CoupledTimeSeriesDataset_initialization(
-    data_dir, dataset_name, scaling_dict, pytestconfig
+def test_CoupledTimeSeriesDatasetZarr_initialization(
+    dataset_path, scaling_dict, pytestconfig
 ):
 
-    from physicsnemo.datapipes.healpix.coupledtimeseries_dataset import (
-        CoupledTimeSeriesDataset,
+    from physicsnemo.datapipes.healpix.coupledtimeseries_dataset_zarr import (
+        CoupledTimeSeriesDatasetZarr,
     )
 
     # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    zarr_ds = xr.open_zarr(ds_path)
-    variables = ["z500", "z1000"]
+    time_da = xr.open_zarr(dataset_path).time.values
+    input_variables = ["z500", "z1000"]
+    valid_start_date = "1979-01-01"
+    valid_end_date = "1979-01-02"
 
     # check for failure of timestep not being a multiple of datatime step
     with pytest.raises(
         ValueError, match=("'time_step' must be a multiple of 'data_time_step' ")
     ):
-        timeseries_ds = CoupledTimeSeriesDataset(
-            dataset=zarr_ds,
-            input_variables=variables,
+        timeseries_ds = CoupledTimeSeriesDatasetZarr(
+            dataset_path=dataset_path,
+            input_variables=input_variables,
             data_time_step="2h",
             time_step="5h",
             scaling=scaling_dict,
+            forecast_init_times=time_da[:2],
         )
 
     # check for failure of gap not being a multiple of datatime step
     with pytest.raises(
         ValueError, match=("'gap' must be a multiple of 'data_time_step' ")
     ):
-        timeseries_ds = CoupledTimeSeriesDataset(
-            dataset=zarr_ds,
-            input_variables=variables,
+        timeseries_ds = CoupledTimeSeriesDatasetZarr(
+            dataset_path=dataset_path,
+            input_variables=input_variables,
             data_time_step="2h",
             time_step="6h",
             gap="3h",
             scaling=scaling_dict,
+            batch_size=1,
+            forecast_init_times=time_da[:2],
         )
 
     # check for failure of invalid scaling variable on input
@@ -447,12 +495,14 @@ def test_CoupledTimeSeriesDataset_initialization(
         }
     )
     with pytest.raises(KeyError, match=("Input channels ")):
-        timeseries_ds = CoupledTimeSeriesDataset(
-            dataset=zarr_ds,
-            input_variables=variables,
+        timeseries_ds = CoupledTimeSeriesDatasetZarr(
+            dataset_path=dataset_path,
+            input_variables=input_variables,
             data_time_step="3h",
             time_step="6h",
             scaling=invalid_scaling,
+            batch_size=1,
+            forecast_init_times=time_da[:2],
         )
 
     # check for warning on batch size > 1 and forecast mode
@@ -463,50 +513,54 @@ def test_CoupledTimeSeriesDataset_initialization(
             "providing 'forecast_init_times' to TimeSeriesDataset requires `batch_size=1`"
         ),
     ):
-        timeseries_ds = CoupledTimeSeriesDataset(
-            dataset=zarr_ds,
-            input_variables=variables,
+        timeseries_ds = CoupledTimeSeriesDatasetZarr(
+            dataset_path=dataset_path,
+            input_variables=input_variables,
             scaling=scaling_dict,
             batch_size=2,
-            forecast_init_times=zarr_ds.time[:2],
+            forecast_init_times=time_da[:2],
         )
+    warnings.resetwarnings()
 
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
-        input_variables=variables,
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         scaling=scaling_dict,
         add_train_noise=True,
+        batch_size=1,
+        forecast_init_times=time_da[:2],
     )
-    assert isinstance(timeseries_ds, CoupledTimeSeriesDataset)
+    assert isinstance(timeseries_ds, CoupledTimeSeriesDatasetZarr)
 
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
-        input_variables=variables,
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         scaling=scaling_dict,
+        start_date=valid_start_date,
+        end_date=valid_end_date,
     )
-    assert isinstance(timeseries_ds, CoupledTimeSeriesDataset)
+    assert isinstance(timeseries_ds, CoupledTimeSeriesDatasetZarr)
 
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
-        input_variables=variables,
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         scaling=scaling_dict,
         batch_size=1,
-        forecast_init_times=zarr_ds.time[:2],
+        forecast_init_times=time_da[:2],
     )
-    assert isinstance(timeseries_ds, CoupledTimeSeriesDataset)
+    assert isinstance(timeseries_ds, CoupledTimeSeriesDatasetZarr)
 
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
-        input_variables=variables,
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         scaling=scaling_dict,
         batch_size=1,
-        forecast_init_times=zarr_ds.time[:2],
+        forecast_init_times=time_da[:2],
         data_time_step="3h",
         time_step="6h",
     )
-    assert isinstance(timeseries_ds, CoupledTimeSeriesDataset)
+    assert isinstance(timeseries_ds, CoupledTimeSeriesDatasetZarr)
 
-    zarr_ds.close()
     DistributedManager.cleanup()
 
 
@@ -514,43 +568,47 @@ def test_CoupledTimeSeriesDataset_initialization(
 @import_or_fail("netCDF4")
 @import_or_fail("xarray")
 @nfsdata_or_fail
-def test_CoupledTimeSeriesDataset_get_constants(
-    data_dir, dataset_name, scaling_dict, pytestconfig
+def test_CoupledTimeSeriesDatasetZarr_get_constants(
+    dataset_path, scaling_dict, constant_coupler_config, pytestconfig
 ):
 
-    from physicsnemo.datapipes.healpix.coupledtimeseries_dataset import (
-        CoupledTimeSeriesDataset,
+    from physicsnemo.datapipes.healpix.coupledtimeseries_dataset_zarr import (
+        CoupledTimeSeriesDatasetZarr,
     )
 
+    input_variables = ["z500", "z1000"]
+    constant_variables = ["lsm"]
+
     # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    zarr_ds = xr.open_zarr(ds_path)
-
-    variables = ["z500", "z1000"]
-
-    constant_coupler = [
-        {
-            "coupler": "ConstantCoupler",
-            "params": {
-                "batch_size": 1,
-                "variables": ["z250"],
-                "input_times": ["0"],
-                "input_time_dim": 1,
-                "output_time_dim": 1,
-                "presteps": 0,
-                "prepared_coupled_data": True,
-            },
-        }
+    zarr_ds = xr.open_zarr(dataset_path)
+    constant_indices = [
+        int(np.where(zarr_ds.channel_c[:] == ch)[0][0]) for ch in constant_variables
     ]
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
-        input_variables=variables,
+
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
+        batch_size=1,
         scaling=scaling_dict,
-        couplings=constant_coupler,
+        couplings=constant_coupler_config,
+        forecast_init_times=zarr_ds.time[:2],
+    )
+    assert timeseries_ds.get_constants() is None
+
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
+        batch_size=1,
+        scaling=scaling_dict,
+        couplings=constant_coupler_config,
+        forecast_init_times=zarr_ds.time[:2],
     )
 
     # constants are reshaped
-    expected = np.transpose(zarr_ds.constants.values, axes=(1, 0, 2, 3))
+    expected = np.transpose(
+        zarr_ds.constants.values[constant_indices], axes=(1, 0, 2, 3)
+    )
     outvar = timeseries_ds.get_constants()
     assert np.array_equal(
         expected,
@@ -565,85 +623,66 @@ def test_CoupledTimeSeriesDataset_get_constants(
 @import_or_fail("netCDF4")
 @import_or_fail("xarray")
 @nfsdata_or_fail
-def test_CoupledTimeSeriesDataset_len(
-    data_dir, dataset_name, scaling_dict, pytestconfig
+def test_CoupledTimeSeriesDatasetZarr_len(
+    dataset_path, scaling_dict, constant_coupler_config, pytestconfig
 ):
-    from physicsnemo.datapipes.healpix.coupledtimeseries_dataset import (
-        CoupledTimeSeriesDataset,
+    from physicsnemo.datapipes.healpix.coupledtimeseries_dataset_zarr import (
+        CoupledTimeSeriesDatasetZarr,
     )
 
     # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    zarr_ds = xr.open_zarr(ds_path)
+    zarr_ds = xr.open_zarr(dataset_path)
 
     variables = ["z500", "z1000"]
+    batch_size = 2
 
-    constant_coupler = [
-        {
-            "coupler": "ConstantCoupler",
-            "params": {
-                "batch_size": 1,
-                "variables": ["z250"],
-                "input_times": ["0h"],
-                "input_time_dim": 1,
-                "output_time_dim": 1,
-                "presteps": 0,
-                "prepared_coupled_data": True,
-            },
-        }
-    ]
     # check forecast mode
-    init_times = random.randint(1, len(zarr_ds.time.values))
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
+    init_times = random.randint(1, zarr_ds.time.shape[0])
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
         input_variables=variables,
         scaling=scaling_dict,
         batch_size=1,
         forecast_init_times=zarr_ds.time[:init_times],
-        couplings=constant_coupler,
+        couplings=constant_coupler_config,
     )
     assert len(timeseries_ds) == init_times
 
-    constant_coupler = [
-        {
-            "coupler": "ConstantCoupler",
-            "params": {
-                "batch_size": 2,
-                "variables": ["z250"],
-                "input_times": ["0h"],
-                "input_time_dim": 1,
-                "output_time_dim": 1,
-                "presteps": 0,
-                "prepared_coupled_data": True,
-            },
-        }
-    ]
+    batch2_coupler = constant_coupler_config.copy()
+    batch2_coupler[0]["params"]["batch_size"] = 2
+
+    # get the last index that's evenly divisible by 3 (9h / 3h)
+    last_index = (zarr_ds.time.shape[0] // 3) * 3 - 1
 
     # check train mode
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
         input_variables=variables,
         data_time_step="3h",
         time_step="9h",
         scaling=scaling_dict,
-        batch_size=2,
-        couplings=constant_coupler,
+        batch_size=batch_size,
+        couplings=batch2_coupler,
+        start_date=zarr_ds.time[0].values,
+        end_date=zarr_ds.time[last_index - 1].values,
     )
     # Window length of 3 for one sample size
-    assert len(timeseries_ds) == (len(zarr_ds.time.values) - 2) // 2
+    assert len(timeseries_ds) == (zarr_ds.time.shape[0] - 3) // batch_size
 
-    # check train mode
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
+    # drop incomplete last window
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
         input_variables=variables,
         data_time_step="3h",
         time_step="9h",
         scaling=scaling_dict,
-        batch_size=2,
+        batch_size=batch_size,
         drop_last=True,
-        couplings=constant_coupler,
+        couplings=batch2_coupler,
+        start_date=zarr_ds.time[0].values,
+        end_date=zarr_ds.time[last_index - 1].values,
     )
-    assert len(timeseries_ds) == (len(zarr_ds.time.values) - 2) // 2
+    assert len(timeseries_ds) == (zarr_ds.time.shape[0] - 4) // batch_size
 
     zarr_ds.close()
     DistributedManager.cleanup()
@@ -653,40 +692,30 @@ def test_CoupledTimeSeriesDataset_len(
 @import_or_fail("netCDF4")
 @import_or_fail("xarray")
 @nfsdata_or_fail
-def test_CoupledTimeSeriesDataset_get(
-    data_dir, dataset_name, scaling_double_dict, pytestconfig
+def test_CoupledTimeSeriesDatasetZarr_get(
+    dataset_path, scaling_double_dict, splits, constant_coupler_config, pytestconfig
 ):
-    from physicsnemo.datapipes.healpix.coupledtimeseries_dataset import (
-        CoupledTimeSeriesDataset,
+    from physicsnemo.datapipes.healpix.coupledtimeseries_dataset_zarr import (
+        CoupledTimeSeriesDatasetZarr,
     )
 
     # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    zarr_ds = xr.open_zarr(ds_path)
+    zarr_ds = xr.open_zarr(dataset_path)
 
-    variables = list(zarr_ds.channel_out.to_numpy())
-
+    input_variables = list(zarr_ds.channel_out.values)
+    constant_variables = ["lsm"]
     batch_size = 2
-    constant_coupler = [
-        {
-            "coupler": "ConstantCoupler",
-            "params": {
-                "batch_size": batch_size,
-                "variables": ["z250"],
-                "input_times": ["0h"],
-                "input_time_dim": 1,
-                "output_time_dim": 1,
-                "presteps": 0,
-                "prepared_coupled_data": True,
-            },
-        }
-    ]
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
-        input_variables=variables,
+    batch2_constant_coupler = constant_coupler_config.copy()
+    batch2_constant_coupler[0]["params"]["batch_size"] = 2
+
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         scaling=scaling_double_dict,
         batch_size=batch_size,
-        couplings=constant_coupler,
+        start_date=zarr_ds.time[0].values,
+        end_date=zarr_ds.time[-1].values,
+        couplings=batch2_constant_coupler,
     )
 
     # check for invalid index
@@ -719,14 +748,16 @@ def test_CoupledTimeSeriesDataset_get(
     # we're not dropping incomplete elements by default
     assert len(targets) == 0
 
-    # this time dropping incomplete so that we get a full sample sample
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
-        input_variables=variables,
+    # this time dropping incomplete so that we get a full sample
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         scaling=scaling_double_dict,
         batch_size=batch_size,
         drop_last=True,
-        couplings=constant_coupler,
+        start_date=zarr_ds.time[0].values,
+        end_date=zarr_ds.time[-1].values,
+        couplings=batch2_constant_coupler,
     )
 
     inputs, targets = timeseries_ds[-1]
@@ -737,30 +768,36 @@ def test_CoupledTimeSeriesDataset_get(
     assert np.array_equal(targets[0][:, 0, :, :], targets_expected)
 
     # without couplings
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
-        input_variables=variables,
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         scaling=scaling_double_dict,
         batch_size=batch_size,
         drop_last=True,
+        start_date=zarr_ds.time[0].values,
+        end_date=zarr_ds.time[-1].values,
         couplings=[],
     )
     non_perturbed_inputs = timeseries_ds
     assert len(non_perturbed_inputs[0][0]) == 2  # just inputs and targets
 
-    # wihtout couplings but with noise
+    # without couplings but with noise
     noise_params = {
         "inputs": scaling_double_dict,
         "couplings": scaling_double_dict,
     }
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
-        input_variables=variables,
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         scaling=scaling_double_dict,
         batch_size=batch_size,
         drop_last=True,
         add_train_noise=True,
         train_noise_params=noise_params,
+        start_date=zarr_ds.time[0].values,
+        end_date=zarr_ds.time[-1].values,
         couplings=[],
     )
     perturbed_inputs = timeseries_ds
@@ -770,26 +807,31 @@ def test_CoupledTimeSeriesDataset_get(
     assert not np.array_equal(non_perturbed_inputs[0][0][0], perturbed_inputs[0][0][0])
 
     # With insolation we get 1 extra channel
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
-        input_variables=variables,
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
+        constant_variables=None,
         scaling=scaling_double_dict,
         batch_size=batch_size,
         drop_last=True,
         add_insolation=True,
-        couplings=constant_coupler,
+        start_date=zarr_ds.time[0].values,
+        end_date=zarr_ds.time[-1].values,
+        couplings=batch2_constant_coupler,
     )
     assert (len(inputs)) + 1 == len(timeseries_ds[0][0])
 
     # nothing should change with forecast mode other than getting just inputs
     init_times = random.randint(1, len(zarr_ds.time.values))
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
-        input_variables=variables,
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
+        constant_variables=None,
         scaling=scaling_double_dict,
         batch_size=1,
-        forecast_init_times=zarr_ds.time[:init_times],
-        couplings=constant_coupler,
+        start_date=zarr_ds.time[0].values,
+        end_date=zarr_ds.time[-1].values,
+        couplings=constant_coupler_config,
     )
     inputs = timeseries_ds[0]
 
@@ -797,29 +839,31 @@ def test_CoupledTimeSeriesDataset_get(
 
     # insolation adds 1 extra channel
     init_times = random.randint(1, len(zarr_ds.time.values))
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds,
-        input_variables=variables,
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
+        constant_variables=None,
         scaling=scaling_double_dict,
         batch_size=1,
         add_insolation=True,
         forecast_init_times=zarr_ds.time[:init_times],
-        couplings=constant_coupler,
+        couplings=constant_coupler_config,
     )
     assert (len(inputs)) + 1 == len(timeseries_ds[0])
 
-    # No constants in input data
+    # Constants + insolation is 2 extra channels
     init_times = random.randint(1, len(zarr_ds.time.values))
-    zarr_ds_no_const = zarr_ds.drop_vars("constants")
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=zarr_ds_no_const,
-        input_variables=variables,
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
+        constant_variables=constant_variables,
         scaling=scaling_double_dict,
         batch_size=1,
+        add_insolation=True,
         forecast_init_times=zarr_ds.time[:init_times],
-        couplings=constant_coupler,
+        couplings=constant_coupler_config,
     )
-    assert len(inputs) == (len(timeseries_ds[0]) + 1)
+    assert len(inputs) + 2 == len(timeseries_ds[0])
 
     zarr_ds.close()
     DistributedManager.cleanup()
@@ -829,84 +873,62 @@ def test_CoupledTimeSeriesDataset_get(
 @import_or_fail("netCDF4")
 @import_or_fail("xarray")
 @nfsdata_or_fail
-def test_CoupledTimeSeriesDataModule_initialization(
-    data_dir, create_path, dataset_name, scaling_double_dict, pytestconfig
+def test_CoupledTimeSeriesDataModuleZarr_initialization(
+    dataset_path, splits, scaling_double_dict, constant_coupler_config, pytestconfig
 ):
 
-    from physicsnemo.datapipes.healpix.data_modules import (
-        CoupledTimeSeriesDataModule,
+    from physicsnemo.datapipes.healpix.data_modules_zarr import (
+        CoupledTimeSeriesDataModuleZarr,
     )
 
-    variables = ["z500", "z1000"]
-    splits = {
-        "train_date_start": "1959-01-01",
-        "train_date_end": "1998-12-31T18:00",
-        "val_date_start": "1999-01-01",
-        "val_date_end": "2000-12-31T18:00",
-        "test_date_start": "2017-01-01",
-        "test_date_end": "2018-12-31T18:00",
-    }
-
-    constant_coupler = [
-        {
-            "coupler": "ConstantCoupler",
-            "params": {
-                "batch_size": 1,
-                "variables": ["z250"],
-                "input_times": ["0h"],
-                "input_time_dim": 1,
-                "output_time_dim": 1,
-                "presteps": 0,
-                "prepared_coupled_data": True,
-            },
-        }
-    ]
+    input_variables = ["z500", "z1000"]
 
     # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    zarr_ds = xr.open_zarr(ds_path)
+    zarr_ds = xr.open_zarr(dataset_path)
+
+    # test for invalid path
+    with pytest.raises(FileNotFoundError, match=("Dataset path not found")):
+        timeseries_dm = CoupledTimeSeriesDataModuleZarr(
+            dataset_path="DoesntExist",
+            input_variables=input_variables,
+            batch_size=1,
+            couplings=constant_coupler_config,
+        )
 
     # use the prebuilt dataset
     # Internally initializes DistributedManager
-    timeseries_dm = CoupledTimeSeriesDataModule(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
-        input_variables=variables,
+    timeseries_dm = CoupledTimeSeriesDataModuleZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         batch_size=1,
-        prebuilt_dataset=True,
-        scaling=scaling_double_dict,
-        couplings=constant_coupler,
-    )
-    assert isinstance(timeseries_dm, CoupledTimeSeriesDataModule)
-
-    # with init times
-    timeseries_dm = CoupledTimeSeriesDataModule(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
-        input_variables=variables,
-        batch_size=1,
-        prebuilt_dataset=True,
-        scaling=scaling_double_dict,
-        forecast_init_times=zarr_ds.time[:2],
-        couplings=constant_coupler,
-    )
-    assert isinstance(timeseries_dm, CoupledTimeSeriesDataModule)
-
-    # with splits
-    timeseries_dm = CoupledTimeSeriesDataModule(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
-        input_variables=variables,
-        batch_size=1,
-        prebuilt_dataset=True,
         scaling=scaling_double_dict,
         splits=omegaconf.DictConfig(splits),
-        couplings=constant_coupler,
+        couplings=constant_coupler_config,
     )
-    assert isinstance(timeseries_dm, CoupledTimeSeriesDataModule)
+    assert isinstance(timeseries_dm, CoupledTimeSeriesDataModuleZarr)
+
+    # with init times
+    timeseries_dm = CoupledTimeSeriesDataModuleZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
+        batch_size=1,
+        scaling=scaling_double_dict,
+        forecast_init_times=zarr_ds.time[:2],
+        couplings=constant_coupler_config,
+    )
+    assert isinstance(timeseries_dm, CoupledTimeSeriesDataModuleZarr)
+
+    # with splits
+    timeseries_dm = CoupledTimeSeriesDataModuleZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
+        batch_size=1,
+        scaling=scaling_double_dict,
+        splits=omegaconf.DictConfig(splits),
+        couplings=constant_coupler_config,
+    )
+    assert isinstance(timeseries_dm, CoupledTimeSeriesDataModuleZarr)
+
     zarr_ds.close()
     DistributedManager.cleanup()
 
@@ -915,69 +937,49 @@ def test_CoupledTimeSeriesDataModule_initialization(
 @import_or_fail("netCDF4")
 @import_or_fail("xarray")
 @nfsdata_or_fail
-def test_CoupledTimeSeriesDataModule_get_constants(
-    data_dir, create_path, dataset_name, scaling_double_dict, pytestconfig
+def test_CoupledTimeSeriesDataModuleZarr_get_constants(
+    dataset_path, scaling_double_dict, splits, constant_coupler_config, pytestconfig
 ):
 
-    from physicsnemo.datapipes.healpix.data_modules import (
-        CoupledTimeSeriesDataModule,
+    from physicsnemo.datapipes.healpix.data_modules_zarr import (
+        CoupledTimeSeriesDataModuleZarr,
     )
 
     variables = ["z500", "z1000"]
-    constants = {"lsm": "lsm"}
-
-    constant_coupler = [
-        {
-            "coupler": "ConstantCoupler",
-            "params": {
-                "batch_size": 1,
-                "variables": ["z250"],
-                "input_times": ["0h"],
-                "input_time_dim": 1,
-                "output_time_dim": 1,
-                "presteps": 0,
-                "prepared_coupled_data": True,
-            },
-        }
-    ]
+    constants = ["lsm"]
 
     # No constants
     # Internally initializes DistributedManager
-    timeseries_dm = CoupledTimeSeriesDataModule(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
+    timeseries_dm = CoupledTimeSeriesDataModuleZarr(
+        dataset_path=dataset_path,
         input_variables=variables,
         batch_size=1,
-        prebuilt_dataset=True,
         scaling=scaling_double_dict,
-        constants=None,
-        couplings=constant_coupler,
+        splits=splits,
+        constant_variables=None,
+        couplings=constant_coupler_config,
     )
 
     assert timeseries_dm.get_constants() is None
 
     # just lsm as constant
-    timeseries_dm = CoupledTimeSeriesDataModule(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
+    timeseries_dm = CoupledTimeSeriesDataModuleZarr(
+        dataset_path=dataset_path,
         input_variables=variables,
         batch_size=1,
-        prebuilt_dataset=True,
         scaling=scaling_double_dict,
-        constants=constants,
-        couplings=constant_coupler,
+        splits=splits,
+        constant_variables=constants,
+        couplings=constant_coupler_config,
     )
 
     # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    zarr_ds = xr.open_zarr(ds_path)
+    zarr_ds = xr.open_zarr(dataset_path)
 
     # divide by 2 due to scaling
     expected = (
         np.transpose(
-            zarr_ds.constants.sel(channel_c=list(constants.keys())).values,
+            zarr_ds.constants.sel(channel_c=constants).values,
             axes=(1, 0, 2, 3),
         )
         / 2.0
@@ -990,16 +992,14 @@ def test_CoupledTimeSeriesDataModule_get_constants(
 
     # with splits we're doing forecasting and get
     # constants from train instead of test dataset
-    timeseries_dm = CoupledTimeSeriesDataModule(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
+    timeseries_dm = CoupledTimeSeriesDataModuleZarr(
+        dataset_path=dataset_path,
         input_variables=variables,
         batch_size=1,
-        prebuilt_dataset=True,
         scaling=scaling_double_dict,
-        constants=constants,
-        couplings=constant_coupler,
+        splits=splits,
+        constant_variables=constants,
+        couplings=constant_coupler_config,
     )
 
     assert np.array_equal(
@@ -1012,52 +1012,26 @@ def test_CoupledTimeSeriesDataModule_get_constants(
 
 @import_or_fail("omegaconf")
 @nfsdata_or_fail
-def test_CoupledTimeSeriesDataModule_get_dataloaders(
-    data_dir, create_path, dataset_name, scaling_double_dict, pytestconfig
+def test_CoupledTimeSeriesDataModuleZarr_get_dataloaders(
+    dataset_path, scaling_double_dict, splits, constant_coupler_config, pytestconfig
 ):
 
-    from physicsnemo.datapipes.healpix.data_modules import (
-        CoupledTimeSeriesDataModule,
+    from physicsnemo.datapipes.healpix.data_modules_zarr import (
+        CoupledTimeSeriesDataModuleZarr,
     )
 
-    variables = ["z500", "z1000"]
-    splits = {
-        "train_date_start": "1979-01-01",
-        "train_date_end": "1979-01-01T21:00",
-        "val_date_start": "1979-01-02",
-        "val_date_end": "1979-01-02T09:00",
-        "test_date_start": "1979-01-02T12:00",
-        "test_date_end": "1979-01-02T18:00",
-    }
-
-    constant_coupler = [
-        {
-            "coupler": "ConstantCoupler",
-            "params": {
-                "batch_size": 1,
-                "variables": ["z250"],
-                "input_times": ["0h"],
-                "input_time_dim": 1,
-                "output_time_dim": 1,
-                "presteps": 0,
-                "prepared_coupled_data": True,
-            },
-        }
-    ]
+    input_variables = ["z500", "z1000"]
 
     # use the prebuilt dataset
     # Internally initializes DistributedManager
-    timeseries_dm = CoupledTimeSeriesDataModule(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
-        input_variables=variables,
+    timeseries_dm = CoupledTimeSeriesDataModuleZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         batch_size=1,
-        prebuilt_dataset=True,
         scaling=scaling_double_dict,
         splits=splits,
         shuffle=False,
-        couplings=constant_coupler,
+        couplings=constant_coupler_config,
     )
 
     # with 1 shard should get no sampler
@@ -1090,41 +1064,29 @@ def test_CoupledTimeSeriesDataModule_get_dataloaders(
 
 @import_or_fail("omegaconf")
 @nfsdata_or_fail
-def test_CoupledTimeSeriesDataModule_get_coupled_vars(
-    data_dir, create_path, dataset_name, scaling_double_dict, pytestconfig
+def test_CoupledTimeSeriesDataModuleZarr_get_coupled_vars(
+    dataset_path,
+    scaling_double_dict,
+    splits,
+    constant_coupler_config,
+    average_coupler_config,
+    pytestconfig,
 ):
-    from physicsnemo.datapipes.healpix.data_modules import (
-        CoupledTimeSeriesDataModule,
+    from physicsnemo.datapipes.healpix.data_modules_zarr import (
+        CoupledTimeSeriesDataModuleZarr,
     )
 
-    variables = ["z500", "z1000"]
-    constant_coupler = [
-        {
-            "coupler": "ConstantCoupler",
-            "params": {
-                "batch_size": 1,
-                "variables": ["z250"],
-                "input_times": ["0h"],
-                "input_time_dim": 1,
-                "output_time_dim": 1,
-                "presteps": 0,
-                "prepared_coupled_data": True,
-            },
-        }
-    ]
+    input_variables = ["z500", "z1000"]
 
     # Constant coupler
     # Internally initializes DistributedManager
-    print(f"test name {dataset_name}")
-    timeseries_dm = CoupledTimeSeriesDataModule(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
-        input_variables=variables,
+    timeseries_dm = CoupledTimeSeriesDataModuleZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         batch_size=1,
-        prebuilt_dataset=True,
         scaling=scaling_double_dict,
-        couplings=constant_coupler,
+        splits=splits,
+        couplings=constant_coupler_config,
     )
 
     outvar = timeseries_dm._get_coupled_vars()
@@ -1134,32 +1096,15 @@ def test_CoupledTimeSeriesDataModule_get_coupled_vars(
 
     assert expected == outvar
 
-    average_coupler = [
-        {
-            "coupler": "TrailingAverageCoupler",
-            "params": {
-                "batch_size": 1,
-                "variables": ["z250"],
-                "input_times": ["6h"],
-                "averaging_window": "6h",
-                "input_time_dim": 1,
-                "output_time_dim": 1,
-                "presteps": 0,
-                "prepared_coupled_data": True,
-            },
-        }
-    ]
     # Average coupler
     # Internally initializes DistributedManager
-    timeseries_dm = CoupledTimeSeriesDataModule(
-        src_directory=create_path,
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
-        input_variables=variables,
+    timeseries_dm = CoupledTimeSeriesDataModuleZarr(
+        dataset_path=dataset_path,
+        input_variables=input_variables,
         batch_size=1,
-        prebuilt_dataset=True,
         scaling=scaling_double_dict,
-        couplings=average_coupler,
+        splits=splits,
+        couplings=average_coupler_config,
     )
     outvar = timeseries_dm._get_coupled_vars()
     outvar.sort()
@@ -1173,11 +1118,11 @@ def test_CoupledTimeSeriesDataModule_get_coupled_vars(
 @import_or_fail("netCDF4")
 @import_or_fail("xarray")
 @nfsdata_or_fail
-def test_CoupledTimeSeriesDataset_next_integration(
-    data_dir, dataset_name, scaling_dict, pytestconfig
+def test_CoupledTimeSeriesDatasetZarr_next_integration(
+    dataset_path, scaling_dict, pytestconfig
 ):
-    from physicsnemo.datapipes.healpix.coupledtimeseries_dataset import (
-        CoupledTimeSeriesDataset,
+    from physicsnemo.datapipes.healpix.coupledtimeseries_dataset_zarr import (
+        CoupledTimeSeriesDatasetZarr,
     )
 
     spatial_dims = [12, 32, 32]
@@ -1205,8 +1150,7 @@ def test_CoupledTimeSeriesDataset_next_integration(
     ]
 
     # open our test dataset
-    ds_path = Path(data_dir, dataset_name + ".zarr")
-    ds = xr.open_zarr(ds_path)
+    ds = xr.open_zarr(dataset_path)
     init_times = random.randint(1, len(ds.time.values))
     # channels need to be subselected before being handed over
     test_ds = ds.sel(
@@ -1214,8 +1158,8 @@ def test_CoupledTimeSeriesDataset_next_integration(
         channel_out=input_variables,
     )
 
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=test_ds,
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
         input_variables=input_variables,
         scaling=scaling_dict,
         batch_size=batch_size,
@@ -1267,8 +1211,8 @@ def test_CoupledTimeSeriesDataset_next_integration(
     assert np.array_equal(test_integration[3], expected_coupling)
 
     # I have absolutely no idea why a coupled dataset has the option for 0 couplings
-    timeseries_ds = CoupledTimeSeriesDataset(
-        dataset=test_ds,
+    timeseries_ds = CoupledTimeSeriesDatasetZarr(
+        dataset_path=dataset_path,
         input_variables=input_variables,
         scaling=scaling_dict,
         batch_size=batch_size,
