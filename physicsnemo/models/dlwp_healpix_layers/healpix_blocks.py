@@ -77,10 +77,9 @@ class ConvGRUBlock(th.nn.Module):
             HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
-            If True, apply compiled padding; only supported with
-            ``hpx_padding_mode='isolatitude'``.
+            If True, apply torch compile to the padding module.
         nside: int, optional
-            HEALPix face resolution; required if ``hpx_padding_mode='isolatitude'``.
+            HEALPix face resolution.
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         """
@@ -194,10 +193,9 @@ class BasicConvBlock(th.nn.Module):
             HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
-            If True, apply compiled padding; only supported with
-            ``hpx_padding_mode='isolatitude'``.
+            If True, apply torch compile to the padding module.
         nside: int, optional
-            HEALPix face resolution; required if ``hpx_padding_mode='isolatitude'``.
+            HEALPix face resolution.
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         """
@@ -286,10 +284,9 @@ class ConvNeXtBlock(th.nn.Module):
             HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
-            If True, apply compiled padding; only supported with
-            ``hpx_padding_mode='isolatitude'``.
+            If True, apply torch compile to the padding module.
         nside: int, optional
-            HEALPix face resolution; required if ``hpx_padding_mode='isolatitude'``.
+            HEALPix face resolution.
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         """
@@ -425,10 +422,9 @@ class DoubleConvNeXtBlock(th.nn.Module):
             HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
-            If True, apply compiled padding; only supported with
-            ``hpx_padding_mode='isolatitude'``.
+            If True, apply torch compile to the padding module.
         nside: int, optional
-            HEALPix face resolution; required if ``hpx_padding_mode='isolatitude'``.
+            HEALPix face resolution.
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         """
@@ -727,10 +723,9 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
             HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
-            If True, apply compiled padding; only supported with
-            ``hpx_padding_mode='isolatitude'``.
+            If True, apply torch compile to the padding module.
         nside: int, optional
-            HEALPix face resolution; required if ``hpx_padding_mode='isolatitude'``.
+            HEALPix face resolution.
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         """
@@ -824,10 +819,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
-            If True, apply compiled padding; only supported with
-            ``hpx_padding_mode='isolatitude'``.
+            If True, apply torch compile to the padding module.
         nside: int, optional
-            HEALPix face resolution; required if ``hpx_padding_mode='isolatitude'``.
+            HEALPix face resolution.
         dropout: float, optional
             Dropout probability to apply after the first convolution
         conditional_layer_norm: th.nn.Module, optional
@@ -1048,10 +1042,9 @@ class MaxPool(th.nn.Module):
             HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
-            If True, apply compiled padding; only supported with
-            ``hpx_padding_mode='isolatitude'``.
+            If True, apply torch compile to the padding module.
         nside: int, optional
-            HEALPix face resolution; required if ``hpx_padding_mode='isolatitude'``.
+            HEALPix face resolution.
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         """
@@ -1110,10 +1103,9 @@ class AvgPool(th.nn.Module):
             HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
-            If True, apply compiled padding; only supported with
-            ``hpx_padding_mode='isolatitude'``.
+            If True, apply torch compile to the padding module.
         nside: int, optional
-            HEALPix face resolution; required if ``hpx_padding_mode='isolatitude'``.
+            HEALPix face resolution.
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         """
@@ -1184,10 +1176,9 @@ class TransposedConvUpsample(th.nn.Module):
             HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
-            If True, apply compiled padding; only supported with
-            ``hpx_padding_mode='isolatitude'``.
+            If True, apply torch compile to the padding module.
         nside: int, optional
-            HEALPix face resolution; required if ``hpx_padding_mode='isolatitude'``.
+            HEALPix face resolution.
         enable_healpixpad: bool, optional
             Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         """

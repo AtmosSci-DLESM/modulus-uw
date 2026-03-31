@@ -114,8 +114,7 @@ class HEALPixUNet(Module):
             Padding strategy: ``earth2grid`` (default; fast path via earth2grid on CUDA),
             ``karlbauer``, or ``isolatitude``
         compile_padding: bool, optional
-            If True, apply compiled isolatitude padding; only supported with
-            ``hpx_padding_mode='isolatitude'``.
+            If True, apply torch compile to the padding module.
         nside : Sequence[int], optional
             Face height/width per UNet level (shallowest to deepest).
             Length must match the encoder ``n_channels`` list length.
