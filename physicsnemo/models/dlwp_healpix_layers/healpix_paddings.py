@@ -164,48 +164,51 @@ class HEALPixUnfoldFaces(th.nn.Module):
 
 class HEALPixPaddingv2(th.nn.Module):
     """
-    HEALPix padding via ``earth2grid.healpix.pad``.
+    Padding layer for data on a HEALPix sphere. This version uses a faster method to calculate the padding.
+    The requirements for using this layer are as follows:
+    - The last three dimensions are (face=12, height, width)
+    - The first four indices in the faces dimension [0, 1, 2, 3] are the faces on the northern hemisphere
+    - The second four indices in the faces dimension [4, 5, 6, 7] are the faces on the equator
+    - The last four indices in the faces dimension [8, 9, 10, 11] are the faces on the southern hemisphere
 
-    Unfolds to ``[B, 12, C, H, W]``, pads with the library implementation, then folds
-    back to ``[B * 12, C, H', W']`` with ``H' = H + 2 * padding``. Uses default NCHW
-    fold/unfold (no ``enable_nhwc`` on the helpers).
+    Orientation and arrangement of the HEALPix faces are outlined above.
+
+    TODO: Missing library to use this class. Need to see if we can get it, if not needs to be removed
     """
 
     def __init__(self, padding: int):  # pragma: no cover
         """
         Parameters
         ----------
-        padding : int
-            Symmetric pad width (pixels) per face edge; output height/width are
-            ``H + 2 * padding``.
+        padding: int
+            The padding size
         """
         super().__init__()
         self.unfold = HEALPixUnfoldFaces(num_faces=12)
         self.fold = HEALPixFoldFaces()
-        self.padding = padding
-        self._backend = Earth2GridPaddingBackends["cuda"]
+        self.padding = HEALPixPad(padding=padding)
 
     def forward(self, x):  # pragma: no cover
         """
-        Pad each face using neighbor faces according to HEALPix connectivity.
+        Pad each face consistently with its according neighbors in the HEALPix (see ordering and neighborhoods above).
+        Assumes the Tensor is folded
 
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input in folded layout ``[N * 12, C, H, W]`` (batch and faces merged).
+        Parmaters
+        ---------
+        data: torch.Tensor
+            The input tensor of shape [..., F, H, W] where each face is to be padded in its HPX context
 
         Returns
         -------
         torch.Tensor
-            Same layout as input; spatial size ``H + 2 * padding`` per dimension.
+            The padded tensor where each face's height and width are increased by 2*p
         """
 
         x = self.unfold(x)
-        with earth2grid_pad_backend(self._backend):
-            x = healpix_pad(x, self.padding)
-        x = self.fold(x)
+        xp = self.padding(x)
+        xp = self.fold(xp)
 
-        return x
+        return xp
 
 
 class HEALPixPadding(th.nn.Module):
@@ -640,6 +643,9 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             ``[N * 12, C, H + 2*p, W + 2*p]``; numerically aligned with the reference
             module for the same ``padding`` and ``H``.
         """
+        # orig_dtype = data.dtype
+        # data = data.to(dtype=th.float16)
+
         H, W = data.shape[-2:]
         if H != W:
             raise ValueError("HEALPix faces must be square (H == W)")
@@ -663,7 +669,7 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
         i1 = idx[1].clamp_min(0)
         g0 = flat.gather(dim=2, index=i0.view(1, 1, -1).expand(B, C, -1)) * v0
         g1 = flat.gather(dim=2, index=i1.view(1, 1, -1).expand(B, C, -1)) * v1
-        denom = (v0.to(flat.dtype) + v1.to(flat.dtype)).clamp_min(1e-12)
+        denom = v0.to(data.dtype) + v1.to(data.dtype)
         out_flat = (g0 + g1) / denom
 
         Hp, Wp = H + 2 * self.p, W + 2 * self.p
@@ -672,6 +678,10 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
         )
         if self.enable_nhwc:
             out = out.to(memory_format=th.channels_last)
+
+        # if out.dtype != orig_dtype:
+        #     out = out.to(dtype=orig_dtype)
+
         return out
 
 
