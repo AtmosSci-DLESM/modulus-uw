@@ -22,7 +22,11 @@ import torch as th
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
-from physicsnemo.models.dlwp_healpix_layers import HEALPixFoldFaces, HEALPixUnfoldFaces
+from physicsnemo.models.dlwp_healpix_layers import (
+    HEALPixFoldFaces,
+    HEALPixUnfoldFaces,
+    warn_deprecated_enable_healpixpad,
+)
 from physicsnemo.models.meta import ModelMetaData
 from physicsnemo.models.module import Module
 
@@ -62,18 +66,20 @@ class HEALPixUNet(Module):
         output_time_dim: int,
         presteps: int = 0,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
         couplings: list = [],
         residual_prediction: bool = False,
         couplings_time_first: bool = True,
         constraints: list[DictConfig] = None,
-        hpx_padding_mode: str = 'karlbauer',
+        hpx_padding_mode: str = 'earth2grid',
+        compile_padding: bool = False,
+        nside: Sequence[int] = (64, 32, 16),
         enforce_reflectional_equivariance: bool = False,
         odd_prognostic_variables: Sequence[str] = None,
         odd_constants: Sequence[str] = None,
         channels: Sequence[str] = None,
         constants: Sequence[str] = None,
         scaling: dict[str, dict[str, float]] = None,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -101,8 +107,6 @@ class HEALPixUNet(Module):
             number of model steps to initialize recurrent states. default: 0
         enable_nhwc: bool, optional
             Model with [N, H, W, C] instead of [N, C, H, W]. default: False
-        enable_healpixpad: bool, optional
-            Enable CUDA HEALPixPadding if installed. default: False
         couplings: list, optional
             sequence of dictionaries that describe coupling mechanisms
         residual_prediction: bool, optional
@@ -113,10 +117,19 @@ class HEALPixUNet(Module):
             List of hydra instantiable DictConfigs specifying constraints 
             (e.g., nonnegativity) to be applied to the model outputs
         hpx_padding_mode: str, optional
-            Method to use for padding HEALPix faces for convolutions. Options
-            are 'karlbauer' (default) and 'isolatitude'.
+            Padding strategy: ``earth2grid`` (default; fast path via earth2grid on CUDA),
+            ``karlbauer``, or ``isolatitude``
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside : Sequence[int], optional
+            Face height/width per UNet level (shallowest to deepest).
+            Length must match the encoder ``n_channels`` list length.
+            Default ``(64, 32, 16)``.
+        enable_healpixpad: bool, optional
+            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         """
         super().__init__()
+        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
 
         if len(couplings) > 0:
             if n_constants == 0:
@@ -140,16 +153,28 @@ class HEALPixUNet(Module):
         self.output_time_dim = output_time_dim
         self.channel_dim = 2  # Now 2 with [B, F, C*T, H, W]. Was 1 in old data format with [B, T*C, F, H, W]
         self.enable_nhwc = enable_nhwc
-        self.enable_healpixpad = enable_healpixpad
         self.residual_prediction = residual_prediction
         self.couplings_time_first = couplings_time_first
         self.hpx_padding_mode = hpx_padding_mode
+        self.compile_padding = compile_padding
+        self.nside = nside
         self.enforce_reflectional_equivariance = enforce_reflectional_equivariance
         self.odd_prognostic_variables = odd_prognostic_variables
         self.odd_constants = odd_constants
         self.channels = channels
         self.constants = constants
         self.scaling = scaling
+
+        if len(encoder["n_channels"]) != len(decoder["n_channels"]):
+            raise ValueError(
+                "encoder and decoder must have the same number of UNet levels; "
+                f"got {len(encoder['n_channels'])} for encoder and {len(decoder['n_channels'])} for decoder"
+            )
+        if len(self.nside) != len(encoder["n_channels"]):
+            raise ValueError(
+                f"nside must have same length as n_channels; got {len(self.nside)} "
+                f"for nside and {len(encoder['n_channels'])} for n_channels"
+            )
 
         # Setting variables which are used for enforcing reflectional equivariance
         self.register_buffer("refl_face_order", th.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=th.long), persistent=False)
@@ -206,16 +231,18 @@ class HEALPixUNet(Module):
             config=encoder,
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
-            enable_healpixpad=self.enable_healpixpad,
             hpx_padding_mode=self.hpx_padding_mode,
+            compile_padding=self.compile_padding,
+            nside=self.nside,
         )
         self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
             config=decoder,
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
-            enable_healpixpad=self.enable_healpixpad,
             hpx_padding_mode=self.hpx_padding_mode,
+            compile_padding=self.compile_padding,
+            nside=self.nside,
         )
 
         self.constraints = None

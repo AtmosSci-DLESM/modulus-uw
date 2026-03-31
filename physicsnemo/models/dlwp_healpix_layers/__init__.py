@@ -28,10 +28,13 @@ from .healpix_blocks import (
 )
 from .healpix_decoder import UNetDecoder
 from .healpix_encoder import UNetEncoder
-from .healpix_layers import (
+from .healpix_layers import HEALPixLayer
+from .healpix_paddings import (
     HEALPixFoldFaces,
-    HEALPixLayer,
     HEALPixPadding,
+    HEALPixPaddingIsolatitude,
     HEALPixPaddingv2,
     HEALPixUnfoldFaces,
+    have_earth2grid,
+    warn_deprecated_enable_healpixpad,
 )
