@@ -188,7 +188,6 @@ def test_HEALPixRecUNet_initialize(device, encoder_dict, decoder_dict, pytestcon
         decoder_input_channels=decoder_input_channels,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
-        nside=(16, 8, 4),
     ).to(device)
     assert isinstance(model, HEALPixRecUNet)
 
@@ -205,7 +204,6 @@ def test_HEALPixRecUNet_initialize(device, encoder_dict, decoder_dict, pytestcon
             decoder_input_channels=decoder_input_channels,
             input_time_dim=2,
             output_time_dim=3,
-            nside=(16, 8, 4),
         ).to(device)
 
     # test fail case for couplings with no constants or decoder input channels
@@ -223,7 +221,6 @@ def test_HEALPixRecUNet_initialize(device, encoder_dict, decoder_dict, pytestcon
             decoder_input_channels=2,
             n_constants=0,
             couplings=["t2m", "v10m"],
-            nside=(16, 8, 4),
         ).to(device)
 
     # test fail case for couplings with no decoder input channels
@@ -241,7 +238,6 @@ def test_HEALPixRecUNet_initialize(device, encoder_dict, decoder_dict, pytestcon
             decoder_input_channels=0,
             n_constants=2,
             couplings=["t2m", "v10m"],
-            nside=(16, 8, 4),
         ).to(device)
 
     with pytest.raises(
@@ -257,7 +253,6 @@ def test_HEALPixRecUNet_initialize(device, encoder_dict, decoder_dict, pytestcon
             decoder_input_channels=0,
             n_constants=2,
             couplings=["t2m", "v10m"],
-            nside=(16, 8, 4),
         ).to(device)
 
     with pytest.raises(
@@ -273,7 +268,6 @@ def test_HEALPixRecUNet_initialize(device, encoder_dict, decoder_dict, pytestcon
             output_time_dim=3,
             decoder_input_channels=0,
             n_constants=0,
-            nside=(16, 8, 4),
         ).to(device)
 
     del model
@@ -301,7 +295,6 @@ def test_HEALPixRecUNet_integration_steps(
         decoder_input_channels=decoder_input_channels,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
-        nside=(16, 8, 4),
     ).to(device)
 
     assert model.integration_steps == output_time_dim // input_time_dim
@@ -339,8 +332,6 @@ def test_HEALPixRecUNet_reset(
     constants = constant_data(channels=n_constants, img_size=size, device=device)
     inputs = [x, decoder_inputs, constants]
 
-    hpx_pad = "earth2grid" if device.type == "cuda" else "karlbauer"
-
     model = HEALPixRecUNet(
         encoder=encoder_dict,
         decoder=decoder_dict,
@@ -350,9 +341,8 @@ def test_HEALPixRecUNet_reset(
         decoder_input_channels=decoder_input_channels,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
-        hpx_padding_mode=hpx_pad,
+        enable_healpixpad=True,
         delta_time="6h",
-        nside=(16, 8, 4),
     ).to(device)
 
     out_var = model(inputs)
@@ -402,8 +392,6 @@ def test_HEALPixRecUNet_forward(
     constants = constant_data(channels=n_constants, img_size=size, device=device)
     inputs = [x, decoder_inputs, constants]
 
-    hpx_pad = "earth2grid" if device.type == "cuda" else "karlbauer"
-
     model = HEALPixRecUNet(
         encoder=encoder_dict,
         decoder=decoder_dict,
@@ -413,10 +401,9 @@ def test_HEALPixRecUNet_forward(
         decoder_input_channels=decoder_input_channels,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
-        hpx_padding_mode=hpx_pad,
+        enable_healpixpad=True,
         delta_time="6h",
         reset_cycle="6h",
-        nside=(16, 8, 4),
     ).to(device)
 
     # one forward step to initialize recurrent states
@@ -447,9 +434,8 @@ def test_HEALPixRecUNet_forward(
         decoder_input_channels=0,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
-        hpx_padding_mode=hpx_pad,
+        enable_healpixpad=True,
         delta_time="6h",
-        nside=(16, 8, 4),
     ).to(device)
 
     # one forward step to initialize recurrent states
@@ -473,9 +459,8 @@ def test_HEALPixRecUNet_forward(
         decoder_input_channels=decoder_input_channels,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
-        hpx_padding_mode=hpx_pad,
+        enable_healpixpad=True,
         delta_time="6h",
-        nside=(16, 8, 4),
     ).to(device)
 
     # one forward step to initialize recurrent states

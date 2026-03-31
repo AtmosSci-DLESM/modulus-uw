@@ -26,11 +26,6 @@ import torch
 from pytest_utils import import_or_fail
 
 
-def _hpx_padding_mode_for_device(device: str) -> str:
-    """Stack default is earth2grid (CUDA); CPU tests must use karlbauer."""
-    return "karlbauer" if device == "cpu" else "earth2grid"
-
-
 @import_or_fail("hydra")
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 def test_UNetEncoder_initialize(device, pytestconfig):
@@ -59,8 +54,6 @@ def test_UNetEncoder_initialize(device, pytestconfig):
         down_sampling_block=down_sampling_block,
         n_channels=n_channels,
         input_channels=channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
-        nside=(16, 8, 4),
     ).to(device)
     assert isinstance(encoder, UNetEncoder)
 
@@ -71,8 +64,6 @@ def test_UNetEncoder_initialize(device, pytestconfig):
         n_channels=n_channels,
         input_channels=channels,
         dilations=(1, 1, 1),
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
-        nside=(16, 8, 4),
     ).to(device)
     assert isinstance(encoder, UNetEncoder)
 
@@ -110,8 +101,6 @@ def test_UNetEncoder_forward(device, pytestconfig):
         down_sampling_block=down_sampling_block,
         n_channels=n_channels,
         input_channels=channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
-        nside=(16, 8, 4),
     ).to(device)
 
     tensor_size = [b_size, channels, hw_size, hw_size]
@@ -160,8 +149,6 @@ def test_UNetEncoder_reset(device, pytestconfig):
         down_sampling_block=down_sampling_block,
         n_channels=n_channels,
         input_channels=channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
-        nside=(16, 8, 4),
     ).to(device)
 
     # doesn't do anything
@@ -222,8 +209,6 @@ def test_UNetDecoder_initilization(device, pytestconfig):
         output_layer=output_layer,
         recurrent_block=recurrent_block,
         n_channels=n_channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
-        nside=(32, 16, 8),
     ).to(device)
 
     assert isinstance(decoder, UNetDecoder)
@@ -236,8 +221,6 @@ def test_UNetDecoder_initilization(device, pytestconfig):
         recurrent_block=None,
         n_channels=n_channels,
         dilations=(1, 1, 1),
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
-        nside=(32, 16, 8),
     ).to(device)
     assert isinstance(decoder, UNetDecoder)
 
@@ -297,8 +280,6 @@ def test_UNetDecoder_forward(device, pytestconfig):
         output_layer=output_layer,
         recurrent_block=recurrent_block,
         n_channels=n_channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
-        nside=(32, 16, 8),
     ).to(device)
 
     expected_size = torch.Size([b_size, out_channels, hw_size, hw_size])
@@ -326,8 +307,6 @@ def test_UNetDecoder_forward(device, pytestconfig):
         recurrent_block=None,
         n_channels=n_channels,
         dilations=(1, 1, 1),
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
-        nside=(32, 16, 8),
     ).to(device)
 
     outvar = decoder(invars)
@@ -389,8 +368,6 @@ def test_UNetDecoder_reset(device, pytestconfig):
         output_layer=output_layer,
         recurrent_block=recurrent_block,
         n_channels=n_channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
-        nside=(32, 16, 8),
     ).to(device)
 
     # build the list of tensors for the decoder
@@ -419,8 +396,6 @@ def test_UNetDecoder_reset(device, pytestconfig):
         output_layer=output_layer,
         recurrent_block=None,
         n_channels=n_channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
-        nside=(32, 16, 8),
     ).to(device)
 
     outvar = decoder(invars)

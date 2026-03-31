@@ -26,11 +26,6 @@ import torch
 from pytest_utils import import_or_fail
 
 
-def _hpx_padding_mode_for_device(device: str) -> str:
-    """Stack default is earth2grid (CUDA); CPU tests must use karlbauer."""
-    return "karlbauer" if device == "cpu" else "earth2grid"
-
-
 @pytest.fixture
 def test_data():
     # create dummy data
@@ -90,10 +85,7 @@ def test_ConvNeXtBlock_initialization(device, pytestconfig):
     )
 
     in_channels = 2
-    convnext_block = ConvNeXtBlock(
-        in_channels=in_channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
-    ).to(device)
+    convnext_block = ConvNeXtBlock(in_channels=in_channels).to(device)
     assert isinstance(convnext_block, ConvNeXtBlock)
 
     in_channels = 2
@@ -102,7 +94,6 @@ def test_ConvNeXtBlock_initialization(device, pytestconfig):
         in_channels=in_channels,
         out_channels=out_channels,
         activation=torch.nn.ReLU(),
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
     assert isinstance(convnext_block, ConvNeXtBlock)
 
@@ -118,10 +109,7 @@ def test_ConvNeXtBlock_forward(device, test_data, pytestconfig):
     in_channels = 2
     out_channels = 1
     tensor_size = 16
-    convnext_block = ConvNeXtBlock(
-        in_channels=in_channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
-    ).to(device)
+    convnext_block = ConvNeXtBlock(in_channels=in_channels).to(device)
 
     invar = test_data(img_size=tensor_size, device=device)
 
@@ -135,7 +123,6 @@ def test_ConvNeXtBlock_forward(device, test_data, pytestconfig):
         in_channels=in_channels,
         out_channels=out_channels,
         activation=torch.nn.ReLU(),
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
     assert outvar.shape == out_shape
 
@@ -155,7 +142,6 @@ def test_DoubleConvNeXtBlock_initialization(device, pytestconfig):
         in_channels=in_channels,
         out_channels=out_channels,
         latent_channels=latent_channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
     assert isinstance(doubleconvnextblock, DoubleConvNeXtBlock)
 
@@ -165,7 +151,6 @@ def test_DoubleConvNeXtBlock_initialization(device, pytestconfig):
         out_channels=out_channels,
         latent_channels=latent_channels,
         activation=torch.nn.ReLU(),
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
     assert isinstance(doubleconvnextblock, DoubleConvNeXtBlock)
 
@@ -186,7 +171,6 @@ def test_DoubleConvNeXtBlock_forward(device, test_data, pytestconfig):
         in_channels=in_channels,
         out_channels=out_channels,
         latent_channels=latent_channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
 
     invar = test_data(img_size=tensor_size, device=device)
@@ -201,7 +185,6 @@ def test_DoubleConvNeXtBlock_forward(device, test_data, pytestconfig):
         in_channels=in_channels,
         out_channels=out_channels,
         latent_channels=latent_channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
 
     outvar = doubleconvnextblock(invar)
@@ -221,7 +204,6 @@ def test_SymmetricConvNeXtBlock_initialization(device, pytestconfig):
     symmetric_convnextblock = SymmetricConvNeXtBlock(
         in_channels=in_channels,
         latent_channels=latent_channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
     assert isinstance(symmetric_convnextblock, SymmetricConvNeXtBlock)
 
@@ -230,7 +212,6 @@ def test_SymmetricConvNeXtBlock_initialization(device, pytestconfig):
         in_channels=in_channels,
         latent_channels=latent_channels,
         activation=torch.nn.ReLU(),
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
     assert isinstance(symmetric_convnextblock, SymmetricConvNeXtBlock)
 
@@ -249,7 +230,6 @@ def test_SymmetricConvNeXtBlock_forward(device, test_data, pytestconfig):
     symmetric_convnextblock = SymmetricConvNeXtBlock(
         in_channels=in_channels,
         latent_channels=latent_channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
 
     invar = test_data(img_size=tensor_size, device=device)
@@ -274,7 +254,6 @@ def test_Multi_SymmetricConvNeXtBlock_initialization(device, pytestconfig):
         in_channels=in_channels,
         latent_channels=latent_channels,
         activation=torch.nn.ReLU(),
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
     assert isinstance(multi_symmetric_convnextblock, Multi_SymmetricConvNeXtBlock)
 
@@ -294,7 +273,6 @@ def test_Multi_SymmetricConvNeXtBlock_forward(device, test_data, pytestconfig):
         in_channels=in_channels,
         latent_channels=latent_channels,
         activation=torch.nn.ReLU(),
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
     assert isinstance(multi_symmetric_convnextblock, Multi_SymmetricConvNeXtBlock)
 
@@ -320,7 +298,6 @@ def test_BasicConvBlock_initialization(device, pytestconfig):
     conv_block = BasicConvBlock(
         in_channels=in_channels,
         out_channels=out_channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
     assert isinstance(conv_block, BasicConvBlock)
 
@@ -330,7 +307,6 @@ def test_BasicConvBlock_initialization(device, pytestconfig):
         out_channels=out_channels,
         latent_channels=latent_channels,
         activation=torch.nn.ReLU(),
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
     assert isinstance(conv_block, BasicConvBlock)
 
@@ -349,7 +325,6 @@ def test_BasicConvBlock_forward(device, test_data, pytestconfig):
     conv_block = BasicConvBlock(
         in_channels=in_channels,
         out_channels=out_channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
 
     invar = test_data(
@@ -439,14 +414,11 @@ def test_TransposedConvUpsample_initialization(device, pytestconfig):
         TransposedConvUpsample,  #
     )
 
-    transposed_conv_upsample_block = TransposedConvUpsample(
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
-    ).to(device)
+    transposed_conv_upsample_block = TransposedConvUpsample().to(device)
     assert isinstance(transposed_conv_upsample_block, TransposedConvUpsample)
 
     transposed_conv_upsample_block = TransposedConvUpsample(
-        activation=torch.nn.ReLU(),
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
+        activation=torch.nn.ReLU()
     ).to(device)
     assert isinstance(transposed_conv_upsample_block, TransposedConvUpsample)
 
@@ -466,7 +438,6 @@ def test_TransposedConvUpsample_forward(device, test_data, pytestconfig):
     transposed_conv_upsample_block = TransposedConvUpsample(
         in_channels=in_channels,
         out_channels=out_channels,
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
     ).to(device)
 
     invar = test_data(faces=1, channels=in_channels, img_size=size, device=device)
@@ -476,8 +447,7 @@ def test_TransposedConvUpsample_forward(device, test_data, pytestconfig):
     assert outvar.shape == outsize
 
     transposed_conv_upsample_block = TransposedConvUpsample(
-        activation=torch.nn.ReLU(),
-        hpx_padding_mode=_hpx_padding_mode_for_device(device),
+        activation=torch.nn.ReLU()
     ).to(device)
 
     invar = test_data(faces=1, channels=(in_channels + 1), img_size=size, device=device)

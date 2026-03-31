@@ -158,12 +158,11 @@ class HEALPixLayer(th.nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Tensor whose face axis has size 12 (e.g. ``[N, 12, C, H, W]``).
+            Tensor of shape (B*F, C, H, W).
 
         Returns
         -------
         torch.Tensor
-            Output of the composed ``Sequential`` (same leading dimensions as ``x``,
-            except where the inner layer changes channel or spatial size).
+            Output of the composed ``Sequential`` of shape (B*F, C', H', W').
         """
         return self.layers(x)
