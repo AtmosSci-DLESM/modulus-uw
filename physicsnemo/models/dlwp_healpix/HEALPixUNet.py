@@ -148,7 +148,6 @@ class HEALPixUNet(Module):
             enable_nhwc=self.enable_nhwc,
             enable_healpixpad=self.enable_healpixpad,
         )
-        self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
             config=decoder,
             output_channels=self._compute_output_channels(),
