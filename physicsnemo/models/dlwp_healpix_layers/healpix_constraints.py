@@ -42,29 +42,25 @@ class NonnegativeConstraint(torch.nn.Module):
             f"model channels and will be ignored."
         )
 
-        var_indices = torch.tensor(
-            [self.channels.index(var) for var in self.variables],
-            dtype=torch.long
+        constrained_set = set(self.variables)
+        per_channel = [
+            (0.0 - scaling[name]["mean"]) / scaling[name]["std"]
+            if name in constrained_set
+            else float("-inf")
+            for name in self.channels
+        ]
+        thresholds = torch.tensor(per_channel, dtype=torch.float32).view(
+            1, 1, 1, -1, 1, 1
         )
-        self.register_buffer('var_indices', var_indices, persistent=False)
-
-        self.var_means = torch.tensor([scaling[var]['mean'] for var in self.variables])
-        self.var_stds = torch.tensor([scaling[var]['std'] for var in self.variables])
-
-        thresholds = (0. - self.var_means) / self.var_stds
-        thresholds = thresholds.view(1, 1, 1, -1, 1, 1)
-        self.register_buffer('thresholds', thresholds, persistent=False)
+        self.register_buffer("thresholds", thresholds, persistent=False)
 
     def forward(self, prediction, input):
         '''
         Tensors are expected to be in the shape [B, F, T, C, H, W]
         '''
-        x = prediction
-        selected_vars = torch.index_select(x, dim=3, index=self.var_indices)
-        clamped = torch.maximum(selected_vars, self.thresholds).to(x.dtype)
-        x.index_copy_(3, self.var_indices, clamped)
-
-        return x
+        return torch.maximum(
+            prediction, self.thresholds.to(dtype=prediction.dtype)
+        )
 
 class DryAirMassConstraint(torch.nn.Module):
     def __init__(
