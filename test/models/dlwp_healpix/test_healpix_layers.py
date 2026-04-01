@@ -115,6 +115,19 @@ HEALPixPadding_testdata = [
 ]
 
 
+def _healpix_layer_forward_cases():
+    """Param combos for test_HEALPixLayer_forward; earth2grid needs CUDA only."""
+    cases = []
+    for padding_mode in ("karlbauer", "isolatitude", "earth2grid"):
+        for device in ("cuda:0", "cpu"):
+            for multiplier in (2, 3, 4):
+                if padding_mode == "earth2grid":
+                    if device != "cuda:0" or not torch.cuda.is_available():
+                        continue
+                cases.append((padding_mode, device, multiplier))
+    return cases
+
+
 @import_or_fail("hydra")
 @pytest.mark.parametrize("device,padding", HEALPixPadding_testdata)
 def test_HEALPixPadding_initialization(device, padding, pytestconfig):
@@ -180,10 +193,10 @@ def test_HEALPixLayer_initialization(padding_mode, multiplier, pytestconfig):
 
 
 @import_or_fail("hydra")
-# @pytest.mark.parametrize("padding_mode,device,multiplier", HEALPixLayer_testdata)
-@pytest.mark.parametrize("padding_mode", ["karlbauer", "isolatitude", "earth2grid"])
-@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
-@pytest.mark.parametrize("multiplier", [2, 3, 4])
+@pytest.mark.parametrize(
+    "padding_mode,device,multiplier",
+    _healpix_layer_forward_cases(),
+)
 def test_HEALPixLayer_forward(padding_mode, device, multiplier, pytestconfig):
 
     from physicsnemo.models.dlwp_healpix_layers import (

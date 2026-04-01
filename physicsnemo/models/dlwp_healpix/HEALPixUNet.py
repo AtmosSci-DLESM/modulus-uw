@@ -235,7 +235,6 @@ class HEALPixUNet(Module):
             compile_padding=self.compile_padding,
             nside=self.nside,
         )
-        self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
             config=decoder,
             output_channels=self._compute_output_channels(),
