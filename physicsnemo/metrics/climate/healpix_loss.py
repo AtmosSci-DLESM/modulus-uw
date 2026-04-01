@@ -23,7 +23,7 @@ import xarray as xr
 import earth2grid
 from cuhpx import SHTCUDA, iSHTCUDA
 from earth2grid.healpix import HEALPIX_PAD_XY, PixelOrder
-from physicsnemo.models.dlwp_healpix_layers.healpix_layers import HEALPixPadding, HEALPixPaddingv2
+from physicsnemo.models.dlwp_healpix_layers.healpix_paddings import HEALPixPadding, HEALPixPaddingv2
 
 """
 Custom dlwp compatible loss classes that allow for more sophisticated training optimization.
@@ -778,7 +778,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
             if self.lambda_spec > 0:
 
-                with th.cuda.amp.autocast(enabled=False):
+                with th.amp.autocast('cuda', enabled=False):
                     # # Reorder predictions: [N, B, F, T, C, H, W] -> [N, B, T, C, F*H*W]
                     # pred_ring = self.reorder_to_ring(prediction.permute(0, 1, 3, 4, 2, 5, 6).reshape(n, b, t, c, f*h*w))
 
@@ -809,7 +809,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
             if self.multiscale > 0:
                 for scale in self.scales:
                     l_filter = self._l_filter(scale, device=prediction.device)
-                    with th.cuda.amp.autocast(enabled=False):
+                    with th.amp.autocast('cuda', enabled=False):
                         sht_pred= self._apply_sht(prediction, face_dim=2, return_abs=False)
                         sht_tar = self._apply_sht(target, face_dim=1, return_abs=False)
 
@@ -849,7 +849,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                 loss = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum(dim=(1,2))/(b*f*t*h*w)
 
                 if self.lambda_spec > 0:
-                    with th.cuda.amp.autocast(enabled=False):
+                    with th.amp.autocast('cuda', enabled=False):
                         # # Reorder predictions: [C, Cond, B, F, T, H, W] -> [C, Cond, B, T, F*H*W]
                         # pred_ring = self.reorder_to_ring(prediction.permute(0, 1, 2, 4, 3, 5, 6).reshape(c, n, b, t, f*h*w))
 
@@ -881,7 +881,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                 loss = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum()/(b*f*c*t*h*w)
 
                 if self.lambda_spec > 0:
-                    with th.cuda.amp.autocast(enabled=False):
+                    with th.amp.autocast('cuda', enabled=False):
                         # # Reorder predictions: [Cond, B, F, T, C, H, W] -> [Cond, B, T, C, F*H*W]
                         # pred_ring = self.reorder_to_ring(prediction.permute(0, 1, 3, 4, 2, 5, 6).reshape(n, b, t, c, f*h*w))
 
@@ -1024,6 +1024,9 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             in order consistent with order of model output channels
         n_members: int
             number of ensemble members in the model output
+        alpha: float
+            hyperparamter for approximating fair CRPS/energy score loss.
+            between 0 and 1, 1 corresponds to a fair CRPS/energy score loss.
         lsm_file: str
             path to the lsm file. Default is None, no lsm is applied.
         open_dict: dict
@@ -1033,9 +1036,9 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         patch_size: int
             size of the patch. Default is 3.
         use_earth2grid_padding: bool
-            whether to use earth2grid hpx padding. Default is False.
+            whether to use earth2grid hpx padding. Default is True.
         enable_nhwc: bool
-            whether to enable nhwc for the hpx padding. Default is False.
+            whether to enable nhwc for the hpx padding. Default is True.
         patch_weight_sigma : float, optional
             If provided, patch-vector norms are weighted by a Gaussian in
             distance from the patch center (weights sum to 1, center gets highest weight).
