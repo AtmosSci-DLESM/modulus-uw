@@ -65,32 +65,29 @@ class NonnegativeConstraint(torch.nn.Module):
 class DryAirMassConstraint(torch.nn.Module):
     def __init__(
         self,
-        channels: list[str],
+        in_channels: list[str],
+        out_channels: list[str],
         scaling: dict[str, dict[str, float]],
     ):
         """
         Parameters
         ----------
-        channels: list[str]
+        in_channels: list[str]
             List of all input channel names in the model.
+        out_channels: list[str]
+            List of all output channel names in the model.
         scaling: dict[str, dict[str, float]]
             Dictionary containing the mean and std for each variable.
         """
         super().__init__()
-        self.channels = channels
+        if out_channels is not None:
+            self.channels = out_channels
+        else:
+            self.channels = in_channels
         self.scaling = scaling
 
-        sp_idx = torch.tensor(
-            channels.index('sp'),
-            dtype=torch.long
-        )
-        self.register_buffer('sp_idx', sp_idx, persistent=False)
-
-        tcwv_idx = torch.tensor(
-            channels.index("tcwv"),
-            dtype=torch.long
-        )
-        self.register_buffer('tcwv_idx', tcwv_idx, persistent=False)
+        self.sp_channel_index = self.channels.index("sp")
+        self.tcwv_channel_index = self.channels.index("tcwv")
 
         ps_mean = torch.tensor(scaling['sp']['mean'])
         ps_std = torch.tensor(scaling['sp']['std'])
@@ -101,8 +98,8 @@ class DryAirMassConstraint(torch.nn.Module):
         self.register_buffer('tcwv_mean', tcwv_mean, persistent=False)
         self.register_buffer('tcwv_std', tcwv_std, persistent=False)
 
-        sp_channel_mask = torch.zeros(len(channels), dtype=torch.float32)
-        sp_channel_mask[channels.index("sp")] = 1.0
+        sp_channel_mask = torch.zeros(len(self.channels), dtype=torch.float32)
+        sp_channel_mask[self.sp_channel_index] = 1.0
         self.register_buffer(
             "sp_channel_mask",
             sp_channel_mask.view(1, 1, 1, -1, 1, 1),
@@ -118,21 +115,22 @@ class DryAirMassConstraint(torch.nn.Module):
         
         # Need to scale to physical units and compute small differences of large
         # surface pressures (in Pa), so disable autocast and force float32 precision
-        with torch.amp.autocast('cuda',enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             prediction = prediction.float()
             input = input.float()
 
-            # Get predicted sp and tcwv
-            sp = torch.index_select(prediction, dim=3, index=self.sp_idx)
+            # Slice on dim 3 with constant bounds (compile-friendly; avoids
+            # index_select + buffer index in backward).
+            sp = prediction[:, :, :, self.sp_channel_index : self.sp_channel_index + 1, :, :]
             sp = sp * self.ps_std + self.ps_mean
-            tcwv = torch.index_select(prediction, dim=3, index=self.tcwv_idx)
+            tcwv = prediction[:, :, :, self.tcwv_channel_index : self.tcwv_channel_index + 1, :, :]
             tcwv = tcwv * self.tcwv_std + self.tcwv_mean
 
             # Get sp and tcwv from last time step of input tensor. Used to 
             # compute initial dry air mass which is to be conserved.
-            sp_0 = torch.index_select(input, dim=3, index=self.sp_idx)[:, :, -1:]
+            sp_0 = input[:, :, -1:, self.sp_channel_index : self.sp_channel_index + 1, :, :]
             sp_0 = sp_0 * self.ps_std + self.ps_mean
-            tcwv_0 = torch.index_select(input, dim=3, index=self.tcwv_idx)[:, :, -1:]
+            tcwv_0 = input[:, :, -1:, self.tcwv_channel_index : self.tcwv_channel_index + 1, :, :]
             tcwv_0 = tcwv_0 * self.tcwv_std + self.tcwv_mean
 
             # Get predicted and initial dry sp
