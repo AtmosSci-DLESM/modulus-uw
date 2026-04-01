@@ -101,6 +101,14 @@ class DryAirMassConstraint(torch.nn.Module):
         self.register_buffer('tcwv_mean', tcwv_mean, persistent=False)
         self.register_buffer('tcwv_std', tcwv_std, persistent=False)
 
+        sp_channel_mask = torch.zeros(len(channels), dtype=torch.float32)
+        sp_channel_mask[channels.index("sp")] = 1.0
+        self.register_buffer(
+            "sp_channel_mask",
+            sp_channel_mask.view(1, 1, 1, -1, 1, 1),
+            persistent=False,
+        )
+
         self.g0 = 9.81
 
     def forward(self, prediction, input):
@@ -110,7 +118,7 @@ class DryAirMassConstraint(torch.nn.Module):
         
         # Need to scale to physical units and compute small differences of large
         # surface pressures (in Pa), so disable autocast and force float32 precision
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda',enabled=False):
             prediction = prediction.float()
             input = input.float()
 
@@ -138,6 +146,9 @@ class DryAirMassConstraint(torch.nn.Module):
             sp_corrected = torch.clamp(sp_corrected, min=0.)
             sp_corrected = (sp_corrected - self.ps_mean) / self.ps_std
 
-            prediction.index_copy_(3, self.sp_idx, sp_corrected)
+            mask = self.sp_channel_mask.to(
+                device=prediction.device, dtype=prediction.dtype
+            )
+            out = prediction * (1.0 - mask) + sp_corrected * mask
 
-            return prediction
+            return out

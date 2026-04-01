@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from physicsnemo.models.dlwp_healpix_layers.healpix_constraints import (
+    DryAirMassConstraint,
     NonnegativeConstraint,
 )
 
@@ -38,6 +39,107 @@ def _reference_forward(prediction, channels, constrained_names, scaling):
         1, 1, 1, -1, 1, 1
     )
     return torch.maximum(prediction, t.to(dtype=prediction.dtype))
+
+
+def _reference_dry_air_mass_forward(prediction, input_tensor, channels, scaling, g0=9.81):
+    """Legacy in-place write path; used only to validate the functional implementation."""
+    sp_idx = channels.index("sp")
+    tcwv_idx = channels.index("tcwv")
+    sp_idx_t = torch.tensor([sp_idx], dtype=torch.long)
+    tcwv_idx_t = torch.tensor([tcwv_idx], dtype=torch.long)
+
+    ps_mean = torch.tensor(scaling["sp"]["mean"], dtype=torch.float32)
+    ps_std = torch.tensor(scaling["sp"]["std"], dtype=torch.float32)
+    tcwv_mean = torch.tensor(scaling["tcwv"]["mean"], dtype=torch.float32)
+    tcwv_std = torch.tensor(scaling["tcwv"]["std"], dtype=torch.float32)
+
+    pred = prediction.float().clone()
+    inp = input_tensor.float().clone()
+
+    sp = torch.index_select(pred, dim=3, index=sp_idx_t)
+    sp_phys = sp * ps_std + ps_mean
+    tcwv = torch.index_select(pred, dim=3, index=tcwv_idx_t)
+    tcwv_phys = tcwv * tcwv_std + tcwv_mean
+
+    sp_0 = torch.index_select(inp, dim=3, index=sp_idx_t)[:, :, -1:]
+    sp_0 = sp_0 * ps_std + ps_mean
+    tcwv_0 = torch.index_select(inp, dim=3, index=tcwv_idx_t)[:, :, -1:]
+    tcwv_0 = tcwv_0 * tcwv_std + tcwv_mean
+
+    sp_dry = sp_phys - g0 * tcwv_phys
+    sp_0_dry = sp_0 - g0 * tcwv_0
+    correction = (sp_dry - sp_0_dry).mean(dim=[1, 4, 5], keepdim=True)
+    sp_corrected_phys = sp_phys - correction
+    sp_corrected_phys = torch.clamp(sp_corrected_phys, min=0.0)
+    sp_corrected = (sp_corrected_phys - ps_mean) / ps_std
+
+    pred.index_copy_(3, sp_idx_t, sp_corrected)
+    return pred
+
+
+def test_dry_air_mass_matches_reference_index_copy():
+    channels = ["t2m", "tcwv", "sp"]
+    scaling = {
+        "sp": {"mean": 100000.0, "std": 5000.0},
+        "tcwv": {"mean": 25.0, "std": 15.0},
+    }
+    mod = DryAirMassConstraint(channels=channels, scaling=scaling)
+    torch.manual_seed(42)
+    b, f, t, h, w = 2, 1, 3, 4, 4
+    c = len(channels)
+    prediction = torch.randn(b, f, t, c, h, w)
+    inp = torch.randn(b, f, t, c, h, w)
+    ref = _reference_dry_air_mass_forward(prediction, inp, channels, scaling)
+    out = mod(prediction, inp)
+    assert torch.allclose(out, ref)
+    assert not out.data_ptr() == prediction.data_ptr()
+
+
+def test_dry_air_mass_non_sp_channels_unchanged():
+    channels = ["tcwv", "sp", "x"]
+    scaling = {
+        "sp": {"mean": 1e5, "std": 1e3},
+        "tcwv": {"mean": 20.0, "std": 10.0},
+    }
+    mod = DryAirMassConstraint(channels=channels, scaling=scaling)
+    torch.manual_seed(7)
+    prediction = torch.randn(1, 1, 2, len(channels), 3, 3)
+    inp = torch.randn_like(prediction)
+    out = mod(prediction, inp)
+    for i, name in enumerate(channels):
+        if name != "sp":
+            assert torch.allclose(out[..., i, :, :], prediction[..., i, :, :])
+
+
+def test_dry_air_mass_sp_channel_mask_buffer():
+    channels = ["a", "sp", "tcwv", "b"]
+    scaling = {
+        "sp": {"mean": 0.0, "std": 1.0},
+        "tcwv": {"mean": 0.0, "std": 1.0},
+    }
+    mod = DryAirMassConstraint(channels=channels, scaling=scaling)
+    m = mod.sp_channel_mask.view(-1)
+    assert m.sum().item() == 1.0
+    assert m[channels.index("sp")].item() == 1.0
+
+
+def test_dry_air_mass_torch_compile_forward():
+    channels = ["tcwv", "sp"]
+    scaling = {
+        "sp": {"mean": 100000.0, "std": 5000.0},
+        "tcwv": {"mean": 25.0, "std": 15.0},
+    }
+    mod = DryAirMassConstraint(channels=channels, scaling=scaling)
+    torch.manual_seed(0)
+    prediction = torch.randn(1, 1, 2, 2, 3, 3)
+    inp = torch.randn(1, 1, 2, 2, 3, 3)
+    ref = mod(prediction, inp)
+    try:
+        compiled = torch.compile(mod)
+    except Exception:
+        pytest.skip("torch.compile not available or failed to compile")
+    out = compiled(prediction, inp)
+    assert torch.allclose(out, ref)
 
 
 def test_nonnegative_threshold_buffer_matches_formula():
