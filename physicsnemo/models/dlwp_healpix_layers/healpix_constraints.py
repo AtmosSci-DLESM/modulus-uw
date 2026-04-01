@@ -42,29 +42,25 @@ class NonnegativeConstraint(torch.nn.Module):
             f"model channels and will be ignored."
         )
 
-        var_indices = torch.tensor(
-            [self.channels.index(var) for var in self.variables],
-            dtype=torch.long
+        constrained_set = set(self.variables)
+        per_channel = [
+            (0.0 - scaling[name]["mean"]) / scaling[name]["std"]
+            if name in constrained_set
+            else float("-inf")
+            for name in self.channels
+        ]
+        thresholds = torch.tensor(per_channel, dtype=torch.float32).view(
+            1, 1, 1, -1, 1, 1
         )
-        self.register_buffer('var_indices', var_indices, persistent=False)
-
-        self.var_means = torch.tensor([scaling[var]['mean'] for var in self.variables])
-        self.var_stds = torch.tensor([scaling[var]['std'] for var in self.variables])
-
-        thresholds = (0. - self.var_means) / self.var_stds
-        thresholds = thresholds.view(1, 1, 1, -1, 1, 1)
-        self.register_buffer('thresholds', thresholds, persistent=False)
+        self.register_buffer("thresholds", thresholds, persistent=False)
 
     def forward(self, prediction, input):
         '''
         Tensors are expected to be in the shape [B, F, T, C, H, W]
         '''
-        x = prediction
-        selected_vars = torch.index_select(x, dim=3, index=self.var_indices)
-        clamped = torch.maximum(selected_vars, self.thresholds).to(x.dtype)
-        x.index_copy_(3, self.var_indices, clamped)
-
-        return x
+        return torch.maximum(
+            prediction, self.thresholds.to(dtype=prediction.dtype)
+        )
 
 class DryAirMassConstraint(torch.nn.Module):
     def __init__(
@@ -105,6 +101,14 @@ class DryAirMassConstraint(torch.nn.Module):
         self.register_buffer('tcwv_mean', tcwv_mean, persistent=False)
         self.register_buffer('tcwv_std', tcwv_std, persistent=False)
 
+        sp_channel_mask = torch.zeros(len(channels), dtype=torch.float32)
+        sp_channel_mask[channels.index("sp")] = 1.0
+        self.register_buffer(
+            "sp_channel_mask",
+            sp_channel_mask.view(1, 1, 1, -1, 1, 1),
+            persistent=False,
+        )
+
         self.g0 = 9.81
 
     def forward(self, prediction, input):
@@ -114,7 +118,7 @@ class DryAirMassConstraint(torch.nn.Module):
         
         # Need to scale to physical units and compute small differences of large
         # surface pressures (in Pa), so disable autocast and force float32 precision
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda',enabled=False):
             prediction = prediction.float()
             input = input.float()
 
@@ -142,6 +146,9 @@ class DryAirMassConstraint(torch.nn.Module):
             sp_corrected = torch.clamp(sp_corrected, min=0.)
             sp_corrected = (sp_corrected - self.ps_mean) / self.ps_std
 
-            prediction.index_copy_(3, self.sp_idx, sp_corrected)
+            mask = self.sp_channel_mask.to(
+                device=prediction.device, dtype=prediction.dtype
+            )
+            out = prediction * (1.0 - mask) + sp_corrected * mask
 
-            return prediction
+            return out
