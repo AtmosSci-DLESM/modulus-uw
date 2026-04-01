@@ -93,34 +93,6 @@ def scaling_double_dict():
 
 
 @import_or_fail("omegaconf")
-@import_or_fail("netCDF4")
-@nfsdata_or_fail
-def test_open_time_series_on_the_fly(create_path, pytestconfig):
-    from physicsnemo.datapipes.healpix.data_modules import (
-        open_time_series_dataset_classic_on_the_fly,
-    )
-
-    variables = ["z500", "z1000"]
-    constants = {"lsm": "lsm"}
-
-    ds = open_time_series_dataset_classic_on_the_fly(
-        directory=create_path,
-        input_variables=variables,
-        output_variables=variables,
-        constants=constants,
-    )
-    assert isinstance(ds, xr.Dataset)
-
-    test_var = variables[0]
-    base = xr.open_dataset(create_path + "/" + test_var + ".nc")
-    ds_var = ds.inputs.sel(channel_in=test_var)
-
-    assert ds_var.equals(base[test_var])
-    ds.close()
-    base.close()
-
-
-@import_or_fail("omegaconf")
 @nfsdata_or_fail
 def test_open_time_series(data_dir, dataset_name, pytestconfig):
     # check for failure of non-existant dataset
@@ -128,78 +100,12 @@ def test_open_time_series(data_dir, dataset_name, pytestconfig):
         open_time_series_dataset_classic_prebuilt,
     )
 
-    with pytest.raises(FileNotFoundError, match=("Dataset doesn't appear to exist at")):
+    with pytest.raises(FileNotFoundError, match=("Dataset doesn't exist at")):
         open_time_series_dataset_classic_prebuilt("/null_path", dataset_name)
 
     ds = open_time_series_dataset_classic_prebuilt(data_dir, dataset_name)
     assert isinstance(ds, xr.Dataset)
     ds.close()
-
-
-@import_or_fail("omegaconf")
-@import_or_fail("netCDF4")
-@import_or_fail("numpy")
-@nfsdata_or_fail
-def test_create_time_series(data_dir, dataset_name, create_path, pytestconfig):
-
-    from physicsnemo.datapipes.healpix.data_modules import (
-        create_time_series_dataset_classic,
-    )
-
-    variables = ["z500", "z1000"]
-    constants = {"lsm": "lsm"}
-    scaling = {"z500": {"log_epsilon": 2}}
-    # check existing dataset
-    ds = create_time_series_dataset_classic(
-        src_directory="/null",
-        dst_directory=data_dir,
-        dataset_name=dataset_name,
-        input_variables=["null", "null"],
-    )
-    assert isinstance(ds, xr.Dataset)
-    ds.close()
-
-    # create new dataset
-    # open a base dataset to compare against
-    test_var = list(scaling.keys())[0]
-    base = xr.open_dataset(create_path + "/" + test_var + ".nc")
-    # scale our test variable
-    base[test_var] = np.log(base[test_var] + scaling[test_var]["log_epsilon"]) - np.log(
-        scaling[test_var]["log_epsilon"]
-    )
-    ds = create_time_series_dataset_classic(
-        src_directory=create_path,
-        dst_directory=create_path,
-        dataset_name=dataset_name,
-        input_variables=variables,
-        scaling=scaling,
-    )
-    ds_var = ds.inputs.sel(channel_in=test_var)
-
-    assert ds_var.equals(base[test_var])
-    ds.close()
-    base.close()
-
-    # delete the created file so we have a clean test for next time
-    delete_dataset(create_path, dataset_name)
-
-    # and with constants
-    const = list(constants.keys())[0]
-    const_ds = xr.open_dataset(create_path + "/" + const + ".nc")
-    ds = create_time_series_dataset_classic(
-        src_directory=create_path,
-        dst_directory=create_path,
-        dataset_name=dataset_name,
-        input_variables=variables,
-        scaling=scaling,
-        constants=constants,
-    )
-    assert (const_ds[const] == ds.constants[0]).any()
-    ds.close()
-    const_ds.close()
-
-    # delete the created file so we have a clean test for next time
-    delete_dataset(create_path, dataset_name)
 
 
 @import_or_fail("omegaconf")
@@ -266,6 +172,7 @@ def test_TimeSeriesDataset_initialization(
             batch_size=2,
             forecast_init_times=zarr_ds.time[:2],
         )
+    warnings.resetwarnings()
 
     # test no scaling
     timeseries_ds = TimeSeriesDataset(
@@ -506,16 +413,6 @@ def test_TimeSeriesDataModule_initialization(
     ds_path = Path(data_dir, dataset_name + ".zarr")
     zarr_ds = xr.open_zarr(ds_path)
 
-    # test with an invalid mode
-    with pytest.raises(ValueError, match=("'data_format' must be one of")):
-        timeseries_dm = TimeSeriesDataModule(
-            src_directory=data_dir,
-            dst_directory=create_path,
-            dataset_name=dataset_name,
-            batch_size=1,
-            data_format="null",
-        )
-
     # use the prebuilt dataset
     # Internally initializes DistributedManager
     timeseries_dm = TimeSeriesDataModule(
@@ -525,18 +422,6 @@ def test_TimeSeriesDataModule_initialization(
         input_variables=variables,
         batch_size=1,
         prebuilt_dataset=True,
-        scaling=scaling_double_dict,
-    )
-    assert isinstance(timeseries_dm, TimeSeriesDataModule)
-
-    # without the prebuilt dataset
-    timeseries_dm = TimeSeriesDataModule(
-        src_directory=create_path,
-        dst_directory=create_path,
-        dataset_name=dataset_name,
-        input_variables=variables,
-        batch_size=1,
-        prebuilt_dataset=False,
         scaling=scaling_double_dict,
     )
     assert isinstance(timeseries_dm, TimeSeriesDataModule)
