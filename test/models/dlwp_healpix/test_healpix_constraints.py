@@ -83,7 +83,7 @@ def test_dry_air_mass_matches_reference_index_copy():
         "sp": {"mean": 100000.0, "std": 5000.0},
         "tcwv": {"mean": 25.0, "std": 15.0},
     }
-    mod = DryAirMassConstraint(channels=channels, scaling=scaling)
+    mod = DryAirMassConstraint(in_channels=channels, out_channels=channels, scaling=scaling)
     torch.manual_seed(42)
     b, f, t, h, w = 2, 1, 3, 4, 4
     c = len(channels)
@@ -101,7 +101,7 @@ def test_dry_air_mass_non_sp_channels_unchanged():
         "sp": {"mean": 1e5, "std": 1e3},
         "tcwv": {"mean": 20.0, "std": 10.0},
     }
-    mod = DryAirMassConstraint(channels=channels, scaling=scaling)
+    mod = DryAirMassConstraint(in_channels=channels, out_channels=channels, scaling=scaling)
     torch.manual_seed(7)
     prediction = torch.randn(1, 1, 2, len(channels), 3, 3)
     inp = torch.randn_like(prediction)
@@ -117,7 +117,7 @@ def test_dry_air_mass_sp_channel_mask_buffer():
         "sp": {"mean": 0.0, "std": 1.0},
         "tcwv": {"mean": 0.0, "std": 1.0},
     }
-    mod = DryAirMassConstraint(channels=channels, scaling=scaling)
+    mod = DryAirMassConstraint(in_channels=channels, out_channels=channels, scaling=scaling)
     m = mod.sp_channel_mask.view(-1)
     assert m.sum().item() == 1.0
     assert m[channels.index("sp")].item() == 1.0
@@ -129,7 +129,7 @@ def test_dry_air_mass_torch_compile_forward():
         "sp": {"mean": 100000.0, "std": 5000.0},
         "tcwv": {"mean": 25.0, "std": 15.0},
     }
-    mod = DryAirMassConstraint(channels=channels, scaling=scaling)
+    mod = DryAirMassConstraint(in_channels=channels, out_channels=channels, scaling=scaling)
     torch.manual_seed(0)
     prediction = torch.randn(1, 1, 2, 2, 3, 3)
     inp = torch.randn(1, 1, 2, 2, 3, 3)
@@ -140,6 +140,30 @@ def test_dry_air_mass_torch_compile_forward():
         pytest.skip("torch.compile not available or failed to compile")
     out = compiled(prediction, inp)
     assert torch.allclose(out, ref)
+
+
+def test_dry_air_mass_torch_compile_backward():
+    """Inductor failed on backward with index_select+buffer index; guard with aot backward."""
+    channels = ["tcwv", "sp"]
+    scaling = {
+        "sp": {"mean": 100000.0, "std": 5000.0},
+        "tcwv": {"mean": 25.0, "std": 15.0},
+    }
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    mod = DryAirMassConstraint(in_channels=channels, out_channels=channels, scaling=scaling).to(device)
+    try:
+        compiled = torch.compile(mod)
+    except Exception:
+        pytest.skip("torch.compile not available or failed to compile")
+    torch.manual_seed(1)
+    prediction = torch.randn(
+        1, 1, 2, 2, 4, 4, device=device, requires_grad=True
+    )
+    inp = torch.randn(1, 1, 2, 2, 4, 4, device=device)
+    out = compiled(prediction, inp)
+    out.sum().backward()
+    assert prediction.grad is not None
+    assert torch.isfinite(prediction.grad).all()
 
 
 def test_nonnegative_threshold_buffer_matches_formula():
