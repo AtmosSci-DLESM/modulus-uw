@@ -5,6 +5,16 @@ import xarray as xr
 
 logger = logging.getLogger(__name__)
 
+'''
+Constraints for the DLWP HEALPix model. All constraints should take two arguments:
+- prediction: the predicted tensor from the model
+- input: the input tensor to the model
+The constraint should return the prediction tensor with the constraints applied.
+Both the prediction and input tensors are expected to be in the shape [B, F, T, C, H, W].
+The input tensor may not be used for some constraints but is always expected as
+an input argument for consistency.
+'''
+
 class NonnegativeConstraint(torch.nn.Module):
     def __init__(
         self,

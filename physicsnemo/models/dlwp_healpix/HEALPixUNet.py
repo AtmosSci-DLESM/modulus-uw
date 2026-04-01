@@ -384,20 +384,21 @@ class HEALPixUNet(Module):
             encodings = self.encoder(input_tensor, **kwargs)
             decodings = self.decoder(encodings, **kwargs)
 
+            # Residual prediction
+            combined = self._reshape_outputs(decodings)
+            prognostics = combined[:, :, :, :self.input_channels]
             orig_input = self._reshape_outputs(input_tensor[:, : self.input_channels * self.input_time_dim])
-            output = self._reshape_outputs(decodings)
-
             if self.residual_prediction:
-                prediction = orig_input + output
-            else:
-                prediction = output
+                prognostics += orig_input
+            diagnostics = combined[:, :, :, self.input_channels:]
+            out = th.cat([prognostics, diagnostics], dim=3)
 
             # Apply constraints
             if self.constraints is not None:
                 for constraint in self.constraints:
-                    prediction = constraint(prediction, orig_input)
+                    out = constraint(out, orig_input)
 
-            outputs.append(prediction)
+            outputs.append(out)
 
         if output_only_last:
             res = outputs[-1]
