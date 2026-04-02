@@ -52,37 +52,62 @@ except ImportError:
     have_earth2grid = False
 
 _ENABLE_HEALPIXPAD_DEPRECATION_MSG = (
-    "enable_healpixpad is deprecated and has no effect; use hpx_padding_mode "
-    "instead (e.g. hpx_padding_mode='earth2grid' for earth2grid padding). To "
-    "reproduce the same behavior as enable_healpixpad=True, set hpx_padding_mode='earth2grid' "
-    "in the model config."
+    "enable_healpixpad is deprecated; use hpx_padding_mode instead "
+    "(e.g. hpx_padding_mode='earth2grid' for earth2grid CUDA padding, "
+    "hpx_padding_mode='karlbauer' for the pure PyTorch HEALPixPadding implementation). "
+    "To reproduce the same behavior as the legacy enable_healpixpad=True, "
+    "set hpx_padding_mode='earth2grid' in the model config."
 )
 
 
 def warn_deprecated_enable_healpixpad(
     enable_healpixpad: bool | None, hpx_padding_mode: str | None = None
-) -> None:
+) -> str:
     """
-    Emit ``DeprecationWarning`` when ``enable_healpixpad`` was explicitly set in a config
-    or call (any value other than the default ``None``).
+    Resolve ``hpx_padding_mode`` for module construction, accounting for deprecated
+    ``enable_healpixpad``.
+
+    ``hpx_padding_mode`` uses ``None`` in signatures to mean \"omitted\" (e.g. Hydra
+    default). Omitted values are treated as the implicit default ``earth2grid`` except
+    when ``enable_healpixpad`` is set and ``hpx_padding_mode`` was omitted: then
+    ``False`` maps to ``karlbauer`` (legacy behavior) and ``True`` to ``earth2grid``.
+
+    If ``hpx_padding_mode`` was explicitly provided (non-``None``), it wins over
+    ``enable_healpixpad`` after logging the deprecation warning.
+
+    Parameters
+    ----------
+    enable_healpixpad : bool or None
+        Deprecated flag from config or kwargs; ``None`` means not set.
+    hpx_padding_mode : str or None
+        Requested mode, or ``None`` if omitted (normalized to ``earth2grid`` before
+        applying legacy mapping).
+
+    Returns
+    -------
+    str
+        Resolved padding mode to store and pass to child modules.
     """
-    if enable_healpixpad is not None:
-        msg = _ENABLE_HEALPIXPAD_DEPRECATION_MSG
-        if hpx_padding_mode is not None:
-            msg = f"{msg} Current hpx_padding_mode={hpx_padding_mode!r}."
-        logger.warning(f"WARNING: {msg}")
+    hpx_padding_mode_explicit = hpx_padding_mode is not None
+    if hpx_padding_mode is None:
+        hpx_padding_mode = "earth2grid"
+    if enable_healpixpad is None:
+        return hpx_padding_mode
+    msg = _ENABLE_HEALPIXPAD_DEPRECATION_MSG
+    msg = f"{msg} Current hpx_padding_mode={hpx_padding_mode!r}, enable_healpixpad={enable_healpixpad!r}."
+    logger.warning(f"WARNING: {msg}")
+    if hpx_padding_mode_explicit:
+        return hpx_padding_mode
+    if enable_healpixpad:
+        return "earth2grid"
+    return "karlbauer"
 
 
-def pop_deprecated_enable_healpixpad_from_kwargs(
-    kwargs: dict, hpx_padding_mode: str | None = None
-) -> None:
-    """Remove ``enable_healpixpad`` from ``kwargs`` (e.g. before ``Conv2d``) and warn if present."""
+def pop_deprecated_enable_healpixpad_from_kwargs(kwargs: dict) -> bool | None:
+    """Remove ``enable_healpixpad`` from ``kwargs`` if present; return its value for legacy resolution."""
     if "enable_healpixpad" in kwargs:
-        kwargs.pop("enable_healpixpad")
-        msg = _ENABLE_HEALPIXPAD_DEPRECATION_MSG
-        if hpx_padding_mode is not None:
-            msg = f"{msg} Current hpx_padding_mode={hpx_padding_mode!r}."
-        logger.warning(f"WARNING: {msg}")
+        return bool(kwargs.pop("enable_healpixpad"))
+    return None
 
 
 class HEALPixFoldFaces(th.nn.Module):

@@ -37,7 +37,7 @@ class UNetEncoder(th.nn.Module):
         n_layers: Sequence = (2, 2, 1),
         dilations: list = None,
         enable_nhwc: bool = False,
-        hpx_padding_mode: str = 'earth2grid',
+        hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
         nside: Sequence[int] = (64, 32, 16),
         per_level_cln: Sequence[bool] = None,
@@ -65,7 +65,8 @@ class UNetEncoder(th.nn.Module):
         enable_nhwc: bool, optional
             If channel last format should be used
         hpx_padding_mode: str, optional
-            Passed through to HEALPix blocks (e.g. ``earth2grid`` for fast CUDA padding).
+            Passed through to HEALPix blocks. ``None`` (omitted) defaults to ``earth2grid``
+            unless deprecated ``enable_healpixpad`` is set without an explicit mode.
         compile_padding: bool, optional
             If True, apply torch compile to the padding module.
         nside: Sequence[int], optional
@@ -79,10 +80,10 @@ class UNetEncoder(th.nn.Module):
             If the checkpointing should be applied to each level of the encoder
             If None, the checkpointing will not be applied
         enable_healpixpad: bool, optional
-            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         if len(nside) != len(n_channels):
             raise ValueError(
                 f"nside must have the same length as n_channels ({len(n_channels)}), "

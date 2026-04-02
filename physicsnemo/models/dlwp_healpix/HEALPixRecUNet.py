@@ -73,7 +73,7 @@ class HEALPixRecUNet(Module):
         residual_prediction: bool = True,
         couplings_time_first: bool = True,
         constraints: list[DictConfig] = None,
-        hpx_padding_mode: str = 'earth2grid',
+        hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
         nside: Sequence[int] = (64, 32, 16),
         enable_healpixpad: bool | None = None,
@@ -119,8 +119,9 @@ class HEALPixRecUNet(Module):
             List of hydra instantiable DictConfigs specifying constraints 
             (e.g., nonnegativity) to be applied to the model outputs
         hpx_padding_mode: str, optional
-            Padding strategy: ``earth2grid`` (default; fast path on CUDA), ``karlbauer``,
-            or ``isolatitude``
+            Padding strategy: ``earth2grid``, ``karlbauer``, or ``isolatitude``.
+            ``None`` (omitted) defaults to ``earth2grid`` unless deprecated ``enable_healpixpad``
+            is set without an explicit ``hpx_padding_mode``.
         compile_padding: bool, optional
             If True, apply torch compile to the padding module.
         nside : Sequence[int], optional
@@ -128,10 +129,11 @@ class HEALPixRecUNet(Module):
             Length must match the encoder/decoder ``n_channels`` list length.
             Default ``(64, 32, 16)``.
         enable_healpixpad: bool, optional
-            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
+            Deprecated. When ``hpx_padding_mode`` is omitted, ``False`` maps to ``karlbauer``
+            and ``True`` to ``earth2grid`` (legacy configs). Prefer ``hpx_padding_mode``.
         """
         super().__init__()
-        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.channel_dim = 2  # Now 2 with [B, F, T*C, H, W]. Was 1 in old data format with [B, T*C, F, H, W]
 
         self.input_channels = input_channels

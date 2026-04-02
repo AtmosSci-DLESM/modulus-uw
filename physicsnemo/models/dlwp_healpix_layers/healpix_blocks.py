@@ -57,7 +57,7 @@ class ConvGRUBlock(th.nn.Module):
         in_channels: int = 3,
         kernel_size: int = 1,
         enable_nhwc: bool = False,
-        hpx_padding_mode: str = 'earth2grid',
+        hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
         nside: int = 64,
         enable_healpixpad: bool | None = None,
@@ -81,10 +81,10 @@ class ConvGRUBlock(th.nn.Module):
         nside: int, optional
             HEALPix face resolution.
         enable_healpixpad: bool, optional
-            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.channels = in_channels
         self.conv_gates = geometry_layer(
             layer=torch.nn.Conv2d,
@@ -163,7 +163,7 @@ class BasicConvBlock(th.nn.Module):
         latent_channels: int = None,
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
-        hpx_padding_mode: str = 'earth2grid',
+        hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
         nside: int = 64,
         enable_healpixpad: bool | None = None,
@@ -197,10 +197,10 @@ class BasicConvBlock(th.nn.Module):
         nside: int, optional
             HEALPix face resolution.
         enable_healpixpad: bool, optional
-            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         if latent_channels is None:
             latent_channels = max(in_channels, out_channels)
         convblock = []
@@ -254,7 +254,7 @@ class ConvNeXtBlock(th.nn.Module):
         upscale_factor: int = 4,
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
-        hpx_padding_mode: str = 'earth2grid',
+        hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
         nside: int = 64,
         enable_healpixpad: bool | None = None,
@@ -288,10 +288,10 @@ class ConvNeXtBlock(th.nn.Module):
         nside: int, optional
             HEALPix face resolution.
         enable_healpixpad: bool, optional
-            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         # Instantiate 1x1 conv to increase/decrease channel depth if necessary
         if in_channels == out_channels:
             self.skip_module = lambda x: x  # Identity-function required in forward pass
@@ -389,7 +389,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         latent_channels: int = 1,
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
-        hpx_padding_mode: str = 'earth2grid',
+        hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
         nside: int = 64,
         conditional_layer_norm: Callable = None,
@@ -426,10 +426,10 @@ class DoubleConvNeXtBlock(th.nn.Module):
         nside: int, optional
             HEALPix face resolution.
         enable_healpixpad: bool, optional
-            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.cln_enabled = conditional_layer_norm is not None
         
         if in_channels == int(latent_channels):
@@ -698,7 +698,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         n_layers: int = 1,
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
-        hpx_padding_mode: str = 'earth2grid',
+        hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
         nside: int = 64,
         dropout: float = 0.0,
@@ -727,10 +727,10 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         nside: int, optional
             HEALPix face resolution.
         enable_healpixpad: bool, optional
-            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         # Create a ModuleList to store complete blocks
         self.blocks = th.nn.ModuleList()
         # flag for conditional layer normalization
@@ -784,7 +784,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         use_block_skip_connection: bool = True,
-        hpx_padding_mode: str = 'earth2grid',
+        hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
         nside: int = 64,
         dropout: float = 0.0,
@@ -832,11 +832,11 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             the conditional layer normalization is applied only once, otherwise it is applied
             for each block.
         enable_healpixpad: bool, optional
-            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
 
         super().__init__()
-        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.use_block_skip_connection = use_block_skip_connection
         self.activation = activation
         self.dropout = dropout > 0.0
@@ -1024,7 +1024,7 @@ class MaxPool(th.nn.Module):
         geometry_layer: th.nn.Module = HEALPixLayer,
         pooling: int = 2,
         enable_nhwc: bool = False,
-        hpx_padding_mode: str = 'earth2grid',
+        hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
         nside: int = 64,
         enable_healpixpad: bool | None = None,
@@ -1046,10 +1046,10 @@ class MaxPool(th.nn.Module):
         nside: int, optional
             HEALPix face resolution.
         enable_healpixpad: bool, optional
-            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.maxpool = geometry_layer(
             layer=torch.nn.MaxPool2d,
             kernel_size=pooling,
@@ -1085,7 +1085,7 @@ class AvgPool(th.nn.Module):
         geometry_layer: th.nn.Module = HEALPixLayer,
         pooling: int = 2,
         enable_nhwc: bool = False,
-        hpx_padding_mode: str = 'earth2grid',
+        hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
         nside: int = 64,
         enable_healpixpad: bool | None = None,
@@ -1107,10 +1107,10 @@ class AvgPool(th.nn.Module):
         nside: int, optional
             HEALPix face resolution.
         enable_healpixpad: bool, optional
-            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.avgpool = geometry_layer(
             layer=torch.nn.AvgPool2d,
             kernel_size=pooling,
@@ -1152,7 +1152,7 @@ class TransposedConvUpsample(th.nn.Module):
         upsampling: int = 2,
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
-        hpx_padding_mode: str = 'earth2grid',
+        hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
         nside: int = 64,
         enable_healpixpad: bool | None = None,
@@ -1180,10 +1180,10 @@ class TransposedConvUpsample(th.nn.Module):
         nside: int, optional
             HEALPix face resolution.
         enable_healpixpad: bool, optional
-            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         upsampler = []
         # Upsample transpose conv
         upsampler.append(
