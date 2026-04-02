@@ -34,6 +34,7 @@ from .healpix_paddings import (
     HEALPixPaddingv2,
     have_earth2grid,
     pop_deprecated_enable_healpixpad_from_kwargs,
+    warn_deprecated_enable_healpixpad,
 )
 
 
@@ -51,7 +52,7 @@ class HEALPixLayer(th.nn.Module):
     def __init__(
         self,
         layer,
-        hpx_padding_mode="earth2grid",
+        hpx_padding_mode=None,
         nside: int = 64,
         compile_padding: bool = False,
         **kwargs,
@@ -63,7 +64,7 @@ class HEALPixLayer(th.nn.Module):
             Layer class (e.g. ``torch.nn.Conv2d``) or module; must match the
             detection logic for convolution vs interpolation vs other.
         hpx_padding_mode : str, optional
-            Which padding implementation to use:
+            Which padding implementation to use (``None`` means omitted; default ``earth2grid``):
             - ``"earth2grid"`` — ``earth2grid.healpix.pad`` (default).
             - ``"karlbauer"`` — Karlbauer et al. (2024) face stitching, same result as earth2grid but slower.
             - ``"isolatitude"`` — alternate padding scheme which preserves isolatitude signals.
@@ -81,7 +82,10 @@ class HEALPixLayer(th.nn.Module):
         super().__init__()
         layers = []
 
-        pop_deprecated_enable_healpixpad_from_kwargs(kwargs, hpx_padding_mode=hpx_padding_mode)
+        legacy_enable_healpixpad = pop_deprecated_enable_healpixpad_from_kwargs(kwargs)
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(
+            legacy_enable_healpixpad, hpx_padding_mode
+        )
 
         if "nside" in kwargs:
             nside = int(kwargs.pop("nside"))
