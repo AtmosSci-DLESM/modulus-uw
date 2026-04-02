@@ -52,8 +52,10 @@ except ImportError:
     have_earth2grid = False
 
 _ENABLE_HEALPIXPAD_DEPRECATION_MSG = (
-    "enable_healpixpad is deprecated and has no effect; use hpx_padding_mode instead "
-    "(e.g. hpx_padding_mode='earth2grid' for earth2grid padding)."
+    "enable_healpixpad is deprecated and has no effect; use hpx_padding_mode "
+    "instead (e.g. hpx_padding_mode='earth2grid' for earth2grid padding). To "
+    "reproduce the same behavior as enable_healpixpad=True, set hpx_padding_mode='earth2grid' "
+    "in the model config."
 )
 
 
