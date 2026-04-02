@@ -37,7 +37,6 @@ Details on the HEALPix can be found at https://iopscience.iop.org/article/10.108
 from __future__ import annotations
 
 import logging
-import warnings
 
 import torch as th
 
@@ -621,8 +620,21 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
                 f"invalid value for 'padding', expected int > 0 but got {padding}"
             )
         idx, valid = build_isolatitude_gather_index(padding, nside)
-        self.register_buffer("_index", idx, persistent=False)
-        self.register_buffer("_valid", valid, persistent=False)
+        self.register_buffer("_index0", idx[0], persistent=False) # always 1
+        self.register_buffer("_index1", idx[1].clamp_min(0), persistent=False)
+
+        # Boolean mask for the second gather source
+        v1_bool = valid[1]
+
+        # Active positions in the 2nd gather source are extremely sparse, 
+        # get the indices of the active positions
+        pos_v1 = th.nonzero(v1_bool, as_tuple=False).squeeze(1).to(dtype=th.long)
+        self.register_buffer("_pos_v1", pos_v1, persistent=False)
+        self.register_buffer(
+            "_index1_pos_v1",
+            self._index1.index_select(0, pos_v1) if pos_v1.numel() > 0 else self._index1[:0],
+            persistent=False,
+        )
 
     def forward(self, data: th.Tensor) -> th.Tensor:
         """
@@ -639,15 +651,11 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             ``[N * 12, C, H + 2*p, W + 2*p]``; numerically aligned with the reference
             module for the same ``padding`` and ``H``.
         """
-        # Forces fp32 internal computation and cast output back to original dtype.
-        # Profiling revealed that in both eager and compiled modes, this padding
-        # was faster with fp32 internal computation, regardless of the amp mode.
-        # This was mostly due to kernels related to scatter/gather operations being
-        # slower in non-fp32 dtypes.
-        orig_dtype = data.dtype
-        data = data.to(dtype=th.float32)
 
-        H, W = data.shape[-2:]
+        BF, C, H, W = data.shape
+        F = 12
+        B = BF // F
+
         if H != W:
             raise ValueError("HEALPix faces must be square (H == W)")
         if H != self._nside:
@@ -656,23 +664,34 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
                 f"(from init), but input has H={H}. Make sure that nside was set correctly "
                 f"in the model config."
             )
-
-        BF, C, _, _ = data.shape
-        F = 12
-        B = BF // F
+        
         x = data.reshape(B, F, C, H, W)
         flat = x.permute(0, 2, 1, 3, 4).reshape(B, C, F * H * W)
 
-        idx = self._index.to(device=flat.device)
-        valid = self._valid.to(device=flat.device)
-        v0 = valid[0].reshape(1, 1, -1).expand(B, C, -1)
-        v1 = valid[1].reshape(1, 1, -1).expand(B, C, -1)
-        i0 = idx[0].clamp_min(0)
-        i1 = idx[1].clamp_min(0)
-        g0 = flat.gather(dim=2, index=i0.view(1, 1, -1).expand(B, C, -1)) * v0
-        g1 = flat.gather(dim=2, index=i1.view(1, 1, -1).expand(B, C, -1)) * v1
-        denom = (v0 + v1).to(data.dtype)
-        out_flat = (g0 + g1) / denom
+        # Gather-based isolatitude pad.
+        # valid[0] is always 1, so output is:
+        #   out = g0                   (where valid1==0)
+        #   out = 0.5 * (g0 + g1)      (where valid1==1)
+        # and valid1==1 positions are extremely sparse.
+        i0 = self._index0.view(1, 1, -1).expand(B, C, -1)
+        g0 = flat.gather(dim=2, index=i0.to(device=data.device))
+
+        pos_v1 = self._pos_v1
+        if pos_v1.numel() > 0:
+            Nv1 = int(pos_v1.numel())
+            g0_sub = g0.index_select(dim=2, index=pos_v1.to(device=data.device))
+
+            i1_sub = self._index1_pos_v1.view(1, 1, Nv1).expand(B, C, Nv1)
+            g1_sub = flat.gather(dim=2, index=i1_sub.to(device=data.device))
+
+            # out[pos_v1] = 0.5 * (g0_sub + g1_sub)
+            #             = g0_sub + 0.5 * (g1_sub - g0_sub)
+            half = flat.new_tensor(0.5)
+            delta = (g1_sub - g0_sub) * half
+            out_flat = g0.clone()
+            out_flat.index_add_(dim=2, index=pos_v1.to(device=data.device), source=delta)
+        else:
+            out_flat = g0
 
         Hp, Wp = H + 2 * self.p, W + 2 * self.p
         out = out_flat.reshape(B, C, F, Hp, Wp).permute(0, 2, 1, 3, 4).reshape(
@@ -681,13 +700,12 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
         if self.enable_nhwc:
             out = out.to(memory_format=th.channels_last)
 
-        if out.dtype != orig_dtype:
-            out = out.to(dtype=orig_dtype)
-
         return out
 
 
-# --- Isolatitude padding helper functions ----------------
+# ------------------------------------------------------------
+# Isolatitude padding helper functions 
+# ------------------------------------------------------------
 
 def kth_diag_indices(n: int, k: int) -> tuple[th.Tensor, th.Tensor]:
     """
