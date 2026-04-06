@@ -40,6 +40,7 @@ class ConditionalLayerNorm(th.nn.Module):
         init_cln_to_zero: bool = False,
         scale_center: float = 0.0,
         ramp_epochs: Optional[int] = None,
+        ramp_start_epoch: int = 0,
         initial_lambda: Optional[float] = None,
     ):
         """
@@ -104,6 +105,7 @@ class ConditionalLayerNorm(th.nn.Module):
         self._lambda: float = 1.0
         self._max_lambda: float = float(initial_lambda) if initial_lambda is not None else 1.0
         self._ramp_epochs: Optional[int] = ramp_epochs
+        self._ramp_start_epoch: int = max(0, int(ramp_start_epoch))
 
         if init_cln_to_zero:
             self.gamma_mlp[-1].weight.data.zero_()
@@ -121,15 +123,28 @@ class ConditionalLayerNorm(th.nn.Module):
     def set_epoch(self, epoch: int) -> None:
         """Update effective lambda using a linear ramp over self._ramp_epochs epochs.
 
-        Lambda starts at 0 for epoch <= 0 and increases linearly to self._max_lambda
-        by epoch >= self._ramp_epochs, then stays constant. If ramping is disabled
-        (self._ramp_epochs is None or <= 0), lambda is fixed to self._max_lambda
-        (default 1.0) for backward-compatible behavior.
+        If ramping is disabled (self._ramp_epochs is None or <= 0), lambda is fixed to
+        self._max_lambda (default 1.0) for backward-compatible behavior.
+
+        Otherwise, lambda stays 0 for epoch < self._ramp_start_epoch, then increases
+        linearly to self._max_lambda over self._ramp_epochs steps.
+
+        For ramp_start_epoch == 0: t = epoch / ramp_epochs (epoch 0 has lambda 0).
+
+        For ramp_start_epoch > 0: first positive lambda is at epoch == ramp_start_epoch
+        using t = (epoch - ramp_start_epoch + 1) / ramp_epochs, reaching self._max_lambda
+        at epoch ramp_start_epoch + ramp_epochs - 1 (same ramp length as the start==0 case).
         """
         if self._ramp_epochs is None or self._ramp_epochs <= 0:
             self._lambda = self._max_lambda
             return
-        t = float(epoch) / float(self._ramp_epochs)
+        if epoch < self._ramp_start_epoch:
+            self._lambda = 0.0
+            return
+        if self._ramp_start_epoch > 0:
+            t = float(epoch - self._ramp_start_epoch + 1) / float(self._ramp_epochs)
+        else:
+            t = float(epoch) / float(self._ramp_epochs)
         if t < 0.0:
             t = 0.0
         elif t > 1.0:
@@ -163,6 +178,12 @@ class ConditionalLayerNorm(th.nn.Module):
             Normalized and conditioned tensor of shape: (B, C, H, W)
         """
 
+        # If conditions arrives as a single vector (1D), promote to batch-first (1, C)
+        # so that gamma_mlp sees a 2D tensor. This preserves the semantics of using
+        # one CLN vector broadcast across the batch while avoiding indexing errors.
+        if getattr(conditions, "ndim", -1) == 1:
+            conditions = conditions.unsqueeze(0)
+
         # normal layer norm without default scale, bias applied (permute to channels_last)
         x = x.permute(0, 2, 3, 1)
         x_norm = self.norm(x)
@@ -186,7 +207,8 @@ class ConditionalLayerNorm(th.nn.Module):
 
         # Apply and reshape to channels first
         x = gamma * x_norm + beta
-        return x.permute(0, 3, 1, 2)
+        out = x.permute(0, 3, 1, 2)
+        return out
 
 class AdaLNZero(th.nn.Module):
     def __init__(
@@ -380,6 +402,7 @@ class SPADE(th.nn.Module):
         conv_hidden_channels: Optional[int] = None,
         init_spade_to_zero: bool = True,
         ramp_epochs: Optional[int] = None,
+        ramp_start_epoch: int = 0,
         initial_lambda: Optional[float] = None,
     ):
         """
@@ -433,6 +456,7 @@ class SPADE(th.nn.Module):
         self._lambda: float = 1.0
         self._max_lambda: float = float(initial_lambda) if initial_lambda is not None else 1.0
         self._ramp_epochs: Optional[int] = ramp_epochs
+        self._ramp_start_epoch: int = max(0, int(ramp_start_epoch))
 
         self.shared_conv = th.nn.Conv2d(
             condition_shape, hidden_channels, kernel_size=3, padding=1
@@ -475,15 +499,22 @@ class SPADE(th.nn.Module):
     def set_epoch(self, epoch: int) -> None:
         """Update effective lambda using a linear ramp over self._ramp_epochs epochs.
 
-        Lambda starts at 0 for epoch <= 0 and increases linearly to self._max_lambda
-        by epoch >= self._ramp_epochs, then stays constant. If ramping is disabled
-        (self._ramp_epochs is None or <= 0), lambda is fixed to self._max_lambda
-        (default 1.0) for backward-compatible behavior.
+        If ramping is disabled (self._ramp_epochs is None or <= 0), lambda is fixed to
+        self._max_lambda (default 1.0) for backward-compatible behavior.
+
+        Otherwise, lambda stays 0 for epoch < self._ramp_start_epoch, then increases
+        linearly to self._max_lambda over self._ramp_epochs steps (same rules as ConditionalLayerNorm).
         """
         if self._ramp_epochs is None or self._ramp_epochs <= 0:
             self._lambda = self._max_lambda
             return
-        t = float(epoch) / float(self._ramp_epochs)
+        if epoch < self._ramp_start_epoch:
+            self._lambda = 0.0
+            return
+        if self._ramp_start_epoch > 0:
+            t = float(epoch - self._ramp_start_epoch + 1) / float(self._ramp_epochs)
+        else:
+            t = float(epoch) / float(self._ramp_epochs)
         if t < 0.0:
             t = 0.0
         elif t > 1.0:
@@ -590,6 +621,7 @@ class AdditiveSpatialNoise(th.nn.Module):
         num_faces: int = 12,
         seed: Optional[int] = None,
         ramp_epochs: Optional[int] = 5,
+        ramp_start_epoch: int = 0,
         initial_alpha: Optional[float] = None,
         init_M_to_zero: bool = True,
     ):
@@ -627,6 +659,7 @@ class AdditiveSpatialNoise(th.nn.Module):
         # constructor alpha for backward compatibility.
         self._max_alpha = float(initial_alpha) if initial_alpha is not None else float(alpha)
         self._ramp_epochs = ramp_epochs
+        self._ramp_start_epoch: int = max(0, int(ramp_start_epoch))
 
         H, W = spatial_size
         if mlp_hidden_dims is None:
@@ -668,14 +701,19 @@ class AdditiveSpatialNoise(th.nn.Module):
     def set_epoch(self, epoch: int) -> None:
         """Update effective alpha using a linear ramp over self._ramp_epochs epochs.
 
-        Alpha starts at 0 for epoch <= 0 and increases linearly to self._max_alpha
-        by epoch >= self._ramp_epochs, then stays constant. If ramping is disabled
-        (self._ramp_epochs is None or <= 0), this is a no-op.
+        If ramping is disabled (self._ramp_epochs is None or <= 0), this is a no-op.
+
+        Otherwise, alpha stays 0 for epoch < self._ramp_start_epoch, then ramps like CLN/SPADE.
         """
         if self._ramp_epochs is None or self._ramp_epochs <= 0:
             return
-        # Compute clamped fractional progress in [0, 1].
-        t = float(epoch) / float(self._ramp_epochs)
+        if epoch < self._ramp_start_epoch:
+            self.alpha = 0.0
+            return
+        if self._ramp_start_epoch > 0:
+            t = float(epoch - self._ramp_start_epoch + 1) / float(self._ramp_epochs)
+        else:
+            t = float(epoch) / float(self._ramp_epochs)
         if t < 0.0:
             t = 0.0
         elif t > 1.0:

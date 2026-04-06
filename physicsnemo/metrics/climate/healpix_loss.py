@@ -15,7 +15,9 @@
 # limitations under the License.
 
 from typing import Sequence, Optional
+import json
 import logging
+import time
 
 import math
 import numpy as np
@@ -37,6 +39,37 @@ losses should also redefine the forward function to contain a flag indicating wh
 average output channels. This is used in the varible wise logging of validation loss by the trainer. 
 
 """
+
+_DEBUG_ENSEMBLE_LOG_PATH = "/pscratch/sd/z/zespinos/.cursor/debug-6e7764.log"
+_DEBUG_SESSION_ID = "6e7764"
+
+
+def _debug_ensemble_rank0() -> bool:
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank() == 0
+    except Exception:
+        pass
+    return True
+
+
+def _debug_ensemble_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    try:
+        entry = {
+            "sessionId": _DEBUG_SESSION_ID,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+            "runId": "pre-fix",
+        }
+        with open(_DEBUG_ENSEMBLE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
 
 
 class BaseMSE(th.nn.MSELoss):
@@ -302,6 +335,8 @@ class WeightedOceanMSE(th.nn.MSELoss):
         self._spectral_hann = None
         self._spectral_nside = None
         self._spectral_first_forward_done = False
+        # Cached scalar components for TensorBoard logging
+        self.last_mse = None
         self.last_variogram = None
         self.last_spectral = None
 
@@ -609,6 +644,17 @@ class WeightedOceanMSE(th.nn.MSELoss):
         else:
             loss = ocean_mean_err / self.lsm_var_sum
 
+        # Cache the base MSE term (before adding variogram / spectral components)
+        try:
+            base_mse = loss.mean() if isinstance(loss, th.Tensor) and loss.ndim > 0 else loss
+            if isinstance(base_mse, th.Tensor):
+                self.last_mse = base_mse.detach()
+            else:
+                self.last_mse = None
+        except Exception:
+            # Never let logging-side bookkeeping affect the training loss
+            self.last_mse = None
+
         self.last_variogram = None
         self.last_spectral = None
 
@@ -780,6 +826,13 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         self.last_spread = None
         self.last_skill = None
         self.last_spread_skill_score = None
+        self._debug_ens_fwd_count = 0
+        self._dbg_training_epoch = -1
+        self._dbg_model_ref = None
+
+    def set_training_epoch(self, epoch: int) -> None:
+        """Trainer hook so diagnostics can correlate with the scheduler epoch index."""
+        self._dbg_training_epoch = int(epoch)
 
     def setup(self, trainer):
         """
@@ -798,6 +851,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
 
         if self.spectral_weight > 0:
             self._init_spectral_swaths(trainer)
+
+        self._dbg_model_ref = getattr(trainer, "model", None)
 
     def _compute_spread_skill_ssr(
         self,
@@ -1225,6 +1280,76 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             self.last_skill = None
             self.last_spread_skill_score = None
 
+        # #region agent log
+        self._debug_ens_fwd_count += 1
+        _dc = self._debug_ens_fwd_count
+        if _debug_ensemble_rank0() and n == 2 and (_dc <= 5 or _dc % 50 == 0):
+            with th.no_grad():
+                pd = prediction
+                d01 = (pd[0] - pd[1]).abs()
+                h1_max = float(d01.max())
+                h1_mean = float(d01.mean())
+                s2 = 0.5 * (pd[0] - pd[1]) ** 2
+                lsm_d = self.lsm_tensor.to(device=pd.device, dtype=pd.dtype)
+                weighted_s2 = s2 * lsm_d
+                m_eff = float(lsm_d.sum())
+                sum_w_s2_ch0 = float(weighted_s2[:, :, :, 0].sum())
+                h2_same_member = (
+                    float((pd[0, 0] - pd[0, 1]).abs().max())
+                    if b > 1
+                    else -1.0
+                )
+                ls = self.last_spread
+                ls_f = float(ls.detach()) if ls is not None and th.is_tensor(ls) else None
+                cln_lambda_sample = []
+                try:
+                    root = self._dbg_model_ref
+                    if root is not None:
+                        root = root.module if hasattr(root, "module") else root
+                        for m in root.modules():
+                            if m.__class__.__name__ == "ConditionalLayerNorm" and hasattr(
+                                m, "_lambda"
+                            ):
+                                cln_lambda_sample.append(float(getattr(m, "_lambda", -1.0)))
+                                if len(cln_lambda_sample) >= 8:
+                                    break
+                except Exception:
+                    pass
+                intl_m = None
+                try:
+                    pf = pd.reshape(n * b, f, t, c, h, w)
+                    intl_m = float(
+                        th.stack(
+                            [
+                                (pf[2 * i] - pf[2 * i + 1]).abs().max()
+                                for i in range(min(b, pf.shape[0] // 2))
+                            ]
+                        ).max()
+                    )
+                except Exception:
+                    pass
+                _debug_ensemble_log(
+                    "H1-H2-H3-H5",
+                    "healpix_loss.py:WeightedCRPSLoss.forward",
+                    "ensemble_pred_vs_spread_diag",
+                    {
+                        "call_idx": _dc,
+                        "trainer_epoch": int(getattr(self, "_dbg_training_epoch", -1)),
+                        "n_members": int(n),
+                        "b": int(b),
+                        "pred_shape": list(pd.shape),
+                        "m0_minus_m1_abs_max": h1_max,
+                        "m0_minus_m1_abs_mean": h1_mean,
+                        "same_member_diff_max_b0_b1": h2_same_member,
+                        "flat_interleaved_adjacent_max": intl_m,
+                        "cln_lambda_first_modules": cln_lambda_sample,
+                        "masked_sigma2_sum_channel0": sum_w_s2_ch0,
+                        "lsm_m_eff": m_eff,
+                        "last_spread_scalar": ls_f,
+                    },
+                )
+        # #endregion
+
         # Spectral term on unweighted fields (before channel weights)
         spec_loss = None
         if self.spectral_weight > 0.0 and self._spectral_lookup is not None:
@@ -1436,6 +1561,15 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         self.pdist = th.nn.PairwiseDistance(p=1)
         self.diag_mask = th.ones(self.n_members, self.n_members) - th.eye(self.n_members) # Mask to zero out diagonal elements
 
+        # Cached per-component loss scalars for TensorBoard logging
+        self.last_crps_base = None
+        self.last_spectral = None
+
+        # Cached ensemble diagnostics (spread/skill/SSR) for TensorBoard logging
+        self.last_spread = None
+        self.last_skill = None
+        self.last_spread_skill_score = None
+
 
     def setup(self, trainer):
         """
@@ -1456,8 +1590,55 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         if self.multiscale > 0:
             self.isht = self.isht.to(device=trainer.device)
             self.reorder_from_ring = self.reorder_from_ring.to(device=trainer.device)
-        if self.lsm_file is not None:
-            self.lsm_tensor = self.lsm_tensor.to(device=trainer.device)
+        # Move LSM tensor to the trainer device even when no lsm_file is provided.
+        # Spread/skill/SSR diagnostics use `self.lsm_tensor` unconditionally, so a
+        # CPU/GPU mismatch would otherwise cause diagnostics to silently fail.
+        self.lsm_tensor = self.lsm_tensor.to(device=trainer.device)
+
+    def _compute_spread_skill_ssr(self, prediction: th.Tensor, target: th.Tensor):
+        """
+        Compute domain-averaged spread, skill, and spread-skill ratio (SSR)
+        from the unweighted ensemble prediction and target.
+
+        prediction: [Cond, B, F, T, C, H, W]
+        target:     [B, F, T, C, H, W]
+        """
+        if prediction.ndim != 7 or target.ndim != 6:
+            raise ValueError(
+                f"_compute_spread_skill_ssr expects prediction [Cond, B, F, T, C, H, W] and target [B, F, T, C, H, W], "
+                f"got {prediction.shape} and {target.shape}"
+            )
+
+        n = self.n_members
+        if n < 2:
+            raise ValueError("Spread/skill diagnostics require at least 2 ensemble members")
+
+        # Ensemble mean at each grid point
+        mu = prediction.mean(dim=0)  # [B, F, T, C, H, W]
+
+        # Local ensemble variance with Bessel's correction (N-1 in denominator)
+        diff = prediction - mu.unsqueeze(0)  # [Cond, B, F, T, C, H, W]
+        sigma2 = (diff * diff).sum(dim=0) / float(max(n - 1, 1))  # [B, F, T, C, H, W]
+
+        # Local squared error of ensemble mean
+        se = (mu - target) ** 2  # [B, F, T, C, H, W]
+
+        # Apply land–sea mask as weight; mask is [1, F, 1, 1, H, W] or all ones
+        weighted_sigma2 = sigma2 * self.lsm_tensor  # [B, F, T, C, H, W]
+        weighted_se = se * self.lsm_tensor  # [B, F, T, C, H, W]
+
+        eps = 1e-8
+        m_eff = self.lsm_tensor.sum()
+
+        # Reduce over batch, faces, time, H, W – keep channels separate
+        spread_var_c = weighted_sigma2.sum(dim=(0, 1, 2, 4, 5)) / (m_eff + eps)  # [C]
+        skill_mse_c = weighted_se.sum(dim=(0, 1, 2, 4, 5)) / (m_eff + eps)  # [C]
+
+        spread_c = th.sqrt(spread_var_c + eps)  # [C]
+        skill_c = th.sqrt(skill_mse_c + eps)  # [C]
+        ssr_c = spread_c / (skill_c + eps)  # [C]
+
+        return spread_c.detach(), skill_c.detach(), ssr_c.detach()
 
     def _apply_sht(self, x, face_dim, return_abs=True):
         """Apply SHT to a tensor
@@ -1534,6 +1715,24 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         prediction = prediction.to(th.float32)
         target = target.to(th.float32)
 
+        # Reset cached diagnostics (avoid stale values if something goes wrong).
+        self.last_crps_base = None
+        self.last_spectral = None
+        self.last_spread = None
+        self.last_skill = None
+        self.last_spread_skill_score = None
+
+        # Ensemble spread/skill diagnostics on unweighted fields (before channel weights)
+        try:
+            spread, skill, ssr = self._compute_spread_skill_ssr(prediction, target)
+            self.last_spread = spread.mean().detach()
+            self.last_skill = skill.mean().detach()
+            self.last_spread_skill_score = ssr.mean().detach()
+        except Exception:
+            self.last_spread = None
+            self.last_skill = None
+            self.last_spread_skill_score = None
+
         # Apply channel weights across channel dims
         prediction *= self.loss_weights[None, None, None, None, :, None, None]
         target *= self.loss_weights[None, None, None, :, None, None]
@@ -1548,6 +1747,9 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                 loss = crps.mean()
             else:
                 loss = crps.mean(dim=(0, 1, 2, 4, 5))
+
+            # Cache base CRPS contribution before adding auxiliary spectral/multiscale terms
+            self.last_crps_base = loss.mean().detach()
 
             if self.lambda_spec > 0:
 
@@ -1577,7 +1779,16 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                     else:
                         spec_loss = crps_sht.mean(dim=(0, 1))
 
-                loss += self.lambda_spec * spec_loss
+                spectral_contrib = self.lambda_spec * spec_loss
+                loss = loss + spectral_contrib
+                # Log spectral contribution as a scalar (channel-averaged if needed)
+                self.last_spectral = (
+                    spectral_contrib.detach()
+                    if average_channels
+                    else spectral_contrib.mean().detach()
+                )
+            else:
+                self.last_spectral = None
             
             if self.multiscale > 0:
                 for scale in self.scales:
@@ -1621,6 +1832,9 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                 diff_terms = self.diag_mask[None, ...] * (diff.unsqueeze(1) + diff.unsqueeze(2)) # [C, Cond, Cond], diagonal elements zeroed out
                 loss = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum(dim=(1,2))/(b*f*t*h*w)
 
+                # Cache base CRPS contribution before adding auxiliary spectral term
+                self.last_crps_base = loss.mean().detach()
+
                 if self.lambda_spec > 0:
                     with th.cuda.amp.autocast(enabled=False):
                         # # Reorder predictions: [C, Cond, B, F, T, H, W] -> [C, Cond, B, T, F*H*W]
@@ -1642,7 +1856,15 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                         dist_matrix = self.pdist(sht_pred.unsqueeze(1), sht_pred.unsqueeze(2))  # [C, Cond, Cond]
                         
                         diff_terms = self.diag_mask[None, ...] * (diff.unsqueeze(1) + diff.unsqueeze(2)) # [C, Cond, Cond], diagonal elements zeroed out
-                        loss += self.lambda_spec * self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum(dim=(1,2))/(b*t*self.lmax*self.mmax)
+                        spectral_contrib = (
+                            self.lambda_spec
+                            * self.averaging_coeff
+                            * (diff_terms - self.coeff_eps * dist_matrix).sum(dim=(1,2))
+                            / (b * t * self.lmax * self.mmax)
+                        )
+
+                        loss = loss + spectral_contrib
+                        self.last_spectral = spectral_contrib.mean().detach()
 
             else:
                 pred = prediction.reshape(n, -1)
@@ -1652,6 +1874,9 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
                 diff_terms = self.diag_mask * (diff.unsqueeze(0) + diff.unsqueeze(1)) # [Cond, Cond], diagonal elements zeroed out
                 loss = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum()/(b*f*c*t*h*w)
+
+                # Cache base CRPS contribution before adding auxiliary spectral term
+                self.last_crps_base = loss.mean().detach()
 
                 if self.lambda_spec > 0:
                     with th.cuda.amp.autocast(enabled=False):
@@ -1673,7 +1898,14 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                         dist_matrix = self.pdist(sht_pred.unsqueeze(1), sht_pred.unsqueeze(0))  # [Cond, Cond] 
                         
                         diff_terms = self.diag_mask * (diff.unsqueeze(0) + diff.unsqueeze(1)) # [Cond, Cond], diagonal elements zeroed out
-                        loss += self.lambda_spec * self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum()/(b*t*self.lmax*self.mmax)
+                        spectral_contrib = (
+                            self.lambda_spec
+                            * self.averaging_coeff
+                            * (diff_terms - self.coeff_eps * dist_matrix).sum()
+                            / (b * t * self.lmax * self.mmax)
+                        )
+                        loss = loss + spectral_contrib
+                        self.last_spectral = spectral_contrib.detach()
 
             return loss
         
@@ -1874,6 +2106,12 @@ class CosineAnnealedOceanCRPSLoss(th.nn.Module):
             pass
         # #endregion
         self.current_epoch = max(0, int(epoch))
+        _inner = getattr(self, "crps_loss", None)
+        if _inner is not None and hasattr(_inner, "set_training_epoch"):
+            try:
+                _inner.set_training_epoch(epoch)
+            except Exception:
+                pass
 
     def set_training_step(self, step: int) -> None:
         """
