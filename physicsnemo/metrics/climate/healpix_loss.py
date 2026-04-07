@@ -338,7 +338,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             list of floats that determine weighting of variable loss, assumed to be
             in order consistent with order of model output channels
         n_members: int
-            number of ensemble members in the model output
+            number of ensemble members in the model output (1 is allowed for deterministic pretraining;
+            inter-member spread terms are zero)
         alpha: float
             hyperparamter for approximating fair CRPS loss. between 0 and 1, 1 corresponds to a fair CRPS loss.
         mean_penalty: float
@@ -357,10 +358,9 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         """
         super().__init__()
         self.loss_weights = th.tensor(weights)
-        if n_members < 2:
-            raise ValueError("n_members must be at least 2 for CRPS loss to be defined")
-        else:    
-            self.n_members = n_members
+        if n_members < 1:
+            raise ValueError("n_members must be at least 1 for CRPS loss to be defined")
+        self.n_members = n_members
         self.device = None
         self.mean_penalty = mean_penalty
         self.multiscale = multiscale
@@ -375,7 +375,9 @@ class WeightedCRPSLoss(th.nn.MSELoss):
 
         # Parameters for "almost fair CRPS" loss. See https://arxiv.org/html/2412.15832v1
         self.coeff_eps = 1 - ((1-alpha) / (n_members))
-        self.averaging_coeff = 1 / (2* n_members * (n_members - 1))
+        self.averaging_coeff = (
+            1 / (2 * n_members * (n_members - 1)) if n_members > 1 else 1.0
+        )
 
         # For n>2, will use pairwise distance to copmute [NxN] distance matrix
         # Diagonal elements of (prediciton - target) matrix are zeroed out to avoid double counting
@@ -399,7 +401,10 @@ class WeightedCRPSLoss(th.nn.MSELoss):
 
     def _2member_crps(self, prediction, target, lsm_tensor):
         diff_target = th.abs(prediction - target.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
-        diff_ensemble = th.abs(prediction[0] - prediction[1]) # [B, F, T, C, H, W]
+        if prediction.shape[0] >= 2:
+            diff_ensemble = th.abs(prediction[0] - prediction[1])  # [B, F, T, C, H, W]
+        else:
+            diff_ensemble = th.zeros_like(diff_target)
         crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
         crps *= lsm_tensor
         return crps
@@ -478,8 +483,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         prediction *= self.loss_weights[None, None, None, None, :, None, None]
         target *= self.loss_weights[None, None, None, :, None, None]
 
-        if n == 2:
-            # Use faster explicit implementation
+        if n <= 2:
+            # Explicit path for n_members 1 (pretrain) or 2
             crps = self._2member_crps(prediction, target, self.lsm_tensor)
 
             if average_channels:
@@ -607,7 +612,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
             list of floats that determine weighting of variable loss, assumed to be
             in order consistent with order of model output channels
         n_members: int
-            number of ensemble members in the model output
+            number of ensemble members in the model output (1 is allowed for deterministic pretraining;
+            inter-member spread terms are zero)
         alpha: float
             hyperparamter for approximating fair CRPS loss. between 0 and 1, 1 corresponds to a fair CRPS loss.
         lambda_spec: float
@@ -629,6 +635,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         """
         super().__init__()
         self.loss_weights = th.tensor(weights)
+        if n_members < 1:
+            raise ValueError("n_members must be at least 1 for CRPS loss to be defined")
         self.n_members = n_members
         self.device = None
         self.lambda_spec = lambda_spec
@@ -636,7 +644,9 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
         # Parameters for "almost fair CRPS" loss. See https://arxiv.org/html/2412.15832v1
         self.coeff_eps = 1 - ((1-alpha) / (n_members))
-        self.averaging_coeff = 1 / (2* n_members * (n_members - 1))
+        self.averaging_coeff = (
+            1 / (2 * n_members * (n_members - 1)) if n_members > 1 else 1.0
+        )
 
         # SHT utils: transform, grid reordering, output indexing
         self.lmax = lmax
@@ -683,8 +693,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         if self.multiscale > 0:
             self.isht = self.isht.to(device=trainer.device)
             self.reorder_from_ring = self.reorder_from_ring.to(device=trainer.device)
-        if self.lsm_file is not None:
-            self.lsm_tensor = self.lsm_tensor.to(device=trainer.device)
+        self.lsm_tensor = self.lsm_tensor.to(device=trainer.device)
 
     def _apply_sht(self, x, face_dim, return_abs=True):
         """Apply SHT to a tensor
@@ -765,10 +774,13 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         prediction *= self.loss_weights[None, None, None, None, :, None, None]
         target *= self.loss_weights[None, None, None, :, None, None]
 
-        if n == 2:
-            # Use faster explicit implementation
+        if n <= 2:
+            # Explicit path for n_members 1 (pretrain) or 2
             diff_target = th.abs(prediction - target.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
-            diff_ensemble = th.abs(prediction[0] - prediction[1]) # [B, F, T, C, H, W]
+            if n >= 2:
+                diff_ensemble = th.abs(prediction[0] - prediction[1])  # [B, F, T, C, H, W]
+            else:
+                diff_ensemble = th.zeros_like(diff_target)
             crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
 
             if average_channels:
@@ -795,7 +807,12 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                     sht_tar = self._apply_sht(target, face_dim=1, return_abs=True)
 
                     diff_sht_target = th.abs(sht_pred - sht_tar.unsqueeze(0)).sum(dim=(0, 4, 5)) # [B, T, C]
-                    diff_sht_ensemble = th.abs(sht_pred[0] - sht_pred[1]).sum(dim=(-1,-2)) # [B, T, C] 
+                    if n >= 2:
+                        diff_sht_ensemble = th.abs(sht_pred[0] - sht_pred[1]).sum(
+                            dim=(-1, -2)
+                        )  # [B, T, C]
+                    else:
+                        diff_sht_ensemble = th.zeros_like(diff_sht_target)
                     crps_sht = self.averaging_coeff * (diff_sht_target - self.coeff_eps * diff_sht_ensemble) # [B, T, C]
 
                     # Compute spectral afCRPS
@@ -820,7 +837,10 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                         tar_smooth = self._apply_isht(l_filter_tar * sht_tar, face_dim=1)
 
                         diff_target = th.abs(pred_smooth - tar_smooth.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
-                        diff_ensemble = th.abs(pred_smooth[0] - pred_smooth[1]) # [B, F, T, C, H, W]
+                        if n >= 2:
+                            diff_ensemble = th.abs(pred_smooth[0] - pred_smooth[1])  # [B, F, T, C, H, W]
+                        else:
+                            diff_ensemble = th.zeros_like(diff_target)
                         crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
 
                         crps *= self.lsm_tensor
