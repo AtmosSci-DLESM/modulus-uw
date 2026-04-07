@@ -401,7 +401,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
 
     def _2member_crps(self, prediction, target, lsm_tensor):
         diff_target = th.abs(prediction - target.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
-        if prediction.shape[0] >= 2:
+        if prediction.shape[0] == 2:
             diff_ensemble = th.abs(prediction[0] - prediction[1])  # [B, F, T, C, H, W]
         else:
             diff_ensemble = th.zeros_like(diff_target)
@@ -777,7 +777,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         if n <= 2:
             # Explicit path for n_members 1 (pretrain) or 2
             diff_target = th.abs(prediction - target.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
-            if n >= 2:
+            if n == 2:
                 diff_ensemble = th.abs(prediction[0] - prediction[1])  # [B, F, T, C, H, W]
             else:
                 diff_ensemble = th.zeros_like(diff_target)
@@ -807,7 +807,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                     sht_tar = self._apply_sht(target, face_dim=1, return_abs=True)
 
                     diff_sht_target = th.abs(sht_pred - sht_tar.unsqueeze(0)).sum(dim=(0, 4, 5)) # [B, T, C]
-                    if n >= 2:
+                    if n == 2:
                         diff_sht_ensemble = th.abs(sht_pred[0] - sht_pred[1]).sum(
                             dim=(-1, -2)
                         )  # [B, T, C]
@@ -837,7 +837,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                         tar_smooth = self._apply_isht(l_filter_tar * sht_tar, face_dim=1)
 
                         diff_target = th.abs(pred_smooth - tar_smooth.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
-                        if n >= 2:
+                        if n == 2:
                             diff_ensemble = th.abs(pred_smooth[0] - pred_smooth[1])  # [B, F, T, C, H, W]
                         else:
                             diff_ensemble = th.zeros_like(diff_target)
