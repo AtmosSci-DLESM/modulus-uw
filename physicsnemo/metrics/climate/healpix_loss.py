@@ -1012,7 +1012,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         selection_dict: dict = {"channel_c": "land_sea_mask"},
         patch_size: int = 3,
         hpx_padding_mode: str = "earth2grid",
-        enable_nhwc: bool = False,
+        enable_nhwc: bool = True,
         nside: int = 64,
         patch_weight_sigma: float = None,
     ):
@@ -1035,7 +1035,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         hpx_padding_mode: str
             HPX padding scheme to use. Default is "earth2grid".
         enable_nhwc: bool
-            whether to enable nhwc for the hpx padding. Default is False.
+            whether to enable nhwc for the hpx padding. Default is True.
         nside: int
             nside for the HEALPix grid. Default is 64.
         patch_weight_sigma : float, optional
@@ -1086,17 +1086,21 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         # HEALPix padding module (expects [..., F, H, W])
         if self.patch_radius > 0:
             if self.hpx_padding_mode == "earth2grid":
-                if not have_earth2grid or not th.cuda.is_available() or self.enable_nhwc:
+                if not have_earth2grid or not th.cuda.is_available():
                     raise ValueError(
-                        f"hpx_padding_mode=earth2grid requires earth2grid to be installed, "
-                        f"CUDA, and enable_nhwc=False. "
+                        f"hpx_padding_mode=earth2grid requires earth2grid to be installed and CUDA. "
                         f"Got have_earth2grid={have_earth2grid}, "
-                        f"th.cuda.is_available()={th.cuda.is_available()}, "
-                        f"enable_nhwc={self.enable_nhwc}"
+                        f"th.cuda.is_available()={th.cuda.is_available()}"
                     )
-                self.hpx_pad = HEALPixPaddingv2(padding=self.patch_radius)
+                self.hpx_pad = HEALPixPaddingv2(
+                    padding=self.patch_radius,
+                    enable_nhwc=self.enable_nhwc
+                )
             elif self.hpx_padding_mode == "karlbauer":
-                self.hpx_pad = HEALPixPadding(padding=self.patch_radius, enable_nhwc=self.enable_nhwc)
+                self.hpx_pad = HEALPixPadding(
+                    padding=self.patch_radius,
+                    enable_nhwc=self.enable_nhwc,
+                )
             elif self.hpx_padding_mode == "isolatitude":
                 self.hpx_pad = HEALPixPaddingIsolatitude(
                     padding=self.patch_radius,

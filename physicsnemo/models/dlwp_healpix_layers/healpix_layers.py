@@ -120,16 +120,13 @@ class HEALPixLayer(th.nn.Module):
             padding = ((kernel_size - 1) // 2) * dilation
 
             if hpx_padding_mode == "earth2grid":
-                if (
-                    have_earth2grid
-                    and th.cuda.is_available()
-                    and not enable_nhwc
-                ):  # pragma: no cover
-                    padding_layer = HEALPixPaddingv2(padding=padding)
+                if have_earth2grid and th.cuda.is_available():  # pragma: no cover
+                    padding_layer = HEALPixPaddingv2(
+                        padding=padding, enable_nhwc=enable_nhwc
+                    )
                 else:
                     raise ValueError(
-                        "hpx_padding_mode=earth2grid requires earth2grid import, "
-                        "CUDA, and enable_nhwc=False."
+                        "hpx_padding_mode=earth2grid requires earth2grid import and CUDA."
                     )
             elif hpx_padding_mode == "karlbauer":
                 padding_layer = HEALPixPadding(padding=padding, enable_nhwc=enable_nhwc)

@@ -15,7 +15,7 @@
 # limitations under the License.
 
 """
-HEALPix padding modules (Karlbauer, earth2grid v2, isolatitude reference and optimized).
+HEALPix padding modules (earth2grid, karlbauer, isolatitude).
 
          HEALPix                              Face order                 3D array representation
                                                                             -----------------
@@ -198,16 +198,19 @@ class HEALPixPaddingv2(th.nn.Module):
     TODO: Missing library to use this class. Need to see if we can get it, if not needs to be removed
     """
 
-    def __init__(self, padding: int):  # pragma: no cover
+    def __init__(self, padding: int, enable_nhwc: bool = False):  # pragma: no cover
         """
         Parameters
         ----------
-        padding: int
+        padding : int
             The padding size
+        enable_nhwc : bool, optional
+            Whether to use channels-last memory format.
         """
         super().__init__()
-        self.unfold = HEALPixUnfoldFaces(num_faces=12)
-        self.fold = HEALPixFoldFaces()
+        self.enable_nhwc = enable_nhwc
+        self.unfold = HEALPixUnfoldFaces(num_faces=12, enable_nhwc=self.enable_nhwc)
+        self.fold = HEALPixFoldFaces(enable_nhwc=self.enable_nhwc)
         self.padding = lambda x: healpix_pad(x, padding=padding)
 
     def forward(self, x):  # pragma: no cover
@@ -229,6 +232,9 @@ class HEALPixPaddingv2(th.nn.Module):
         x = self.unfold(x)
         xp = self.padding(x)
         xp = self.fold(xp)
+
+        if self.enable_nhwc:
+            xp = xp.to(memory_format=th.channels_last)
 
         return xp
 
