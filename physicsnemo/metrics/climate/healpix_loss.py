@@ -1033,7 +1033,9 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         patch_size: int
             size of the patch. Default is 3.
         hpx_padding_mode: str
-            HPX padding scheme to use. Default is "earth2grid".
+            HPX padding scheme to use. Options are "earth2grid", "karlbauer", and "isolatitude".
+            Default is "earth2grid". More info about padding schemes can be found in
+            physicsnemo.models.dlwp_healpix_layers.healpix_paddings.
         enable_nhwc: bool
             whether to enable nhwc for the hpx padding. Default is True.
         nside: int
