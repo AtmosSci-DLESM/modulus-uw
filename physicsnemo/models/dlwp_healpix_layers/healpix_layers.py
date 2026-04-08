@@ -52,7 +52,7 @@ class HEALPixLayer(th.nn.Module):
         self,
         layer,
         hpx_padding_mode=None,
-        nside: int = 64,
+        nside: int | None = None,
         compile_padding: bool = False,
         **kwargs,
     ):
@@ -67,8 +67,9 @@ class HEALPixLayer(th.nn.Module):
             - ``"earth2grid"`` — ``earth2grid.healpix.pad`` (default).
             - ``"karlbauer"`` — Karlbauer et al. (2024) face stitching, same result as earth2grid but slower.
             - ``"isolatitude"`` — alternate padding scheme which preserves isolatitude signals.
-        nside : int, optional
-            Native resolution of each HEALPix face (height = width = ``nside``).
+        nside : int or None, optional
+            Native resolution of each HEALPix face (height = width). Required when
+            ``hpx_padding_mode=="isolatitude"``.
         compile_padding : bool, optional
             Whether to wrap isolatitude padding in ``_CompilePaddingWrapper``. Only
             supported when ``hpx_padding_mode="isolatitude"``.
@@ -87,7 +88,8 @@ class HEALPixLayer(th.nn.Module):
         )
 
         if "nside" in kwargs:
-            nside = int(kwargs.pop("nside"))
+            _ns = kwargs.pop("nside")
+            nside = int(_ns) if _ns is not None else None
         if "compile_padding" in kwargs:
             compile_padding = bool(kwargs.pop("compile_padding"))
 
@@ -131,7 +133,12 @@ class HEALPixLayer(th.nn.Module):
             elif hpx_padding_mode == "karlbauer":
                 padding_layer = HEALPixPadding(padding=padding, enable_nhwc=enable_nhwc)
             elif hpx_padding_mode == "isolatitude":
-                padding_layer =  HEALPixPaddingIsolatitude(
+                if nside is None:
+                    raise ValueError(
+                        'hpx_padding_mode="isolatitude" requires nside (positive int, '
+                        "native face height/width) to build gather indices."
+                    )
+                padding_layer = HEALPixPaddingIsolatitude(
                     padding=padding,
                     nside=nside,
                     enable_nhwc=enable_nhwc,
