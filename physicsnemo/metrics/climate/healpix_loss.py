@@ -23,7 +23,7 @@ import xarray as xr
 import earth2grid
 from cuhpx import SHTCUDA, iSHTCUDA
 from earth2grid.healpix import HEALPIX_PAD_XY, PixelOrder
-from physicsnemo.models.dlwp_healpix_layers.healpix_paddings import HEALPixPadding, HEALPixPaddingv2, HEALPixPaddingIsolatitude, have_earth2grid
+from physicsnemo.models.dlwp_healpix_layers.healpix_paddings import make_hpx_padding_layer
 """
 Custom dlwp compatible loss classes that allow for more sophisticated training optimization.
 
@@ -1013,7 +1013,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         patch_size: int = 3,
         hpx_padding_mode: str = "earth2grid",
         enable_nhwc: bool = True,
-        nside: int = 64,
+        nside: int | None = None,
         patch_weight_sigma: float = None,
     ):
         """
@@ -1038,8 +1038,8 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             physicsnemo.models.dlwp_healpix_layers.healpix_paddings.
         enable_nhwc: bool
             whether to enable nhwc for the hpx padding. Default is True.
-        nside: int
-            nside for the HEALPix grid. Default is 64.
+        nside: int or None, optional
+            Native HEALPix face height/width; default ``None``.
         patch_weight_sigma : float, optional
             If provided, patch-vector norms are weighted by a Gaussian in
             distance from the patch center (weights sum to 1, center gets highest weight).
@@ -1087,33 +1087,12 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         self.diag_mask = th.ones(self.n_members, self.n_members) - th.eye(self.n_members)
         # HEALPix padding module (expects [..., F, H, W])
         if self.patch_radius > 0:
-            if self.hpx_padding_mode == "earth2grid":
-                if not have_earth2grid or not th.cuda.is_available():
-                    raise ValueError(
-                        f"hpx_padding_mode=earth2grid requires earth2grid to be installed and CUDA. "
-                        f"Got have_earth2grid={have_earth2grid}, "
-                        f"th.cuda.is_available()={th.cuda.is_available()}"
-                    )
-                self.hpx_pad = HEALPixPaddingv2(
-                    padding=self.patch_radius,
-                    enable_nhwc=self.enable_nhwc
-                )
-            elif self.hpx_padding_mode == "karlbauer":
-                self.hpx_pad = HEALPixPadding(
-                    padding=self.patch_radius,
-                    enable_nhwc=self.enable_nhwc,
-                )
-            elif self.hpx_padding_mode == "isolatitude":
-                self.hpx_pad = HEALPixPaddingIsolatitude(
-                    padding=self.patch_radius,
-                    enable_nhwc=self.enable_nhwc,
-                    nside=self.nside,
-                )
-            else:
-                raise ValueError(
-                    f"Invalid HPX padding mode: {self.hpx_padding_mode}, "
-                    f"expected one of ['earth2grid', 'karlbauer', 'isolatitude']"
-                )
+            self.hpx_pad = make_hpx_padding_layer(
+                padding=self.patch_radius,
+                hpx_padding_mode=self.hpx_padding_mode,
+                enable_nhwc=self.enable_nhwc,
+                nside=self.nside,
+            )
         else:
             self.hpx_pad = None
 
