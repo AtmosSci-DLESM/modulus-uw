@@ -177,6 +177,21 @@ def test_HEALPixPadding_forward(device, padding, pytestconfig):
 
 
 @import_or_fail("hydra")
+def test_HEALPixLayer_isolatitude_requires_nside(pytestconfig):
+    """Isolatitude padding needs nside to build gather indices."""
+    from physicsnemo.models.dlwp_healpix_layers import HEALPixLayer
+
+    with pytest.raises(ValueError, match="isolatitude"):
+        HEALPixLayer(
+            layer=torch.nn.Conv2d,
+            hpx_padding_mode="isolatitude",
+            in_channels=2,
+            out_channels=2,
+            kernel_size=3,
+        )
+
+
+@import_or_fail("hydra")
 @pytest.mark.parametrize("padding_mode", ["karlbauer", "isolatitude", "earth2grid"])
 @pytest.mark.parametrize("multiplier", [2, 3, 4])
 def test_HEALPixLayer_initialization(padding_mode, multiplier, pytestconfig):

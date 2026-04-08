@@ -60,7 +60,7 @@ class ConvGRUBlock(th.nn.Module):
         enable_nhwc: bool = False,
         hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
-        nside: int = 64,
+        nside: int | None = None,
         enable_healpixpad: bool | None = None,
     ):
         """
@@ -79,8 +79,9 @@ class ConvGRUBlock(th.nn.Module):
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
             If True, apply torch compile to the padding module.
-        nside: int, optional
-            HEALPix face resolution.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
             Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
@@ -166,7 +167,7 @@ class BasicConvBlock(th.nn.Module):
         enable_nhwc: bool = False,
         hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
-        nside: int = 64,
+        nside: int | None = None,
         enable_healpixpad: bool | None = None,
     ):
         """
@@ -195,8 +196,9 @@ class BasicConvBlock(th.nn.Module):
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
             If True, apply torch compile to the padding module.
-        nside: int, optional
-            HEALPix face resolution.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
             Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
@@ -257,7 +259,7 @@ class ConvNeXtBlock(th.nn.Module):
         enable_nhwc: bool = False,
         hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
-        nside: int = 64,
+        nside: int | None = None,
         enable_healpixpad: bool | None = None,
     ):
         """
@@ -286,8 +288,9 @@ class ConvNeXtBlock(th.nn.Module):
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
             If True, apply torch compile to the padding module.
-        nside: int, optional
-            HEALPix face resolution.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
             Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
@@ -392,7 +395,7 @@ class DoubleConvNeXtBlock(th.nn.Module):
         enable_nhwc: bool = False,
         hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
-        nside: int = 64,
+        nside: int | None = None,
         conditional_layer_norm: Callable = None,
         conditional_layer_norm_once: bool = False,
         dropout: float = 0.0,
@@ -424,8 +427,9 @@ class DoubleConvNeXtBlock(th.nn.Module):
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
             If True, apply torch compile to the padding module.
-        nside: int, optional
-            HEALPix face resolution.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
             Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
@@ -701,7 +705,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         enable_nhwc: bool = False,
         hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
-        nside: int = 64,
+        nside: int | None = None,
         dropout: float = 0.0,
         conditional_layer_norm: Callable = None,
         conditional_layer_norm_once: bool = False,
@@ -725,8 +729,9 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
             If True, apply torch compile to the padding module.
-        nside: int, optional
-            HEALPix face resolution.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
             Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
@@ -787,7 +792,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         use_block_skip_connection: bool = True,
         hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
-        nside: int = 64,
+        nside: int | None = None,
         dropout: float = 0.0,
         conditional_layer_norm: th.nn.Module = None,
         conditional_layer_norm_once: bool = False,
@@ -821,8 +826,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
             If True, apply torch compile to the padding module.
-        nside: int, optional
-            HEALPix face resolution.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         dropout: float, optional
             Dropout probability to apply after the first convolution
         conditional_layer_norm: th.nn.Module, optional
@@ -1027,7 +1033,7 @@ class MaxPool(th.nn.Module):
         enable_nhwc: bool = False,
         hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
-        nside: int = 64,
+        nside: int | None = None,
         enable_healpixpad: bool | None = None,
     ):
         """
@@ -1044,8 +1050,9 @@ class MaxPool(th.nn.Module):
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
             If True, apply torch compile to the padding module.
-        nside: int, optional
-            HEALPix face resolution.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
             Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
@@ -1088,7 +1095,7 @@ class AvgPool(th.nn.Module):
         enable_nhwc: bool = False,
         hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
-        nside: int = 64,
+        nside: int | None = None,
         enable_healpixpad: bool | None = None,
     ):
         """
@@ -1105,8 +1112,9 @@ class AvgPool(th.nn.Module):
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
             If True, apply torch compile to the padding module.
-        nside: int, optional
-            HEALPix face resolution.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
             Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
@@ -1155,7 +1163,7 @@ class TransposedConvUpsample(th.nn.Module):
         enable_nhwc: bool = False,
         hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
-        nside: int = 64,
+        nside: int | None = None,
         enable_healpixpad: bool | None = None,
     ):
         """
@@ -1178,8 +1186,9 @@ class TransposedConvUpsample(th.nn.Module):
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
             If True, apply torch compile to the padding module.
-        nside: int, optional
-            HEALPix face resolution.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
             Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """

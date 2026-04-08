@@ -105,7 +105,8 @@ def test_healpix_padding_isolatitude_matches_folded_reference(
 @import_or_fail("hydra")
 @pytest.mark.parametrize("padding", [1, 2, 3, 4, 5])
 @pytest.mark.parametrize("hw", [16, 32, 64])
-def test_healpix_padding_karlbauer_matches_earth2grid_v2(padding, hw, pytestconfig):
+@pytest.mark.parametrize("enable_nhwc", [False, True])
+def test_healpix_padding_karlbauer_matches_earth2grid_v2(padding, hw, enable_nhwc, pytestconfig):
     """Karlbauer HEALPixPadding and earth2grid HEALPixPaddingv2 agree for several pad widths."""
     from physicsnemo.models.dlwp_healpix_layers import (
         HEALPixPadding,
@@ -124,7 +125,7 @@ def test_healpix_padding_karlbauer_matches_earth2grid_v2(padding, hw, pytestconf
     c = 5
     x = torch.randn(batch_size * num_faces, c, hw, hw, device=device)
 
-    y1 = HEALPixPadding(padding=padding, enable_nhwc=False)(x)
-    y2 = HEALPixPaddingv2(padding=padding)(x)
+    y1 = HEALPixPadding(padding=padding, enable_nhwc=enable_nhwc)(x)
+    y2 = HEALPixPaddingv2(padding=padding, enable_nhwc=enable_nhwc)(x)
 
     torch.testing.assert_close(y1, y2, rtol=0.0, atol=0.0)

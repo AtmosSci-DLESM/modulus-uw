@@ -29,10 +29,7 @@ from typing import Union, Optional
 logger = logging.getLogger(__name__)
 
 from .healpix_paddings import (
-    HEALPixPadding,
-    HEALPixPaddingIsolatitude,
-    HEALPixPaddingv2,
-    have_earth2grid,
+    make_hpx_padding_layer,
     pop_deprecated_enable_healpixpad_from_kwargs,
     warn_deprecated_enable_healpixpad,
 )
@@ -53,7 +50,7 @@ class HEALPixLayer(th.nn.Module):
         self,
         layer,
         hpx_padding_mode=None,
-        nside: int = 64,
+        nside: int | None = None,
         compile_padding: bool = False,
         **kwargs,
     ):
@@ -68,8 +65,9 @@ class HEALPixLayer(th.nn.Module):
             - ``"earth2grid"`` — ``earth2grid.healpix.pad`` (default).
             - ``"karlbauer"`` — Karlbauer et al. (2024) face stitching, same result as earth2grid but slower.
             - ``"isolatitude"`` — alternate padding scheme which preserves isolatitude signals.
-        nside : int, optional
-            Native resolution of each HEALPix face (height = width = ``nside``).
+        nside : int or None, optional
+            Native resolution of each HEALPix face (height = width). Required when
+            ``hpx_padding_mode=="isolatitude"``.
         compile_padding : bool, optional
             Whether to wrap isolatitude padding in ``_CompilePaddingWrapper``. Only
             supported when ``hpx_padding_mode="isolatitude"``.
@@ -88,7 +86,8 @@ class HEALPixLayer(th.nn.Module):
         )
 
         if "nside" in kwargs:
-            nside = int(kwargs.pop("nside"))
+            _ns = kwargs.pop("nside")
+            nside = int(_ns) if _ns is not None else None
         if "compile_padding" in kwargs:
             compile_padding = bool(kwargs.pop("compile_padding"))
 
@@ -120,30 +119,12 @@ class HEALPixLayer(th.nn.Module):
             dilation = 1 if "dilation" not in kwargs else kwargs["dilation"]
             padding = ((kernel_size - 1) // 2) * dilation
 
-            if hpx_padding_mode == "earth2grid":
-                if (
-                    have_earth2grid
-                    and th.cuda.is_available()
-                    and not enable_nhwc
-                ):  # pragma: no cover
-                    padding_layer = HEALPixPaddingv2(padding=padding)
-                else:
-                    raise ValueError(
-                        "hpx_padding_mode=earth2grid requires earth2grid import, "
-                        "CUDA, and enable_nhwc=False."
-                    )
-            elif hpx_padding_mode == "karlbauer":
-                padding_layer = HEALPixPadding(padding=padding, enable_nhwc=enable_nhwc)
-            elif hpx_padding_mode == "isolatitude":
-                padding_layer =  HEALPixPaddingIsolatitude(
-                    padding=padding,
-                    nside=nside,
-                    enable_nhwc=enable_nhwc,
-                )
-            else:
-                raise ValueError(
-                    f"Unsupported hpx_padding_mode={hpx_padding_mode!r}."
-                )
+            padding_layer = make_hpx_padding_layer(
+                padding=padding,
+                hpx_padding_mode=hpx_padding_mode,
+                enable_nhwc=enable_nhwc,
+                nside=nside,
+            )
 
         if padding_layer is not None:
             if compile_padding:

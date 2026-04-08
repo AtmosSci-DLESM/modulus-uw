@@ -15,7 +15,7 @@
 # limitations under the License.
 
 """
-HEALPix padding modules (Karlbauer, earth2grid v2, isolatitude reference and optimized).
+HEALPix padding modules (earth2grid, karlbauer, isolatitude).
 
          HEALPix                              Face order                 3D array representation
                                                                             -----------------
@@ -110,6 +110,65 @@ def pop_deprecated_enable_healpixpad_from_kwargs(kwargs: dict) -> bool | None:
     return None
 
 
+def make_hpx_padding_layer(
+    padding: int,
+    hpx_padding_mode: str,
+    enable_nhwc: bool,
+    nside: int | None = None,
+) -> th.nn.Module:
+    """
+    Construct the HEALPix padding submodule for a given mode.
+
+    Parameters
+    ----------
+    padding : int
+        Symmetric pad width on each face edge (``p >= 1``).
+    hpx_padding_mode : str
+        One of ``"earth2grid"``, ``"karlbauer"``, or ``"isolatitude"``.
+    enable_nhwc : bool
+        Passed to padding modules that support channels-last output.
+    nside : int or None, optional
+        Native face height/width. Required when ``hpx_padding_mode=="isolatitude"``;
+        ignored otherwise.
+
+    Returns
+    -------
+    torch.nn.Module
+        ``HEALPixPaddingv2``, ``HEALPixPadding``, or ``HEALPixPaddingIsolatitude``.
+
+    Raises
+    ------
+    ValueError
+        Unknown mode, isolatitude without ``nside``, or earth2grid when earth2grid
+        is unavailable or CUDA is not available.
+    """
+    if hpx_padding_mode == "earth2grid":
+        if not have_earth2grid or not th.cuda.is_available():
+            raise ValueError(
+                "hpx_padding_mode=earth2grid requires earth2grid import and CUDA "
+                f"(have_earth2grid={have_earth2grid}, "
+                f"th.cuda.is_available()={th.cuda.is_available()})."
+            )
+        return HEALPixPaddingv2(padding=padding, enable_nhwc=enable_nhwc)
+    if hpx_padding_mode == "karlbauer":
+        return HEALPixPadding(padding=padding, enable_nhwc=enable_nhwc)
+    if hpx_padding_mode == "isolatitude":
+        if nside is None:
+            raise ValueError(
+                'hpx_padding_mode="isolatitude" requires nside (positive int, '
+                "native face height/width) to build gather indices."
+            )
+        return HEALPixPaddingIsolatitude(
+            padding=padding,
+            nside=nside,
+            enable_nhwc=enable_nhwc,
+        )
+    raise ValueError(
+        f"Unsupported hpx_padding_mode={hpx_padding_mode!r}; "
+        "expected one of 'earth2grid', 'karlbauer', 'isolatitude'."
+    )
+
+
 class HEALPixFoldFaces(th.nn.Module):
     """Merge the HEALPix face dimension into the batch dimension (NCHW layout)."""
 
@@ -198,16 +257,19 @@ class HEALPixPaddingv2(th.nn.Module):
     TODO: Missing library to use this class. Need to see if we can get it, if not needs to be removed
     """
 
-    def __init__(self, padding: int):  # pragma: no cover
+    def __init__(self, padding: int, enable_nhwc: bool = False):  # pragma: no cover
         """
         Parameters
         ----------
-        padding: int
+        padding : int
             The padding size
+        enable_nhwc : bool, optional
+            Whether to use channels-last memory format.
         """
         super().__init__()
-        self.unfold = HEALPixUnfoldFaces(num_faces=12)
-        self.fold = HEALPixFoldFaces()
+        self.enable_nhwc = enable_nhwc
+        self.unfold = HEALPixUnfoldFaces(num_faces=12, enable_nhwc=self.enable_nhwc)
+        self.fold = HEALPixFoldFaces(enable_nhwc=self.enable_nhwc)
         self.padding = lambda x: healpix_pad(x, padding=padding)
 
     def forward(self, x):  # pragma: no cover
@@ -229,6 +291,9 @@ class HEALPixPaddingv2(th.nn.Module):
         x = self.unfold(x)
         xp = self.padding(x)
         xp = self.fold(xp)
+
+        if self.enable_nhwc:
+            xp = xp.to(memory_format=th.channels_last)
 
         return xp
 

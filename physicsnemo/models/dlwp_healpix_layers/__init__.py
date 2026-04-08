@@ -36,5 +36,6 @@ from .healpix_paddings import (
     HEALPixPaddingv2,
     HEALPixUnfoldFaces,
     have_earth2grid,
+    make_hpx_padding_layer,
     warn_deprecated_enable_healpixpad,
 )
