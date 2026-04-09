@@ -38,8 +38,27 @@ average output channels. This is used in the varible wise logging of validation 
 
 """
 
-
+# Distributed primitives for probabilistic losses
 def _distributed_reduce_loss(loss, ensemble_group=None, enabled=False):
+    """
+    Reduces the loss tensor by averaging across all processes in the specified distributed group.
+
+    This function performs an all-reduce (sum) operation on the input `loss` tensor across all processes
+    in the `ensemble_group` communicator, and then divides the summed loss by the world size to obtain the
+    mean loss over all processes. This is useful when you want to compute the globally averaged loss value
+    in distributed training, for correct logging or optimization step equivalence.
+
+    If distributed mode is not enabled, or if the group is None or collective communication is not
+    initialized, the loss is returned unchanged.
+
+    Args:
+        loss (torch.Tensor): The loss tensor to reduce (e.g., a scalar or per-variable loss).
+        ensemble_group (optional): The distributed process group to perform reduction over. Default: None.
+        enabled (bool): If True, perform reduction, otherwise return input as-is.
+
+    Returns:
+        torch.Tensor: The reduced (averaged across group) loss tensor.
+    """
     if not enabled or ensemble_group is None or not dist.is_initialized():
         return loss
     dist.all_reduce(loss, group=ensemble_group)
@@ -48,6 +67,21 @@ def _distributed_reduce_loss(loss, ensemble_group=None, enabled=False):
 
 
 def _dist_allreduce_sum(x, group):
+    """
+    Sums the input tensor `x` across all processes in the specified distributed process group.
+
+    Performs an in-place all-reduce (sum) on `x` over the given group, which is useful for synchronizing
+    results or statistics in distributed settings.
+
+    If the group is None or distributed mode is not initialized, returns the original input tensor.
+
+    Args:
+        x (torch.Tensor): The tensor to sum/reduce across all participating processes.
+        group (optional): The process group for all-reduce. Default: None.
+
+    Returns:
+        torch.Tensor: The summed tensor across the group.
+    """
     if group is None or not dist.is_initialized():
         return x
     dist.all_reduce(x, group=group)
@@ -55,6 +89,38 @@ def _dist_allreduce_sum(x, group):
 
 
 def _dist_ring_rotate(block: th.Tensor, group):
+    """
+    Perform a ring exchange (rotate) of a tensor block across distributed processes.
+
+    In a distributed environment with multiple processes (e.g., in distributed ensemble loss calculations),
+    this function performs a ring-wise rotation of the input tensor `block` among all processes in the
+    specified `group`. Each process sends its tensor to the next process in the ring and receives a tensor
+    from the previous process.
+
+    The operation can be visualized as:
+        rank i sends its tensor to rank (i+1) % world_size,
+        and receives a tensor from rank (i-1+world_size) % world_size.
+
+    If distributed mode is not enabled, no collective is initialized, or the group size is 1, 
+    then the input block is returned unchanged.
+
+    Parameters
+    ----------
+    block : torch.Tensor
+        The tensor to be exchanged.
+    group : Any
+        The process group for communication (typically torch.distributed process group).
+
+    Returns
+    -------
+    torch.Tensor
+        The received tensor from the previous process in the ring.
+
+    Notes
+    -----
+    This is used for exactly ordered member-member terms via ring exchange in distributed ensemble loss 
+    computation.
+    """
     if group is None or not dist.is_initialized():
         return block
     ws = dist.get_world_size(group=group)
