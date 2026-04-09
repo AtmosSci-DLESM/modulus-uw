@@ -495,13 +495,19 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             The target tensor shape [B, F, T, C, H, W]
         average_channels: bool, optional
             whether the mean of the channels should be taken
+        **kwargs
+            Optional distributed context from the training loop (e.g. NV-dlesm
+            ``Trainer._criterion_kwargs``): ``distributed_ensemble_loss`` (bool)
+            enables member-sharded CRPS with collectives over ``ensemble_group``
+            (``torch.distributed.ProcessGroup``). ``ensemble_group_size`` may
+            also be passed for symmetry but is unused here.
         """
         
         # Unfold ensemble dimension from batch dimension to have shape [Cond, B, F, T, C, H, W]
         b, f, t, c, h, w = target.shape
         n = prediction.shape[0] // b
         prediction = prediction.view(n, b, f, t, c, h, w)
-        distributed_loss = bool(kwargs.get("loss_distributed", False))
+        distributed_loss = bool(kwargs.get("distributed_ensemble_loss", False))
         ensemble_group = kwargs.get("ensemble_group", None)
 
         # checks for dimensions 
@@ -512,26 +518,6 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             raise ValueError(f"Shape of prediction should have ensemble dimension of size {self.n_members}, got {prediction.shape[0]}")
         if distributed_loss and n < 1:
             raise ValueError(f"Distributed loss needs local members >= 1, got {n}")
-        # Avoid th.tensor/th.ones allocations here when using distributed exact loss:
-        # CUDA graph capture forbids creating new tensors during the captured region.
-        if not distributed_loss:
-            local_diag_mask = (
-                self.diag_mask if n == self.n_members else
-                (th.ones(n, n, device=prediction.device) - th.eye(n, device=prediction.device))
-            )
-            local_coeff_eps = (
-                self.coeff_eps if n == self.n_members else
-                th.tensor(1 - ((1 - self.alpha) / n), device=prediction.device)
-            )
-            local_averaging_coeff = (
-                self.averaging_coeff
-                if n == self.n_members
-                else (
-                    th.tensor(1 / (2 * n * (n - 1)), device=prediction.device)
-                    if n > 1
-                    else th.tensor(0.0, device=prediction.device)
-                )
-            )
 
         # Manual Cast
         prediction = prediction.to(th.float32)
@@ -704,16 +690,16 @@ class WeightedCRPSLoss(th.nn.MSELoss):
                 diff = self.pdist(prediction, target) # [C, Cond]
                 dist_matrix = self.pdist(prediction.unsqueeze(1), prediction.unsqueeze(2))  # [C, Cond, Cond]
                 
-                diff_terms = local_diag_mask[None, ...] * (diff.unsqueeze(1) + diff.unsqueeze(2)) # [C, Cond, Cond], diagonal elements zeroed out
-                crps = local_averaging_coeff * (diff_terms - local_coeff_eps * dist_matrix).sum(dim=(1,2))/valid_pixels
+                diff_terms = self.diag_mask[None, ...] * (diff.unsqueeze(1) + diff.unsqueeze(2)) # [C, Cond, Cond], diagonal elements zeroed out
+                crps = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum(dim=(1,2))/valid_pixels
             else:
                 prediction = prediction.reshape(n, -1)
                 target = target.unsqueeze(0).reshape(1, -1) # [1, ...] (first dim will broadcast across ensemble)
                 diff = self.pdist(prediction, target) # [Cond]
                 dist_matrix = self.pdist(prediction.unsqueeze(1), prediction.unsqueeze(0))  # [Cond, Cond] 
 
-                diff_terms = local_diag_mask * (diff.unsqueeze(0) + diff.unsqueeze(1)) # [Cond, Cond], diagonal elements zeroed out
-                crps = local_averaging_coeff * (diff_terms - local_coeff_eps * dist_matrix).sum()/valid_pixels
+                diff_terms = self.diag_mask * (diff.unsqueeze(0) + diff.unsqueeze(1)) # [Cond, Cond], diagonal elements zeroed out
+                crps = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum()/valid_pixels
 
             return _distributed_reduce_loss(
                 crps + bias_penalty,
@@ -874,7 +860,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
     def forward(self, prediction, target, average_channels=True, **kwargs):
         """
-        Forward pass of the WeightedCRPSLoss 
+        Forward pass of the WeightedCRPSLossSpectral 
         Computes the CRPS loss for the model prediction and target.
 
         Parameters
@@ -885,13 +871,19 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
             The target tensor shape [B, F, T, C, H, W]
         average_channels: bool, optional
             whether the mean of the channels should be taken
+        **kwargs
+            Optional distributed context from the training loop (e.g. NV-dlesm
+            ``Trainer._criterion_kwargs``): ``distributed_ensemble_loss`` (bool)
+            enables member-sharded CRPS with collectives over ``ensemble_group``
+            (``torch.distributed.ProcessGroup``). ``ensemble_group_size`` may
+            also be passed for symmetry but is unused here.
         """
         
         # Unfold ensemble dimension from batch dimension to have shape [Cond, B, F, T, C, H, W]
         b, f, t, c, h, w = target.shape
         n = prediction.shape[0] // b
         prediction = prediction.view(n, b, f, t, c, h, w)
-        distributed_loss = bool(kwargs.get("loss_distributed", False))
+        distributed_loss = bool(kwargs.get("distributed_ensemble_loss", False))
         ensemble_group = kwargs.get("ensemble_group", None)
 
         # checks for dimensions 
@@ -902,24 +894,6 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
             raise ValueError(f"Shape of prediction should have ensemble dimension of size {self.n_members}, got {prediction.shape[0]}")
         if distributed_loss and n < 1:
             raise ValueError(f"Distributed loss needs local members >= 1, got {n}")
-        if not distributed_loss:
-            local_diag_mask = (
-                self.diag_mask if n == self.n_members else
-                (th.ones(n, n, device=prediction.device) - th.eye(n, device=prediction.device))
-            )
-            local_coeff_eps = (
-                self.coeff_eps if n == self.n_members else
-                th.tensor(1 - ((1 - self.alpha) / n), device=prediction.device)
-            )
-            local_averaging_coeff = (
-                self.averaging_coeff
-                if n == self.n_members
-                else (
-                    th.tensor(1 / (2 * n * (n - 1)), device=prediction.device)
-                    if n > 1
-                    else th.tensor(0.0, device=prediction.device)
-                )
-            )
 
         # Manual cast
         prediction = prediction.to(th.float32)
@@ -1002,7 +976,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
             # Use faster explicit implementation
             diff_target = th.abs(prediction - target.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
             diff_ensemble = th.abs(prediction[0] - prediction[1]) # [B, F, T, C, H, W]
-            crps = local_averaging_coeff*(diff_target - local_coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
+            crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
 
             if average_channels:
                 loss = crps.mean()
@@ -1029,7 +1003,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
                     diff_sht_target = th.abs(sht_pred - sht_tar.unsqueeze(0)).sum(dim=(0, 4, 5)) # [B, T, C]
                     diff_sht_ensemble = th.abs(sht_pred[0] - sht_pred[1]).sum(dim=(-1,-2)) # [B, T, C] 
-                    crps_sht = local_averaging_coeff * (diff_sht_target - local_coeff_eps * diff_sht_ensemble) # [B, T, C]
+                    crps_sht = self.averaging_coeff * (diff_sht_target - self.coeff_eps * diff_sht_ensemble) # [B, T, C]
 
                     # Compute spectral afCRPS
                     if average_channels:
@@ -1054,7 +1028,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
                         diff_target = th.abs(pred_smooth - tar_smooth.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
                         diff_ensemble = th.abs(pred_smooth[0] - pred_smooth[1]) # [B, F, T, C, H, W]
-                        crps = local_averaging_coeff*(diff_target - local_coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
+                        crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
 
                         crps *= self.lsm_tensor
 
@@ -1082,8 +1056,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                 diff = self.pdist(pred, tar) # [C, Cond]
                 dist_matrix = self.pdist(pred.unsqueeze(1), pred.unsqueeze(2))  # [C, Cond, Cond]
                 
-                diff_terms = local_diag_mask[None, ...] * (diff.unsqueeze(1) + diff.unsqueeze(2)) # [C, Cond, Cond], diagonal elements zeroed out
-                loss = local_averaging_coeff * (diff_terms - local_coeff_eps * dist_matrix).sum(dim=(1,2))/(b*f*t*h*w)
+                diff_terms = self.diag_mask[None, ...] * (diff.unsqueeze(1) + diff.unsqueeze(2)) # [C, Cond, Cond], diagonal elements zeroed out
+                loss = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum(dim=(1,2))/(b*f*t*h*w)
 
                 if self.lambda_spec > 0:
                     with th.cuda.amp.autocast(enabled=False):
@@ -1105,8 +1079,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                         diff = self.pdist(sht_pred, sht_tar) # [C, Cond]
                         dist_matrix = self.pdist(sht_pred.unsqueeze(1), sht_pred.unsqueeze(2))  # [C, Cond, Cond]
                         
-                        diff_terms = local_diag_mask[None, ...] * (diff.unsqueeze(1) + diff.unsqueeze(2)) # [C, Cond, Cond], diagonal elements zeroed out
-                        loss += self.lambda_spec * local_averaging_coeff * (diff_terms - local_coeff_eps * dist_matrix).sum(dim=(1,2))/(b*t*self.lmax*self.mmax)
+                        diff_terms = self.diag_mask[None, ...] * (diff.unsqueeze(1) + diff.unsqueeze(2)) # [C, Cond, Cond], diagonal elements zeroed out
+                        loss += self.lambda_spec * self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum(dim=(1,2))/(b*t*self.lmax*self.mmax)
 
             else:
                 pred = prediction.reshape(n, -1)
@@ -1114,8 +1088,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                 diff = self.pdist(pred, tar) # [Cond]
                 dist_matrix = self.pdist(pred.unsqueeze(1), pred.unsqueeze(0))  # [Cond, Cond] 
 
-                diff_terms = local_diag_mask * (diff.unsqueeze(0) + diff.unsqueeze(1)) # [Cond, Cond], diagonal elements zeroed out
-                loss = local_averaging_coeff * (diff_terms - local_coeff_eps * dist_matrix).sum()/(b*f*c*t*h*w)
+                diff_terms = self.diag_mask * (diff.unsqueeze(0) + diff.unsqueeze(1)) # [Cond, Cond], diagonal elements zeroed out
+                loss = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum()/(b*f*c*t*h*w)
 
                 if self.lambda_spec > 0:
                     with th.cuda.amp.autocast(enabled=False):
@@ -1136,8 +1110,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                         diff = self.pdist(sht_pred, sht_tar) # [Cond]
                         dist_matrix = self.pdist(sht_pred.unsqueeze(1), sht_pred.unsqueeze(0))  # [Cond, Cond] 
                         
-                        diff_terms = local_diag_mask * (diff.unsqueeze(0) + diff.unsqueeze(1)) # [Cond, Cond], diagonal elements zeroed out
-                        loss += self.lambda_spec * local_averaging_coeff * (diff_terms - local_coeff_eps * dist_matrix).sum()/(b*t*self.lmax*self.mmax)
+                        diff_terms = self.diag_mask * (diff.unsqueeze(0) + diff.unsqueeze(1)) # [Cond, Cond], diagonal elements zeroed out
+                        loss += self.lambda_spec * self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum()/(b*t*self.lmax*self.mmax)
 
             return _distributed_reduce_loss(
                 loss,
@@ -1418,11 +1392,16 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
 
         prediction: [Cond*B, F, T, C, H, W]
         target: [B, F, T, C, H, W]
+        **kwargs
+            Optional distributed context (e.g. NV-dlesm ``Trainer._criterion_kwargs``):
+            ``distributed_ensemble_loss`` and ``ensemble_group`` for member-sharded
+            energy score with ensemble-group collectives. ``ensemble_group_size`` may
+            be passed for symmetry but is unused here.
         """
         b, f, t, c, h, w = target.shape
         n = prediction.shape[0] // b
         prediction = prediction.view(n, b, f, t, c, h, w)
-        distributed_loss = bool(kwargs.get("loss_distributed", False))
+        distributed_loss = bool(kwargs.get("distributed_ensemble_loss", False))
         ensemble_group = kwargs.get("ensemble_group", None)
 
         if prediction.shape[1:] != target.shape:
@@ -1438,24 +1417,6 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             )
         if distributed_loss and n < 1:
             raise ValueError(f"Distributed loss needs local members >= 1, got {n}")
-        if not distributed_loss:
-            local_diag_mask = (
-                self.diag_mask if n == self.n_members else
-                (th.ones(n, n, device=prediction.device) - th.eye(n, device=prediction.device))
-            )
-            local_coeff_eps = (
-                self.coeff_eps if n == self.n_members else
-                th.tensor(1 - ((1 - self.alpha) / n), device=prediction.device)
-            )
-            local_averaging_coeff = (
-                self.averaging_coeff
-                if n == self.n_members
-                else (
-                    th.tensor(1 / (2 * n * (n - 1)), device=prediction.device)
-                    if n > 1
-                    else th.tensor(0.0, device=prediction.device)
-                )
-            )
 
         prediction = prediction.to(th.float32)
         target = target.to(th.float32)
@@ -1527,7 +1488,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             diff_ensemble = self._weighted_patch_norm(
                 pred_patches[0] - pred_patches[1]
             )  # [B,F,T,C,H,W]
-            es = local_averaging_coeff * (diff_target - local_coeff_eps * diff_ensemble)
+            es = self.averaging_coeff * (diff_target - self.coeff_eps * diff_ensemble)
         else:
             diff_i = diff_to_target  # [Cond,B,F,T,C,H,W]
             diff_i_i = diff_i.unsqueeze(0)  # [1,Cond,B,F,T,C,H,W]
@@ -1537,11 +1498,11 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             pred_j = pred_patches.unsqueeze(0)  # [1,Cond,B,F,T,C,H,W,D]
             dist_ensemble = self._weighted_patch_norm(pred_i - pred_j)  # [Cond,Cond,B,F,T,C,H,W]
 
-            mask = local_diag_mask[:, :, None, None, None, None, None, None]
+            mask = self.diag_mask[:, :, None, None, None, None, None, None]
             diff_terms = mask * (diff_i_i + diff_j_i)
             dist_terms = mask * dist_ensemble
 
-            es = local_averaging_coeff * (diff_terms - local_coeff_eps * dist_terms).sum(
+            es = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_terms).sum(
                 dim=(0, 1)
             )  # [B,F,T,C,H,W]
 

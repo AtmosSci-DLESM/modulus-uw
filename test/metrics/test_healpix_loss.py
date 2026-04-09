@@ -548,7 +548,7 @@ def test_WeightedCRPSLoss_shape_checks():
     loss_fn_bad_members = WeightedCRPSLoss(weights=[1.0, 1.0], n_members=3)
     loss_fn_bad_members.setup(trainer)
     with pytest.raises(ValueError):
-        loss_fn_bad_members(pred, tar, average_channels=True, loss_distributed=False)
+        loss_fn_bad_members(pred, tar, average_channels=True, distributed_ensemble_loss=False)
 
 
 def test_WeightedCRPSLossSpectral_apply_sht_face_dim_validation_cpu():
@@ -605,7 +605,7 @@ def test_WeightedCRPSLoss_distributed_exact_matches_single_rank(average_channels
 
     # Simulate n=1 local shard with world_size=1 by passing distributed flag.
     local_pred = pred_members[:1].reshape(b, f, t, c, h, w)
-    got = loss_fn(local_pred, target, average_channels=average_channels, loss_distributed=True)
+    got = loss_fn(local_pred, target, average_channels=average_channels, distributed_ensemble_loss=True)
     assert torch.isfinite(got).all()
     assert got.shape == ref.shape
 
@@ -631,7 +631,7 @@ def _dist_crps_worker(rank: int, world_size: int, init_file: str):
         prediction_local,
         target,
         average_channels=True,
-        loss_distributed=True,
+        distributed_ensemble_loss=True,
         ensemble_group=dist.group.WORLD,
     )
     gathered = [torch.zeros_like(dist_loss) for _ in range(world_size)]
@@ -659,11 +659,9 @@ def test_PatchedEnergyScoreLoss_distributed_exact_equivalence():
         weights=[1.0, 1.0],
         n_members=n_members,
         patch_size=3,
-        hpx_padding_mode="karlbauer",
         enable_nhwc=False,
-        nside=64,
     )
     trainer = trainer_helper(output_variables=["v0", "v1"], device="cpu")
     loss_fn.setup(trainer)
-    out = loss_fn(local_pred, target, average_channels=True, loss_distributed=True)
+    out = loss_fn(local_pred, target, average_channels=True, distributed_ensemble_loss=True)
     assert torch.isfinite(out)
