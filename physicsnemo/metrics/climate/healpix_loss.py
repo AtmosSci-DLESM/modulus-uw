@@ -132,7 +132,7 @@ def _dist_ring_rotate(block: th.Tensor, group):
     recv_peer = (rank - 1 + ws) % ws
     send_to = dist.get_global_rank(group, send_peer)
     recv_from = dist.get_global_rank(group, recv_peer)
-    recv = th.empty_like(block)
+    recv = th.empty(block.shape, dtype=block.dtype, device=block.device)
     ops = [
         dist.P2POp(dist.isend, block.contiguous(), send_to, group),
         dist.P2POp(dist.irecv, recv, recv_from, group),
@@ -141,6 +141,37 @@ def _dist_ring_rotate(block: th.Tensor, group):
     for req in reqs:
         req.wait()
     return recv
+
+
+def _dist_pairwise_duplicate_factor(ensemble_group, n_members: int) -> float:
+    """When ``n_members == 2`` and the ensemble group has two ranks, each rank's ring
+    step computes the same member–member distance; ``all_reduce`` sums two identical
+    contributions. Halve the all-reduced spread sum after reduction in that case only.
+    """
+    if n_members != 2 or ensemble_group is None or not dist.is_initialized():
+        return 1.0
+    if dist.get_world_size(group=ensemble_group) != 2:
+        return 1.0
+    return 0.5
+
+
+def _dist_ensemble_skill_prefactor(n_members: int) -> int:
+    """Scale the all-reduced **skill** sum (total ``Σ_i ‖x_i - y‖``) in distributed
+    almost-fair CRPS / energy score.
+
+    Here ``skill`` is the global sum of ‖pred−target‖ contributions from every
+    rank's local members, i.e. it already aggregates the full ensemble once. For
+    ``n_members > 2`` the ordered-pair expansion uses a ``2*(n_members-1)`` factor
+    (see the non-distributed pairwise reduction). For ``n_members == 2`` the
+    closed-form path (``_2member_crps``) uses that total once; applying ``2*(n-1)=2``
+    would double the skill term. The spread term (member–member distances) may 
+    still be doubled across two ranks; see ``_dist_pairwise_duplicate_factor``.
+    """
+    if n_members < 2:
+        raise ValueError("n_members must be at least 2")
+    if n_members == 2:
+        return 1
+    return 2 * (n_members - 1)
 
 
 class BaseMSE(th.nn.MSELoss):
@@ -601,28 +632,37 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             else:
                 valid_pixels = b * f * t * h * w
 
+            skill_mul = _dist_ensemble_skill_prefactor(self.n_members)
+
             if average_channels:
+                if self.n_members == 2 and not (
+                    self.masked_processing and self.lsm_tensor.numel() > 1
+                ):
+                    valid_px_avg = b * f * t * c * h * w
+                else:
+                    valid_px_avg = valid_pixels
                 pred_flat = prediction.reshape(n, -1)
                 tar_flat = target.reshape(1, -1)
-                s1_local = th.abs(pred_flat - tar_flat).sum()
+                skill_local = th.abs(pred_flat - tar_flat).sum()
 
-                # exact ordered pairwise sum over all members via ring
-                s2_local = pred_flat.new_tensor(0.0)
+                # spread: ordered member–member L1 sum via ring (see non-distributed pairwise CRPS)
+                spread_local = pred_flat.new_tensor(0.0)
                 # local-local ordered pairs
-                s2_local = s2_local + th.cdist(pred_flat, pred_flat, p=1).sum()
+                spread_local = spread_local + th.cdist(pred_flat, pred_flat, p=1).sum()
                 remote = pred_flat
                 ws = dist.get_world_size(group=ensemble_group) if (ensemble_group is not None and dist.is_initialized()) else 1
                 for _ in range(ws - 1):
                     remote = _dist_ring_rotate(remote, ensemble_group)
-                    s2_local = s2_local + th.cdist(pred_flat, remote, p=1).sum()
+                    spread_local = spread_local + th.cdist(pred_flat, remote, p=1).sum()
 
-                s1 = _dist_allreduce_sum(s1_local, ensemble_group)
-                s2 = _dist_allreduce_sum(s2_local, ensemble_group)
+                skill = _dist_allreduce_sum(skill_local, ensemble_group)
+                spread = _dist_allreduce_sum(spread_local, ensemble_group)
+                spread = spread * _dist_pairwise_duplicate_factor(ensemble_group, self.n_members)
                 # remove diagonal contribution from local-local block
                 # diagonal elements are zero in L1, so no-op retained for clarity
                 crps = self.averaging_coeff * (
-                    2 * (self.n_members - 1) * s1 - self.coeff_eps * s2
-                ) / valid_pixels
+                    skill_mul * skill - self.coeff_eps * spread
+                ) / valid_px_avg
 
                 bias_penalty = pred_flat.new_tensor(0.0)
                 if self.mean_penalty > 0:
@@ -637,22 +677,23 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             else:
                 pred_c = prediction.permute(4, 0, 1, 2, 3, 5, 6).reshape(c, n, -1)
                 tar_c = target.permute(3, 0, 1, 2, 4, 5).reshape(c, 1, -1)
-                s1_local = th.abs(pred_c - tar_c).sum(dim=(1, 2))
+                skill_local = th.abs(pred_c - tar_c).sum(dim=(1, 2))
 
-                s2_local = pred_c.new_zeros(c)
+                spread_local = pred_c.new_zeros(c)
                 for ci in range(c):
                     local = pred_c[ci]
-                    s2_local[ci] += th.cdist(local, local, p=1).sum()
+                    spread_local[ci] += th.cdist(local, local, p=1).sum()
                     remote = local
                     ws = dist.get_world_size(group=ensemble_group) if (ensemble_group is not None and dist.is_initialized()) else 1
                     for _ in range(ws - 1):
                         remote = _dist_ring_rotate(remote, ensemble_group)
-                        s2_local[ci] += th.cdist(local, remote, p=1).sum()
+                        spread_local[ci] += th.cdist(local, remote, p=1).sum()
 
-                s1 = _dist_allreduce_sum(s1_local, ensemble_group)
-                s2 = _dist_allreduce_sum(s2_local, ensemble_group)
+                skill = _dist_allreduce_sum(skill_local, ensemble_group)
+                spread = _dist_allreduce_sum(spread_local, ensemble_group)
+                spread = spread * _dist_pairwise_duplicate_factor(ensemble_group, self.n_members)
                 crps = self.averaging_coeff * (
-                    2 * (self.n_members - 1) * s1 - self.coeff_eps * s2
+                    skill_mul * skill - self.coeff_eps * spread
                 ) / valid_pixels
                 if self.mean_penalty > 0:
                     ens_global_sum = _dist_allreduce_sum((prediction * self.lsm_tensor).sum(dim=(0, 1, 2, 3, 5, 6)), ensemble_group)
@@ -975,66 +1016,71 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                     "Exact distributed spectral mode does not support multiscale > 0 yet."
                 )
             ws = dist.get_world_size(group=ensemble_group) if (ensemble_group is not None and dist.is_initialized()) else 1
+            skill_mul = _dist_ensemble_skill_prefactor(self.n_members)
             if average_channels:
                 pred_flat = prediction.reshape(n, -1)
                 tar_flat = target.reshape(1, -1)
-                s1_local = th.abs(pred_flat - tar_flat).sum()
-                s2_local = th.cdist(pred_flat, pred_flat, p=1).sum()
+                skill_local = th.abs(pred_flat - tar_flat).sum()
+                spread_local = th.cdist(pred_flat, pred_flat, p=1).sum()
                 remote = pred_flat
                 for _ in range(ws - 1):
                     remote = _dist_ring_rotate(remote, ensemble_group)
-                    s2_local = s2_local + th.cdist(pred_flat, remote, p=1).sum()
-                s1 = _dist_allreduce_sum(s1_local, ensemble_group)
-                s2 = _dist_allreduce_sum(s2_local, ensemble_group)
-                loss = self.averaging_coeff * (2 * (self.n_members - 1) * s1 - self.coeff_eps * s2) / (b * f * c * t * h * w)
+                    spread_local = spread_local + th.cdist(pred_flat, remote, p=1).sum()
+                skill = _dist_allreduce_sum(skill_local, ensemble_group)
+                spread = _dist_allreduce_sum(spread_local, ensemble_group)
+                spread = spread * _dist_pairwise_duplicate_factor(ensemble_group, self.n_members)
+                loss = self.averaging_coeff * (skill_mul * skill - self.coeff_eps * spread) / (b * f * c * t * h * w)
 
                 if self.lambda_spec > 0:
                     with th.amp.autocast("cuda", enabled=False):
                         sht_pred = self._apply_sht(prediction, face_dim=2, return_abs=True).reshape(n, -1)
                         sht_tar = self._apply_sht(target, face_dim=1, return_abs=True).reshape(1, -1)
-                        s1s_local = th.abs(sht_pred - sht_tar).sum()
-                        s2s_local = th.cdist(sht_pred, sht_pred, p=1).sum()
+                        skill_spec_local = th.abs(sht_pred - sht_tar).sum()
+                        spread_spec_local = th.cdist(sht_pred, sht_pred, p=1).sum()
                         remote_s = sht_pred
                         for _ in range(ws - 1):
                             remote_s = _dist_ring_rotate(remote_s, ensemble_group)
-                            s2s_local = s2s_local + th.cdist(sht_pred, remote_s, p=1).sum()
-                        s1s = _dist_allreduce_sum(s1s_local, ensemble_group)
-                        s2s = _dist_allreduce_sum(s2s_local, ensemble_group)
-                        spec_loss = self.averaging_coeff * (2 * (self.n_members - 1) * s1s - self.coeff_eps * s2s) / (b * t * self.lmax * self.mmax)
+                            spread_spec_local = spread_spec_local + th.cdist(sht_pred, remote_s, p=1).sum()
+                        skill_spec = _dist_allreduce_sum(skill_spec_local, ensemble_group)
+                        spread_spec = _dist_allreduce_sum(spread_spec_local, ensemble_group)
+                        spread_spec = spread_spec * _dist_pairwise_duplicate_factor(ensemble_group, self.n_members)
+                        spec_loss = self.averaging_coeff * (skill_mul * skill_spec - self.coeff_eps * spread_spec) / (b * t * self.lmax * self.mmax)
                     loss = loss + self.lambda_spec * spec_loss
                 return loss
 
             pred_c = prediction.permute(4, 0, 1, 2, 3, 5, 6).reshape(c, n, -1)
             tar_c = target.permute(3, 0, 1, 2, 4, 5).reshape(c, 1, -1)
-            s1_local = th.abs(pred_c - tar_c).sum(dim=(1, 2))
-            s2_local = pred_c.new_zeros(c)
+            skill_local = th.abs(pred_c - tar_c).sum(dim=(1, 2))
+            spread_local = pred_c.new_zeros(c)
             for ci in range(c):
                 local = pred_c[ci]
-                s2_local[ci] += th.cdist(local, local, p=1).sum()
+                spread_local[ci] += th.cdist(local, local, p=1).sum()
                 remote = local
                 for _ in range(ws - 1):
                     remote = _dist_ring_rotate(remote, ensemble_group)
-                    s2_local[ci] += th.cdist(local, remote, p=1).sum()
-            s1 = _dist_allreduce_sum(s1_local, ensemble_group)
-            s2 = _dist_allreduce_sum(s2_local, ensemble_group)
-            loss = self.averaging_coeff * (2 * (self.n_members - 1) * s1 - self.coeff_eps * s2) / (b * f * t * h * w)
+                    spread_local[ci] += th.cdist(local, remote, p=1).sum()
+            skill = _dist_allreduce_sum(skill_local, ensemble_group)
+            spread = _dist_allreduce_sum(spread_local, ensemble_group)
+            spread = spread * _dist_pairwise_duplicate_factor(ensemble_group, self.n_members)
+            loss = self.averaging_coeff * (skill_mul * skill - self.coeff_eps * spread) / (b * f * t * h * w)
             if self.lambda_spec > 0:
                 with th.amp.autocast("cuda", enabled=False):
                     sht_pred = self._apply_sht(prediction, face_dim=2, return_abs=True).permute(3, 0, 1, 2, 4, 5).reshape(c, n, -1)
                     sht_tar = self._apply_sht(target, face_dim=1, return_abs=True).permute(2, 0, 1, 3, 4).reshape(c, 1, -1)
-                    s1s_local = th.abs(sht_pred - sht_tar).sum(dim=(1, 2))
-                    s2s_local = sht_pred.new_zeros(c)
+                    skill_spec_local = th.abs(sht_pred - sht_tar).sum(dim=(1, 2))
+                    spread_spec_local = sht_pred.new_zeros(c)
                     for ci in range(c):
                         local = sht_pred[ci]
-                        s2s_local[ci] += th.cdist(local, local, p=1).sum()
+                        spread_spec_local[ci] += th.cdist(local, local, p=1).sum()
                         remote = local
                         for _ in range(ws - 1):
                             remote = _dist_ring_rotate(remote, ensemble_group)
-                            s2s_local[ci] += th.cdist(local, remote, p=1).sum()
-                    s1s = _dist_allreduce_sum(s1s_local, ensemble_group)
-                    s2s = _dist_allreduce_sum(s2s_local, ensemble_group)
+                            spread_spec_local[ci] += th.cdist(local, remote, p=1).sum()
+                    skill_spec = _dist_allreduce_sum(skill_spec_local, ensemble_group)
+                    spread_spec = _dist_allreduce_sum(spread_spec_local, ensemble_group)
+                    spread_spec = spread_spec * _dist_pairwise_duplicate_factor(ensemble_group, self.n_members)
                     loss = loss + self.lambda_spec * self.averaging_coeff * (
-                        2 * (self.n_members - 1) * s1s - self.coeff_eps * s2s
+                        skill_mul * skill_spec - self.coeff_eps * spread_spec
                     ) / (b * t * self.lmax * self.mmax)
             return loss
 
@@ -1498,15 +1544,16 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
 
         if distributed_loss:
             ws = dist.get_world_size(group=ensemble_group) if (ensemble_group is not None and dist.is_initialized()) else 1
+            skill_mul = _dist_ensemble_skill_prefactor(self.n_members)
             if average_channels:
-                s1_local = diff_to_target.sum()
+                skill_local = diff_to_target.sum()
 
-                # exact ordered member-member term via ring exchange
-                s2_local = pred_patches.new_tensor(0.0)
+                # spread: ordered member–member patch distances via ring exchange
+                spread_local = pred_patches.new_tensor(0.0)
                 # local-local block
                 for i in range(n):
                     for j in range(n):
-                        s2_local = s2_local + self._weighted_patch_norm(
+                        spread_local = spread_local + self._weighted_patch_norm(
                             pred_patches[i] - pred_patches[j]
                         ).sum()
                 remote = pred_patches
@@ -1514,38 +1561,41 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
                     remote = _dist_ring_rotate(remote, ensemble_group)
                     for i in range(n):
                         for j in range(n):
-                            s2_local = s2_local + self._weighted_patch_norm(
+                            spread_local = spread_local + self._weighted_patch_norm(
                                 pred_patches[i] - remote[j]
                             ).sum()
 
-                s1 = _dist_allreduce_sum(s1_local, ensemble_group)
-                s2 = _dist_allreduce_sum(s2_local, ensemble_group)
+                skill = _dist_allreduce_sum(skill_local, ensemble_group)
+                spread = _dist_allreduce_sum(spread_local, ensemble_group)
+                spread = spread * _dist_pairwise_duplicate_factor(ensemble_group, self.n_members)
                 es = self.averaging_coeff * (
-                    2 * (self.n_members - 1) * s1 - self.coeff_eps * s2
+                    skill_mul * skill - self.coeff_eps * spread
                 )
                 es = es / (b * f * t * c * h * w)
                 return es
             else:
-                s1_local = diff_to_target.sum(dim=(0, 1, 2, 4, 5))  # [C]
-                s2_local = pred_patches.new_zeros(c)
+                # diff_to_target: [Cond, B, F, T, C, H, W] — reduce to one value per channel
+                skill_local = diff_to_target.sum(dim=(0, 1, 2, 3, 5, 6))
+                spread_local = pred_patches.new_zeros(c)
                 for i in range(n):
                     for j in range(n):
-                        s2_local = s2_local + self._weighted_patch_norm(
+                        spread_local = spread_local + self._weighted_patch_norm(
                             pred_patches[i] - pred_patches[j]
-                        ).sum(dim=(0, 1, 3, 4))
+                        ).sum(dim=(0, 1, 2, 4, 5))
                 remote = pred_patches
                 for _ in range(ws - 1):
                     remote = _dist_ring_rotate(remote, ensemble_group)
                     for i in range(n):
                         for j in range(n):
-                            s2_local = s2_local + self._weighted_patch_norm(
+                            spread_local = spread_local + self._weighted_patch_norm(
                                 pred_patches[i] - remote[j]
-                            ).sum(dim=(0, 1, 3, 4))
+                            ).sum(dim=(0, 1, 2, 4, 5))
 
-                s1 = _dist_allreduce_sum(s1_local, ensemble_group)
-                s2 = _dist_allreduce_sum(s2_local, ensemble_group)
+                skill = _dist_allreduce_sum(skill_local, ensemble_group)
+                spread = _dist_allreduce_sum(spread_local, ensemble_group)
+                spread = spread * _dist_pairwise_duplicate_factor(ensemble_group, self.n_members)
                 es = self.averaging_coeff * (
-                    2 * (self.n_members - 1) * s1 - self.coeff_eps * s2
+                    skill_mul * skill - self.coeff_eps * spread
                 ) / (b * f * t * h * w)
                 return es
 
