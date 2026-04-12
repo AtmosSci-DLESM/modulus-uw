@@ -591,7 +591,7 @@ def test_WeightedCRPSLossSpectral_lambda0_perfect_forecast_smoke():
 
 
 @pytest.mark.parametrize("average_channels", [True, False])
-def test_WeightedCRPSLoss_distributed_exact_matches_single_rank(average_channels: bool):
+def test_WeightedCRPSLoss_distributed_matches_single_rank(average_channels: bool):
     b, f, t, c, h, w = 2, 12, 2, 2, 64, 64
     n_members = 2
     target = torch.randn(b, f, t, c, h, w, dtype=torch.float32)
@@ -668,16 +668,6 @@ def _crps_dist_matches_gathered_worker(
     loss_fn.setup(trainer)
 
     local = pred_all[rank].reshape(b, f, t, c, h, w)
-    gathered = [torch.empty_like(local) for _ in range(world_size)]
-    dist.all_gather(gathered, local, group=dist.group.WORLD)
-    pred_full = torch.cat(gathered, dim=0)
-    ref = loss_fn(
-        pred_full,
-        target,
-        average_channels=average_channels,
-        distributed_ensemble_loss=False,
-    )
-
     dist_loss = loss_fn(
         local,
         target,
@@ -685,6 +675,17 @@ def _crps_dist_matches_gathered_worker(
         distributed_ensemble_loss=True,
         ensemble_group=dist.group.WORLD,
     )
+    if rank == 0:
+        pred_full = pred_all.reshape(world_size * b, f, t, c, h, w)
+        ref = loss_fn(
+            pred_full,
+            target,
+            average_channels=average_channels,
+            distributed_ensemble_loss=False,
+        )
+    else:
+        ref = torch.zeros_like(dist_loss)
+    dist.broadcast(ref, src=0, group=dist.group.WORLD)
     assert torch.allclose(
         dist_loss,
         ref,
@@ -729,16 +730,6 @@ def _spectral_crps_dist_matches_gathered_worker(
     loss_fn.setup(trainer)
 
     local = pred_all[rank].reshape(b, f, t, c, h, w)
-    gathered = [torch.empty_like(local) for _ in range(world_size)]
-    dist.all_gather(gathered, local, group=dist.group.WORLD)
-    pred_full = torch.cat(gathered, dim=0)
-    ref = loss_fn(
-        pred_full,
-        target,
-        average_channels=average_channels,
-        distributed_ensemble_loss=False,
-    )
-
     dist_loss = loss_fn(
         local,
         target,
@@ -746,6 +737,17 @@ def _spectral_crps_dist_matches_gathered_worker(
         distributed_ensemble_loss=True,
         ensemble_group=dist.group.WORLD,
     )
+    if rank == 0:
+        pred_full = pred_all.reshape(world_size * b, f, t, c, h, w)
+        ref = loss_fn(
+            pred_full,
+            target,
+            average_channels=average_channels,
+            distributed_ensemble_loss=False,
+        )
+    else:
+        ref = torch.zeros_like(dist_loss)
+    dist.broadcast(ref, src=0, group=dist.group.WORLD)
     assert torch.allclose(
         dist_loss,
         ref,
@@ -786,16 +788,6 @@ def _energy_dist_matches_gathered_worker(
     loss_fn.setup(trainer)
 
     local = pred_all[rank].reshape(b, f, t, c, h, w)
-    gathered = [torch.empty_like(local) for _ in range(world_size)]
-    dist.all_gather(gathered, local, group=dist.group.WORLD)
-    pred_full = torch.cat(gathered, dim=0)
-    ref = loss_fn(
-        pred_full,
-        target,
-        average_channels=average_channels,
-        distributed_ensemble_loss=False,
-    )
-
     dist_loss = loss_fn(
         local,
         target,
@@ -803,6 +795,17 @@ def _energy_dist_matches_gathered_worker(
         distributed_ensemble_loss=True,
         ensemble_group=dist.group.WORLD,
     )
+    if rank == 0:
+        pred_full = pred_all.reshape(world_size * b, f, t, c, h, w)
+        ref = loss_fn(
+            pred_full,
+            target,
+            average_channels=average_channels,
+            distributed_ensemble_loss=False,
+        )
+    else:
+        ref = torch.zeros_like(dist_loss)
+    dist.broadcast(ref, src=0, group=dist.group.WORLD)
     assert torch.allclose(
         dist_loss,
         ref,
@@ -813,7 +816,7 @@ def _energy_dist_matches_gathered_worker(
     dist.destroy_process_group()
 
 
-def test_WeightedCRPSLoss_distributed_exact_equivalence():
+def test_WeightedCRPSLoss_distributed_equivalence():
     mp.set_start_method("spawn", force=True)
     with tempfile.NamedTemporaryFile(delete=True) as tmp:
         mp.spawn(_dist_crps_worker, args=(2, tmp.name), nprocs=2, join=True)
@@ -821,13 +824,13 @@ def test_WeightedCRPSLoss_distributed_exact_equivalence():
 
 @pytest.mark.parametrize("average_channels", [True, False])
 @pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("world_size", [2, 3])
+@pytest.mark.parametrize("world_size", [2, 3, 4])
 def test_WeightedCRPSLoss_distributed_matches_gathered_ensemble(
     average_channels: bool,
     batch_size: int,
     world_size: int,
 ):
-    """Distributed shards vs ``all_gather``+concat reference (one member per rank).
+    """Distributed shards vs gathered reference.
 
     For ``n_members == 2`` the implementation must use
     ``_dist_ensemble_skill_prefactor`` and the scalar ``valid_px_avg`` fix so the
@@ -843,55 +846,15 @@ def test_WeightedCRPSLoss_distributed_matches_gathered_ensemble(
         )
 
 
-@pytest.mark.slow
 @pytest.mark.parametrize("average_channels", [True, False])
 @pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("world_size", [4])
-def test_WeightedCRPSLoss_distributed_matches_gathered_ensemble_slow(
-    average_channels: bool,
-    batch_size: int,
-    world_size: int,
-):
-    """Same as ``test_WeightedCRPSLoss_distributed_matches_gathered_ensemble`` with four ranks."""
-    mp.set_start_method("spawn", force=True)
-    with tempfile.NamedTemporaryFile(delete=True) as tmp:
-        mp.spawn(
-            _crps_dist_matches_gathered_worker,
-            args=(world_size, tmp.name, average_channels, batch_size),
-            nprocs=world_size,
-            join=True,
-        )
-
-
-@pytest.mark.parametrize("average_channels", [True, False])
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("world_size", [2, 3])
+@pytest.mark.parametrize("world_size", [2, 3, 4])
 def test_PatchedEnergyScoreLoss_distributed_matches_gathered_ensemble(
     average_channels: bool,
     batch_size: int,
     world_size: int,
 ):
     """Same gather equivalence as CRPS for patched energy score."""
-    mp.set_start_method("spawn", force=True)
-    with tempfile.NamedTemporaryFile(delete=True) as tmp:
-        mp.spawn(
-            _energy_dist_matches_gathered_worker,
-            args=(world_size, tmp.name, average_channels, batch_size),
-            nprocs=world_size,
-            join=True,
-        )
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize("average_channels", [True, False])
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("world_size", [4])
-def test_PatchedEnergyScoreLoss_distributed_matches_gathered_ensemble_slow(
-    average_channels: bool,
-    batch_size: int,
-    world_size: int,
-):
-    """Same as ``test_PatchedEnergyScoreLoss_distributed_matches_gathered_ensemble`` with four ranks."""
     mp.set_start_method("spawn", force=True)
     with tempfile.NamedTemporaryFile(delete=True) as tmp:
         mp.spawn(
@@ -920,7 +883,7 @@ def _require_weighted_crps_loss_spectral_cpu():
 
 @pytest.mark.parametrize("average_channels", [True, False])
 @pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("world_size", [2, 3])
+@pytest.mark.parametrize("world_size", [2, 3, 4])
 def test_WeightedCRPSLossSpectral_distributed_matches_gathered_ensemble(
     average_channels: bool,
     batch_size: int,
@@ -938,28 +901,7 @@ def test_WeightedCRPSLossSpectral_distributed_matches_gathered_ensemble(
         )
 
 
-@pytest.mark.slow
-@pytest.mark.parametrize("average_channels", [True, False])
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("world_size", [4])
-def test_WeightedCRPSLossSpectral_distributed_matches_gathered_ensemble_slow(
-    average_channels: bool,
-    batch_size: int,
-    world_size: int,
-):
-    """Same as ``test_WeightedCRPSLossSpectral_distributed_matches_gathered_ensemble`` with four ranks."""
-    _require_weighted_crps_loss_spectral_cpu()
-    mp.set_start_method("spawn", force=True)
-    with tempfile.NamedTemporaryFile(delete=True) as tmp:
-        mp.spawn(
-            _spectral_crps_dist_matches_gathered_worker,
-            args=(world_size, tmp.name, average_channels, batch_size),
-            nprocs=world_size,
-            join=True,
-        )
-
-
-def test_PatchedEnergyScoreLoss_distributed_exact_equivalence():
+def test_PatchedEnergyScoreLoss_distributed_equivalence():
     b, f, t, c, h, w = 1, 12, 1, 2, 64, 64
     n_members = 2
     target = torch.randn(b, f, t, c, h, w, dtype=torch.float32)
