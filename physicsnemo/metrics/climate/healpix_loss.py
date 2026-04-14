@@ -538,7 +538,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         diff_target = th.abs(prediction - target.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
         diff_ensemble = th.abs(prediction[0] - prediction[1]) # [B, F, T, C, H, W]
         crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
-        crps *= lsm_tensor
+        crps = crps * lsm_tensor
         return crps
 
     def _pool(self, tensor, scale):
@@ -621,8 +621,10 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         target = target.to(th.float32)
         
         # Apply channel weights across channel dims
-        prediction *= self.loss_weights[None, None, None, None, :, None, None]
-        target *= self.loss_weights[None, None, None, :, None, None]
+        lw_p = self.loss_weights[None, None, None, None, :, None, None]
+        lw_t = self.loss_weights[None, None, None, :, None, None]
+        prediction = prediction * lw_p
+        target = target * lw_t
 
         if distributed_loss:
             if self.masked_processing and self.lsm_tensor.numel() > 1:
@@ -1007,8 +1009,10 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         target = target.to(th.float32)
 
         # Apply channel weights across channel dims
-        prediction *= self.loss_weights[None, None, None, None, :, None, None]
-        target *= self.loss_weights[None, None, None, :, None, None]
+        lw_p = self.loss_weights[None, None, None, None, :, None, None]
+        lw_t = self.loss_weights[None, None, None, :, None, None]
+        prediction = prediction * lw_p
+        target = target * lw_t
 
         if distributed_loss:
             if self.multiscale > 0:
@@ -1044,7 +1048,15 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                         skill_spec = _dist_allreduce_sum(skill_spec_local, ensemble_group)
                         spread_spec = _dist_allreduce_sum(spread_spec_local, ensemble_group)
                         spread_spec = spread_spec * _dist_pairwise_duplicate_factor(ensemble_group, self.n_members)
-                        spec_loss = self.averaging_coeff * (skill_mul * skill_spec - self.coeff_eps * spread_spec) / (b * t * self.lmax * self.mmax)
+                        # Required to match non-distributed n==2 special case
+                        spec_denom = (
+                            b * t * c
+                            if self.n_members == 2
+                            else b * t * self.lmax * self.mmax
+                        )
+                        spec_loss = self.averaging_coeff * (
+                            skill_mul * skill_spec - self.coeff_eps * spread_spec
+                        ) / spec_denom
                     loss = loss + self.lambda_spec * spec_loss
                 return loss
 
@@ -1079,9 +1091,15 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                     skill_spec = _dist_allreduce_sum(skill_spec_local, ensemble_group)
                     spread_spec = _dist_allreduce_sum(spread_spec_local, ensemble_group)
                     spread_spec = spread_spec * _dist_pairwise_duplicate_factor(ensemble_group, self.n_members)
+                    # Required to match non-distributed n==2 special case
+                    spec_denom = (
+                        b * t
+                        if self.n_members == 2
+                        else b * t * self.lmax * self.mmax
+                    )
                     loss = loss + self.lambda_spec * self.averaging_coeff * (
                         skill_mul * skill_spec - self.coeff_eps * spread_spec
-                    ) / (b * t * self.lmax * self.mmax)
+                    ) / spec_denom
             return loss
 
         if n == 2:
@@ -1097,7 +1115,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
             if self.lambda_spec > 0:
 
-                with th.cuda.amp.autocast(enabled=False):
+                with th.amp.autocast("cuda", enabled=False):
                     # # Reorder predictions: [N, B, F, T, C, H, W] -> [N, B, T, C, F*H*W]
                     # pred_ring = self.reorder_to_ring(prediction.permute(0, 1, 3, 4, 2, 5, 6).reshape(n, b, t, c, f*h*w))
 
@@ -1128,7 +1146,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
             if self.multiscale > 0:
                 for scale in self.scales:
                     l_filter = self._l_filter(scale, device=prediction.device)
-                    with th.cuda.amp.autocast(enabled=False):
+                    with th.amp.autocast("cuda", enabled=False):
                         sht_pred= self._apply_sht(prediction, face_dim=2, return_abs=False)
                         sht_tar = self._apply_sht(target, face_dim=1, return_abs=False)
 
@@ -1142,7 +1160,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                         diff_ensemble = th.abs(pred_smooth[0] - pred_smooth[1]) # [B, F, T, C, H, W]
                         crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
 
-                        crps *= self.lsm_tensor
+                        crps = crps * self.lsm_tensor
 
                         if average_channels:
                             loss += self.multiscale * crps.mean()
@@ -1172,7 +1190,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                 loss = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum(dim=(1,2))/(b*f*t*h*w)
 
                 if self.lambda_spec > 0:
-                    with th.cuda.amp.autocast(enabled=False):
+                    with th.amp.autocast("cuda", enabled=False):
                         # # Reorder predictions: [C, Cond, B, F, T, H, W] -> [C, Cond, B, T, F*H*W]
                         # pred_ring = self.reorder_to_ring(prediction.permute(0, 1, 2, 4, 3, 5, 6).reshape(c, n, b, t, f*h*w))
 
@@ -1204,7 +1222,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                 loss = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_matrix).sum()/(b*f*c*t*h*w)
 
                 if self.lambda_spec > 0:
-                    with th.cuda.amp.autocast(enabled=False):
+                    with th.amp.autocast("cuda", enabled=False):
                         # # Reorder predictions: [Cond, B, F, T, C, H, W] -> [Cond, B, T, C, F*H*W]
                         # pred_ring = self.reorder_to_ring(prediction.permute(0, 1, 3, 4, 2, 5, 6).reshape(n, b, t, c, f*h*w))
 
@@ -1295,8 +1313,10 @@ class SpreadSkillRatioLoss(th.nn.MSELoss):
         target = target.to(th.float32)
 
         # Apply channel weights before computing spread and skill.
-        prediction *= self.loss_weights[None, None, None, None, :, None, None]
-        target *= self.loss_weights[None, None, None, :, None, None]
+        lw_p = self.loss_weights[None, None, None, None, :, None, None]
+        lw_t = self.loss_weights[None, None, None, :, None, None]
+        prediction = prediction * lw_p
+        target = target * lw_t
 
         spread_field = prediction.std(dim=0)
         spread = spread_field.mean(dim=(0, 1, 2, 4, 5))
@@ -1622,10 +1642,10 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
                 dim=(0, 1)
             )  # [B,F,T,C,H,W]
 
-        es *= self.lsm_tensor
+        es = es * self.lsm_tensor
 
         # Apply channel weights (per-variable scaling)
-        es *= self.loss_weights[None, None, None, :, None, None]
+        es = es * self.loss_weights[None, None, None, :, None, None]
 
         if average_channels:
             loss = es.mean()
