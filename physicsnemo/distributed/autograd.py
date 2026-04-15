@@ -333,6 +333,75 @@ def gather_v(
     return GatherVAutograd.apply(tensor, sizes, dim, dst, group)
 
 
+class RingExchangeAutograd(torch.autograd.Function):
+    """
+    Ring exchange autograd primitive.
+
+    Forward maps output_r <- input_{r-1}. Backward performs reverse exchange.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        group: Optional[dist.ProcessGroup] = None,
+    ) -> torch.Tensor:  # pragma: no cover
+        if group is None or not dist.is_initialized():
+            return tensor
+        ws = dist.get_world_size(group=group)
+        if ws == 1:
+            return tensor
+        rank = dist.get_rank(group=group)
+        send_peer = (rank + 1) % ws
+        recv_peer = (rank - 1 + ws) % ws
+        send_to = dist.get_global_rank(group, send_peer)
+        recv_from = dist.get_global_rank(group, recv_peer)
+        tensor = tensor.contiguous()
+        recv = torch.empty_like(tensor)
+        ops = [
+            dist.P2POp(dist.isend, tensor, send_to, group),
+            dist.P2POp(dist.irecv, recv, recv_from, group),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+        ctx.group = group
+        return recv
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):  # pragma: no cover
+        group = ctx.group
+        if group is None or not dist.is_initialized():
+            return grad_output, None
+        ws = dist.get_world_size(group=group)
+        if ws == 1:
+            return grad_output, None
+        rank = dist.get_rank(group=group)
+        # Reverse communication for gradient of ring shift.
+        send_peer = (rank - 1 + ws) % ws
+        recv_peer = (rank + 1) % ws
+        send_to = dist.get_global_rank(group, send_peer)
+        recv_from = dist.get_global_rank(group, recv_peer)
+        grad_output = grad_output.contiguous()
+        grad_input = torch.empty_like(grad_output)
+        ops = [
+            dist.P2POp(dist.isend, grad_output, send_to, group),
+            dist.P2POp(dist.irecv, grad_input, recv_from, group),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+        return grad_input, None
+
+
+def ring_exchange(
+    tensor: torch.Tensor,
+    group: Optional[dist.ProcessGroup] = None,
+) -> torch.Tensor:  # pragma: no cover
+    """Autograd-safe one-step ring exchange."""
+    return RingExchangeAutograd.apply(tensor, group)
+
+
 def scatter_v(
     tensor: torch.Tensor,
     sizes: List[int],
