@@ -23,6 +23,7 @@ import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn_func
 import torch.multiprocessing as mp
 from pytest_utils import import_or_fail, nfsdata_or_fail
 
@@ -1175,14 +1176,17 @@ def _build_shared_model_inputs(rank: int, n_members: int, b: int, c: int, device
     return base, target, noise
 
 
-def _assert_model_grads_close(model_ref, model_dist, rank: int, rtol=1e-4, atol=1e-4):
+def _assert_model_grads_close(
+    model_ref, model_dist, rank: int, rtol=1e-4, atol=1e-4, reduce_dist_grads: bool = True
+):
     for (name_ref, p_ref), (name_dist, p_dist) in zip(
         model_ref.named_parameters(), model_dist.named_parameters()
     ):
         assert name_ref == name_dist
         assert p_ref.grad is not None and p_dist.grad is not None
         dist_grad = p_dist.grad.detach().clone()
-        dist.all_reduce(dist_grad, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
+        if reduce_dist_grads:
+            dist.all_reduce(dist_grad, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
         assert torch.allclose(p_ref.grad, dist_grad, rtol=rtol, atol=atol), (
             f"rank {rank}: parameter grad mismatch for {name_ref}, "
             f"max_abs_diff={(p_ref.grad - dist_grad).abs().max().item()}"
@@ -1210,6 +1214,8 @@ def _crps_weight_grad_worker(
         torch.manual_seed(991)
         model_ref = _NoisyEnsembleModel(channels=c).to(device)
         torch.manual_seed(991)
+        model_gather = _NoisyEnsembleModel(channels=c).to(device)
+        torch.manual_seed(991)
         model_dist = _NoisyEnsembleModel(channels=c).to(device)
 
         loss_fn = WeightedCRPSLoss(weights=[1.0, 1.0], n_members=n_members)
@@ -1225,15 +1231,33 @@ def _crps_weight_grad_worker(
         )
         ref_loss.sum().backward()
 
-        pred_loc = model_dist(base, noise[start:stop]).reshape(local_members * b, 12, 2, c, 32, 32)
+        pred_loc_gather = model_gather(base, noise[start:stop]).reshape(
+            local_members * b, 12, 2, c, 32, 32
+        )
+        pred_gather = torch.cat(
+            list(dist_nn_func.all_gather(pred_loc_gather, group=dist.group.WORLD)), dim=0
+        )
+        gather_loss = loss_fn(
+            pred_gather,
+            target,
+            average_channels=average_channels,
+            distributed_ensemble_loss=False,
+        )
+        gather_loss = gather_loss / world_size
+        gather_loss.sum().backward()
+
+        pred_loc_dist = model_dist(base, noise[start:stop]).reshape(
+            local_members * b, 12, 2, c, 32, 32
+        )
         dist_loss = loss_fn(
-            pred_loc,
+            pred_loc_dist,
             target,
             average_channels=average_channels,
             distributed_ensemble_loss=True,
             ensemble_group=dist.group.WORLD,
         )
         dist_loss.sum().backward()
+        _assert_model_grads_close(model_ref, model_gather, rank=rank, reduce_dist_grads=True)
         _assert_model_grads_close(model_ref, model_dist, rank=rank)
     finally:
         dist.destroy_process_group()
@@ -1261,6 +1285,8 @@ def _spectral_weight_grad_worker(
         torch.manual_seed(992)
         model_ref = _NoisyEnsembleModel(channels=c).to(device)
         torch.manual_seed(992)
+        model_gather = _NoisyEnsembleModel(channels=c).to(device)
+        torch.manual_seed(992)
         model_dist = _NoisyEnsembleModel(channels=c).to(device)
 
         loss_fn = WeightedCRPSLossSpectral(
@@ -1283,15 +1309,33 @@ def _spectral_weight_grad_worker(
         )
         ref_loss.sum().backward()
 
-        pred_loc = model_dist(base, noise[start:stop]).reshape(local_members * b, 12, 2, c, 32, 32)
+        pred_loc_gather = model_gather(base, noise[start:stop]).reshape(
+            local_members * b, 12, 2, c, 32, 32
+        )
+        pred_gather = torch.cat(
+            list(dist_nn_func.all_gather(pred_loc_gather, group=dist.group.WORLD)), dim=0
+        )
+        gather_loss = loss_fn(
+            pred_gather,
+            target,
+            average_channels=average_channels,
+            distributed_ensemble_loss=False,
+        )
+        gather_loss = gather_loss / world_size
+        gather_loss.sum().backward()
+
+        pred_loc_dist = model_dist(base, noise[start:stop]).reshape(
+            local_members * b, 12, 2, c, 32, 32
+        )
         dist_loss = loss_fn(
-            pred_loc,
+            pred_loc_dist,
             target,
             average_channels=average_channels,
             distributed_ensemble_loss=True,
             ensemble_group=dist.group.WORLD,
         )
         dist_loss.sum().backward()
+        _assert_model_grads_close(model_ref, model_gather, rank=rank, reduce_dist_grads=True)
         _assert_model_grads_close(model_ref, model_dist, rank=rank)
     finally:
         dist.destroy_process_group()
@@ -1318,6 +1362,8 @@ def _energy_weight_grad_worker(
         torch.manual_seed(993)
         model_ref = _NoisyEnsembleModel(channels=c).to(device)
         torch.manual_seed(993)
+        model_gather = _NoisyEnsembleModel(channels=c).to(device)
+        torch.manual_seed(993)
         model_dist = _NoisyEnsembleModel(channels=c).to(device)
 
         loss_fn = PatchedEnergyScoreLoss(
@@ -1335,15 +1381,33 @@ def _energy_weight_grad_worker(
         )
         ref_loss.sum().backward()
 
-        pred_loc = model_dist(base, noise[start:stop]).reshape(local_members * b, 12, 2, c, 32, 32)
+        pred_loc_gather = model_gather(base, noise[start:stop]).reshape(
+            local_members * b, 12, 2, c, 32, 32
+        )
+        pred_gather = torch.cat(
+            list(dist_nn_func.all_gather(pred_loc_gather, group=dist.group.WORLD)), dim=0
+        )
+        gather_loss = loss_fn(
+            pred_gather,
+            target,
+            average_channels=average_channels,
+            distributed_ensemble_loss=False,
+        )
+        gather_loss = gather_loss / world_size
+        gather_loss.sum().backward()
+
+        pred_loc_dist = model_dist(base, noise[start:stop]).reshape(
+            local_members * b, 12, 2, c, 32, 32
+        )
         dist_loss = loss_fn(
-            pred_loc,
+            pred_loc_dist,
             target,
             average_channels=average_channels,
             distributed_ensemble_loss=True,
             ensemble_group=dist.group.WORLD,
         )
         dist_loss.sum().backward()
+        _assert_model_grads_close(model_ref, model_gather, rank=rank, reduce_dist_grads=True)
         _assert_model_grads_close(model_ref, model_dist, rank=rank)
     finally:
         dist.destroy_process_group()
@@ -1353,7 +1417,7 @@ def _energy_weight_grad_worker(
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("n_members", [4, 8])
-def test_WeightedCRPSLoss_distributed_model_weight_grads_match_gathered(
+def test_WeightedCRPSLoss_model_weight_grads_match_across_ensemble_modes(
     average_channels: bool, batch_size: int, world_size: int, n_members: int
 ):
     if n_members % world_size != 0:
@@ -1373,7 +1437,7 @@ def test_WeightedCRPSLoss_distributed_model_weight_grads_match_gathered(
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("n_members", [4, 8])
-def test_WeightedCRPSLossSpectral_distributed_model_weight_grads_match_gathered(
+def test_WeightedCRPSLossSpectral_model_weight_grads_match_across_ensemble_modes(
     average_channels: bool, batch_size: int, world_size: int, n_members: int
 ):
     if n_members % world_size != 0:
@@ -1393,7 +1457,7 @@ def test_WeightedCRPSLossSpectral_distributed_model_weight_grads_match_gathered(
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("n_members", [4, 8])
-def test_PatchedEnergyScoreLoss_distributed_model_weight_grads_match_gathered(
+def test_PatchedEnergyScoreLoss_model_weight_grads_match_across_ensemble_modes(
     average_channels: bool, batch_size: int, world_size: int, n_members: int
 ):
     if n_members % world_size != 0:
