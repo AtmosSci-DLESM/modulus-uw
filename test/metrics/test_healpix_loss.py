@@ -1176,24 +1176,93 @@ def _build_shared_model_inputs(rank: int, n_members: int, b: int, c: int, device
     return base, target, noise
 
 
-def _assert_model_grads_close(
-    model_ref, model_dist, rank: int, rtol=1e-4, atol=1e-4, reduce_dist_grads: bool = True
+def _assert_model_params_close(
+    model_ref, model_test, rank: int, rtol=1e-5, atol=1e-6, reduce_test_params: bool = False
 ):
-    for (name_ref, p_ref), (name_dist, p_dist) in zip(
-        model_ref.named_parameters(), model_dist.named_parameters()
+    for (name_ref, p_ref), (name_test, p_test) in zip(
+        model_ref.named_parameters(), model_test.named_parameters()
     ):
-        assert name_ref == name_dist
-        assert p_ref.grad is not None and p_dist.grad is not None
-        dist_grad = p_dist.grad.detach().clone()
-        if reduce_dist_grads:
-            dist.all_reduce(dist_grad, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
-        assert torch.allclose(p_ref.grad, dist_grad, rtol=rtol, atol=atol), (
-            f"rank {rank}: parameter grad mismatch for {name_ref}, "
-            f"max_abs_diff={(p_ref.grad - dist_grad).abs().max().item()}"
+        assert name_ref == name_test
+        test_param = p_test.detach().clone()
+        if reduce_test_params:
+            dist.all_reduce(test_param, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
+        assert torch.allclose(p_ref.detach(), test_param, rtol=rtol, atol=atol), (
+            f"rank {rank}: parameter update mismatch for {name_ref}, "
+            f"max_abs_diff={(p_ref.detach() - test_param).abs().max().item()}"
         )
 
 
-def _crps_weight_grad_worker(
+def _optimizer_step_all_modes(
+    model_ref,
+    model_gather,
+    model_dist,
+    loss_fn,
+    base: torch.Tensor,
+    target: torch.Tensor,
+    noise: torch.Tensor,
+    start: int,
+    stop: int,
+    average_channels: bool,
+    world_size: int,
+):
+    b = base.shape[0]
+    c = base.shape[3]
+    local_members = stop - start
+
+    opt_ref = torch.optim.SGD(model_ref.parameters(), lr=1e-2)
+    opt_gather = torch.optim.SGD(model_gather.parameters(), lr=1e-2)
+    opt_dist = torch.optim.SGD(model_dist.parameters(), lr=1e-2)
+
+    opt_ref.zero_grad(set_to_none=True)
+    pred_ref = model_ref(base, noise).reshape(noise.shape[0] * b, 12, 2, c, 32, 32)
+    ref_loss = loss_fn(
+        pred_ref,
+        target,
+        average_channels=average_channels,
+        distributed_ensemble_loss=False,
+    )
+    ref_loss.sum().backward()
+    opt_ref.step()
+
+    opt_gather.zero_grad(set_to_none=True)
+    pred_loc_gather = model_gather(base, noise[start:stop]).reshape(
+        local_members * b, 12, 2, c, 32, 32
+    )
+    pred_gather = torch.cat(
+        list(dist_nn_func.all_gather(pred_loc_gather, group=dist.group.WORLD)), dim=0
+    )
+    gather_loss = loss_fn(
+        pred_gather,
+        target,
+        average_channels=average_channels,
+        distributed_ensemble_loss=False,
+    )
+    gather_loss = gather_loss / world_size
+    gather_loss.sum().backward()
+    for param in model_gather.parameters():
+        if param.grad is not None:
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
+    opt_gather.step()
+
+    opt_dist.zero_grad(set_to_none=True)
+    pred_loc_dist = model_dist(base, noise[start:stop]).reshape(
+        local_members * b, 12, 2, c, 32, 32
+    )
+    dist_loss = loss_fn(
+        pred_loc_dist,
+        target,
+        average_channels=average_channels,
+        distributed_ensemble_loss=True,
+        ensemble_group=dist.group.WORLD,
+    )
+    dist_loss.sum().backward()
+    for param in model_dist.parameters():
+        if param.grad is not None:
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
+    opt_dist.step()
+
+
+def _crps_weight_update_worker(
     rank: int,
     world_size: int,
     n_members: int,
@@ -1222,48 +1291,28 @@ def _crps_weight_grad_worker(
         trainer = trainer_helper(output_variables=["v0", "v1"], device=device)
         loss_fn.setup(trainer)
 
-        pred_ref = model_ref(base, noise).reshape(n_members * b, 12, 2, c, 32, 32)
-        ref_loss = loss_fn(
-            pred_ref,
-            target,
+        _optimizer_step_all_modes(
+            model_ref=model_ref,
+            model_gather=model_gather,
+            model_dist=model_dist,
+            loss_fn=loss_fn,
+            base=base,
+            target=target,
+            noise=noise,
+            start=start,
+            stop=stop,
             average_channels=average_channels,
-            distributed_ensemble_loss=False,
+            world_size=world_size,
         )
-        ref_loss.sum().backward()
-
-        pred_loc_gather = model_gather(base, noise[start:stop]).reshape(
-            local_members * b, 12, 2, c, 32, 32
+        _assert_model_params_close(
+            model_ref, model_gather, rank=rank, reduce_test_params=False
         )
-        pred_gather = torch.cat(
-            list(dist_nn_func.all_gather(pred_loc_gather, group=dist.group.WORLD)), dim=0
-        )
-        gather_loss = loss_fn(
-            pred_gather,
-            target,
-            average_channels=average_channels,
-            distributed_ensemble_loss=False,
-        )
-        gather_loss = gather_loss / world_size
-        gather_loss.sum().backward()
-
-        pred_loc_dist = model_dist(base, noise[start:stop]).reshape(
-            local_members * b, 12, 2, c, 32, 32
-        )
-        dist_loss = loss_fn(
-            pred_loc_dist,
-            target,
-            average_channels=average_channels,
-            distributed_ensemble_loss=True,
-            ensemble_group=dist.group.WORLD,
-        )
-        dist_loss.sum().backward()
-        _assert_model_grads_close(model_ref, model_gather, rank=rank, reduce_dist_grads=True)
-        _assert_model_grads_close(model_ref, model_dist, rank=rank)
+        _assert_model_params_close(model_ref, model_dist, rank=rank)
     finally:
         dist.destroy_process_group()
 
 
-def _spectral_weight_grad_worker(
+def _spectral_weight_update_worker(
     rank: int,
     world_size: int,
     n_members: int,
@@ -1300,48 +1349,28 @@ def _spectral_weight_grad_worker(
         trainer = trainer_helper(output_variables=["v0", "v1"], device=device)
         loss_fn.setup(trainer)
 
-        pred_ref = model_ref(base, noise).reshape(n_members * b, 12, 2, c, 32, 32)
-        ref_loss = loss_fn(
-            pred_ref,
-            target,
+        _optimizer_step_all_modes(
+            model_ref=model_ref,
+            model_gather=model_gather,
+            model_dist=model_dist,
+            loss_fn=loss_fn,
+            base=base,
+            target=target,
+            noise=noise,
+            start=start,
+            stop=stop,
             average_channels=average_channels,
-            distributed_ensemble_loss=False,
+            world_size=world_size,
         )
-        ref_loss.sum().backward()
-
-        pred_loc_gather = model_gather(base, noise[start:stop]).reshape(
-            local_members * b, 12, 2, c, 32, 32
+        _assert_model_params_close(
+            model_ref, model_gather, rank=rank, reduce_test_params=False
         )
-        pred_gather = torch.cat(
-            list(dist_nn_func.all_gather(pred_loc_gather, group=dist.group.WORLD)), dim=0
-        )
-        gather_loss = loss_fn(
-            pred_gather,
-            target,
-            average_channels=average_channels,
-            distributed_ensemble_loss=False,
-        )
-        gather_loss = gather_loss / world_size
-        gather_loss.sum().backward()
-
-        pred_loc_dist = model_dist(base, noise[start:stop]).reshape(
-            local_members * b, 12, 2, c, 32, 32
-        )
-        dist_loss = loss_fn(
-            pred_loc_dist,
-            target,
-            average_channels=average_channels,
-            distributed_ensemble_loss=True,
-            ensemble_group=dist.group.WORLD,
-        )
-        dist_loss.sum().backward()
-        _assert_model_grads_close(model_ref, model_gather, rank=rank, reduce_dist_grads=True)
-        _assert_model_grads_close(model_ref, model_dist, rank=rank)
+        _assert_model_params_close(model_ref, model_dist, rank=rank)
     finally:
         dist.destroy_process_group()
 
 
-def _energy_weight_grad_worker(
+def _energy_weight_update_worker(
     rank: int,
     world_size: int,
     n_members: int,
@@ -1372,43 +1401,23 @@ def _energy_weight_grad_worker(
         trainer = trainer_helper(output_variables=["v0", "v1"], device=device)
         loss_fn.setup(trainer)
 
-        pred_ref = model_ref(base, noise).reshape(n_members * b, 12, 2, c, 32, 32)
-        ref_loss = loss_fn(
-            pred_ref,
-            target,
+        _optimizer_step_all_modes(
+            model_ref=model_ref,
+            model_gather=model_gather,
+            model_dist=model_dist,
+            loss_fn=loss_fn,
+            base=base,
+            target=target,
+            noise=noise,
+            start=start,
+            stop=stop,
             average_channels=average_channels,
-            distributed_ensemble_loss=False,
+            world_size=world_size,
         )
-        ref_loss.sum().backward()
-
-        pred_loc_gather = model_gather(base, noise[start:stop]).reshape(
-            local_members * b, 12, 2, c, 32, 32
+        _assert_model_params_close(
+            model_ref, model_gather, rank=rank, reduce_test_params=False
         )
-        pred_gather = torch.cat(
-            list(dist_nn_func.all_gather(pred_loc_gather, group=dist.group.WORLD)), dim=0
-        )
-        gather_loss = loss_fn(
-            pred_gather,
-            target,
-            average_channels=average_channels,
-            distributed_ensemble_loss=False,
-        )
-        gather_loss = gather_loss / world_size
-        gather_loss.sum().backward()
-
-        pred_loc_dist = model_dist(base, noise[start:stop]).reshape(
-            local_members * b, 12, 2, c, 32, 32
-        )
-        dist_loss = loss_fn(
-            pred_loc_dist,
-            target,
-            average_channels=average_channels,
-            distributed_ensemble_loss=True,
-            ensemble_group=dist.group.WORLD,
-        )
-        dist_loss.sum().backward()
-        _assert_model_grads_close(model_ref, model_gather, rank=rank, reduce_dist_grads=True)
-        _assert_model_grads_close(model_ref, model_dist, rank=rank)
+        _assert_model_params_close(model_ref, model_dist, rank=rank)
     finally:
         dist.destroy_process_group()
 
@@ -1417,7 +1426,7 @@ def _energy_weight_grad_worker(
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("n_members", [4, 8])
-def test_WeightedCRPSLoss_model_weight_grads_match_across_ensemble_modes(
+def test_WeightedCRPSLoss_model_weight_updates_match_across_ensemble_modes(
     average_channels: bool, batch_size: int, world_size: int, n_members: int
 ):
     if n_members % world_size != 0:
@@ -1426,7 +1435,7 @@ def test_WeightedCRPSLoss_model_weight_grads_match_across_ensemble_modes(
     mp.set_start_method("spawn", force=True)
     with tempfile.NamedTemporaryFile(delete=True) as tmp:
         mp.spawn(
-            _crps_weight_grad_worker,
+            _crps_weight_update_worker,
             args=(world_size, n_members, tmp.name, average_channels, batch_size),
             nprocs=world_size,
             join=True,
@@ -1437,7 +1446,7 @@ def test_WeightedCRPSLoss_model_weight_grads_match_across_ensemble_modes(
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("n_members", [4, 8])
-def test_WeightedCRPSLossSpectral_model_weight_grads_match_across_ensemble_modes(
+def test_WeightedCRPSLossSpectral_model_weight_updates_match_across_ensemble_modes(
     average_channels: bool, batch_size: int, world_size: int, n_members: int
 ):
     if n_members % world_size != 0:
@@ -1446,7 +1455,7 @@ def test_WeightedCRPSLossSpectral_model_weight_grads_match_across_ensemble_modes
     mp.set_start_method("spawn", force=True)
     with tempfile.NamedTemporaryFile(delete=True) as tmp:
         mp.spawn(
-            _spectral_weight_grad_worker,
+            _spectral_weight_update_worker,
             args=(world_size, n_members, tmp.name, average_channels, batch_size),
             nprocs=world_size,
             join=True,
@@ -1457,7 +1466,7 @@ def test_WeightedCRPSLossSpectral_model_weight_grads_match_across_ensemble_modes
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("n_members", [4, 8])
-def test_PatchedEnergyScoreLoss_model_weight_grads_match_across_ensemble_modes(
+def test_PatchedEnergyScoreLoss_model_weight_updates_match_across_ensemble_modes(
     average_channels: bool, batch_size: int, world_size: int, n_members: int
 ):
     if n_members % world_size != 0:
@@ -1466,7 +1475,7 @@ def test_PatchedEnergyScoreLoss_model_weight_grads_match_across_ensemble_modes(
     mp.set_start_method("spawn", force=True)
     with tempfile.NamedTemporaryFile(delete=True) as tmp:
         mp.spawn(
-            _energy_weight_grad_worker,
+            _energy_weight_update_worker,
             args=(world_size, n_members, tmp.name, average_channels, batch_size),
             nprocs=world_size,
             join=True,
