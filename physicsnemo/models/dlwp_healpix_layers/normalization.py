@@ -85,13 +85,10 @@ class ConditionalLayerNorm(th.nn.Module):
             [2 * h for h in self.hidden_dims],
             2 * self.channel_depth,
             self.activation,
+            init_cln_to_zero,
         )
         self.n_faces = n_faces
         self.scale_center = scale_center
-
-        if init_cln_to_zero:
-            self.gamma_beta_mlp[-1].weight.data.zero_()
-            self.gamma_beta_mlp[-1].bias.data.zero_()
 
         if norm_op == "torch":
             self.norm = th.nn.LayerNorm(channel_depth, elementwise_affine=False)
@@ -100,15 +97,23 @@ class ConditionalLayerNorm(th.nn.Module):
                 raise ImportError("Apex FusedLayerNorm requested but apex is not available, please install it from https://github.com/NVIDIA/apex")
             self.norm = FusedLayerNorm(channel_depth, elementwise_affine=False)
 
-    def _make_mlp(self, in_dim: int, hidden_dims: List[int], out_dim: int, activation: th.nn.Module) -> th.nn.Sequential:
+    def _make_mlp(self, in_dim: int, hidden_dims: List[int], out_dim: int, activation: th.nn.Module, init_cln_to_zero: bool) -> th.nn.Sequential:
 
         layers = []
         for hdim in hidden_dims:
             layers.append(th.nn.Linear(in_dim, hdim))
+            if init_cln_to_zero:
+                layers[-1].weight.data.zero_()
+                layers[-1].bias.data.zero_()
+
             if activation:
                 layers.append(activation)
             in_dim = hdim
+
         layers.append(th.nn.Linear(in_dim, out_dim))
+        if init_cln_to_zero:
+            layers[-1].weight.data.zero_()
+            layers[-1].bias.data.zero_()
         return th.nn.Sequential(*layers)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
