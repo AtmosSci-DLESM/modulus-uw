@@ -601,7 +601,7 @@ class HEALPixRecUNet(Module):
         -------
         th.Tensor: Predicted outputs
         """
-        self.reset()
+        # self.reset()
         outputs = []
         for step in range(self.integration_steps):
             # (Re-)initialize recurrent hidden states
