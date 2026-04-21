@@ -508,7 +508,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
 
         return Tv_error
 
-    def forward(self, prediction, target, average_channels=True):
+    def forward(self, prediction, target, average_channels=True, **kwargs):
         """
         Forward pass of the WeightedMSE pass
         Tensors are expected to be in the shape [N, F, B, C, H, W]
@@ -521,6 +521,8 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             The target tensor
         average_channels: bool, optional
             whether the mean of the channels should be taken
+        **kwargs: dict, optional
+            Additional keyword arguments
         """
 
         # Need to scale back to physical units here so disable autocast
