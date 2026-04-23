@@ -66,6 +66,10 @@ class trainer_helper:
 
     output_variables: Sequence
     device: str
+    distributed_ensemble_loss: bool = False
+    ensemble_group_size: int = 1
+    ensemble_group: object = None
+    ensemble_sharding_enabled: bool = False
 
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
@@ -549,7 +553,7 @@ def test_WeightedCRPSLoss_shape_checks():
     loss_fn_bad_members = WeightedCRPSLoss(weights=[1.0, 1.0], n_members=3)
     loss_fn_bad_members.setup(trainer)
     with pytest.raises(ValueError):
-        loss_fn_bad_members(pred, tar, average_channels=True, distributed_ensemble_loss=False)
+        loss_fn_bad_members(pred, tar, average_channels=True)
 
 
 def test_WeightedCRPSLossSpectral_apply_sht_face_dim_validation_cpu():
@@ -720,6 +724,24 @@ def test_WeightedCRPSLossSpectral_lambda0_perfect_forecast_smoke():
     assert torch.isfinite(out)
 
 
+# --- Ensemble / distributed loss equivalence (multi-GPU) ---------------------------------
+#
+# We compare three operational modes. Outputs (forward tests) and parameter updates
+# (weight-update tests) should agree across them where applicable.
+#
+# Mode A — Unsharded: all ensemble members on one process/GPU; loss is computed locally
+#   in non-distributed mode (full prediction tensor, ``distributed_ensemble_loss=False``).
+#
+# Mode B — Sharded, gathered loss: ensemble members are split across processes; each rank
+#   holds a local shard. Predictions are all_gather'd along the member dimension, then
+#   the same non-distributed loss runs on the full tensor (simulates "gather then one-GPU
+#   loss" without changing the loss code path to distributed).
+#
+# Mode C — Sharded, distributed loss: each rank keeps its shard; the loss uses
+#   ``distributed_ensemble_loss=True`` and ensemble-group collectives (including a ring
+#   exchange) so the result matches the global ensemble objective.
+
+
 def _require_distributed_cuda(world_size: int):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for distributed probabilistic GPU tests")
@@ -772,31 +794,53 @@ def _crps_dist_matches_gathered_worker(
         )
 
         loss_fn = WeightedCRPSLoss(weights=[1.0, 1.0], n_members=n_members)
-        trainer = trainer_helper(output_variables=["v0", "v1"], device=device)
+        trainer = trainer_helper(
+            output_variables=["v0", "v1"],
+            device=device,
+            distributed_ensemble_loss=True,
+            ensemble_group_size=world_size,
+            ensemble_group=dist.group.WORLD,
+            ensemble_sharding_enabled=True,
+        )
         loss_fn.setup(trainer)
 
         local_members = n_members // world_size
         start = rank * local_members
         stop = start + local_members
         local = pred_all[start:stop].reshape(local_members * b, f, t, c, h, w)
+        # Mode C: sharded members, distributed loss (ring / ensemble collectives)
         dist_loss = loss_fn(
             local,
             target,
             average_channels=average_channels,
-            distributed_ensemble_loss=True,
-            ensemble_group=dist.group.WORLD,
         )
+        # Mode B: sharded members, all_gather full prediction, then non-distributed loss
+        gathered = torch.cat(
+            list(dist_nn_func.all_gather(local, group=dist.group.WORLD)), dim=0
+        )
+        loss_fn.distributed_ensemble_loss = False
+        gather_loss = loss_fn(
+            gathered,
+            target,
+            average_channels=average_channels,
+        )
+        # Mode A: unsharded (full member dim on one rank; reference)
         if rank == 0:
             pred_full = pred_all.reshape(n_members * b, f, t, c, h, w)
             ref = loss_fn(
                 pred_full,
                 target,
                 average_channels=average_channels,
-                distributed_ensemble_loss=False,
             )
         else:
             ref = torch.zeros_like(dist_loss)
         dist.broadcast(ref, src=0, group=dist.group.WORLD)
+        assert torch.allclose(
+            gather_loss,
+            ref,
+            rtol=1e-4,
+            atol=1e-4,
+        ), f"rank {rank}: gather_loss={gather_loss} ref={ref}"
         assert torch.allclose(
             dist_loss,
             ref,
@@ -838,31 +882,53 @@ def _spectral_crps_dist_matches_gathered_worker(
             lmax=lmax,
             mmax=mmax,
         )
-        trainer = trainer_helper(output_variables=["v0", "v1"], device=device)
+        trainer = trainer_helper(
+            output_variables=["v0", "v1"],
+            device=device,
+            distributed_ensemble_loss=True,
+            ensemble_group_size=world_size,
+            ensemble_group=dist.group.WORLD,
+            ensemble_sharding_enabled=True,
+        )
         loss_fn.setup(trainer)
 
         local_members = n_members // world_size
         start = rank * local_members
         stop = start + local_members
         local = pred_all[start:stop].reshape(local_members * b, f, t, c, h, w)
+        # Mode C: sharded, distributed loss
         dist_loss = loss_fn(
             local,
             target,
             average_channels=average_channels,
-            distributed_ensemble_loss=True,
-            ensemble_group=dist.group.WORLD,
         )
+        # Mode B: sharded, gather then non-distributed loss
+        gathered = torch.cat(
+            list(dist_nn_func.all_gather(local, group=dist.group.WORLD)), dim=0
+        )
+        loss_fn.distributed_ensemble_loss = False
+        gather_loss = loss_fn(
+            gathered,
+            target,
+            average_channels=average_channels,
+        )
+        # Mode A: unsharded reference
         if rank == 0:
             pred_full = pred_all.reshape(n_members * b, f, t, c, h, w)
             ref = loss_fn(
                 pred_full,
                 target,
                 average_channels=average_channels,
-                distributed_ensemble_loss=False,
             )
         else:
             ref = torch.zeros_like(dist_loss)
         dist.broadcast(ref, src=0, group=dist.group.WORLD)
+        assert torch.allclose(
+            gather_loss,
+            ref,
+            rtol=1e-4,
+            atol=1e-4,
+        ), f"rank {rank}: gather_loss={gather_loss} ref={ref}"
         assert torch.allclose(
             dist_loss,
             ref,
@@ -899,244 +965,59 @@ def _energy_dist_matches_gathered_worker(
             patch_size=3,
             enable_nhwc=False,
         )
-        trainer = trainer_helper(output_variables=["v0", "v1"], device=device)
+        trainer = trainer_helper(
+            output_variables=["v0", "v1"],
+            device=device,
+            distributed_ensemble_loss=True,
+            ensemble_group_size=world_size,
+            ensemble_group=dist.group.WORLD,
+            ensemble_sharding_enabled=True,
+        )
         loss_fn.setup(trainer)
 
         local_members = n_members // world_size
         start = rank * local_members
         stop = start + local_members
         local = pred_all[start:stop].reshape(local_members * b, f, t, c, h, w)
+        # Mode C: sharded, distributed loss
         dist_loss = loss_fn(
             local,
             target,
             average_channels=average_channels,
-            distributed_ensemble_loss=True,
-            ensemble_group=dist.group.WORLD,
         )
+        # Mode B: sharded, gather then non-distributed loss
+        gathered = torch.cat(
+            list(dist_nn_func.all_gather(local, group=dist.group.WORLD)), dim=0
+        )
+        loss_fn.distributed_ensemble_loss = False
+        gather_loss = loss_fn(
+            gathered,
+            target,
+            average_channels=average_channels,
+        )
+        # Mode A: unsharded reference
         if rank == 0:
             pred_full = pred_all.reshape(n_members * b, f, t, c, h, w)
             ref = loss_fn(
                 pred_full,
                 target,
                 average_channels=average_channels,
-                distributed_ensemble_loss=False,
             )
         else:
             ref = torch.zeros_like(dist_loss)
         dist.broadcast(ref, src=0, group=dist.group.WORLD)
+        assert torch.allclose(
+            gather_loss,
+            ref,
+            rtol=1e-4,
+            atol=1e-4,
+        ), f"rank {rank}: gather_loss={gather_loss} ref={ref}"
         assert torch.allclose(
             dist_loss,
             ref,
             rtol=1e-4,
             atol=1e-4,
         ), f"rank {rank}: dist_loss={dist_loss} ref={ref}"
-    finally:
-        dist.destroy_process_group()
-
-
-def _crps_dist_backward_matches_gathered_worker(
-    rank: int,
-    world_size: int,
-    n_members: int,
-    init_file: str,
-    average_channels: bool,
-    batch_size: int,
-):
-    _init_cuda_process_group(rank, world_size, init_file)
-    device = f"cuda:{rank}"
-    try:
-        torch.manual_seed(2025)
-        b = batch_size
-        f, t, c, h, w = 12, 2, 2, 32, 32
-        target, pred_all = _build_shared_random_tensors(
-            rank,
-            (b, f, t, c, h, w),
-            (n_members, b, f, t, c, h, w),
-        )
-
-        loss_fn = WeightedCRPSLoss(weights=[1.0, 1.0], n_members=n_members)
-        trainer = trainer_helper(output_variables=["v0", "v1"], device=device)
-        loss_fn.setup(trainer)
-        local_members = n_members // world_size
-        start = rank * local_members
-        stop = start + local_members
-
-        pred_ref = (
-            pred_all.reshape(n_members * b, f, t, c, h, w).clone().requires_grad_(True)
-        )
-        ref_loss = loss_fn(
-            pred_ref,
-            target,
-            average_channels=average_channels,
-            distributed_ensemble_loss=False,
-        )
-        ref_loss.sum().backward()
-        grad_ref_shard = (
-            pred_ref.grad.view(n_members, b, f, t, c, h, w)[start:stop]
-            .contiguous()
-            .reshape(local_members * b, f, t, c, h, w)
-        )
-
-        pred_loc = pred_all[start:stop].reshape(local_members * b, f, t, c, h, w).clone().requires_grad_(True)
-        dist_loss = loss_fn(
-            pred_loc,
-            target,
-            average_channels=average_channels,
-            distributed_ensemble_loss=True,
-            ensemble_group=dist.group.WORLD,
-        )
-        dist_loss.sum().backward()
-        grad_loc = pred_loc.grad
-
-        assert torch.isfinite(grad_ref_shard).all(), f"rank {rank}: non-finite ref grad"
-        assert torch.isfinite(grad_loc).all(), f"rank {rank}: non-finite dist grad"
-        assert torch.allclose(grad_ref_shard, grad_loc, rtol=1e-4, atol=1e-4), (
-            f"rank {rank}: grad mismatch vs gathered reference, "
-            f"max_abs_diff={(grad_ref_shard - grad_loc).abs().max().item()}"
-        )
-    finally:
-        dist.destroy_process_group()
-
-
-def _spectral_crps_dist_backward_matches_gathered_worker(
-    rank: int,
-    world_size: int,
-    n_members: int,
-    init_file: str,
-    average_channels: bool,
-    batch_size: int,
-    lambda_spec: float,
-):
-    _init_cuda_process_group(rank, world_size, init_file)
-    device = f"cuda:{rank}"
-    try:
-        torch.manual_seed(2025)
-        b = batch_size
-        f, t, c, h, w = 12, 2, 2, 32, 32
-        nside = 32
-        lmax = mmax = 3 * nside - 1
-        target, pred_all = _build_shared_random_tensors(
-            rank,
-            (b, f, t, c, h, w),
-            (n_members, b, f, t, c, h, w),
-        )
-
-        loss_fn = WeightedCRPSLossSpectral(
-            weights=[1.0, 1.0],
-            n_members=n_members,
-            lambda_spec=lambda_spec,
-            nside=nside,
-            lmax=lmax,
-            mmax=mmax,
-        )
-        trainer = trainer_helper(output_variables=["v0", "v1"], device=device)
-        loss_fn.setup(trainer)
-
-        local_members = n_members // world_size
-        start = rank * local_members
-        stop = start + local_members
-        pred_ref = (
-            pred_all.reshape(n_members * b, f, t, c, h, w).clone().requires_grad_(True)
-        )
-        ref_loss = loss_fn(
-            pred_ref,
-            target,
-            average_channels=average_channels,
-            distributed_ensemble_loss=False,
-        )
-        ref_loss.sum().backward()
-        grad_ref_shard = (
-            pred_ref.grad.view(n_members, b, f, t, c, h, w)[start:stop]
-            .contiguous()
-            .reshape(local_members * b, f, t, c, h, w)
-        )
-
-        pred_loc = pred_all[start:stop].reshape(local_members * b, f, t, c, h, w).clone().requires_grad_(True)
-        dist_loss = loss_fn(
-            pred_loc,
-            target,
-            average_channels=average_channels,
-            distributed_ensemble_loss=True,
-            ensemble_group=dist.group.WORLD,
-        )
-        dist_loss.sum().backward()
-        grad_loc = pred_loc.grad
-
-        assert torch.isfinite(grad_ref_shard).all(), f"rank {rank}: non-finite ref grad"
-        assert torch.isfinite(grad_loc).all(), f"rank {rank}: non-finite dist grad"
-        assert torch.allclose(grad_ref_shard, grad_loc, rtol=1e-4, atol=1e-4), (
-            f"rank {rank}: spectral grad mismatch vs gathered reference, "
-            f"max_abs_diff={(grad_ref_shard - grad_loc).abs().max().item()}"
-        )
-    finally:
-        dist.destroy_process_group()
-
-
-def _energy_dist_backward_matches_gathered_worker(
-    rank: int,
-    world_size: int,
-    n_members: int,
-    init_file: str,
-    average_channels: bool,
-    batch_size: int,
-):
-    _init_cuda_process_group(rank, world_size, init_file)
-    device = f"cuda:{rank}"
-    try:
-        torch.manual_seed(4242)
-        b = batch_size
-        f, t, c, h, w = 12, 2, 2, 32, 32
-        target, pred_all = _build_shared_random_tensors(
-            rank,
-            (b, f, t, c, h, w),
-            (n_members, b, f, t, c, h, w),
-        )
-
-        loss_fn = PatchedEnergyScoreLoss(
-            weights=[1.0, 1.0],
-            n_members=n_members,
-            patch_size=3,
-            enable_nhwc=False,
-        )
-        trainer = trainer_helper(output_variables=["v0", "v1"], device=device)
-        loss_fn.setup(trainer)
-
-        local_members = n_members // world_size
-        start = rank * local_members
-        stop = start + local_members
-        pred_ref = (
-            pred_all.reshape(n_members * b, f, t, c, h, w).clone().requires_grad_(True)
-        )
-        ref_loss = loss_fn(
-            pred_ref,
-            target,
-            average_channels=average_channels,
-            distributed_ensemble_loss=False,
-        )
-        ref_loss.sum().backward()
-        grad_ref_shard = (
-            pred_ref.grad.view(n_members, b, f, t, c, h, w)[start:stop]
-            .contiguous()
-            .reshape(local_members * b, f, t, c, h, w)
-        )
-
-        pred_loc = pred_all[start:stop].reshape(local_members * b, f, t, c, h, w).clone().requires_grad_(True)
-        dist_loss = loss_fn(
-            pred_loc,
-            target,
-            average_channels=average_channels,
-            distributed_ensemble_loss=True,
-            ensemble_group=dist.group.WORLD,
-        )
-        dist_loss.sum().backward()
-        grad_loc = pred_loc.grad
-
-        assert torch.isfinite(grad_ref_shard).all(), f"rank {rank}: non-finite ref grad"
-        assert torch.isfinite(grad_loc).all(), f"rank {rank}: non-finite dist grad"
-        assert torch.allclose(grad_ref_shard, grad_loc, rtol=1e-4, atol=1e-4), (
-            f"rank {rank}: energy-score grad mismatch vs gathered reference, "
-            f"max_abs_diff={(grad_ref_shard - grad_loc).abs().max().item()}"
-        )
     finally:
         dist.destroy_process_group()
 
@@ -1202,9 +1083,9 @@ def _optimizer_step_all_modes(
     noise: torch.Tensor,
     start: int,
     stop: int,
-    average_channels: bool,
     world_size: int,
 ):
+    """One optimizer step each for Mode A, Mode B, and Mode C; always ``average_channels=True``."""
     b = base.shape[0]
     c = base.shape[3]
     local_members = stop - start
@@ -1215,11 +1096,11 @@ def _optimizer_step_all_modes(
 
     opt_ref.zero_grad(set_to_none=True)
     pred_ref = model_ref(base, noise).reshape(noise.shape[0] * b, 12, 2, c, 32, 32)
+    loss_fn.distributed_ensemble_loss = False
     ref_loss = loss_fn(
         pred_ref,
         target,
-        average_channels=average_channels,
-        distributed_ensemble_loss=False,
+        average_channels=True,
     )
     ref_loss.sum().backward()
     opt_ref.step()
@@ -1231,11 +1112,11 @@ def _optimizer_step_all_modes(
     pred_gather = torch.cat(
         list(dist_nn_func.all_gather(pred_loc_gather, group=dist.group.WORLD)), dim=0
     )
+    loss_fn.distributed_ensemble_loss = False
     gather_loss = loss_fn(
         pred_gather,
         target,
-        average_channels=average_channels,
-        distributed_ensemble_loss=False,
+        average_channels=True,
     )
     gather_loss = gather_loss / world_size
     gather_loss.sum().backward()
@@ -1248,12 +1129,11 @@ def _optimizer_step_all_modes(
     pred_loc_dist = model_dist(base, noise[start:stop]).reshape(
         local_members * b, 12, 2, c, 32, 32
     )
+    loss_fn.distributed_ensemble_loss = True
     dist_loss = loss_fn(
         pred_loc_dist,
         target,
-        average_channels=average_channels,
-        distributed_ensemble_loss=True,
-        ensemble_group=dist.group.WORLD,
+        average_channels=True,
     )
     dist_loss.sum().backward()
     for param in model_dist.parameters():
@@ -1267,7 +1147,6 @@ def _crps_weight_update_worker(
     world_size: int,
     n_members: int,
     init_file: str,
-    average_channels: bool,
     batch_size: int,
 ):
     _init_cuda_process_group(rank, world_size, init_file)
@@ -1288,7 +1167,14 @@ def _crps_weight_update_worker(
         model_dist = _NoisyEnsembleModel(channels=c).to(device)
 
         loss_fn = WeightedCRPSLoss(weights=[1.0, 1.0], n_members=n_members)
-        trainer = trainer_helper(output_variables=["v0", "v1"], device=device)
+        trainer = trainer_helper(
+            output_variables=["v0", "v1"],
+            device=device,
+            distributed_ensemble_loss=True,
+            ensemble_group_size=world_size,
+            ensemble_group=dist.group.WORLD,
+            ensemble_sharding_enabled=True,
+        )
         loss_fn.setup(trainer)
 
         _optimizer_step_all_modes(
@@ -1301,7 +1187,6 @@ def _crps_weight_update_worker(
             noise=noise,
             start=start,
             stop=stop,
-            average_channels=average_channels,
             world_size=world_size,
         )
         _assert_model_params_close(
@@ -1317,7 +1202,6 @@ def _spectral_weight_update_worker(
     world_size: int,
     n_members: int,
     init_file: str,
-    average_channels: bool,
     batch_size: int,
 ):
     _init_cuda_process_group(rank, world_size, init_file)
@@ -1346,7 +1230,14 @@ def _spectral_weight_update_worker(
             lmax=3 * nside - 1,
             mmax=3 * nside - 1,
         )
-        trainer = trainer_helper(output_variables=["v0", "v1"], device=device)
+        trainer = trainer_helper(
+            output_variables=["v0", "v1"],
+            device=device,
+            distributed_ensemble_loss=True,
+            ensemble_group_size=world_size,
+            ensemble_group=dist.group.WORLD,
+            ensemble_sharding_enabled=True,
+        )
         loss_fn.setup(trainer)
 
         _optimizer_step_all_modes(
@@ -1359,7 +1250,6 @@ def _spectral_weight_update_worker(
             noise=noise,
             start=start,
             stop=stop,
-            average_channels=average_channels,
             world_size=world_size,
         )
         _assert_model_params_close(
@@ -1375,7 +1265,6 @@ def _energy_weight_update_worker(
     world_size: int,
     n_members: int,
     init_file: str,
-    average_channels: bool,
     batch_size: int,
 ):
     _init_cuda_process_group(rank, world_size, init_file)
@@ -1398,7 +1287,14 @@ def _energy_weight_update_worker(
         loss_fn = PatchedEnergyScoreLoss(
             weights=[1.0, 1.0], n_members=n_members, patch_size=3, enable_nhwc=False
         )
-        trainer = trainer_helper(output_variables=["v0", "v1"], device=device)
+        trainer = trainer_helper(
+            output_variables=["v0", "v1"],
+            device=device,
+            distributed_ensemble_loss=True,
+            ensemble_group_size=world_size,
+            ensemble_group=dist.group.WORLD,
+            ensemble_sharding_enabled=True,
+        )
         loss_fn.setup(trainer)
 
         _optimizer_step_all_modes(
@@ -1411,7 +1307,6 @@ def _energy_weight_update_worker(
             noise=noise,
             start=start,
             stop=stop,
-            average_channels=average_channels,
             world_size=world_size,
         )
         _assert_model_params_close(
@@ -1422,13 +1317,13 @@ def _energy_weight_update_worker(
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("average_channels", [True, False])
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("n_members", [4, 8])
 def test_WeightedCRPSLoss_model_weight_updates_match_across_ensemble_modes(
-    average_channels: bool, batch_size: int, world_size: int, n_members: int
+    batch_size: int, world_size: int, n_members: int
 ):
+    """Mode A vs B vs C: parameter updates match; loss always ``average_channels=True`` (scalar training objective). See module docstring above for mode definitions."""
     if n_members % world_size != 0:
         pytest.skip("n_members must be divisible by world_size")
     _require_distributed_cuda(world_size)
@@ -1436,19 +1331,19 @@ def test_WeightedCRPSLoss_model_weight_updates_match_across_ensemble_modes(
     with tempfile.NamedTemporaryFile(delete=True) as tmp:
         mp.spawn(
             _crps_weight_update_worker,
-            args=(world_size, n_members, tmp.name, average_channels, batch_size),
+            args=(world_size, n_members, tmp.name, batch_size),
             nprocs=world_size,
             join=True,
         )
 
 
-@pytest.mark.parametrize("average_channels", [True, False])
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("n_members", [4, 8])
 def test_WeightedCRPSLossSpectral_model_weight_updates_match_across_ensemble_modes(
-    average_channels: bool, batch_size: int, world_size: int, n_members: int
+    batch_size: int, world_size: int, n_members: int
 ):
+    """Mode A vs B vs C: parameter updates match; loss always ``average_channels=True``. See module docstring for modes."""
     if n_members % world_size != 0:
         pytest.skip("n_members must be divisible by world_size")
     _require_distributed_cuda(world_size)
@@ -1456,19 +1351,19 @@ def test_WeightedCRPSLossSpectral_model_weight_updates_match_across_ensemble_mod
     with tempfile.NamedTemporaryFile(delete=True) as tmp:
         mp.spawn(
             _spectral_weight_update_worker,
-            args=(world_size, n_members, tmp.name, average_channels, batch_size),
+            args=(world_size, n_members, tmp.name, batch_size),
             nprocs=world_size,
             join=True,
         )
 
 
-@pytest.mark.parametrize("average_channels", [True, False])
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("n_members", [4, 8])
 def test_PatchedEnergyScoreLoss_model_weight_updates_match_across_ensemble_modes(
-    average_channels: bool, batch_size: int, world_size: int, n_members: int
+    batch_size: int, world_size: int, n_members: int
 ):
+    """Mode A vs B vs C: parameter updates match; loss always ``average_channels=True``. See module docstring for modes."""
     if n_members % world_size != 0:
         pytest.skip("n_members must be divisible by world_size")
     _require_distributed_cuda(world_size)
@@ -1476,7 +1371,7 @@ def test_PatchedEnergyScoreLoss_model_weight_updates_match_across_ensemble_modes
     with tempfile.NamedTemporaryFile(delete=True) as tmp:
         mp.spawn(
             _energy_weight_update_worker,
-            args=(world_size, n_members, tmp.name, average_channels, batch_size),
+            args=(world_size, n_members, tmp.name, batch_size),
             nprocs=world_size,
             join=True,
         )
@@ -1486,12 +1381,14 @@ def test_PatchedEnergyScoreLoss_model_weight_updates_match_across_ensemble_modes
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("n_members", [4, 8])
-def test_WeightedCRPSLoss_distributed_matches_gathered_ensemble(
+def test_WeightedCRPSLoss_forward_matches_across_ensemble_modes(
     average_channels: bool,
     batch_size: int,
     world_size: int,
     n_members: int,
 ):
+    """Mode A, B, C forward outputs match. Parametrized on ``average_channels`` (True: scalar
+    like training loss, False: per-channel like validation logging). See module docstring."""
     if n_members % world_size != 0:
         pytest.skip("n_members must be divisible by world_size")
     _require_distributed_cuda(world_size)
@@ -1510,13 +1407,14 @@ def test_WeightedCRPSLoss_distributed_matches_gathered_ensemble(
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("n_members", [4, 8])
 @pytest.mark.parametrize("lambda_spec", [0.0, 0.3])
-def test_WeightedCRPSLossSpectral_distributed_matches_gathered_ensemble(
+def test_WeightedCRPSLossSpectral_forward_matches_across_ensemble_modes(
     average_channels: bool,
     batch_size: int,
     world_size: int,
     n_members: int,
     lambda_spec: float,
 ):
+    """Mode A, B, C forward outputs match; both ``average_channels`` values. See module docstring."""
     if n_members % world_size != 0:
         pytest.skip("n_members must be divisible by world_size")
     _require_distributed_cuda(world_size)
@@ -1534,12 +1432,13 @@ def test_WeightedCRPSLossSpectral_distributed_matches_gathered_ensemble(
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("n_members", [4, 8])
-def test_PatchedEnergyScoreLoss_distributed_matches_gathered_ensemble(
+def test_PatchedEnergyScoreLoss_forward_matches_across_ensemble_modes(
     average_channels: bool,
     batch_size: int,
     world_size: int,
     n_members: int,
 ):
+    """Mode A, B, C forward outputs match; both ``average_channels`` values. See module docstring."""
     if n_members % world_size != 0:
         pytest.skip("n_members must be divisible by world_size")
     _require_distributed_cuda(world_size)
@@ -1552,73 +1451,3 @@ def test_PatchedEnergyScoreLoss_distributed_matches_gathered_ensemble(
             join=True,
         )
 
-
-@pytest.mark.parametrize("average_channels", [True, False])
-@pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("world_size", [2, 4])
-@pytest.mark.parametrize("n_members", [4, 8])
-def test_WeightedCRPSLoss_distributed_backward_matches_gathered_ensemble(
-    average_channels: bool,
-    batch_size: int,
-    world_size: int,
-    n_members: int,
-):
-    if n_members % world_size != 0:
-        pytest.skip("n_members must be divisible by world_size")
-    _require_distributed_cuda(world_size)
-    mp.set_start_method("spawn", force=True)
-    with tempfile.NamedTemporaryFile(delete=True) as tmp:
-        mp.spawn(
-            _crps_dist_backward_matches_gathered_worker,
-            args=(world_size, n_members, tmp.name, average_channels, batch_size),
-            nprocs=world_size,
-            join=True,
-        )
-
-
-@pytest.mark.parametrize("average_channels", [True, False])
-@pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("world_size", [2, 4])
-@pytest.mark.parametrize("n_members", [4, 8])
-@pytest.mark.parametrize("lambda_spec", [0.0, 0.3])
-def test_WeightedCRPSLossSpectral_distributed_backward_matches_gathered_ensemble(
-    average_channels: bool,
-    batch_size: int,
-    world_size: int,
-    n_members: int,
-    lambda_spec: float,
-):
-    if n_members % world_size != 0:
-        pytest.skip("n_members must be divisible by world_size")
-    _require_distributed_cuda(world_size)
-    mp.set_start_method("spawn", force=True)
-    with tempfile.NamedTemporaryFile(delete=True) as tmp:
-        mp.spawn(
-            _spectral_crps_dist_backward_matches_gathered_worker,
-            args=(world_size, n_members, tmp.name, average_channels, batch_size, lambda_spec),
-            nprocs=world_size,
-            join=True,
-        )
-
-
-@pytest.mark.parametrize("average_channels", [True, False])
-@pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("world_size", [2, 4])
-@pytest.mark.parametrize("n_members", [4, 8])
-def test_PatchedEnergyScoreLoss_distributed_backward_matches_gathered_ensemble(
-    average_channels: bool,
-    batch_size: int,
-    world_size: int,
-    n_members: int,
-):
-    if n_members % world_size != 0:
-        pytest.skip("n_members must be divisible by world_size")
-    _require_distributed_cuda(world_size)
-    mp.set_start_method("spawn", force=True)
-    with tempfile.NamedTemporaryFile(delete=True) as tmp:
-        mp.spawn(
-            _energy_dist_backward_matches_gathered_worker,
-            args=(world_size, n_members, tmp.name, average_channels, batch_size),
-            nprocs=world_size,
-            join=True,
-        )
