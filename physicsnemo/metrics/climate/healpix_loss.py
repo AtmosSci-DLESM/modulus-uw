@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence, Optional
+from typing import Optional, Sequence, Tuple
 import json
 import logging
 import time
@@ -40,36 +40,30 @@ average output channels. This is used in the varible wise logging of validation 
 
 """
 
-_DEBUG_ENSEMBLE_LOG_PATH = "/pscratch/sd/z/zespinos/.cursor/debug-6e7764.log"
-_DEBUG_SESSION_ID = "6e7764"
 
-
-def _debug_ensemble_rank0() -> bool:
-    try:
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized():
-            return dist.get_rank() == 0
-    except Exception:
-        pass
-    return True
-
-
-def _debug_ensemble_log(hypothesis_id: str, location: str, message: str, data: dict) -> None:
-    try:
-        entry = {
-            "sessionId": _DEBUG_SESSION_ID,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-            "runId": "pre-fix",
-        }
-        with open(_DEBUG_ENSEMBLE_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
+def _spectral_truncate_freq_bins(
+    pred_power: th.Tensor,
+    tar_power: th.Tensor,
+    max_bins: Optional[int],
+    log: logging.Logger,
+    state: object,
+) -> Tuple[th.Tensor, th.Tensor]:
+    """
+    Drop highest rFFT bins (shortest wavelengths) after DC removal.
+    Sets ``state._spectral_trunc_logged`` True after logging once.
+    """
+    n_freq = pred_power.shape[-1]
+    if max_bins is None:
+        return pred_power, tar_power
+    k_eff = min(int(max_bins), n_freq)
+    if k_eff < n_freq and not getattr(state, "_spectral_trunc_logged", False):
+        log.info(
+            "spectral_loss: using first %d of %d non-DC frequency bins (spectral_max_freq_bins)",
+            k_eff,
+            n_freq,
+        )
+        state._spectral_trunc_logged = True
+    return pred_power[..., :k_eff], tar_power[..., :k_eff]
 
 
 class BaseMSE(th.nn.MSELoss):
@@ -305,7 +299,13 @@ class WeightedOceanMSE(th.nn.MSELoss):
         spectral_stride: int = 16,
         spectral_min_ring: int = 32,
         spectral_variables: Optional[Sequence[str]] = None,
+        spectral_max_freq_bins: Optional[int] = None,
+        spectral_per_swath_mse: bool = False,
     ):
+        """
+        spectral_max_freq_bins: optional cap on positive-frequency bins (low wavenumbers kept).
+        spectral_per_swath_mse: if True, MSE of log-PSD per swath then mean over swaths.
+        """
         super().__init__()
         self.device = None
         self.lsm_file = lsm_file
@@ -330,6 +330,13 @@ class WeightedOceanMSE(th.nn.MSELoss):
         self.spectral_stride = int(spectral_stride)
         self.spectral_min_ring = int(spectral_min_ring)
         self.spectral_variables = list(spectral_variables) if spectral_variables is not None else None
+        if spectral_max_freq_bins is not None and int(spectral_max_freq_bins) <= 0:
+            raise ValueError("spectral_max_freq_bins must be positive when set")
+        self.spectral_max_freq_bins = (
+            int(spectral_max_freq_bins) if spectral_max_freq_bins is not None else None
+        )
+        self.spectral_per_swath_mse = bool(spectral_per_swath_mse)
+        self._spectral_trunc_logged = False
         self._spectral_channel_idx = None
         self._spectral_lookup = None
         self._spectral_hann = None
@@ -595,29 +602,46 @@ class WeightedOceanMSE(th.nn.MSELoss):
             tar_fft = th.fft.rfft(tar_tapered, dim=-1)
             pred_power = (pred_fft.real ** 2 + pred_fft.imag ** 2)[..., 1:]
             tar_power = (tar_fft.real ** 2 + tar_fft.imag ** 2)[..., 1:]
+            log = logging.getLogger(__name__)
+            pred_power, tar_power = _spectral_truncate_freq_bins(
+                pred_power,
+                tar_power,
+                self.spectral_max_freq_bins,
+                log,
+                self,
+            )
             n_freq = pred_power.shape[-1]
-            pred_power_mean_swath = pred_power.mean(dim=1)
-            tar_power_mean_swath = tar_power.mean(dim=1)
-            if pred_spec.ndim == 6:
-                pred_power_mean_swath = pred_power_mean_swath.reshape(n, t, c_spec, n_freq)
-                tar_power_mean_swath = tar_power_mean_swath.reshape(n, t, c_spec, n_freq)
-            else:
-                pred_power_mean_swath = pred_power_mean_swath.reshape(n, b, t, c_spec, n_freq)
-                tar_power_mean_swath = tar_power_mean_swath.reshape(n, b, t, c_spec, n_freq)
             eps = 1e-8
-            log_pred = th.log(pred_power_mean_swath + eps)
-            log_tar = th.log(tar_power_mean_swath + eps)
-            mse_per_sample = ((log_pred - log_tar) ** 2).mean(dim=-1)
+            if self.spectral_per_swath_mse:
+                log_pred = th.log(pred_power + eps)
+                log_tar = th.log(tar_power + eps)
+                mse_per_swath = ((log_pred - log_tar) ** 2).mean(dim=-1)
+                mse_per_sample = mse_per_swath.mean(dim=1)
+                if pred_spec.ndim == 6:
+                    mse_per_sample = mse_per_sample.reshape(n, t, c_spec)
+                else:
+                    mse_per_sample = mse_per_sample.reshape(n, b, t, c_spec)
+            else:
+                pred_power_mean_swath = pred_power.mean(dim=1)
+                tar_power_mean_swath = tar_power.mean(dim=1)
+                if pred_spec.ndim == 6:
+                    pred_power_mean_swath = pred_power_mean_swath.reshape(n, t, c_spec, n_freq)
+                    tar_power_mean_swath = tar_power_mean_swath.reshape(n, t, c_spec, n_freq)
+                else:
+                    pred_power_mean_swath = pred_power_mean_swath.reshape(n, b, t, c_spec, n_freq)
+                    tar_power_mean_swath = tar_power_mean_swath.reshape(n, b, t, c_spec, n_freq)
+                log_pred = th.log(pred_power_mean_swath + eps)
+                log_tar = th.log(tar_power_mean_swath + eps)
+                mse_per_sample = ((log_pred - log_tar) ** 2).mean(dim=-1)
             spec_weights = self.loss_weights[idx]
             if average_channels:
                 if pred_spec.ndim == 6:
                     weighted = mse_per_sample * spec_weights.view(1, 1, -1)
-                    c_total = prediction.shape[3]
-                    spec_loss = weighted.sum() / (n * t * c_total)
+                    # Normalize by C_spec (not full C) so scale is invariant to non-spectral channels
+                    spec_loss = weighted.sum() / (n * t * c_spec)
                 else:
                     weighted = mse_per_sample * spec_weights.view(1, 1, 1, -1)
-                    c_total = prediction.shape[4]
-                    spec_loss = weighted.sum() / (n * b * t * c_total)
+                    spec_loss = weighted.sum() / (n * b * t * c_spec)
             else:
                 if pred_spec.ndim == 6:
                     weighted = mse_per_sample * spec_weights.view(1, 1, -1)
@@ -705,6 +729,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         spectral_stride: int = 16,
         spectral_min_ring: int = 32,
         spectral_variables: Optional[Sequence[str]] = None,
+        spectral_max_freq_bins: Optional[int] = None,
+        spectral_per_swath_mse: bool = False,
     ):
         """
         Parameters
@@ -759,6 +785,11 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             minimum number of pixels in a ring to be considered. Default 32.
         spectral_variables: Sequence[str], optional
             names of output variables to which the spectral term applies. If None, all channels.
+        spectral_max_freq_bins: int, optional
+            If set, keep only this many lowest non-DC rFFT bins (longest wavelengths). None uses all bins.
+        spectral_per_swath_mse: bool, optional
+            If True, compute log-PSD MSE per swath then average over swaths. If False (default),
+            average PSD across swaths first, then log and MSE (original behavior).
         """
         super().__init__()
         self.loss_weights = th.tensor(weights)
@@ -785,6 +816,13 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         self.spectral_stride = int(spectral_stride)
         self.spectral_min_ring = int(spectral_min_ring)
         self.spectral_variables = list(spectral_variables) if spectral_variables is not None else None
+        if spectral_max_freq_bins is not None and int(spectral_max_freq_bins) <= 0:
+            raise ValueError("spectral_max_freq_bins must be positive when set")
+        self.spectral_max_freq_bins = (
+            int(spectral_max_freq_bins) if spectral_max_freq_bins is not None else None
+        )
+        self.spectral_per_swath_mse = bool(spectral_per_swath_mse)
+        self._spectral_trunc_logged = False
         self._spectral_channel_idx = None
         self._spectral_lookup = None
         self._spectral_hann = None
@@ -808,7 +846,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
 
         # Parameters for "almost fair CRPS" loss. See https://arxiv.org/html/2412.15832v1
         self.coeff_eps = 1 - ((1-alpha) / (n_members))
-        self.averaging_coeff = 1 / (2* n_members * (n_members - 1))
+        # self.averaging_coeff = 1 / (2* n_members * (n_members - 1)) -> this results in a factor 1/2 too small for 2 members
+        self.averaging_coeff = 1 / n_members # this is a correction that only works for M=2
 
         # For n>2, will use pairwise distance to copmute [NxN] distance matrix
         # Diagonal elements of (prediciton - target) matrix are zeroed out to avoid double counting
@@ -826,13 +865,10 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         self.last_spread = None
         self.last_skill = None
         self.last_spread_skill_score = None
-        self._debug_ens_fwd_count = 0
-        self._dbg_training_epoch = -1
-        self._dbg_model_ref = None
 
     def set_training_epoch(self, epoch: int) -> None:
-        """Trainer hook so diagnostics can correlate with the scheduler epoch index."""
-        self._dbg_training_epoch = int(epoch)
+        """Trainer hook (no-op); reserved for APIs that pass the training epoch index."""
+        pass
 
     def setup(self, trainer):
         """
@@ -851,8 +887,6 @@ class WeightedCRPSLoss(th.nn.MSELoss):
 
         if self.spectral_weight > 0:
             self._init_spectral_swaths(trainer)
-
-        self._dbg_model_ref = getattr(trainer, "model", None)
 
     def _compute_spread_skill_ssr(
         self,
@@ -1056,31 +1090,44 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             tar_fft = th.fft.rfft(tar_tapered, dim=-1)
             pred_power = (pred_fft.real ** 2 + pred_fft.imag ** 2)[..., 1:]
             tar_power = (tar_fft.real ** 2 + tar_fft.imag ** 2)[..., 1:]
+            log = logging.getLogger(__name__)
+            pred_power, tar_power = _spectral_truncate_freq_bins(
+                pred_power,
+                tar_power,
+                self.spectral_max_freq_bins,
+                log,
+                self,
+            )
             n_freq = pred_power.shape[-1]
-            # Average over swaths first, but keep batch/time/ensemble separate
-            pred_power_mean_swath = pred_power.mean(dim=2)
-            tar_power_mean_swath = tar_power.mean(dim=2)
-            pred_power_mean_swath = pred_power_mean_swath.reshape(
-                n_cond, b, t, c_spec, n_freq
-            )
-            tar_power_mean_swath = tar_power_mean_swath.reshape(
-                b, t, c_spec, n_freq
-            )
             eps = 1e-8
-            # Compute log-spectra per member, batch, time, channel
-            log_pred = th.log(pred_power_mean_swath + eps)                # [n_cond, B, T, C_spec, F]
-            log_tar = th.log(tar_power_mean_swath + eps).unsqueeze(0)     # [1,      B, T, C_spec, F]
-            # MSE over frequency per (member, batch, time, channel)
-            mse_per_sample = ((log_pred - log_tar) ** 2).mean(dim=-1)     # [n_cond, B, T, C_spec]
+            if self.spectral_per_swath_mse:
+                print("smallest number in pred power:", pred_power.min())
+                print("smallest number in tar power:", tar_power.min())
+                print("fraction of zeros in pred power:", (pred_power < eps).float().mean())
+                print("fraction of zeros in tar power:", (tar_power < eps).float().mean())
+                log_pred = th.log(pred_power + eps)
+                log_tar = th.log(tar_power + eps)
+                mse_sw = ((log_pred - log_tar) ** 2).mean(dim=-1)
+                mse_per_sample = mse_sw.mean(dim=2).reshape(n_cond, b, t, c_spec)
+            else:
+                # Average over swaths first, but keep batch/time/ensemble separate
+                pred_power_mean_swath = pred_power.mean(dim=2)
+                tar_power_mean_swath = tar_power.mean(dim=2)
+                pred_power_mean_swath = pred_power_mean_swath.reshape(
+                    n_cond, b, t, c_spec, n_freq
+                )
+                tar_power_mean_swath = tar_power_mean_swath.reshape(
+                    b, t, c_spec, n_freq
+                )
+                log_pred = th.log(pred_power_mean_swath + eps)
+                log_tar = th.log(tar_power_mean_swath + eps).unsqueeze(0)
+                mse_per_sample = ((log_pred - log_tar) ** 2).mean(dim=-1)
             spec_weights = self.loss_weights[idx]                          # [C_spec]
             if average_channels:
-                # Weight channels, then average over (ensemble, batch, time) but divide by
-                # total channel count C so spectral_weight is comparable to base CRPS (which
-                # uses .mean() over all dims including C). Otherwise C_spec=2 with C=20 would
-                # amplify the spectral term by 10x.
+                # Weight channels, then average over (ensemble, batch, time); divide by C_spec
+                # so loss scale is invariant to how many non-spectral channels exist in the model.
                 weighted = mse_per_sample * spec_weights.view(1, 1, 1, -1)
-                c_total = prediction.shape[4]
-                spec_loss = weighted.sum() / (n_cond * b * t * c_total)
+                spec_loss = weighted.sum() / (n_cond * b * t * c_spec)
             else:
                 # Keep per-channel loss: average over ensemble, batch, time only
                 weighted = mse_per_sample * spec_weights.view(1, 1, 1, -1)
@@ -1279,76 +1326,6 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             self.last_spread = None
             self.last_skill = None
             self.last_spread_skill_score = None
-
-        # #region agent log
-        self._debug_ens_fwd_count += 1
-        _dc = self._debug_ens_fwd_count
-        if _debug_ensemble_rank0() and n == 2 and (_dc <= 5 or _dc % 50 == 0):
-            with th.no_grad():
-                pd = prediction
-                d01 = (pd[0] - pd[1]).abs()
-                h1_max = float(d01.max())
-                h1_mean = float(d01.mean())
-                s2 = 0.5 * (pd[0] - pd[1]) ** 2
-                lsm_d = self.lsm_tensor.to(device=pd.device, dtype=pd.dtype)
-                weighted_s2 = s2 * lsm_d
-                m_eff = float(lsm_d.sum())
-                sum_w_s2_ch0 = float(weighted_s2[:, :, :, 0].sum())
-                h2_same_member = (
-                    float((pd[0, 0] - pd[0, 1]).abs().max())
-                    if b > 1
-                    else -1.0
-                )
-                ls = self.last_spread
-                ls_f = float(ls.detach()) if ls is not None and th.is_tensor(ls) else None
-                cln_lambda_sample = []
-                try:
-                    root = self._dbg_model_ref
-                    if root is not None:
-                        root = root.module if hasattr(root, "module") else root
-                        for m in root.modules():
-                            if m.__class__.__name__ == "ConditionalLayerNorm" and hasattr(
-                                m, "_lambda"
-                            ):
-                                cln_lambda_sample.append(float(getattr(m, "_lambda", -1.0)))
-                                if len(cln_lambda_sample) >= 8:
-                                    break
-                except Exception:
-                    pass
-                intl_m = None
-                try:
-                    pf = pd.reshape(n * b, f, t, c, h, w)
-                    intl_m = float(
-                        th.stack(
-                            [
-                                (pf[2 * i] - pf[2 * i + 1]).abs().max()
-                                for i in range(min(b, pf.shape[0] // 2))
-                            ]
-                        ).max()
-                    )
-                except Exception:
-                    pass
-                _debug_ensemble_log(
-                    "H1-H2-H3-H5",
-                    "healpix_loss.py:WeightedCRPSLoss.forward",
-                    "ensemble_pred_vs_spread_diag",
-                    {
-                        "call_idx": _dc,
-                        "trainer_epoch": int(getattr(self, "_dbg_training_epoch", -1)),
-                        "n_members": int(n),
-                        "b": int(b),
-                        "pred_shape": list(pd.shape),
-                        "m0_minus_m1_abs_max": h1_max,
-                        "m0_minus_m1_abs_mean": h1_mean,
-                        "same_member_diff_max_b0_b1": h2_same_member,
-                        "flat_interleaved_adjacent_max": intl_m,
-                        "cln_lambda_first_modules": cln_lambda_sample,
-                        "masked_sigma2_sum_channel0": sum_w_s2_ch0,
-                        "lsm_m_eff": m_eff,
-                        "last_spread_scalar": ls_f,
-                    },
-                )
-        # #endregion
 
         # Spectral term on unweighted fields (before channel weights)
         spec_loss = None
