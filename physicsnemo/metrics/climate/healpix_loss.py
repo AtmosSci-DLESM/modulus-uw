@@ -365,6 +365,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         selection_dict: dict = {"channel_c": "land_sea_mask"},
         multiscale: float = 0.0,
         masked_processing: bool = False,
+        distributed_ensemble_loss: bool = False,
+        ensemble_group=None,
     ):
         """
         Parameters
@@ -389,6 +391,10 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             weight for the multiscale CRPS loss. Default is 0, no multiscale loss is applied.
         masked_processing: bool, optional
             whether masked pixels should be excluded from the processing. Default is False, no masked processing is applied.
+        distributed_ensemble_loss: bool, optional
+            Enable member-sharded distributed loss mode. Default False.
+        ensemble_group: torch.distributed.ProcessGroup, optional
+            Process group used for ensemble-member collectives in distributed loss mode.
         """
         super().__init__()
         self.loss_weights = th.tensor(weights)
@@ -417,6 +423,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         # Diagonal elements of (prediciton - target) matrix are zeroed out to avoid double counting
         self.pdist = th.nn.PairwiseDistance(p=1)
         self.diag_mask = th.ones(self.n_members, self.n_members) - th.eye(self.n_members) # Mask to zero out diagonal elements
+        self.distributed_ensemble_loss = bool(distributed_ensemble_loss)
+        self.ensemble_group = ensemble_group
 
     def setup(self, trainer):
         """
@@ -432,6 +440,11 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         self.pdist = self.pdist.to(device=trainer.device)
         self.diag_mask = self.diag_mask.to(device=trainer.device)   
         self.lsm_tensor = self.lsm_tensor.to(device=trainer.device)
+        self.distributed_ensemble_loss = bool(
+            getattr(trainer, "distributed_ensemble_loss", self.distributed_ensemble_loss)
+            and getattr(trainer, "ensemble_sharding_enabled", False)
+        )
+        self.ensemble_group = getattr(trainer, "ensemble_group", self.ensemble_group)
 
     def _2member_crps(self, prediction, target, lsm_tensor):
         diff_target = th.abs(prediction - target.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
@@ -478,7 +491,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         pooled_tensor = pooled_values / (pooled_mask + 1e-8) # Avoid division by zero
         return pooled_tensor, pooled_mask
 
-    def forward(self, prediction, target, average_channels=True, **kwargs):
+    def forward(self, prediction, target, average_channels=True):
         """
         Forward pass of the WeightedCRPSLoss 
         Computes the CRPS loss for the model prediction and target.
@@ -491,20 +504,14 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             The target tensor shape [B, F, T, C, H, W]
         average_channels: bool, optional
             whether the mean of the channels should be taken
-        **kwargs
-            Optional distributed context from the training loop (e.g. NV-dlesm
-            ``Trainer._criterion_kwargs``): ``distributed_ensemble_loss`` (bool)
-            enables member-sharded CRPS with collectives over ``ensemble_group``
-            (``torch.distributed.ProcessGroup``). ``ensemble_group_size`` may
-            also be passed for symmetry but is unused here.
         """
         
         # Unfold ensemble dimension from batch dimension to have shape [Cond, B, F, T, C, H, W]
         b, f, t, c, h, w = target.shape
         n = prediction.shape[0] // b
         prediction = prediction.view(n, b, f, t, c, h, w)
-        distributed_loss = bool(kwargs.get("distributed_ensemble_loss", False))
-        ensemble_group = kwargs.get("ensemble_group", None)
+        distributed_loss = self.distributed_ensemble_loss
+        ensemble_group = self.ensemble_group
 
         # checks for dimensions 
         if not prediction.shape[1:] == target.shape:
@@ -727,6 +734,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         lsm_file: str = None,
         open_dict: dict = {"engine": "zarr"},
         selection_dict: dict = {"channel_c": "land_sea_mask"},
+        distributed_ensemble_loss: bool = False,
+        ensemble_group=None,
     ):
         """
         Parameters
@@ -754,6 +763,10 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
             dictionary of keyword arguments for xarray.open_dataset. Default is {"engine": "zarr"}.
         selection_dict: dict
             dictionary of keyword arguments for xarray.open_dataset. Default is {"channel_c": "land_sea_mask"}.
+        distributed_ensemble_loss: bool, optional
+            Enable member-sharded distributed loss mode. Default False.
+        ensemble_group: torch.distributed.ProcessGroup, optional
+            Process group used for ensemble-member collectives in distributed loss mode.
         """
         super().__init__()
         self.loss_weights = th.tensor(weights)
@@ -791,6 +804,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         # Diagonal elements of (prediciton - target) matrix are zeroed out to avoid double counting
         self.pdist = th.nn.PairwiseDistance(p=1)
         self.diag_mask = th.ones(self.n_members, self.n_members) - th.eye(self.n_members) # Mask to zero out diagonal elements
+        self.distributed_ensemble_loss = bool(distributed_ensemble_loss)
+        self.ensemble_group = ensemble_group
 
 
     def setup(self, trainer):
@@ -814,6 +829,11 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
             self.reorder_from_ring = self.reorder_from_ring.to(device=trainer.device)
         if self.lsm_file is not None:
             self.lsm_tensor = self.lsm_tensor.to(device=trainer.device)
+        self.distributed_ensemble_loss = bool(
+            getattr(trainer, "distributed_ensemble_loss", self.distributed_ensemble_loss)
+            and getattr(trainer, "ensemble_sharding_enabled", False)
+        )
+        self.ensemble_group = getattr(trainer, "ensemble_group", self.ensemble_group)
 
     def _apply_sht(self, x, face_dim, return_abs=True):
         """Apply SHT to a tensor
@@ -858,7 +878,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         ell = th.arange(self.lmax, device=device, dtype=th.float32)
         return th.exp(-0.5* ell * (ell + 1) * (scale_radians ** 2))
 
-    def forward(self, prediction, target, average_channels=True, **kwargs):
+    def forward(self, prediction, target, average_channels=True):
         """
         Forward pass of the WeightedCRPSLossSpectral 
         Computes the CRPS loss for the model prediction and target.
@@ -871,20 +891,14 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
             The target tensor shape [B, F, T, C, H, W]
         average_channels: bool, optional
             whether the mean of the channels should be taken
-        **kwargs
-            Optional distributed context from the training loop (e.g. NV-dlesm
-            ``Trainer._criterion_kwargs``): ``distributed_ensemble_loss`` (bool)
-            enables member-sharded CRPS with collectives over ``ensemble_group``
-            (``torch.distributed.ProcessGroup``). ``ensemble_group_size`` may
-            also be passed for symmetry but is unused here.
         """
         
         # Unfold ensemble dimension from batch dimension to have shape [Cond, B, F, T, C, H, W]
         b, f, t, c, h, w = target.shape
         n = prediction.shape[0] // b
         prediction = prediction.view(n, b, f, t, c, h, w)
-        distributed_loss = bool(kwargs.get("distributed_ensemble_loss", False))
-        ensemble_group = kwargs.get("ensemble_group", None)
+        distributed_loss = self.distributed_ensemble_loss
+        ensemble_group = self.ensemble_group
 
         # checks for dimensions 
         if not prediction.shape[1:] == target.shape:
@@ -1243,6 +1257,8 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         use_earth2grid_padding: bool = True,
         enable_nhwc: bool = True,
         patch_weight_sigma: float = None,
+        distributed_ensemble_loss: bool = False,
+        ensemble_group=None,
     ):
         """
         Parameters
@@ -1270,6 +1286,10 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             Patch_weight_sigma is the standard deviation of the Gaussian.
             Patch_weight_sigma = 1 for standard normal distribution.
             If None, no spatial weighting within the patch (default).
+        distributed_ensemble_loss: bool, optional
+            Enable member-sharded distributed loss mode. Default False.
+        ensemble_group: torch.distributed.ProcessGroup, optional
+            Process group used for ensemble-member collectives in distributed loss mode.
         """
         super().__init__()
         if n_members < 2:
@@ -1320,6 +1340,8 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
                 )
         else:
             self.hpx_pad = None
+        self.distributed_ensemble_loss = bool(distributed_ensemble_loss)
+        self.ensemble_group = ensemble_group
 
     def setup(self, trainer):
         if len(trainer.output_variables) != len(self.loss_weights):
@@ -1334,6 +1356,11 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             self.hpx_pad = self.hpx_pad.to(device=trainer.device)
         if self.patch_weights is not None:
             self.patch_weights = self.patch_weights.to(device=trainer.device)
+        self.distributed_ensemble_loss = bool(
+            getattr(trainer, "distributed_ensemble_loss", self.distributed_ensemble_loss)
+            and getattr(trainer, "ensemble_sharding_enabled", False)
+        )
+        self.ensemble_group = getattr(trainer, "ensemble_group", self.ensemble_group)
 
     def _weighted_patch_norm(self, diff_vec: th.Tensor) -> th.Tensor:
         """
@@ -1399,23 +1426,18 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         patches = patches.permute(0, 2, 1, 3, 5, 6, 4)  # [B, F, T, C, H, W, D]
         return patches
 
-    def forward(self, prediction, target, average_channels: bool = True, **kwargs):
+    def forward(self, prediction, target, average_channels: bool = True):
         """
         Forward pass of the patched energy score loss.
 
         prediction: [Cond*B, F, T, C, H, W]
         target: [B, F, T, C, H, W]
-        **kwargs
-            Optional distributed context (e.g. NV-dlesm ``Trainer._criterion_kwargs``):
-            ``distributed_ensemble_loss`` and ``ensemble_group`` for member-sharded
-            energy score with ensemble-group collectives. ``ensemble_group_size`` may
-            be passed for symmetry but is unused here.
         """
         b, f, t, c, h, w = target.shape
         n = prediction.shape[0] // b
         prediction = prediction.view(n, b, f, t, c, h, w)
-        distributed_loss = bool(kwargs.get("distributed_ensemble_loss", False))
-        ensemble_group = kwargs.get("ensemble_group", None)
+        distributed_loss = self.distributed_ensemble_loss
+        ensemble_group = self.ensemble_group
 
         if prediction.shape[1:] != target.shape:
             raise ValueError(
