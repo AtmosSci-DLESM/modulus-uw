@@ -778,8 +778,7 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
 
             # out[pos_v1] = 0.5 * (g0_sub + g1_sub)
             #             = g0_sub + 0.5 * (g1_sub - g0_sub)
-            half = flat.new_tensor(0.5)
-            delta = (g1_sub - g0_sub) * half
+            delta = (g1_sub - g0_sub) * 0.5
             out_flat = g0.clone()
             out_flat.index_add_(dim=2, index=pos_v1.to(device=data.device), source=delta)
         else:
