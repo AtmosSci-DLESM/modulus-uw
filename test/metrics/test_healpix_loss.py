@@ -735,7 +735,10 @@ def test_WeightedCRPSLossSpectral_lambda0_perfect_forecast_smoke():
 # Mode B — Sharded, gathered loss: ensemble members are split across processes; each rank
 #   holds a local shard. Predictions are all_gather'd along the member dimension, then
 #   the same non-distributed loss runs on the full tensor (simulates "gather then one-GPU
-#   loss" without changing the loss code path to distributed).
+#   loss" without changing the loss code path to distributed). To ensure that gradient
+#   updates are the same whether we use ensemble sharding or not, parameter gradients are
+#   all-reduced with ``ReduceOp.AVG`` over the world group (same as ``loss / world_size``
+#   then ``ReduceOp.SUM`` on gradients since loss is the same for all ranks).
 #
 # Mode C — Sharded, distributed loss: each rank keeps its shard; the loss uses
 #   ``distributed_ensemble_loss=True`` and ensemble-group collectives (including a ring
@@ -1118,11 +1121,19 @@ def _optimizer_step_all_modes(
         target,
         average_channels=True,
     )
-    gather_loss = gather_loss / world_size
+    assert torch.allclose(
+        ref_loss.detach(),
+        gather_loss.detach(),
+        rtol=1e-4,
+        atol=1e-4,
+    ), (
+        f"rank {dist.get_rank()}: Gathered loss does not match reference "
+        f"loss: {ref_loss.detach()} vs {gather_loss.detach()}"
+    )
     gather_loss.sum().backward()
     for param in model_gather.parameters():
         if param.grad is not None:
-            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
+            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=dist.group.WORLD)
     opt_gather.step()
 
     opt_dist.zero_grad(set_to_none=True)
@@ -1134,6 +1145,15 @@ def _optimizer_step_all_modes(
         pred_loc_dist,
         target,
         average_channels=True,
+    )
+    assert torch.allclose(
+        ref_loss.detach(),
+        dist_loss.detach(),
+        rtol=1e-4,
+        atol=1e-4,
+    ), (
+        f"rank {dist.get_rank()}: Loss from distributed ensemble does not match reference "
+        f"loss: {ref_loss.detach()} vs {dist_loss.detach()}"
     )
     dist_loss.sum().backward()
     for param in model_dist.parameters():
