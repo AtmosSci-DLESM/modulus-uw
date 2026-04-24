@@ -357,6 +357,10 @@ class ConstantCoupler(BaseCoupler):
             the right side of a averaging_window window.
             This is highly recommended for training, default True
         """
+        # It doesn't make sense to have more than one input time for a constant coupler
+        if len(input_times) != 1:
+            raise ValueError("ConstantCoupler only supports one input time")
+
         super().__init__(
             dataset=dataset,
             batch_size=batch_size,
@@ -413,10 +417,9 @@ class ConstantCoupler(BaseCoupler):
             + list(self.spatial_dims[1:])
         )
         # we use a constant set of values so we just copy time 0
-        for i in range(self.coupled_integration_dim):
-            self.preset_coupled_fields[:, :, i, :, :, :] = coupled_fields[
-                :, :, 0, -1:, :, :
-            ]
+
+        # broadcast the first time step to the entire coupled integration dimension
+        self.preset_coupled_fields[:, :, :, :, :, :] = coupled_fields[:, :, :1, :, :, :]
         if self.time_first:
             self.preset_coupled_fields = self.preset_coupled_fields.permute(2, 0, 3, 1, 4, 5)
         # flag for construct integrated coupling method to use this array
