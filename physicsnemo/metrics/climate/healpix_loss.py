@@ -64,8 +64,15 @@ def _validate_distributed_members(
         )
 
 
-def _distributed_value_from_local(local_value: th.Tensor, ensemble_group=None):
-    """Return global summed value while keeping local gradient flow."""
+def _allreduce_sum_with_local_grad(local_value: th.Tensor, ensemble_group=None):
+    """
+    All-reduce local scalar/tensor by sum while preserving local backward path.
+
+    In distributed ensemble-loss mode, each rank computes a local contribution.
+    This helper returns the total loss value as the sum of the local contributions,
+    but keeps gradients flowing only through the local tensor by using a detached
+    all-reduced copy in the forward value.
+    """
     if ensemble_group is None or not dist.is_initialized():
         return local_value
     value = local_value.detach().clone()
@@ -611,7 +618,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
                         (prediction.sum(dim=(0, 1, 2, 3, 5, 6)) / prediction_count)
                         - (target.sum(dim=(0, 1, 2, 4, 5)) / target_count)
                     )
-            return _distributed_value_from_local(local_loss, ensemble_group=ensemble_group)
+            return _allreduce_sum_with_local_grad(local_loss, ensemble_group=ensemble_group)
 
         if n == 2:
             # Use faster explicit implementation
@@ -1003,7 +1010,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
                             skill_mul * skill_spec_local
                             - self.coeff_eps * spread_spec_local
                         ) / (b * t * self.lmax * self.mmax)
-            return _distributed_value_from_local(local_loss, ensemble_group=ensemble_group)
+            return _allreduce_sum_with_local_grad(local_loss, ensemble_group=ensemble_group)
 
         if n == 2:
             # Use faster explicit implementation
@@ -1494,7 +1501,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             ) / (b * f * t * h * w)
             channel_loss = channel_loss * self.loss_weights
             local_loss = channel_loss.mean() if average_channels else channel_loss
-            return _distributed_value_from_local(local_loss, ensemble_group=ensemble_group)
+            return _allreduce_sum_with_local_grad(local_loss, ensemble_group=ensemble_group)
 
         if n == 2:
             diff_target = diff_to_target.sum(dim=0)  # [B,F,T,C,H,W]
