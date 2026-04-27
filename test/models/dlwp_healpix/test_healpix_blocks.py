@@ -409,6 +409,86 @@ def test_AvgPool_forward(device, test_data, pytestconfig):
 
 @import_or_fail("hydra")
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_BlurPool_initialization(device, pytestconfig):
+    from physicsnemo.models.dlwp_healpix_layers import BlurPool
+
+    channels = 4
+    block = BlurPool(in_channels=channels).to(device)
+    assert isinstance(block, BlurPool)
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_BlurPool_forward_m1_equals_strided_slice(device, test_data, pytestconfig):
+    """resample_filter length 1 => no HEALPix halo; depthwise 1x1 stride s matches ::s."""
+    from physicsnemo.models.dlwp_healpix_layers import BlurPool
+
+    channels = 3
+    stride = 2
+    h = 24
+    block = BlurPool(
+        in_channels=channels,
+        resample_filter=(1.0,),
+        stride=stride,
+        enable_healpixpad=False,
+    ).to(device)
+
+    invar = test_data(channels=channels, img_size=h, device=device)
+    out = block(invar)
+    expected = invar[..., ::stride, ::stride]
+    assert out.shape == expected.shape
+    assert common.compare_output(expected, out)
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_BlurPool_inner_conv_matches_f_conv2d(device, test_data, pytestconfig):
+    """Depthwise blur conv (no HEALPix wrapper) matches F.conv2d with symmetric padding."""
+    import torch.nn.functional as F
+
+    from physicsnemo.models.dlwp_healpix_layers import BlurPool
+
+    c, m, s = 2, 3, 2
+    filt = (1.0, 2.0, 1.0)
+    conv = torch.nn.Conv2d(
+        c, c, kernel_size=m, stride=s, padding=0, groups=c, bias=False
+    ).to(device)
+    w = BlurPool._normalized_depthwise_blur_weights(filt, c).to(device)
+    with torch.no_grad():
+        conv.weight.copy_(w)
+
+    x = test_data(channels=c, img_size=32, device=device)
+    assert torch.allclose(conv.weight, w, atol=1e-5, rtol=1e-5)
+    p = (m - 1) // 2
+    ref = F.conv2d(x, w, padding=p, stride=s, groups=c)
+    out = F.conv2d(x, conv.weight, padding=p, stride=s, groups=c)
+    assert torch.allclose(ref, out, atol=1e-5, rtol=1e-5)
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_BlurPool_default_shape(device, test_data, pytestconfig):
+    from physicsnemo.models.dlwp_healpix_layers import BlurPool
+
+    channels = 2
+    stride = 2
+    h = 32
+    block = BlurPool(in_channels=channels, stride=stride, enable_healpixpad=False).to(
+        device
+    )
+    invar = test_data(channels=channels, img_size=h, device=device)
+    out = block(invar)
+    assert out.shape == (
+        invar.shape[0],
+        invar.shape[1],
+        h // stride,
+        h // stride,
+    )
+    assert torch.isfinite(out).all()
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 def test_TransposedConvUpsample_initialization(device, pytestconfig):
     from physicsnemo.models.dlwp_healpix_layers import (
         TransposedConvUpsample,  #
