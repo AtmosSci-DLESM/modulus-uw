@@ -1175,7 +1175,10 @@ class BlurPool(th.nn.Module):
         resample_filter: Sequence[float] = (1.0, 2.0, 1.0),
         stride: int = 2,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: int | None = None,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -1194,6 +1197,7 @@ class BlurPool(th.nn.Module):
             Passed to ``geometry_layer``.
         """
         super().__init__()
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         filt = tuple(float(x) for x in resample_filter)
         m = len(filt)
         if m < 1:
@@ -1214,7 +1218,9 @@ class BlurPool(th.nn.Module):
             bias=False,
             dilation=1,
             enable_nhwc=enable_nhwc,
-            enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
+            compile_padding=compile_padding,
+            nside=nside,
         )
         w = BlurPool._normalized_depthwise_blur_weights(filt, in_channels)
         conv = self.pool.layers[-1]
