@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence, Tuple, Union, Callable
+from typing import Callable, Sequence, Tuple, Union
 
 import torch
 import torch as th
@@ -1010,6 +1010,89 @@ class AvgPool(th.nn.Module):
         """
         return self.avgpool(x)
 
+class BlurPool(th.nn.Module):
+    """
+    Anti-aliased downsampling via depthwise blur then strided convolution (BlurPool-style).
+
+    Builds a 2D kernel as the outer product of a 1D ``resample_filter``, normalized to sum
+    to one, and applies it depthwise with stride ``stride``.
+
+    Typical filters from Zhang et al.: rectangle-2 ``[1, 1]``, triangle-3 ``[1, 2, 1]``,
+    binomial-5 ``[1, 4, 6, 4, 1]``. 
+    """
+
+    @staticmethod
+    def _normalized_depthwise_blur_weights(
+        resample_filter: Sequence[float], in_channels: int
+    ) -> torch.Tensor:
+        """Outer product of 1D ``resample_filter``, normalized; shape ``(C, 1, m, m)``."""
+        f = torch.as_tensor(list(resample_filter), dtype=torch.float32)
+        if f.ndim != 1:
+            raise ValueError("resample_filter must be 1D")
+        m = int(f.numel())
+        f2d = f[:, None] * f[None, :]
+        f2d = f2d / f2d.sum()
+        return f2d.unsqueeze(0).unsqueeze(0).expand(in_channels, 1, m, m).clone()
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels: int = 3,
+        resample_filter: Sequence[float] = (1.0, 2.0, 1.0),
+        stride: int = 2,
+        enable_nhwc: bool = False,
+        enable_healpixpad: bool = False,
+    ):
+        """
+        Parameters
+        ----------
+        geometry_layer: torch.nn.Module, optional
+            Wrapper (default :class:`HEALPixLayer`) for HEALPix tensor geometry.
+        in_channels: int, optional
+            Number of input (and output) channels for depthwise blur.
+        resample_filter: sequence of float, optional
+            1D nonnegative weights; 2D kernel is their outer product, normalized.
+        stride: int, optional
+            Stride of the blur convolution (downsampling factor).
+        enable_nhwc: bool, optional
+            Passed to ``geometry_layer``.
+        enable_healpixpad: bool, optional
+            Passed to ``geometry_layer``.
+        """
+        super().__init__()
+        filt = tuple(float(x) for x in resample_filter)
+        m = len(filt)
+        if m < 1:
+            raise ValueError("resample_filter must be non-empty")
+        if sum(filt) == 0:
+            raise ValueError("resample_filter must not sum to zero")
+
+        # Use torch.nn.Conv2d as the layer class so HEALPixLayer recognizes
+        # it as a convolution layer and adds HEALPixPadding
+        self.pool = geometry_layer(
+            layer=th.nn.Conv2d,
+            in_channels=in_channels,
+            out_channels=in_channels,
+            kernel_size=m,
+            stride=stride,
+            padding=0,
+            groups=in_channels,
+            bias=False,
+            dilation=1,
+            enable_nhwc=enable_nhwc,
+            enable_healpixpad=enable_healpixpad,
+        )
+        w = BlurPool._normalized_depthwise_blur_weights(filt, in_channels)
+        conv = self.pool.layers[-1]
+        if not isinstance(conv, th.nn.Conv2d):
+            raise TypeError("expected last HEALPixLayer sub-module to be Conv2d")
+        with torch.no_grad():
+            conv.weight.copy_(w)
+        conv.weight.requires_grad_(False)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """Apply blur pool along the last two spatial dimensions per HEALPix face."""
+        return self.pool(x)
 
 #
 # UPSAMPLING BLOCKS

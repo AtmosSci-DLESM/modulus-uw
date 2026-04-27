@@ -16,6 +16,7 @@
 
 from .healpix_blocks import (
     AvgPool,
+    BlurPool,
     BasicConvBlock,
     ConvGRUBlock,
     ConvNeXtBlock,
