@@ -587,6 +587,7 @@ class HEALPixLayer(th.nn.Module):
         dilation = 1 if "dilation" not in kwargs else kwargs["dilation"]
         padding = ((kernel_size - 1) // 2) * dilation
         
+        # Define a HEALPixPadding layer if padding is necessary
         if padding > 0:
             if layer.__bases__[0] is th.nn.modules.conv._ConvNd:
                 kwargs["padding"] = 0 # Disable native padding
