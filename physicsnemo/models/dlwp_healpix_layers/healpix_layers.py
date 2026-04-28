@@ -97,28 +97,14 @@ class HEALPixLayer(th.nn.Module):
         else:
             enable_nhwc = False
 
-        # Define a HEALPixPadding layer if the given layer is a convolution or
-        # interpolation layer
-        if layer.__bases__[0] is th.nn.modules.conv._ConvNd:
-            layer_type = "conv"
-        elif "Interpolate" in layer.__name__:
-            layer_type = "interp"
-        else:
-            layer_type = "other"
+        kernel_size = 3 if "kernel_size" not in kwargs else kwargs["kernel_size"]
+        dilation = 1 if "dilation" not in kwargs else kwargs["dilation"]
+        padding = ((kernel_size - 1) // 2) * dilation
 
+        # Define a HEALPixPadding layer if padding is necessary
         padding_layer = None
-
-        if (
-            (layer_type == "conv" and kwargs["kernel_size"] > 1)
-            or (layer_type == "interp")
-        ):
-            if layer_type == "conv":
-                # HEALPix padding replaces symmetric conv padding on each face.
-                kwargs["padding"] = 0
-            kernel_size = 3 if "kernel_size" not in kwargs else kwargs["kernel_size"]
-            dilation = 1 if "dilation" not in kwargs else kwargs["dilation"]
-            padding = ((kernel_size - 1) // 2) * dilation
-
+        
+        if padding > 0:
             padding_layer = make_hpx_padding_layer(
                 padding=padding,
                 hpx_padding_mode=hpx_padding_mode,

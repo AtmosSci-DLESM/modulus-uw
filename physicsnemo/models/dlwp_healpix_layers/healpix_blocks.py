@@ -16,6 +16,7 @@
 
 from typing import Callable, Sequence, Tuple, Union
 
+import math
 import torch
 import torch as th
 from .healpix_layers import HEALPixLayer
@@ -1147,9 +1148,10 @@ class AvgPool(th.nn.Module):
         """
         return self.avgpool(x)
 
-class BlurPool(th.nn.Module):
+
+class DealiasedDownsample(th.nn.Module):
     """
-    Anti-aliased downsampling via depthwise blur then strided convolution (BlurPool-style).
+    De-aliased downsampling via fixed depthwise blur stages.
 
     Builds a 2D kernel as the outer product of a 1D ``resample_filter``, normalized to sum
     to one, and applies it depthwise with stride ``stride``.
@@ -1157,19 +1159,6 @@ class BlurPool(th.nn.Module):
     Typical filters from Zhang et al.: rectangle-2 ``[1, 1]``, triangle-3 ``[1, 2, 1]``,
     binomial-5 ``[1, 4, 6, 4, 1]``. 
     """
-
-    @staticmethod
-    def _normalized_depthwise_blur_weights(
-        resample_filter: Sequence[float], in_channels: int
-    ) -> torch.Tensor:
-        """Outer product of 1D ``resample_filter``, normalized; shape ``(C, 1, m, m)``."""
-        f = torch.as_tensor(list(resample_filter), dtype=torch.float32)
-        if f.ndim != 1:
-            raise ValueError("resample_filter must be 1D")
-        m = int(f.numel())
-        f2d = f[:, None] * f[None, :]
-        f2d = f2d / f2d.sum()
-        return f2d.unsqueeze(0).unsqueeze(0).expand(in_channels, 1, m, m).clone()
 
     def __init__(
         self,
@@ -1207,36 +1196,33 @@ class BlurPool(th.nn.Module):
             raise ValueError("resample_filter must be non-empty")
         if sum(filt) == 0:
             raise ValueError("resample_filter must not sum to zero")
+        if stride < 1 or (math.log2(stride) % 1) != 0:
+            raise ValueError("stride must be a positive power of 2")
 
-        # Use torch.nn.Conv2d as the layer class so HEALPixLayer recognizes
-        # it as a convolution layer and adds HEALPixPadding
-        self.pool = geometry_layer(
-            layer=th.nn.Conv2d,
-            in_channels=in_channels,
-            out_channels=in_channels,
-            kernel_size=m,
-            stride=stride,
-            padding=0,
-            groups=in_channels,
-            bias=False,
-            dilation=1,
-            enable_nhwc=enable_nhwc,
-            hpx_padding_mode=hpx_padding_mode,
-            compile_padding=compile_padding,
-            nside=nside,
-        )
-        w = BlurPool._normalized_depthwise_blur_weights(filt, in_channels)
-        if enable_nhwc:
-            w = w.to(memory_format=th.channels_last)
-        conv = self.pool.layers[-1]
-        if not isinstance(conv, th.nn.Conv2d):
-            raise TypeError("expected last HEALPixLayer sub-module to be Conv2d")
-        with torch.no_grad():
-            conv.weight.copy_(w)
-        conv.weight.requires_grad_(False)
+        n_layers = int(math.log2(stride))
+        pool_layers = []
+        for _ in range(n_layers):
+            pool_layers.append(
+                geometry_layer(
+                    layer=DealiasBlurConv2d,
+                    in_channels=in_channels,
+                    out_channels=in_channels,
+                    kernel_size=m,
+                    stride=2,
+                    padding=0,
+                    groups=in_channels,
+                    bias=False,
+                    dilation=1,
+                    resample_filter=filt,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+
+        self.pool = th.nn.Sequential(*pool_layers)
 
     def forward(self, x: th.Tensor) -> th.Tensor:
-        """Apply blur pool along the last two spatial dimensions per HEALPix face."""
+        """Apply de-aliased downsampling along spatial dimensions per HEALPix face."""
         return self.pool(x)
 
 #
@@ -1478,66 +1464,49 @@ class Interpolate(th.nn.Module):
         """
         return self.interp(inputs, scale_factor=self.scale_factor, mode=self.mode)
 
-class SmoothedInterpolate(th.nn.Module):
-    """
-    Helper class for interpolating a HEALPix signal then applying a four point
-    smoother which preserves zonal uniformity if the upsampling mode is nearest
-    neighbor or bilinear.
-    """
-    
+
+class DealiasBlurConv2d(th.nn.Module):
+    """Depthwise blur with fixed kernel using functional conv2d."""
+
+    @staticmethod
+    def _normalized_depthwise_blur_weights(
+        resample_filter: Sequence[float], in_channels: int
+    ) -> th.Tensor:
+        f = th.as_tensor(list(resample_filter), dtype=th.float32)
+        if f.ndim != 1:
+            raise ValueError("resample_filter must be 1D")
+        m = int(f.numel())
+        f2d = f[:, None] * f[None, :]
+        f2d = f2d / f2d.sum()
+        return f2d.unsqueeze(0).unsqueeze(0).expand(in_channels, 1, m, m).clone()
+
     def __init__(
         self,
-        in_channels: int = 3,
-        scale_factor: int = 2,
-        mode: str = 'nearest',
-        trim_size: int = 0,
+        in_channels: int,
+        stride: int = 1,
+        resample_filter: Sequence[float] = (1.0, 2.0, 1.0),
+        **kwargs,
     ):
-        """
-        Parameters
-        ----------
-        in_channels: int, optional
-            The number of input channels
-        scale_factor: int, optional
-            Multiplier for spatial size, passed to torch.nn.functional.interpolate
-        mode: str, optional
-            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
-        trim_size: int, optional
-            Amount of padding to trim from final tensor, which is assumed to be
-            square
-        """
         super().__init__()
+        filt = tuple(float(x) for x in resample_filter)
+        if len(filt) < 1:
+            raise ValueError("resample_filter must be non-empty")
+        if sum(filt) == 0:
+            raise ValueError("resample_filter must not sum to zero")
 
         self.in_channels = in_channels
-        self.scale_factor = scale_factor
-        self.mode = mode
-        self.trim_size = trim_size
-        self.interp = th.nn.functional.interpolate
-
-        # Four point smoother specific to HPX grid. This smooths out the specific
-        # type of aliasing that nearest neighbor and bilinear upsampling introduce
-        # into zonally uniform signals
-        self.smoother_kernel = torch.tensor(
-            [[0.,1.,0.],
-             [1.,0.,1.],
-             [0.,1.,0.]]
+        self.stride = stride
+        self.register_buffer(
+            "weight",
+            self._normalized_depthwise_blur_weights(filt, in_channels),
         )
-        self.smoother_kernel = self.smoother_kernel.unsqueeze(0).unsqueeze(0)  # shape (1,1,3,3)
-        self.smoother_kernel = self.smoother_kernel.repeat((in_channels,1,1,1))
 
     def forward(self, x: th.Tensor) -> th.Tensor:
-        self.smoother_kernel = self.smoother_kernel.to(device=x.device, dtype=x.dtype)
-
-        # Interpolate, smooth, trim in order
-        x = self.interp(x, scale_factor=self.scale_factor, mode=self.mode)
-
-        x = torch.nn.functional.conv2d(
+        return th.nn.functional.conv2d(
             x,
-            self.smoother_kernel,
-            padding=0,
-            groups=self.in_channels
-        ) / 4 # divide by 4 to take average of 4 neighbors
-
-        if self.trim_size > 0:
-            x = x[..., self.trim_size:-self.trim_size, self.trim_size:-self.trim_size]
-
-        return x
+            self.weight.to(device=x.device, dtype=x.dtype),
+            bias=None,
+            stride=self.stride,
+            padding=0, # Padding is handled by HEALPixLayer if necessary
+            groups=self.in_channels,
+        )
