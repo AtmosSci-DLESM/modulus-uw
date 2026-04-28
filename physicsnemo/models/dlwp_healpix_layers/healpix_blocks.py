@@ -1086,6 +1086,8 @@ class BlurPool(th.nn.Module):
             enable_healpixpad=enable_healpixpad,
         )
         w = BlurPool._normalized_depthwise_blur_weights(filt, in_channels)
+        if enable_nhwc:
+            w = w.to(memory_format=th.channels_last)
         conv = self.pool.layers[-1]
         if not isinstance(conv, th.nn.Conv2d):
             raise TypeError("expected last HEALPixLayer sub-module to be Conv2d")
