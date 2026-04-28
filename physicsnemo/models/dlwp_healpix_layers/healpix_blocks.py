@@ -1013,6 +1013,53 @@ class AvgPool(th.nn.Module):
         """
         return self.avgpool(x)
 
+
+class FixedDepthwiseBlurConv2d(th.nn.Module):
+    """Depthwise blur using fixed kernel with functional conv2d."""
+
+    @staticmethod
+    def _normalized_depthwise_blur_weights(
+        resample_filter: Sequence[float], in_channels: int
+    ) -> th.Tensor:
+        f = th.as_tensor(list(resample_filter), dtype=th.float32)
+        if f.ndim != 1:
+            raise ValueError("resample_filter must be 1D")
+        m = int(f.numel())
+        f2d = f[:, None] * f[None, :]
+        f2d = f2d / f2d.sum()
+        return f2d.unsqueeze(0).unsqueeze(0).expand(in_channels, 1, m, m).clone()
+
+    def __init__(
+        self,
+        in_channels: int,
+        stride: int = 1,
+        resample_filter: Sequence[float] = (1.0, 2.0, 1.0),
+        **kwargs,
+    ):
+        super().__init__()
+        filt = tuple(float(x) for x in resample_filter)
+        if len(filt) < 1:
+            raise ValueError("resample_filter must be non-empty")
+        if sum(filt) == 0:
+            raise ValueError("resample_filter must not sum to zero")
+
+        self.in_channels = in_channels
+        self.stride = stride
+
+        w = self._normalized_depthwise_blur_weights(filt, in_channels)
+        self.register_buffer("weight", w)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        return th.nn.functional.conv2d(
+            x,
+            self.weight.to(device=x.device, dtype=x.dtype),
+            bias=None,
+            stride=self.stride,
+            padding=0,
+            groups=self.in_channels,
+        )
+
+
 class BlurPool(th.nn.Module):
     """
     Anti-aliased downsampling via depthwise blur then strided convolution (BlurPool-style).
@@ -1023,19 +1070,6 @@ class BlurPool(th.nn.Module):
     Typical filters from Zhang et al.: rectangle-2 ``[1, 1]``, triangle-3 ``[1, 2, 1]``,
     binomial-5 ``[1, 4, 6, 4, 1]``. 
     """
-
-    @staticmethod
-    def _normalized_depthwise_blur_weights(
-        resample_filter: Sequence[float], in_channels: int
-    ) -> torch.Tensor:
-        """Outer product of 1D ``resample_filter``, normalized; shape ``(C, 1, m, m)``."""
-        f = torch.as_tensor(list(resample_filter), dtype=torch.float32)
-        if f.ndim != 1:
-            raise ValueError("resample_filter must be 1D")
-        m = int(f.numel())
-        f2d = f[:, None] * f[None, :]
-        f2d = f2d / f2d.sum()
-        return f2d.unsqueeze(0).unsqueeze(0).expand(in_channels, 1, m, m).clone()
 
     def __init__(
         self,
@@ -1070,10 +1104,8 @@ class BlurPool(th.nn.Module):
         if sum(filt) == 0:
             raise ValueError("resample_filter must not sum to zero")
 
-        # Use torch.nn.Conv2d as the layer class so HEALPixLayer recognizes
-        # it as a convolution layer and adds HEALPixPadding
         self.pool = geometry_layer(
-            layer=th.nn.Conv2d,
+            layer=FixedDepthwiseBlurConv2d,
             in_channels=in_channels,
             out_channels=in_channels,
             kernel_size=m,
@@ -1082,18 +1114,10 @@ class BlurPool(th.nn.Module):
             groups=in_channels,
             bias=False,
             dilation=1,
+            resample_filter=filt,
             enable_nhwc=enable_nhwc,
             enable_healpixpad=enable_healpixpad,
         )
-        w = BlurPool._normalized_depthwise_blur_weights(filt, in_channels)
-        if enable_nhwc:
-            w = w.to(memory_format=th.channels_last)
-        conv = self.pool.layers[-1]
-        if not isinstance(conv, th.nn.Conv2d):
-            raise TypeError("expected last HEALPixLayer sub-module to be Conv2d")
-        with torch.no_grad():
-            conv.weight.copy_(w)
-        conv.weight.requires_grad_(False)
 
     def forward(self, x: th.Tensor) -> th.Tensor:
         """Apply blur pool along the last two spatial dimensions per HEALPix face."""
