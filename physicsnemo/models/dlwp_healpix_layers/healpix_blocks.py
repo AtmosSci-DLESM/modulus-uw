@@ -1091,6 +1091,7 @@ class AvgPool(th.nn.Module):
     def __init__(
         self,
         geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels: int = 3,
         pooling: int = 2,
         enable_nhwc: bool = False,
         hpx_padding_mode: str | None = None,
@@ -1103,6 +1104,8 @@ class AvgPool(th.nn.Module):
         ----------
         geometry_layer: torch.nn.Module, optional
             The wrapper for the geometry of the tensor being bassed to MaxPool2d
+        in_channels: int, optional
+            Not used, but required for hydra instantiation
         pooling: int, optional
             Pooling kernel size passed to geometry layer
         enable_nhwc: bool, optional
