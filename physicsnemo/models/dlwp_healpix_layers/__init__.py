@@ -19,6 +19,7 @@ from .healpix_blocks import (
     BasicConvBlock,
     ConvGRUBlock,
     ConvNeXtBlock,
+    DealiasedDownsample,
     DoubleConvNeXtBlock,
     Interpolate,
     MaxPool,
