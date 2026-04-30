@@ -1245,3 +1245,68 @@ class DealiasBlurConv2d(th.nn.Module):
             padding=0, # Padding is handled by HEALPixLayer if necessary
             groups=self.in_channels,
         )
+
+
+class SmoothedInterpolate(th.nn.Module):
+    """
+    Helper class for interpolating a HEALPix signal then applying a four point
+    smoother which preserves zonal uniformity if the upsampling mode is nearest
+    neighbor or bilinear.
+    """
+    
+    def __init__(
+        self,
+        in_channels: int = 3,
+        scale_factor: int = 2,
+        mode: str = 'nearest',
+        trim_size: int = 0,
+    ):
+        """
+        Parameters
+        ----------
+        in_channels: int, optional
+            The number of input channels
+        scale_factor: int, optional
+            Multiplier for spatial size, passed to torch.nn.functional.interpolate
+        mode: str, optional
+            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
+        trim_size: int, optional
+            Amount of padding to trim from final tensor, which is assumed to be
+            square
+        """
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.scale_factor = scale_factor
+        self.mode = mode
+        self.trim_size = trim_size
+        self.interp = th.nn.functional.interpolate
+
+        # Four point smoother specific to HPX grid. This smooths out the specific
+        # type of aliasing that nearest neighbor and bilinear upsampling introduce
+        # into zonally uniform signals
+        self.smoother_kernel = torch.tensor(
+            [[0.,1.,0.],
+             [1.,0.,1.],
+             [0.,1.,0.]]
+        )
+        self.smoother_kernel = self.smoother_kernel.unsqueeze(0).unsqueeze(0)  # shape (1,1,3,3)
+        self.smoother_kernel = self.smoother_kernel.repeat((in_channels,1,1,1))
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        self.smoother_kernel = self.smoother_kernel.to(device=x.device, dtype=x.dtype)
+
+        # Interpolate, smooth, trim in order
+        x = self.interp(x, scale_factor=self.scale_factor, mode=self.mode)
+
+        x = torch.nn.functional.conv2d(
+            x,
+            self.smoother_kernel,
+            padding=0,
+            groups=self.in_channels
+        ) / 4 # divide by 4 to take average of 4 neighbors
+
+        if self.trim_size > 0:
+            x = x[..., self.trim_size:-self.trim_size, self.trim_size:-self.trim_size]
+
+        return x
