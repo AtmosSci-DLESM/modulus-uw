@@ -118,6 +118,7 @@ class UNetEncoder(th.nn.Module):
                 modules.append(
                     instantiate(
                         config=down_sampling_block,
+                        in_channels=old_channels,
                         enable_nhwc=enable_nhwc,
                         hpx_padding_mode=hpx_padding_mode,
                         compile_padding=compile_padding,
