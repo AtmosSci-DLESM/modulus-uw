@@ -26,6 +26,7 @@ from .healpix_blocks import (
     Multi_SymmetricConvNeXtBlock,
     SymmetricConvNeXtBlock,
     TransposedConvUpsample,
+    SmoothedInterpolateConv,
 )
 from .healpix_decoder import UNetDecoder
 from .healpix_encoder import UNetEncoder
