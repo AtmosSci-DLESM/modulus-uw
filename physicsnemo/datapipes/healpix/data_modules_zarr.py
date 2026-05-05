@@ -62,6 +62,8 @@ class TimeSeriesDataModuleZarr:
         add_insolation: bool = False,
         num_workers: int = 4,
         pin_memory: bool = True,
+        persistent_workers: bool = False,
+        prefetch_factor: Optional[int] = None,
         forecast_init_times: Optional[Sequence] = None,
         add_train_noise: Optional[bool] = False,
         train_noise_params: Optional[DictConfig] = None,
@@ -113,6 +115,11 @@ class TimeSeriesDataModuleZarr:
             Number of parallel data loading workers, default 4
         pin_memory: bool, optional
             Whether pinned (page locked) memory should be used to store the tensors, improves GPU I/O, default True
+        persistent_workers: bool, optional
+            Keep dataloader workers alive between epochs, default False
+        prefetch_factor: int, optional
+            Number of batches loaded in advance by each worker. Only used when
+            num_workers > 0. If not provided, PyTorch default is used.
         forecast_init_times: Sequence, optional
             A Sequence of pandas Timestamps dictating the specific initialization times
             to produce inputs for. default None
@@ -147,6 +154,8 @@ class TimeSeriesDataModuleZarr:
         self.add_insolation = add_insolation
         self.num_workers = num_workers
         self.pin_memory = pin_memory
+        self.persistent_workers = persistent_workers
+        self.prefetch_factor = prefetch_factor
         self.forecast_init_times = forecast_init_times
         self.add_train_noise = add_train_noise
         self.train_noise_params = train_noise_params
@@ -320,16 +329,20 @@ class TimeSeriesDataModuleZarr:
             shuffle = False
             drop_last = False
 
-        loader = DataLoader(
-            dataset=dataset,
-            pin_memory=self.pin_memory,
-            num_workers=self.num_workers,
-            shuffle=shuffle,
-            drop_last=drop_last,
-            sampler=sampler,
-            collate_fn=self.collate_fn,
-            batch_size=self.dataloader_batch_size,
-        )
+        dataloader_kwargs = {
+            "dataset": dataset,
+            "pin_memory": self.pin_memory,
+            "num_workers": self.num_workers,
+            "persistent_workers": (self.persistent_workers and self.num_workers > 0),
+            "shuffle": shuffle,
+            "drop_last": drop_last,
+            "sampler": sampler,
+            "collate_fn": self.collate_fn,
+            "batch_size": self.dataloader_batch_size,
+        }
+        if self.prefetch_factor is not None and self.num_workers > 0:
+            dataloader_kwargs["prefetch_factor"] = self.prefetch_factor
+        loader = DataLoader(**dataloader_kwargs)
 
         return loader, sampler
 
@@ -430,6 +443,8 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         add_insolation: bool = False,
         num_workers: int = 4,
         pin_memory: bool = True,
+        persistent_workers: bool = False,
+        prefetch_factor: Optional[int] = None,
         forecast_init_times: Optional[Sequence] = None,
         couplings: Sequence = None,
         add_train_noise: Optional[bool] = False,
@@ -482,6 +497,11 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             Number of parallel data loading workers, default 4
         pin_memory: bool, optional
             Whether pinned (page locked) memory should be used to store the tensors, improves GPU I/O, default True
+        persistent_workers: bool, optional
+            Keep dataloader workers alive between epochs, default False
+        prefetch_factor: int, optional
+            Number of batches loaded in advance by each worker. Only used when
+            num_workers > 0. If not provided, PyTorch default is used.
         forecast_init_times: Sequence, optional
             A Sequence of pandas Timestamps dictating the specific initialization times
             to produce inputs for. default None
@@ -521,6 +541,8 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             add_insolation,
             num_workers,
             pin_memory,
+            persistent_workers,
+            prefetch_factor,
             forecast_init_times,
             add_train_noise,
             train_noise_params,
