@@ -102,17 +102,16 @@ class HEALPixLayer(th.nn.Module):
         padding = ((kernel_size - 1) // 2) * dilation
 
         # Define a HEALPixPadding layer if padding is necessary
-        padding_layer = None
-        
         if padding > 0:
+            # Disable native padding for conv layers
+            if layer.__bases__[0] is th.nn.modules.conv._ConvNd:
+                kwargs["padding"] = 0
             padding_layer = make_hpx_padding_layer(
                 padding=padding,
                 hpx_padding_mode=hpx_padding_mode,
                 enable_nhwc=enable_nhwc,
                 nside=nside,
             )
-
-        if padding_layer is not None:
             if compile_padding:
                 padding_layer = th.compile(padding_layer)
             layers.append(padding_layer)

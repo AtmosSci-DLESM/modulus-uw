@@ -1184,9 +1184,17 @@ class DealiasedDownsample(th.nn.Module):
         stride: int, optional
             Stride of the blur convolution (downsampling factor).
         enable_nhwc: bool, optional
-            Passed to ``geometry_layer``.
+            Enable nhwc format, passed to wrapper
+        hpx_padding_mode: str, optional
+            HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
+            ``karlbauer``, or ``isolatitude``).
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
-            Passed to ``geometry_layer``.
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
@@ -1215,7 +1223,9 @@ class DealiasedDownsample(th.nn.Module):
                     dilation=1,
                     resample_filter=filt,
                     enable_nhwc=enable_nhwc,
-                    enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
+                    compile_padding=compile_padding,
+                    nside=nside,
                 )
             )
 
