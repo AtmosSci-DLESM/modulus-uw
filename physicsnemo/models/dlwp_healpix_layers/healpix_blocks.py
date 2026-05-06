@@ -1412,7 +1412,7 @@ class SmoothedInterpolateConv(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
                 compile_padding=compile_padding,
-                nside=nside,
+                nside=scale_factor*nside,
             )
         ]
 
