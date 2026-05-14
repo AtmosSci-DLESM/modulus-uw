@@ -29,7 +29,7 @@ from physicsnemo.utils.insolation import insolation
 
 from . import couplers
 from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
-from .base_timeseries_dataset_zarr import _check_availability
+from .base_timeseries_dataset_zarr import _check_availability, _open_object_store, _is_object_store_path
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +107,12 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         # We setup couplers first so superclass can properly initialize
         # and set the scaling
         _check_availability(dataset_path)
-        self.ds = zarr.open(dataset_path)
+    
+        if _is_object_store_path(dataset_path):
+            self.ds = _open_object_store(dataset_path)
+        else:
+            self.ds = zarr.open(dataset_path)
+
         self.couplings = [
             getattr(couplers, c["coupler"])(
                 self.ds,
@@ -138,6 +143,11 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
             train_noise_seed=train_noise_seed,
             meta=meta,
         )
+
+        # Superclass re-opens ``self.ds``; keep couplers on the same zarr group.
+        for c in self.couplings:
+            if getattr(c, "use_zarr", False):
+                c.ds = self.ds
 
         # calculate static indices for coupling
         for c in self.couplings:

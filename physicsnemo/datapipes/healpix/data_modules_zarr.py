@@ -25,15 +25,30 @@ import numpy as np
 
 # External modules
 from omegaconf import DictConfig
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, get_worker_info
 from torch.utils.data.distributed import DistributedSampler
 
 from physicsnemo.distributed import DistributedManager
 
+from .base_timeseries_dataset_zarr import _check_availability
 from .coupledtimeseries_dataset_zarr import CoupledTimeSeriesDatasetZarr
 from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
 
 logger = logging.getLogger(__name__)
+
+
+def _zarr_dataloader_worker_init_fn(_worker_id: int) -> None:
+    """Re-bind Fsspec-backed Zarr to this worker process after fork/spawn.
+
+    See ``BaseTimeSeriesDatasetZarr._ensure_zarr_for_current_process``.
+    """
+    info = get_worker_info()
+    if info is None:
+        return
+    dataset = info.dataset
+    ensure = getattr(dataset, "_ensure_zarr_for_current_process", None)
+    if ensure is not None:
+        ensure()
 
 
 class TimeSeriesDataModuleZarr:
@@ -128,7 +143,7 @@ class TimeSeriesDataModuleZarr:
             Seed for the random number generator for adding noise to the training data, default 42
         """
         super().__init__()
-        self.dataset_path = Path(dataset_path)
+        self.dataset_path = dataset_path
         self.dataset_batch_size = batch_size
         self.dataloader_batch_size = dataloader_batch_size
         self.drop_last = drop_last
@@ -195,8 +210,7 @@ class TimeSeriesDataModuleZarr:
 
     def _validate_setup_requirements(self) -> None:
         """Validate that required setup conditions are met"""
-        if not self.dataset_path.exists():
-            raise FileNotFoundError(f"Dataset path not found: {self.dataset_path}")
+        _check_availability(self.dataset_path)
 
         if self.splits is None and self.forecast_init_times is None:
             raise ValueError("Either splits or forecast_init_times must be provided")
@@ -329,6 +343,9 @@ class TimeSeriesDataModuleZarr:
             sampler=sampler,
             collate_fn=self.collate_fn,
             batch_size=self.dataloader_batch_size,
+            worker_init_fn=(
+                _zarr_dataloader_worker_init_fn if self.num_workers > 0 else None
+            ),
         )
 
         return loader, sampler

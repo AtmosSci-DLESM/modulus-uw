@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import zarr
+from zarr.storage import FsspecStore
 from physicsnemo.datapipes.datapipe import Datapipe
 from physicsnemo.datapipes.meta import DatapipeMetaData
 from omegaconf import DictConfig, OmegaConf
@@ -48,6 +49,85 @@ def _is_object_store_path(path: str) -> bool:  # pragma: no cover
     """
     return "://" in str(path) or "::" in str(path)
 
+
+class MissingEnvironmentVariable(Exception):
+    """ Helper to tag missing enviromnet variable """
+    pass
+
+
+def _open_object_store(path: str) -> zarr.group: # pragma: no cover
+    """Open a path as an s3 object store, this requires some items
+    to be sepecified as environment variables
+
+    Parameters
+    ----------
+    path : str
+        Path to open
+
+    Returns
+    -------
+    zarr.group
+        The data on the specified path
+    """
+
+    endpoint_url = os.environ.get("S3_ENDPOINT_URL", None)
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID", None)
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", None)
+
+
+    if not access_key:
+        raise MissingEnvironmentVariable("AWS_ACCESS_KEY_ID not found in enviroment variables")
+    if not secret_key:
+        raise MissingEnvironmentVariable("AWS_SECRET_ACCESS_KEY not found in enviroment variables")
+
+    storage_options = {
+        "key":'team-earth2-datasets',
+        "secret":'927e947bd9a8b9dd38ac7c3ea0f53d90'
+    }
+    if endpoint_url is not None:
+        storage_options["endpoint_url"] = endpoint_url
+
+    store = FsspecStore.from_url(path, read_only=True, storage_options=storage_options)
+    group = zarr.open_group(store=store, mode="r")
+
+    return group
+    
+
+def _open_xarray_store(path: str) -> xr.Dataset: # pragma: no cover
+    """Open a path as an xarray store, this requires some items
+    to be sepecified as environment variables
+
+    Parameters
+    ----------
+    path : str
+        Path to open
+
+    Returns
+    -------
+    xr.Dataset
+        The data on the specified path
+    """
+
+    endpoint_url = os.environ.get("S3_ENDPOINT_URL", None)
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID", None)
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", None)
+
+
+    if not access_key:
+        raise MissingEnvironmentVariable("AWS_ACCESS_KEY_ID not found in enviroment variables")
+    if not secret_key:
+        raise MissingEnvironmentVariable("AWS_SECRET_ACCESS_KEY not found in enviroment variables")
+
+    storage_options = {
+        "key":'team-earth2-datasets',
+        "secret":'927e947bd9a8b9dd38ac7c3ea0f53d90'
+    }
+    if endpoint_url is not None:
+        storage_options["endpoint_url"] = endpoint_url
+
+    #store = FsspecStore.from_url(path, read_only=True, storage_options=storage_options)
+    #group = zarr.open_group(store=store, mode="r")
+    return xr.open_dataset(path, engine="zarr", storage_options=storage_options)
 
 def _check_availability(path: str) -> None:  # pragma: no cover
     """
@@ -182,7 +262,12 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         # Check if for fsspec if necessary and make sure path exist
         _check_availability(dataset_path)
 
-        self.ds = zarr.open(dataset_path)
+        if _is_object_store_path(dataset_path):
+            self.ds = _open_object_store(dataset_path)
+            self._zarr_store_pid = os.getpid()
+        else:
+            self.ds = zarr.open(dataset_path)
+            self._zarr_store_pid = None
 
         if (
             start_date is None or end_date is None
@@ -285,6 +370,29 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         if self.add_train_noise:
             self.rng = np.random.default_rng(train_noise_seed)
 
+    def _ensure_zarr_for_current_process(self) -> None:
+        """Re-open the object-store Zarr group in this OS process if needed.
+
+        ``FsspecStore`` (Zarr v3) uses asyncio resources bound to the process and
+        event loop where the store was created. With ``DataLoader(..., num_workers>0)``
+        the dataset is typically used from forked worker processes that inherit a
+        store created in the parent, which leads to errors such as
+        "Task attached to a different loop". Opening once per process avoids that.
+
+        ``TimeSeriesDataModuleZarr`` registers this via ``worker_init_fn`` on the
+        DataLoader; call explicitly if you build a DataLoader without that hook.
+        """
+        if not _is_object_store_path(self.dataset_path):
+            return
+        pid = os.getpid()
+        if getattr(self, "_zarr_store_pid", None) == pid:
+            return
+        self.ds = _open_object_store(self.dataset_path)
+        self._zarr_store_pid = pid
+        for c in getattr(self, "couplings", None) or ():
+            if getattr(c, "use_zarr", False):
+                c.ds = self.ds
+
     @staticmethod
     def _convert_time_step(dt: Union[int, str]) -> pd.Timedelta:
         """Convert time step specification to Timedelta.
@@ -324,7 +432,10 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         # Check if fsspec is available for object store paths
         _check_availability(dataset_path)
 
-        ds = xr.open_zarr(dataset_path)
+        if _is_object_store_path(dataset_path):
+            ds = _open_xarray_store(dataset_path)
+        else:
+            ds = xr.open_zarr(dataset_path)
 
         if "time" not in ds:
             raise KeyError(f"Dataset missing time. Dataset provided {dataset_path}")
