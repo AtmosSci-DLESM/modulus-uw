@@ -1101,10 +1101,6 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             n_freq = pred_power.shape[-1]
             eps = 1e-8
             if self.spectral_per_swath_mse:
-                print("smallest number in pred power:", pred_power.min())
-                print("smallest number in tar power:", tar_power.min())
-                print("fraction of zeros in pred power:", (pred_power < eps).float().mean())
-                print("fraction of zeros in tar power:", (tar_power < eps).float().mean())
                 log_pred = th.log(pred_power + eps)
                 log_tar = th.log(tar_power + eps)
                 mse_sw = ((log_pred - log_tar) ** 2).mean(dim=-1)
@@ -2233,3 +2229,313 @@ class CosineAnnealedOceanCRPSLoss(th.nn.Module):
             setattr(self, attr, getattr(self.crps_loss, attr, None))
 
         return total
+
+
+class WeightedAlmostFairPatchEnergyScoreLoss(th.nn.MSELoss):
+    """
+    Probabilistic loss function implementing the almost-fair Patch Energy Score (afPES).
+
+    For each spatial patch p on a HEALPix face, with ensemble {x_1, ..., x_M} and target y:
+
+        afPES(y_p, {x_i,p}) = (1/M) * sum_i ||x_i,p - y_p||
+                              - (1 - eps) / (2 M (M-1)) * sum_{i,j} ||x_i,p - x_j,p||
+
+    where ||.|| is the L2 (Euclidean) norm over the patch's spatial cells. The
+    almost-fair coefficient eps is parameterized via `alpha` so that
+    `eps = (1 - alpha) / n_members`, matching `WeightedCRPSLoss`. With `patch_size=1`
+    and no LSM the per-cell expression and reduction reduce exactly to
+    `WeightedCRPSLoss._2member_crps` (for M=2).
+
+    Patches are extracted per HEALPix face (no cross-face boundaries) with
+    `tensor.unfold` on the H, W dims. For partial-land patches we use a
+    Horvitz-Thompson-style extrapolation: the squared sum over valid (ocean) cells
+    is rescaled by `P^2 / n_valid` so the L2 norm magnitude scales correctly with
+    patch size across variable land-sea geometries. Fully-land patches are dropped
+    from both the numerator and the denominator of the final mean.
+    """
+
+    def __init__(
+        self,
+        weights: Sequence = [],
+        n_members: int = 2,
+        alpha: float = 0.95,
+        patch_size: int = 3,
+        patch_stride: int = 1,
+        lsm_file: str = None,
+        open_dict: dict = {"engine": "zarr"},
+        selection_dict: dict = {"channel_c": "land_sea_mask"},
+        lsm_binary_mask: bool = False,
+        lsm_binary_threshold: float = 0.5,
+    ):
+        """
+        Parameters
+        ----------
+        weights: Sequence
+            list of floats that determine weighting of variable loss, assumed to be
+            in order consistent with order of model output channels.
+        n_members: int
+            number of ensemble members in the model output. Must be >= 2.
+        alpha: float
+            hyperparameter for the almost-fair coefficient. `alpha=1` recovers the
+            strictly fair estimator (eps=0); `alpha=0` recovers the biased empirical
+            Energy Score (eps=1/M). Same semantics as `WeightedCRPSLoss`.
+        patch_size: int, optional
+            side length of each spatial patch in HEALPix face pixels. Default 3.
+        patch_stride: int, optional
+            stride between consecutive patches along H and W (per face). Default 1
+            (overlapping, dense). Use `patch_stride=patch_size` for non-overlapping.
+        lsm_file: str, optional
+            land-sea-mask file. When provided, lsm_tensor weights the loss per
+            grid cell (ocean=1, land=0). When omitted, all cells are valid.
+        open_dict, selection_dict, lsm_binary_mask, lsm_binary_threshold:
+            same semantics as `WeightedCRPSLoss`.
+        """
+        super().__init__()
+        if n_members < 2:
+            raise ValueError("n_members must be at least 2 for afPES to be defined")
+        if patch_size < 1:
+            raise ValueError("patch_size must be >= 1")
+        if patch_stride < 1:
+            raise ValueError("patch_stride must be >= 1")
+
+        self.loss_weights = th.tensor(weights)
+        self.n_members = n_members
+        self.patch_size = int(patch_size)
+        self.patch_stride = int(patch_stride)
+        self.device = None
+
+        # LSM loading: mirrors WeightedCRPSLoss
+        self.lsm_binary_mask = lsm_binary_mask
+        if lsm_file is not None:
+            self.lsm_ds = xr.open_dataset(lsm_file, **open_dict).constants.sel(selection_dict)
+            lsm_values = np.expand_dims(self.lsm_ds.values, (0, 2, 3))
+            if lsm_binary_mask:
+                lsm_binary = (lsm_values < lsm_binary_threshold).astype(np.float32)
+                self.lsm_tensor = th.tensor(lsm_binary)
+            else:
+                self.lsm_tensor = 1 - th.tensor(lsm_values.astype(np.float32))
+            self._has_lsm = True
+        else:
+            self.lsm_tensor = th.ones(1, 1, 1, 1, 1, 1)
+            self._has_lsm = False
+
+        # Almost-fair coefficient: eps = (1 - alpha) / n_members, so (1 - eps) = coeff_eps.
+        # This matches WeightedCRPSLoss so that at patch_size=1 the formulas agree.
+        self.coeff_eps = 1 - ((1 - alpha) / n_members)
+        # 1/M outer averaging coefficient on the first term (sum_i ||x_i - y||)
+        self.averaging_coeff = 1.0 / n_members
+        # Coefficient on the second term: (1-eps) / (2 M (M-1)) = coeff_eps / (2 M (M-1))
+        self.pair_coeff = self.coeff_eps / (2.0 * n_members * (n_members - 1))
+
+        # Cached per-component loss scalars for TensorBoard logging
+        self.last_afpes_base = None
+        self.last_afpes_xy_term = None
+        self.last_afpes_xx_term = None
+        # Ensemble diagnostics (picked up by trainer under loss_components/{spread, skill, spread_skill_score})
+        self.last_spread = None
+        self.last_skill = None
+        self.last_spread_skill_score = None
+
+    def set_training_epoch(self, epoch: int) -> None:
+        """Trainer hook (no-op); reserved for APIs that pass the training epoch index."""
+        pass
+
+    def setup(self, trainer):
+        """Push constants to the trainer device."""
+        if len(trainer.output_variables) != len(self.loss_weights):
+            raise ValueError("Length of outputs and loss_weights is not the same!")
+
+        self.loss_weights = self.loss_weights.to(device=trainer.device)
+        self.averaging_coeff = th.tensor(self.averaging_coeff, device=trainer.device)
+        self.coeff_eps = th.tensor(self.coeff_eps, device=trainer.device)
+        self.pair_coeff = th.tensor(self.pair_coeff, device=trainer.device)
+        self.lsm_tensor = self.lsm_tensor.to(device=trainer.device)
+        self.device = trainer.device
+
+    def _patchify(self, x: th.Tensor) -> th.Tensor:
+        """Extract patches from the last 2 dims (H, W) per HEALPix face.
+
+        Input: [..., H, W]
+        Output: [..., Hp, Wp, P*P], where Hp = (H - P) // S + 1, Wp similarly.
+        """
+        P, S = self.patch_size, self.patch_stride
+        # unfold(-2, P, S): replaces dim -2 with (-2: count, -1: window) → appends window dim at end
+        x_u = x.unfold(-2, P, S).unfold(-2, P, S)  # [..., Hp, Wp, P, P]
+        return x_u.reshape(*x_u.shape[:-2], P * P)
+
+    def _build_lsm_for_data(self, h: int, w: int, device, dtype) -> th.Tensor:
+        """Return an LSM tensor broadcastable to [B, F, T, C, H, W] with shape [1, F, 1, 1, H, W].
+
+        If the loss was constructed without an `lsm_file`, returns an all-ones tensor of
+        spatial shape (h, w) so patchify works uniformly. If an LSM was loaded, returns it
+        directly (already shape [1, F, 1, 1, H, W]).
+        """
+        if self._has_lsm:
+            return self.lsm_tensor
+        return th.ones(1, 1, 1, 1, h, w, device=device, dtype=dtype)
+
+    def _compute_spread_skill_ssr(
+        self,
+        prediction: th.Tensor,
+        target: th.Tensor,
+        lsm: th.Tensor,
+    ):
+        """
+        Compute domain-averaged spread, skill, and spread-skill ratio (SSR) from the
+        unweighted ensemble prediction and target. Same diagnostic as
+        `WeightedCRPSLoss._compute_spread_skill_ssr`, but accepts the LSM as an argument
+        so the no-LSM case (full ones over the data H, W) works correctly.
+
+        prediction: [Cond, B, F, T, C, H, W]
+        target:     [B, F, T, C, H, W]
+        lsm:        broadcastable to [B, F, T, C, H, W] (shape [1, F, 1, 1, H, W])
+        """
+        if prediction.ndim != 7 or target.ndim != 6:
+            raise ValueError(
+                f"_compute_spread_skill_ssr expects prediction [Cond, B, F, T, C, H, W] and target [B, F, T, C, H, W], "
+                f"got {prediction.shape} and {target.shape}"
+            )
+
+        n = self.n_members
+        if n < 2:
+            raise ValueError("Spread/skill diagnostics require at least 2 ensemble members")
+
+        # Ensemble mean at each grid point
+        mu = prediction.mean(dim=0)  # [B, F, T, C, H, W]
+
+        # Local ensemble variance with Bessel's correction (N-1 in denominator)
+        diff = prediction - mu.unsqueeze(0)
+        sigma2 = (diff * diff).sum(dim=0) / float(max(n - 1, 1))  # [B, F, T, C, H, W]
+
+        # Local squared error of ensemble mean
+        se = (mu - target) ** 2  # [B, F, T, C, H, W]
+
+        weighted_sigma2 = sigma2 * lsm
+        weighted_se = se * lsm
+
+        eps = 1e-8
+        # Effective count of masked pixels (mask has no B, T, C dim so this counts (F, H, W))
+        m_eff = lsm.sum()
+
+        # Reduce over batch, faces, time, H, W -- keep channels separate
+        spread_var_c = weighted_sigma2.sum(dim=(0, 1, 2, 4, 5)) / (m_eff + eps)
+        skill_mse_c = weighted_se.sum(dim=(0, 1, 2, 4, 5)) / (m_eff + eps)
+
+        spread_c = th.sqrt(spread_var_c + eps)
+        skill_c = th.sqrt(skill_mse_c + eps)
+        ssr_c = spread_c / (skill_c + eps)
+
+        return spread_c.detach(), skill_c.detach(), ssr_c.detach()
+
+    def forward(self, prediction: th.Tensor, target: th.Tensor, average_channels: bool = True):
+        """Forward pass of the almost-fair Patch Energy Score loss.
+
+        Parameters
+        ----------
+        prediction: th.Tensor
+            Shape [Cond*B, F, T, C, H, W] where Cond = n_members is the ensemble axis.
+        target: th.Tensor
+            Shape [B, F, T, C, H, W].
+        average_channels: bool, optional
+            If True (default), returns a scalar (mean over all dims, including channels).
+            If False, returns a per-channel tensor of shape [C].
+        """
+        b, f, t, c, h, w = target.shape
+        prediction = prediction.view(self.n_members, b, f, t, c, h, w)
+
+        if not prediction.shape[1:] == target.shape:
+            raise ValueError(
+                f"Shape of prediction should match shape of target along non-ensemble dimensions, "
+                f"got {prediction.shape} and {target.shape}"
+            )
+        if not prediction.shape[0] == self.n_members:
+            raise ValueError(
+                f"Shape of prediction should have ensemble dimension of size {self.n_members}, "
+                f"got {prediction.shape[0]}"
+            )
+
+        prediction = prediction.to(th.float32)
+        target = target.to(th.float32)
+
+        # Build a full-shape LSM (loaded mask if present, else ones over data H, W)
+        lsm_full = self._build_lsm_for_data(h, w, prediction.device, prediction.dtype)
+
+        # Ensemble spread/skill diagnostics on unweighted fields (before channel weights),
+        # matching WeightedCRPSLoss. Failures are silently ignored so logging cannot
+        # interrupt training.
+        try:
+            spread, skill, ssr = self._compute_spread_skill_ssr(prediction, target, lsm_full)
+            self.last_spread = spread.mean()
+            self.last_skill = skill.mean()
+            self.last_spread_skill_score = ssr.mean()
+        except Exception:
+            self.last_spread = None
+            self.last_skill = None
+            self.last_spread_skill_score = None
+
+        # Apply channel weights across channel dims (same convention as WeightedCRPSLoss)
+        prediction = prediction * self.loss_weights[None, None, None, None, :, None, None]
+        target = target * self.loss_weights[None, None, None, :, None, None]
+
+        # Patchify per face: [..., H, W] -> [..., Hp, Wp, P*P]
+        pred_p = self._patchify(prediction)               # [M, B, F, T, C, Hp, Wp, P*P]
+        tar_p = self._patchify(target)                    # [B, F, T, C, Hp, Wp, P*P]
+        lsm_p = self._patchify(lsm_full)                  # [1, F, 1, 1, Hp, Wp, P*P]
+
+        n_valid = lsm_p.sum(dim=-1)                       # [1, F, 1, 1, Hp, Wp]
+        valid_patch = (n_valid > 0).to(prediction.dtype)  # [1, F, 1, 1, Hp, Wp]
+        safe_n = n_valid.clamp(min=1.0)
+        scale = (self.patch_size * self.patch_size) / safe_n  # H-T extrapolation factor
+        eps = 1e-12  # sqrt(0) gradient guard
+
+        # Per-patch L2 norm of (x_i - y), masked and H-T-extrapolated
+        sq_xy = (scale * ((pred_p - tar_p.unsqueeze(0)) ** 2 * lsm_p).sum(dim=-1)).clamp(min=eps)
+        diff_xy = th.sqrt(sq_xy) * valid_patch            # [M, B, F, T, C, Hp, Wp]
+
+        # First term: (1/M) * sum_i ||x_i - y||
+        xy_term = self.averaging_coeff * diff_xy.sum(dim=0)  # [B, F, T, C, Hp, Wp]
+
+        # Second term: (1 - eps) / (2 M (M-1)) * sum_{i,j} ||x_i - x_j||
+        if self.n_members == 2:
+            # Only one unique ordered pair magnitude; sum_{i,j} ||x_i - x_j|| = 2 * ||x_0 - x_1||
+            sq_xx = (scale * ((pred_p[0] - pred_p[1]) ** 2 * lsm_p).sum(dim=-1)).clamp(min=eps)
+            diff_xx_one = th.sqrt(sq_xx) * valid_patch    # [B, F, T, C, Hp, Wp]
+            xx_sum = 2.0 * diff_xx_one
+        else:
+            # Memory-light pairwise loop. Exploit ||x_i - x_j|| == ||x_j - x_i|| to iterate the
+            # strict upper triangle (i < j) only -- halves sqrt count and autograd graph depth --
+            # then double to restore the full sum_{i,j != i} magnitude.
+            xx_sum = None
+            for i in range(self.n_members):
+                for j in range(i + 1, self.n_members):
+                    sq_ij = (scale * ((pred_p[i] - pred_p[j]) ** 2 * lsm_p).sum(dim=-1)).clamp(min=eps)
+                    term = th.sqrt(sq_ij) * valid_patch
+                    xx_sum = term if xx_sum is None else xx_sum + term
+            xx_sum = 2.0 * xx_sum
+
+        xx_term = self.pair_coeff * xx_sum                # [B, F, T, C, Hp, Wp]
+        afpes_per_patch = xy_term - xx_term                # [B, F, T, C, Hp, Wp]
+
+        # Aggregate over (B, F, T, C, Hp, Wp), dropping fully-land patches from
+        # both numerator AND denominator. afpes_per_patch is already zero at fully-land
+        # (F, Hp, Wp) locations because every per-pair diff factor was multiplied by
+        # valid_patch before summation, so the explicit `* valid_full` in the numerator
+        # would be redundant.
+        valid_full = valid_patch.expand_as(afpes_per_patch)
+        if average_channels:
+            num = afpes_per_patch.sum()
+            denom = valid_full.sum().clamp(min=1.0)
+            loss = num / denom
+        else:
+            reduce_dims = (0, 1, 2, 4, 5)  # B, F, T, Hp, Wp (channels at dim 3 kept)
+            num = afpes_per_patch.sum(dim=reduce_dims)
+            denom = valid_full.sum(dim=reduce_dims).clamp(min=1.0)
+            loss = num / denom
+
+        # Cache diagnostics (xy_term and xx_term are already zeroed at invalid patches)
+        self.last_afpes_base = loss.mean().detach() if isinstance(loss, th.Tensor) else None
+        valid_count = valid_full.sum().clamp(min=1.0)
+        self.last_afpes_xy_term = xy_term.sum().detach() / valid_count
+        self.last_afpes_xx_term = xx_term.sum().detach() / valid_count
+
+        return loss
