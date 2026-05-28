@@ -23,7 +23,7 @@ sys.path.append(os.path.join(os.path.dirname(script_path), ".."))
 import common
 import pytest
 import torch
-from graphcast.utils import fix_random_seeds
+from utils import fix_random_seeds
 from pytest_utils import import_or_fail
 
 from physicsnemo.models.dlwp_healpix import HEALPixRecUNet
