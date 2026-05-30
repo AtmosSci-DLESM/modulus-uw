@@ -159,13 +159,15 @@ class ConstantCoupler:
             "std": np.expand_dims(coupled_scaling["std"].to_numpy(), (0, 2, 3, 4)),
         }
 
-    def setup_coupling(self, coupled_module):
+    def setup_coupling(self, coupled_module, data_module):
         """
         get proper channels from coupled component output   
         Parameters
         ----------
         coupled_module: module or sequence of modules
             the module(s) that are being coupled to
+        data_module: DataModule
+            the data module that is being coupled to
         """
         # To expediate the coupling process the coupled_forecast
         # get proper channels from coupled component output
@@ -228,9 +230,21 @@ class ConstantCoupler:
         )
         # we use a constant set of values so we just copy time 0
         for i in range(len(self.preset_coupled_fields)):
+            # print('')
+            # print(f'coupled_fields.shape: {coupled_fields.shape}')
+            # print(f'coupled_fields[0, :, :, :, :, :].shape: {coupled_fields[0, :, :, :, :, :].shape}')
+            # print(f'self.preset_coupled_fields.shape: {self.preset_coupled_fields.shape}')
+            # print(f'i: {i}')
+            # exit()
+
+            # previous version was broadcasting channel dimension in coupled fields
+            # self.preset_coupled_fields[i, :, :, :, :, :] = coupled_fields[
+            #     0, :, -1:, :, :, :
+            # ]
             self.preset_coupled_fields[i, :, :, :, :, :] = coupled_fields[
-                0, :, -1:, :, :, :
+                0, :, :, :, :, :
             ]
+
         # flag for construct integrated coupling method to use this array
         self.coupled_mode = True
 
@@ -357,7 +371,12 @@ class TrailingAverageCoupler:
         self.coupled_integration_dim = self._compute_coupled_integration_dim()
         self.timevar_dim = self._compute_timevar_dim()
         self.coupled_inputs_shape = None
+        self.coupled_means = None
+        self.coupled_stds = None
+        self.means = None
+        self.stds = None
         self.scaling_dict = None
+        self.coupled_scaling = None
         self._coupled_offsets = None
         self.integrated_couplings = None
         self.coupled_mode = False  # if forecasting with another coupled model
@@ -438,7 +457,7 @@ class TrailingAverageCoupler:
 
         return self.presteps + max(self.output_time_dim // self.input_time_dim, 1)
 
-    def setup_coupling(self, coupled_module):
+    def setup_coupling(self, coupled_module, data_module):
 
         # To expediate the coupling process the coupled_forecast
         # get proper channels from coupled component output
@@ -456,16 +475,32 @@ class TrailingAverageCoupler:
         #
         # for example 'z1000' is in 'z1000-48H'
         channel_indices = []
+        channel_source_names = []
         for v in self.variables:
             if v == "ttr-3h-48H":
                 # Special case for ttr-3h-48H
                 channel_indices.append(list(output_channels).index("ttr-3h"))
+                channel_source_names.append("ttr-3h")
             else:
                 for i, oc in enumerate(output_channels):
-                    if oc == v.split("-")[0]:
+                    if oc == "-".join(v.split("-")[:-1]):
                         channel_indices.append(i)
-
+                        channel_source_names.append(oc)
         self.coupled_channel_indices = channel_indices
+
+        # we need to keep track of scaling statistics for online coupling later on. 
+        self.coupled_scaling = {n:coupled_module.scaling[n] for n in channel_source_names}
+        self.scaling_dict = {n:data_module.scaling[n] for n in self.variables}
+        # create broadcasta-able array of mean and std for each variable
+        self.coupled_means = th.tensor([self.coupled_scaling[n]["mean"] for n in channel_source_names]).view(1, 1, 1, len(channel_source_names), 1, 1)
+        self.coupled_stds = th.tensor([self.coupled_scaling[n]["std"] for n in channel_source_names]).view(1, 1, 1, len(channel_source_names), 1, 1)
+        # and then for the averaged version 
+        self.means = th.tensor([self.scaling_dict[n]["mean"] for n in self.variables])
+        self.stds = th.tensor([self.scaling_dict[n]["std"] for n in self.variables])
+        # here we stack means and stds on themselves len(coupled_integration_dim) times to match the time-var dimension of the coupled fields
+        input_coupled_times = len(data_module.couplings[0].params.input_times)
+        self.means = self.means.repeat(input_coupled_times).view(1, 1, 1, len(self.variables)*input_coupled_times, 1, 1)
+        self.stds = self.stds.repeat(input_coupled_times).view(1, 1, 1, len(self.variables)*input_coupled_times, 1, 1)
 
         # find averaging periods from componenet output
         averaging_window_max_indices = [
@@ -503,11 +538,22 @@ class TrailingAverageCoupler:
             The data to use when the dataloader requests coupled fields. Also accepts sequence of tensors for 3+ component inference.
             Expected tensor format is [B, F, T, C, H, W]
         """
+
+        # extract the coupled fields from the coupled_fields tensor
+        coupled_fields = coupled_fields[:, :, :, self.coupled_channel_indices, :, :]
+
+        # here we want to accomodate the fact that coupled fields are scaled 
+        # before being averaged below. The only way to accomodate this is to: 
+        # 1. rescaled the inputs based on the source scaling stats 
+        # 2. calculate the time average if the dimensional inputs 
+        # 3. scale the averaged inputs with the trailed averaged statistics. 
+
+        coupled_fields = (coupled_fields * self.coupled_stds) + self.coupled_means
+
         # if coupled_fields is a list of tensors, concatenate along channel dimension
         if isinstance(coupled_fields, (list, tuple)):
             coupled_fields = th.cat(coupled_fields, dim=3)
         
-        coupled_fields = coupled_fields[:, :, :, self.coupled_channel_indices, :, :]
         # TODO: Now support output_time_dim =/= input_time_dim, but presteps need to be 0, will add support for presteps>0
         coupled_averaging_periods = []
         for j in range(self.coupled_integration_dim):
@@ -518,7 +564,15 @@ class TrailingAverageCoupler:
             coupled_averaging_periods.append(th.concat(averaging_periods, dim=3))
         self.preset_coupled_fields = th.concat(
             coupled_averaging_periods, dim=2
-        ).permute(2, 0, 3, 1, 4, 5)
+        )
+        
+        # the time-var dimension should now have size len(averaging_slices)*len(self.variables)
+        # try to stack means and stds on itself len(averaging_slices) times
+
+        # rescale the averaged inputs with the trailed averaged statistics. 
+        self.preset_coupled_fields = (self.preset_coupled_fields - self.means) / self.stds
+        # permute the tensor to the correct shape
+        self.preset_coupled_fields = self.preset_coupled_fields.permute(2, 0, 3, 1, 4, 5)
         # flag for construct integrated coupling method to use this array
         self.coupled_mode = True
 

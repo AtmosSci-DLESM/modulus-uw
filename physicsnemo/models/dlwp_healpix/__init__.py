@@ -17,5 +17,6 @@
 from .HEALPixRecUNet import HEALPixRecUNet
 from .HEALPixUNet import HEALPixUNet
 from .HEALPixResNet import HEALPixResNet
+from .diagnostic_models import gt_model, climo_model
 
-__all__ = ["HEALPixRecUNet", "HEALPixUNet", "HEALPixResNet"]
+__all__ = ["HEALPixRecUNet", "HEALPixUNet", "HEALPixResNet", "gt_model", "climo_model"]

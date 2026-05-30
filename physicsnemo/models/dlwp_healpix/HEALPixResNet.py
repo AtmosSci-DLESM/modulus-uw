@@ -65,6 +65,7 @@ class HEALPixResNet(Module):
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
         couplings: list = [],
+        constraints: list[DictConfig] = None,
     ):
         """
         Parameters
@@ -99,6 +100,8 @@ class HEALPixResNet(Module):
             Enable CUDA HEALPixPadding if installed. default: False
         couplings: list, optional
             sequence of dictionaries that describe coupling mechanisms
+        constraints: list[DictConfig], optional
+            sequence of dictionaries that describe constraints on the model
         """
         super().__init__()
 
@@ -179,6 +182,9 @@ class HEALPixResNet(Module):
 
         self.resnet = th.nn.ModuleList(self.resnet)
 
+        self.constraints = constraints
+        self.set_constraints(constraints)
+
     @property
     def integration_steps(self):
         """Number of integration steps"""
@@ -204,6 +210,18 @@ class HEALPixResNet(Module):
     def _compute_output_channels(self) -> int:
         """Compute the total number of output channels in the model"""
         return self.input_time_dim * self.output_channels
+    
+    def set_constraints(self, constraints: list[DictConfig] = None):
+        """
+        Sets constraints (e.g., non-negative) to be applied to the model outputs
+
+        Parameters
+        ----------
+        constraints: list[DictConfig]
+            List of hydra instantiable DictConfigs specifying constraints
+        """
+        if constraints is not None:
+            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
 
     def _reshape_inputs(self, inputs: Sequence, step: int = 0) -> th.Tensor:
         """
@@ -360,7 +378,7 @@ is not available at this time."
 
         return res
 
-    def forward(self, inputs: Sequence, output_only_last=False) -> th.Tensor:
+    def forward(self, inputs: Sequence, output_only_last=False, print_exit=False) -> th.Tensor:
         """
         Forward pass of the HEALPixUnet
 
@@ -377,6 +395,21 @@ is not available at this time."
         -------
         th.Tensor: Predicted outputs
         """
+
+        # TODO: There is a slight discrepency between the coupled fields when
+        #       running the model in coupled mode vs forced mode. Bug can be observed 
+        #       by uncommenting the code block below. 
+        # if print_exit:
+        #     import numpy as np
+        #     print(f'saving inputs to {print_exit}_prognostics.npy, {print_exit}_constants.npy, {print_exit}_decoder.npy, {print_exit}_coupled.npy')
+        #     # convert to numpy as save as pickle
+        #     inputs = [i.cpu().numpy() for i in inputs]
+        #     np.save(f'{print_exit}_prognostics.npy', inputs[0])
+        #     np.save(f'{print_exit}_constants.npy', inputs[2])
+        #     np.save(f'{print_exit}_decoder.npy', inputs[1])
+        #     np.save(f'{print_exit}_coupled.npy', inputs[3])
+        #     exit()
+
         outputs = []
         for step in range(self.integration_steps):
             if step == 0:
@@ -402,6 +435,12 @@ is not available at this time."
                 resnet_output = layer(resnet_output)
 
             reshaped = self._reshape_outputs(resnet_output + input_tensor[:, :self.input_channels*self.input_time_dim])  # Residual prediction
+            
+            # Apply constraints
+            if self.constraints is not None:
+                for constraint in self.constraints:
+                    reshaped = constraint(reshaped)
+            
             outputs.append(reshaped)
 
         if output_only_last:
