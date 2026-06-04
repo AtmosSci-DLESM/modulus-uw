@@ -1338,7 +1338,10 @@ class SmoothedInterpolateConv(th.nn.Module):
         mode = 'nearest',
         activation: th.nn.Module = None,
         enable_nhwc = False,
-        enable_healpixpad = True,
+        hpx_padding_mode: str = 'earth2grid',
+        compile_padding: bool = False,
+        nside: int = 64,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -1361,13 +1364,20 @@ class SmoothedInterpolateConv(th.nn.Module):
             Activation function used in upsampling
         enable_nhwc: bool, optional
             Enable nhwc format, passed to wrapper
+        hpx_padding_mode: str, optional
+            HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
+            ``karlbauer``, or ``isolatitude``).
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: int, optional
+            HEALPix face resolution.
         enable_healpixpad: bool, optional
-            If HEALPixPadding should be enabled, passed to wrapper
+            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         """
         super().__init__()
-
+        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         if dilation > 1:
-            raise ValueError(
+            raise Exception(
                 f"dilation > 1 is not currently supported for hpx resize \
                 convolutions, received dilation = {dilation}"
             )
@@ -1388,7 +1398,9 @@ class SmoothedInterpolateConv(th.nn.Module):
                 mode=mode,
                 trim_size=trim_size,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             ),
             geometry_layer(
                 layer=torch.nn.Conv2d,
@@ -1397,7 +1409,9 @@ class SmoothedInterpolateConv(th.nn.Module):
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside*scale_factor,
             )
         ]
 
