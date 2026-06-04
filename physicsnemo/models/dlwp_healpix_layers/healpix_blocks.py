@@ -1319,6 +1319,110 @@ class TransposedConvUpsample(th.nn.Module):
         """
         return self.upsampler(x)
 
+
+class SmoothedInterpolateConv(th.nn.Module):
+    """
+    Class for sequentially interpolating, applying a smoothing filter which
+    preserves zonally uniform signals, then applying a simple Conv2d on
+    HEALPix tensor data
+    """
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels = 3,
+        out_channels = 3,
+        kernel_size = 3,
+        dilation = 1,
+        scale_factor = 2,
+        mode = 'nearest',
+        activation: th.nn.Module = None,
+        enable_nhwc = False,
+        enable_healpixpad = True,
+    ):
+        """
+        Parameters
+        ----------
+        geometry_layer: torch.nn.Module, optional
+            The wrapper for the geometry of the tensor being bassed to this module
+        in_channels: int, optional
+            The number of input channels
+        out_channels: int, optional
+            The number of output channels
+        kernel_size: int, optional
+            Size of the convolutional kernel
+        dilation: int, optional
+            Spacing between kernel points, passed to torch.nn.Conv2d
+        scale_factor: int, optional
+            Multiplier for spatial size, passed to torch.nn.functional.interpolate
+        mode: str, optional
+            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
+        activation: torch.nn.Module, optional
+            Activation function used in upsampling
+        enable_nhwc: bool, optional
+            Enable nhwc format, passed to wrapper
+        enable_healpixpad: bool, optional
+            If HEALPixPadding should be enabled, passed to wrapper
+        """
+        super().__init__()
+
+        if dilation > 1:
+            raise ValueError(
+                f"dilation > 1 is not currently supported for hpx resize \
+                convolutions, received dilation = {dilation}"
+            )
+
+        # We pad first before upsampling to prevent edge artifacts at seams
+        # between HPX faces. This means that our final upsampled signal will
+        # have extra padding which we need to trim before passing to conv. We
+        # only require padding=1 before upsampling, so only need to trim 1 row/
+        # column from each side of result.
+        trim_size = 1 
+
+        block = []
+        block += [
+            geometry_layer(
+                layer=SmoothedInterpolate,
+                in_channels=in_channels,
+                scale_factor=scale_factor,
+                mode=mode,
+                trim_size=trim_size,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            ),
+            geometry_layer(
+                layer=torch.nn.Conv2d,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
+        ]
+
+        if activation is not None:
+            block.append(activation)
+        self.block = th.nn.Sequential(*block)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """
+        Forward pass of the ResizeConv layer
+
+        Parameters
+        ----------
+        x: torch.Tensor
+            inputs to the forward pass
+
+        Returns
+        -------
+        torch.Tensor
+            result of the forward pass
+        """
+        x = self.block(x)
+        return x
+
+
 #
 # Helper classes
 #
@@ -1403,3 +1507,70 @@ class DealiasBlurConv2d(th.nn.Module):
             padding=0, # Padding is handled by HEALPixLayer if necessary
             groups=self.in_channels,
         )
+
+
+class SmoothedInterpolate(th.nn.Module):
+    """
+    Helper class for interpolating a HEALPix signal then applying a four point
+    smoother which preserves zonal uniformity if the upsampling mode is nearest
+    neighbor or bilinear.
+    """
+    
+    def __init__(
+        self,
+        in_channels: int = 3,
+        scale_factor: int = 2,
+        mode: str = 'nearest',
+        trim_size: int = 0,
+    ):
+        """
+        Parameters
+        ----------
+        in_channels: int, optional
+            The number of input channels
+        scale_factor: int, optional
+            Multiplier for spatial size, passed to torch.nn.functional.interpolate
+        mode: str, optional
+            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
+        trim_size: int, optional
+            Amount of padding to trim from final tensor, which is assumed to be
+            square
+        """
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.scale_factor = scale_factor
+        self.mode = mode
+        self.trim_size = trim_size
+        self.interp = th.nn.functional.interpolate
+
+        # Four point smoother specific to HPX grid. This smooths out the specific
+        # type of aliasing that nearest neighbor and bilinear upsampling introduce
+        # into zonally uniform signals
+        self.smoother_kernel = torch.tensor(
+            [[0.,1.,0.],
+             [1.,0.,1.],
+             [0.,1.,0.]]
+        )
+        # Normalize the kernel to sum to 1
+        self.smoother_kernel = self.smoother_kernel / self.smoother_kernel.sum()
+        self.smoother_kernel = self.smoother_kernel.unsqueeze(0).unsqueeze(0)  # shape (1,1,3,3)
+        self.smoother_kernel = self.smoother_kernel.repeat((in_channels,1,1,1))
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        self.smoother_kernel = self.smoother_kernel.to(device=x.device, dtype=x.dtype)
+
+        # Interpolate, smooth, trim in order
+        x = self.interp(x, scale_factor=self.scale_factor, mode=self.mode)
+
+        x = torch.nn.functional.conv2d(
+            x,
+            self.smoother_kernel,
+            padding=0,
+            groups=self.in_channels
+        )
+
+        if self.trim_size > 0:
+            x = x[..., self.trim_size:-self.trim_size, self.trim_size:-self.trim_size]
+
+        return x
