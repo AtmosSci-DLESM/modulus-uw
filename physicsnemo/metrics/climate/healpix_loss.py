@@ -1092,6 +1092,8 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         else:
             self.hpx_pad = None
 
+        self.unfold = th.nn.Unfold(kernel_size=self.patch_size, padding=0, stride=1)
+
     def setup(self, trainer):
         if len(trainer.output_variables) != len(self.loss_weights):
             raise ValueError(f"Length of outputs {len(trainer.output_variables)} and loss_weights {len(self.loss_weights)} is not the same!")
@@ -1103,72 +1105,57 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         self.lsm_tensor = self.lsm_tensor.to(device=trainer.device)
         if self.hpx_pad is not None:
             self.hpx_pad = self.hpx_pad.to(device=trainer.device)
+        self.unfold = self.unfold.to(device=trainer.device)
         if self.patch_weights is not None:
             self.patch_weights = self.patch_weights.to(device=trainer.device)
 
-    def _weighted_patch_norm(self, diff_vec: th.Tensor) -> th.Tensor:
+    def _weighted_patch_norm(self, diff_vec: th.Tensor, patch_dim: int = -1) -> th.Tensor:
         """
         Weighted L2 norm over the patch dimension: sqrt(sum_k w_k * v_k^2).
-        If patch_weights is None, returns the usual vector_norm(diff_vec, dim=-1).
+        ``patch_dim=-1`` for [..., D]; ``patch_dim=-2`` for unfold layout [..., D, HW].
         """
         if self.patch_weights is None:
-            return th.linalg.vector_norm(diff_vec, dim=-1)
-        weighted_sq = diff_vec ** 2 * self.patch_weights
-        return th.sqrt((weighted_sq).sum(dim=-1).clamp(min=0.0))
+            return th.linalg.vector_norm(diff_vec, dim=patch_dim)
+        w = self.patch_weights
+        if patch_dim == -2:
+            w = w.unsqueeze(-1)
+        return th.sqrt((diff_vec ** 2 * w).sum(dim=patch_dim).clamp(min=0.0))
 
-    def _extract_patches_prediction(self, prediction: th.Tensor) -> th.Tensor:
+    def _pad_and_unfold(self, x: th.Tensor) -> th.Tensor:
+        """Pad HEALPix faces if needed, then unfold to [N*C, D, H*W]."""
+        n_flat, c, h, w = x.shape
+        if self.hpx_pad is not None:
+            x = self.hpx_pad(x)
+        h_pad, w_pad = x.shape[-2], x.shape[-1]
+        x_unfold = x.reshape(n_flat * c, 1, h_pad, w_pad)
+        return self.unfold(x_unfold)
+
+    def _reshape_member_norms(
+        self, norms: th.Tensor, b: int, f: int, t: int, c: int, h: int, w: int
+    ) -> th.Tensor:
+        """[N, B*T*F*C, H*W] -> [N, B, F, T, C, H, W]."""
+        return norms.view(norms.shape[0], b, t, f, c, h, w).permute(0, 1, 3, 2, 4, 5, 6)
+
+    def _unfold_prediction_members(self, prediction: th.Tensor) -> th.Tensor:
         """
-        Extract N×N patches for predictions.
+        Unfold prediction patches per member.
         prediction: [Cond, B, F, T, C, H, W]
-        returns: [Cond, B, F, T, C, H, W, D]
+        returns: [Cond, B*T*F*C, D, H*W]
         """
         n, b, f, t, c, h, w = prediction.shape
-        # Move faces to last spatial block and fold leading dims
-        x = prediction.permute(0, 1, 3, 2, 4, 5, 6)  # [Cond, B, T, F, C, H, W]
-        x = x.reshape(n * b * t * f, c, h, w)  # [Cond*B*T*F, C, H, W]
+        x = prediction.permute(0, 1, 3, 2, 4, 5, 6).reshape(n * b * t * f, c, h, w)
+        unfolded = self._pad_and_unfold(x)
+        return unfolded.view(n, b * t * f * c, self.patch_size ** 2, h * w)
 
-        # Apply HEALPix padding across faces if requested
-        if self.hpx_pad is not None:
-            x = self.hpx_pad(x)  # [Cond*B*T*F, C, H_pad, W_pad]
-            _, _, h_pad, w_pad = x.shape
-        else:
-            h_pad, w_pad = h, w
-
-        # Unfold patches over H/W for each face independently, then stack
-        unfold = th.nn.Unfold(kernel_size=self.patch_size, padding=0, stride=1)
-        # Treat F as extra batch dim: combine Nflat and F, unfold over H/W
-        x_unfold = x.reshape(n * b * t * f * c, 1, h_pad, w_pad)
-        patches = unfold(x_unfold)  # [Cond*B*T*F*C, D, H*W]
-
-        d = self.patch_size ** 2
-        patches = patches.reshape(n, b, t, f, c, d, h, w)
-        patches = patches.permute(0, 1, 3, 2, 4, 6, 7, 5)  # [Cond, B, F, T, C, H, W, D]
-        return patches
-
-    def _extract_patches_target(self, target: th.Tensor) -> th.Tensor:
+    def _unfold_target(self, target: th.Tensor) -> th.Tensor:
         """
-        Extract N×N patches for targets.
+        Unfold target patches.
         target: [B, F, T, C, H, W]
-        returns: [B, F, T, C, H, W, D]
+        returns: [B*T*F*C, D, H*W]
         """
         b, f, t, c, h, w = target.shape
-        x = target.permute(0, 2, 1, 3, 4, 5)  # [B, T, F, C, H, W]
-        x = x.reshape(b * t * f, c, h, w)  # [B*T*F, C, H, W]
-
-        if self.hpx_pad is not None:
-            x = self.hpx_pad(x)  # [B*T*F, C, H_pad, W_pad]
-            _, _, h_pad, w_pad = x.shape
-        else:
-            h_pad, w_pad = h, w
-
-        unfold = th.nn.Unfold(kernel_size=self.patch_size, padding=0, stride=1)
-        x_unfold = x.reshape(b * t * f * c, 1, h_pad, w_pad)
-        patches = unfold(x_unfold)  # [B*T*F*C, D, H*W]
-
-        d = self.patch_size ** 2
-        patches = patches.reshape(b, t, f, c, d, h, w)
-        patches = patches.permute(0, 2, 1, 3, 5, 6, 4)  # [B, F, T, C, H, W, D]
-        return patches
+        x = target.permute(0, 2, 1, 3, 4, 5).reshape(b * t * f, c, h, w)
+        return self._pad_and_unfold(x)
 
     def forward(self, prediction, target, average_channels: bool = True):
         """
@@ -1194,32 +1181,46 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
 
         n = self.n_members
 
-        prediction = prediction.to(th.float32)
-        target = target.to(th.float32)
+        pred_unfold = self._unfold_prediction_members(prediction)  # [Cond, BTC, D, HW]
+        tar_unfold = self._unfold_target(target)  # [BTC, D, HW]
 
-        # Extract patches (HEALPix-aware)
-        pred_patches = self._extract_patches_prediction(prediction)  # [Cond,B,F,T,C,H,W,D]
-        tar_patches = self._extract_patches_target(target)  # [B,F,T,C,H,W,D]
-
-        # Compute per-member distances to target (weighted patch norm if enabled)
-        diff_to_target = self._weighted_patch_norm(
-            pred_patches - tar_patches.unsqueeze(0)
+        diff_to_target = self._reshape_member_norms(
+            self._weighted_patch_norm(
+                pred_unfold - tar_unfold.unsqueeze(0), patch_dim=-2
+            ),
+            b,
+            f,
+            t,
+            c,
+            h,
+            w,
         )  # [Cond,B,F,T,C,H,W]
 
         if n == 2:
             diff_target = diff_to_target.sum(dim=0)  # [B,F,T,C,H,W]
-            diff_ensemble = self._weighted_patch_norm(
-                pred_patches[0] - pred_patches[1]
-            )  # [B,F,T,C,H,W]
+            diff_ensemble = self._reshape_member_norms(
+                self._weighted_patch_norm(
+                    pred_unfold[0] - pred_unfold[1], patch_dim=-2
+                ).unsqueeze(0),
+                b,
+                f,
+                t,
+                c,
+                h,
+                w,
+            ).squeeze(0)  # [B,F,T,C,H,W]
             es = self.averaging_coeff * (diff_target - self.coeff_eps * diff_ensemble)
         else:
             diff_i = diff_to_target  # [Cond,B,F,T,C,H,W]
             diff_i_i = diff_i.unsqueeze(0)  # [1,Cond,B,F,T,C,H,W]
             diff_j_i = diff_i.unsqueeze(1)  # [Cond,1,B,F,T,C,H,W]
 
-            pred_i = pred_patches.unsqueeze(1)  # [Cond,1,B,F,T,C,H,W,D]
-            pred_j = pred_patches.unsqueeze(0)  # [1,Cond,B,F,T,C,H,W,D]
-            dist_ensemble = self._weighted_patch_norm(pred_i - pred_j)  # [Cond,Cond,B,F,T,C,H,W]
+            pred_i = pred_unfold.unsqueeze(1)  # [Cond,1,BTC,D,HW]
+            pred_j = pred_unfold.unsqueeze(0)  # [1,Cond,BTC,D,HW]
+            dist_ensemble = self._weighted_patch_norm(pred_i - pred_j, patch_dim=-2)
+            dist_ensemble = dist_ensemble.view(n, n, b, t, f, c, h, w).permute(
+                0, 1, 2, 4, 3, 5, 6, 7
+            )  # [Cond,Cond,B,F,T,C,H,W]
 
             mask = self.diag_mask[:, :, None, None, None, None, None, None]
             diff_terms = mask * (diff_i_i + diff_j_i)
