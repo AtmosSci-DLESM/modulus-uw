@@ -21,8 +21,12 @@ import numpy as np
 import torch
 import xarray as xr
 
-logger = logging.getLogger(__name__)
+from physicsnemo.distributed import DistributedManager
+from physicsnemo.launch.logging import RankZeroLoggingWrapper
 
+logger = logging.getLogger(__name__)
+if DistributedManager.is_initialized():
+    logger = RankZeroLoggingWrapper(logger, DistributedManager())
 
 def _average_virtual_temperature_from_geopotential_height(z1, z2, p1, p2, R, g0):
     return g0 / (R * np.log(p1 / p2)) * (z2 - z1)

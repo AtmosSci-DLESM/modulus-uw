@@ -6,7 +6,7 @@ import xarray as xr
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.launch.logging import PythonLogger, RankZeroLoggingWrapper
 
-logger = PythonLogger(name="train")
+logger = PythonLogger(name="physicsnemo.models.dlwp_healpix_layers.healpix_constraints")
 if DistributedManager.is_initialized():
     logger0 = RankZeroLoggingWrapper(logger, DistributedManager())
 else:
