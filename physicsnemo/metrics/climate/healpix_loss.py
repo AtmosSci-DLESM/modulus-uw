@@ -1015,6 +1015,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         use_earth2grid_padding: bool = True,
         enable_nhwc: bool = True,
         patch_weight_sigma: float = None,
+        channel_chunk_size: int | None = 8,
     ):
         """
         Parameters
@@ -1042,6 +1043,9 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             Patch_weight_sigma is the standard deviation of the Gaussian.
             Patch_weight_sigma = 1 for standard normal distribution.
             If None, no spatial weighting within the patch (default).
+        channel_chunk_size: int or None, optional
+            Pad/unfold this many channels at a time to reduce peak memory.
+            Default ``8``. ``None`` processes all channels in one pass.
         """
         super().__init__()
         if n_members < 2:
@@ -1056,6 +1060,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         self.patch_radius = (patch_size - 1) // 2
         self.use_earth2grid_padding = use_earth2grid_padding
         self.enable_nhwc = enable_nhwc
+        self.channel_chunk_size = channel_chunk_size
 
         # Gaussian weights for patch positions (row-major, center-weighted, sum=1)
         if patch_weight_sigma is not None and patch_weight_sigma > 0:
@@ -1157,32 +1162,23 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         x = target.permute(0, 2, 1, 3, 4, 5).reshape(b * t * f, c, h, w)
         return self._pad_and_unfold(x)
 
-    def forward(self, prediction, target, average_channels: bool = True):
-        """
-        Forward pass of the patched energy score loss.
-
-        prediction: [Cond*B, F, T, C, H, W]
-        target: [B, F, T, C, H, W]
-        """
-        b, f, t, c, h, w = target.shape
-        prediction = prediction.view(self.n_members, b, f, t, c, h, w)
-
-        if prediction.shape[1:] != target.shape:
-            raise ValueError(
-                f"Shape of prediction should match shape of target along non-ensemble dimensions, "
-                f"got {prediction.shape} and {target.shape}"
-            )
-
-        if prediction.shape[0] != self.n_members:
-            raise ValueError(
-                f"Shape of prediction should have ensemble dimension of size {self.n_members}, "
-                f"got {prediction.shape[0]}"
-            )
-
-        n = self.n_members
+    def _energy_score_field(
+        self,
+        prediction: th.Tensor,
+        target: th.Tensor,
+        n: int,
+        b: int,
+        f: int,
+        t: int,
+        c: int,
+        h: int,
+        w: int,
+    ) -> th.Tensor:
+        """Per-channel energy score field [B, F, T, C, H, W] for one channel slice."""
+        with th.no_grad():
+            tar_unfold = self._unfold_target(target)  # [B*T*F*C, D, HW]
 
         pred_unfold = self._unfold_prediction_members(prediction)  # [Cond, BTC, D, HW]
-        tar_unfold = self._unfold_target(target)  # [BTC, D, HW]
 
         diff_to_target = self._reshape_member_norms(
             self._weighted_patch_norm(
@@ -1209,26 +1205,75 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
                 h,
                 w,
             ).squeeze(0)  # [B,F,T,C,H,W]
-            es = self.averaging_coeff * (diff_target - self.coeff_eps * diff_ensemble)
+            return self.averaging_coeff * (diff_target - self.coeff_eps * diff_ensemble)
+
+        diff_i = diff_to_target  # [Cond,B,F,T,C,H,W]
+        diff_i_i = diff_i.unsqueeze(0)  # [1,Cond,B,F,T,C,H,W]
+        diff_j_i = diff_i.unsqueeze(1)  # [Cond,1,B,F,T,C,H,W]
+
+        pred_i = pred_unfold.unsqueeze(1)  # [Cond,1,BTC,D,HW]
+        pred_j = pred_unfold.unsqueeze(0)  # [1,Cond,BTC,D,HW]
+        dist_ensemble = self._weighted_patch_norm(pred_i - pred_j, patch_dim=-2)
+        dist_ensemble = dist_ensemble.view(n, n, b, t, f, c, h, w).permute(
+            0, 1, 2, 4, 3, 5, 6, 7
+        )  # [Cond,Cond,B,F,T,C,H,W]
+
+        mask = self.diag_mask[:, :, None, None, None, None, None, None]
+        diff_terms = mask * (diff_i_i + diff_j_i)
+        dist_terms = mask * dist_ensemble
+
+        return self.averaging_coeff * (diff_terms - self.coeff_eps * dist_terms).sum(
+            dim=(0, 1)
+        )  # [B,F,T,C,H,W]
+
+    def forward(self, prediction, target, average_channels: bool = True):
+        """
+        Forward pass of the patched energy score loss.
+
+        prediction: [Cond*B, F, T, C, H, W]
+        target: [B, F, T, C, H, W]
+        """
+        b, f, t, c, h, w = target.shape
+        if prediction.shape[0] % b != 0:
+            raise ValueError(
+                f"Leading prediction dimension must be divisible by batch size, "
+                f"got prediction.shape[0]={prediction.shape[0]} and batch={b}"
+            )
+        n = prediction.shape[0] // b
+        prediction = prediction.view(n, b, f, t, c, h, w)
+
+        if prediction.shape[1:] != target.shape:
+            raise ValueError(
+                f"Shape of prediction should match shape of target along non-ensemble dimensions, "
+                f"got {prediction.shape} and {target.shape}"
+            )
+
+        if n != self.n_members:
+            raise ValueError(
+                f"Shape of prediction should have ensemble dimension of size {self.n_members}, "
+                f"got {n}"
+            )
+
+        n = self.n_members
+
+        chunk = self.channel_chunk_size
+        if chunk is None or chunk >= c:
+            es = self._energy_score_field(prediction, target, n, b, f, t, c, h, w)
         else:
-            diff_i = diff_to_target  # [Cond,B,F,T,C,H,W]
-            diff_i_i = diff_i.unsqueeze(0)  # [1,Cond,B,F,T,C,H,W]
-            diff_j_i = diff_i.unsqueeze(1)  # [Cond,1,B,F,T,C,H,W]
-
-            pred_i = pred_unfold.unsqueeze(1)  # [Cond,1,BTC,D,HW]
-            pred_j = pred_unfold.unsqueeze(0)  # [1,Cond,BTC,D,HW]
-            dist_ensemble = self._weighted_patch_norm(pred_i - pred_j, patch_dim=-2)
-            dist_ensemble = dist_ensemble.view(n, n, b, t, f, c, h, w).permute(
-                0, 1, 2, 4, 3, 5, 6, 7
-            )  # [Cond,Cond,B,F,T,C,H,W]
-
-            mask = self.diag_mask[:, :, None, None, None, None, None, None]
-            diff_terms = mask * (diff_i_i + diff_j_i)
-            dist_terms = mask * dist_ensemble
-
-            es = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_terms).sum(
-                dim=(0, 1)
-            )  # [B,F,T,C,H,W]
+            es = th.empty(b, f, t, c, h, w, device=prediction.device, dtype=prediction.dtype)
+            for c0 in range(0, c, chunk):
+                c_end = min(c0 + chunk, c)
+                es[:, :, :, c0:c_end] = self._energy_score_field(
+                    prediction[:, :, :, :, c0:c_end],
+                    target[:, :, :, c0:c_end],
+                    n,
+                    b,
+                    f,
+                    t,
+                    c_end - c0,
+                    h,
+                    w,
+                )
 
         es *= self.lsm_tensor
 
