@@ -1377,7 +1377,7 @@ class SmoothedInterpolateConv(th.nn.Module):
         super().__init__()
         warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         if dilation > 1:
-            raise Exception(
+            raise ValueError(
                 f"dilation > 1 is not currently supported for hpx resize \
                 convolutions, received dilation = {dilation}"
             )
@@ -1566,6 +1566,8 @@ class SmoothedInterpolate(th.nn.Module):
              [1.,0.,1.],
              [0.,1.,0.]]
         )
+        # Normalize the kernel to sum to 1
+        self.smoother_kernel = self.smoother_kernel / self.smoother_kernel.sum()
         self.smoother_kernel = self.smoother_kernel.unsqueeze(0).unsqueeze(0)  # shape (1,1,3,3)
         self.smoother_kernel = self.smoother_kernel.repeat((in_channels,1,1,1))
 
@@ -1580,7 +1582,7 @@ class SmoothedInterpolate(th.nn.Module):
             self.smoother_kernel,
             padding=0,
             groups=self.in_channels
-        ) / 4 # divide by 4 to take average of 4 neighbors
+        )
 
         if self.trim_size > 0:
             x = x[..., self.trim_size:-self.trim_size, self.trim_size:-self.trim_size]
