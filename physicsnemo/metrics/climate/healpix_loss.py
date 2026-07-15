@@ -54,7 +54,7 @@ class BaseMSE(th.nn.MSELoss):
         """
         pass
 
-    def forward(self, prediction, target, average_channels=True, **kwargs):
+    def forward(self, prediction, target, average_channels=True):
         """
         Forward pass of the base MSE class
         Tensors are expected to be in the shape [N, B, F, C, H, W]
@@ -109,7 +109,7 @@ class WeightedMSE(th.nn.MSELoss):
 
         self.loss_weights = self.loss_weights.to(device=trainer.device)
 
-    def forward(self, prediction, target, average_channels=True, **kwargs):
+    def forward(self, prediction, target, average_channels=True):
         """
         Forward pass of the WeightedMSE pass
         Tensors are expected to be in the shape [N, B, F, C, H, W]
@@ -228,7 +228,7 @@ class OceanMSE(th.nn.MSELoss):
             np.expand_dims(self.lsm_ds.values, (0, 2, 3))
         ).to(trainer.device)
 
-    def forward(self, prediction, target, average_channels=True, **kwargs):
+    def forward(self, prediction, target, average_channels=True):
 
         if not self.lsm_sum_calculated:
             self.lsm_sum = th.broadcast_to(self.lsm_tensor, target.shape).sum()
@@ -441,7 +441,7 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         pooled_tensor = pooled_values / (pooled_mask + 1e-8) # Avoid division by zero
         return pooled_tensor, pooled_mask
 
-    def forward(self, prediction, target, average_channels=True, **kwargs):
+    def forward(self, prediction, target, average_channels=True):
         """
         Forward pass of the WeightedCRPSLoss 
         Computes the CRPS loss for the model prediction and target.
@@ -731,7 +731,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         ell = th.arange(self.lmax, device=device, dtype=th.float32)
         return th.exp(-0.5* ell * (ell + 1) * (scale_radians ** 2))
 
-    def forward(self, prediction, target, average_channels=True, **kwargs):
+    def forward(self, prediction, target, average_channels=True):
         """
         Forward pass of the WeightedCRPSLossSpectral 
         Computes the CRPS loss for the model prediction and target.
