@@ -392,7 +392,7 @@ class HEALPixUNet(Module):
             decodings = self.decoder(encodings, **kwargs)
 
             # Residual prediction applies only to prognostics; diagnostics are
-            # absolute (same split as HEALPixRecUNet / PR #41).
+            # absolute (same split as HEALPixRecUNet).
             combined = self._reshape_outputs(decodings)
             prognostics = combined[:, :, :, : self.input_channels]
             if self.residual_prediction:
