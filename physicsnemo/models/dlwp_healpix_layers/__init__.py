@@ -19,12 +19,14 @@ from .healpix_blocks import (
     BasicConvBlock,
     ConvGRUBlock,
     ConvNeXtBlock,
+    DealiasedDownsample,
     DoubleConvNeXtBlock,
     Interpolate,
     MaxPool,
     Multi_SymmetricConvNeXtBlock,
     SymmetricConvNeXtBlock,
     TransposedConvUpsample,
+    SmoothedInterpolateConv,
 )
 from .healpix_decoder import UNetDecoder
 from .healpix_encoder import UNetEncoder
