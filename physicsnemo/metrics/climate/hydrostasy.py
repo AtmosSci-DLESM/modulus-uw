@@ -21,8 +21,12 @@ import numpy as np
 import torch
 import xarray as xr
 
-logger = logging.getLogger(__name__)
+from physicsnemo.distributed import DistributedManager
+from physicsnemo.launch.logging import RankZeroLoggingWrapper
 
+logger = logging.getLogger(__name__)
+if DistributedManager.is_initialized():
+    logger = RankZeroLoggingWrapper(logger, DistributedManager())
 
 def _average_virtual_temperature_from_geopotential_height(z1, z2, p1, p2, R, g0):
     return g0 / (R * np.log(p1 / p2)) * (z2 - z1)
@@ -231,12 +235,11 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         weights: Sequence,
         alpha: Sequence[float],  # K
         scaling: Dict[str, Dict[str, float]],
-        src_directory: str,
-        dst_directory: str,
-        dataset_name: str,
-        data_format: str,
+        dataset_path: str,
+        surface_geopotential_name: str,
         surface_geopotential_mean: float = -597.7115478515625,
         surface_geopotential_std: float = 55658.21484375,
+        convert_topography_to_meters: bool = True,
         R: float = 287,  # J K^{-1} kg^{-1}
         g0: float = 9.81,  # m s^{-2}
         topography_masking: bool = True,
@@ -252,6 +255,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.loss_weights = torch.tensor(weights)
         self.device = None
         self.g0 = g0
+        self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
 
         # Get channel index to pressure level mapping
@@ -346,11 +350,13 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.q_level_mapping = torch.tensor(list(self.q_pressure_levels.keys()))
 
         # Get topography information
-        ds = xr.open_zarr(f"{src_directory}{dataset_name}.zarr")
+        ds = xr.open_zarr(dataset_path)
         self.topography = (
-            surface_geopotential_std * ds.constants[1, :, :, :].values
+            surface_geopotential_std * ds["constants"].sel(channel_c=surface_geopotential_name).values
             + surface_geopotential_mean
-        ) / self.g0
+        )
+        if self.convert_topography_to_meters:
+            self.topography /= self.g0
 
         self.topography = torch.tensor(
             self.topography[np.newaxis, :, np.newaxis, :, :], dtype=torch.float
@@ -358,6 +364,8 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         logger.info(
             f"Min/Max topography (m): {self.topography.min()}/{self.topography.max()}"
         )
+        if self.topography.min() < -1000. or self.topography.max() > 10000.:
+            raise ValueError("Topography values fall outside realistic range!")
 
     def setup(self, trainer):
         """
@@ -430,7 +438,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         # Combine N and B dimensions and return
         return x_scaled.reshape((-1, F, C_scaled, H, W))
 
-    def error_histogram(self, prediction, bins, accumulator=None):
+    def error_histogram(self, prediction, bins, accumulator=None, exclude_masked: bool = False):
         N, F, B, C, H, W = tuple(prediction.shape)
 
         if not (prediction.ndim == 6):
@@ -440,9 +448,16 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         x = self.scale(prediction)
         Tv_avg, Tv_model_avg = self.constraint(x)
         Tv_error = Tv_avg - Tv_model_avg
+
+        valid_mask = torch.ones_like(Tv_error, dtype=torch.bool, device=Tv_error.device)
         # Mask out error in regions below the surface
         if self.topography_masking:
-            Tv_error[x[:, :, 1 : self.num_z_levels, :, :] < self.topography] = 0.0
+            valid_mask[:, :, :Tv_error.shape[2]] = (
+                x[:, :, 1 : self.num_z_levels, :, :] >= self.topography
+            )
+            Tv_error[:, :, :Tv_error.shape[2]][
+                ~valid_mask[:, :, :Tv_error.shape[2]]
+            ] = 0.0
 
         vlevels = Tv_error.shape[2]
         if accumulator is None:
@@ -466,14 +481,36 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             bin_edges = bins
 
         for l in range(vlevels):
+            if exclude_masked:
+                values = torch.absolute(Tv_error[:, :, l, :, :][valid_mask[:, :, l, :, :]])
+            else:
+                values = torch.absolute(Tv_error[:, :, l, :, :])
             hist, be = torch.histogram(
-                torch.absolute(Tv_error[:, :, l, :, :]),
+                values,
                 bins=bins if isinstance(bins, int) else bin_edges[l, :],
             )
             accumulator[l, :] += hist
             bin_edges[l, :] = be
 
         return accumulator, bin_edges
+
+    def get_tv_error(self, prediction):
+        N, F, B, C, H, W = tuple(prediction.shape)
+
+        if not (prediction.ndim == 6):
+            raise AssertionError("Expected predictions to have 6 dimensions")
+
+        # Scale to physical units and compute virtual temperature
+        x = self.scale(prediction)
+        Tv_avg, Tv_model_avg = self.constraint(x)
+        Tv_error = Tv_avg - Tv_model_avg
+        # Mask out error in regions below the surface
+        if self.topography_masking:
+            Tv_error[:, :, :Tv_error.shape[2]][
+                x[:, :, 1 : self.num_z_levels, :, :] < self.topography
+            ] = 0.0
+
+        return Tv_error
 
     def forward(self, prediction, target, average_channels=True):
         """
@@ -537,12 +574,11 @@ class LossWithHydrostasy(torch.nn.MSELoss):
         weights: Sequence,
         alpha: Sequence[float],  # K
         scaling: Dict[str, Dict[str, float]],
-        src_directory: str,
-        dst_directory: str,
-        dataset_name: str,
-        data_format: str,
+        dataset_path: str,
+        surface_geopotential_name: str,
         surface_geopotential_mean: float = -597.7115478515625,
         surface_geopotential_std: float = 55658.21484375,
+        convert_topography_to_meters: bool = True,
         R: float = 287,  # J K^{-1} kg^{-1}
         g0: float = 9.81,  # m s^{-2}
         topography_masking: bool = True,
@@ -559,6 +595,7 @@ class LossWithHydrostasy(torch.nn.MSELoss):
         self.loss_weights = torch.tensor(weights)
         self.device = None
         self.g0 = g0
+        self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
 
         # Get channel index to pressure level mapping
@@ -653,11 +690,13 @@ class LossWithHydrostasy(torch.nn.MSELoss):
         self.q_level_mapping = torch.tensor(list(self.q_pressure_levels.keys()))
 
         # Get topography information
-        ds = xr.open_zarr(f"{src_directory}{dataset_name}.zarr")
+        ds = xr.open_zarr(dataset_path)
         self.topography = (
-            surface_geopotential_std * ds.constants.sel(channel_c='z').values
+            surface_geopotential_std * ds["constants"].sel(channel_c=surface_geopotential_name).values
             + surface_geopotential_mean
-        ) / self.g0
+        )
+        if self.convert_topography_to_meters:
+            self.topography /= self.g0
 
         self.topography = torch.tensor(
             self.topography[np.newaxis, :, np.newaxis, :, :], dtype=torch.float
@@ -665,6 +704,8 @@ class LossWithHydrostasy(torch.nn.MSELoss):
         logger.info(
             f"Min/Max topography (m): {self.topography.min()}/{self.topography.max()}"
         )
+        if self.topography.min() < -1000. or self.topography.max() > 10000.:
+            raise ValueError("Topography values fall outside realistic range!")
 
     def setup(self, trainer):
         """
