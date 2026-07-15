@@ -394,7 +394,8 @@ class LossWithSoftConstraints(torch.nn.Module):
 
     ``needs_input`` is True if any child soft constraint requires the prognostic
     input tensor. Trainers should use that flag (rather than unconditionally
-    forwarding ``input=``) so ordinary data losses need not accept ``**kwargs``.
+    forwarding ``input=``) so ordinary data losses can keep a plain
+    ``(prediction, target, average_channels=...)`` signature.
     """
 
     def __init__(
@@ -426,8 +427,7 @@ class LossWithSoftConstraints(torch.nn.Module):
         average_channels: bool = True,
         input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Call the data loss with the standard criterion signature only. Do not
-        # forward soft-constraint kwargs into unrelated losses.
+        # Call the data loss with the standard criterion signature only.
         data = self.data_loss(
             prediction,
             target,
