@@ -121,6 +121,8 @@ def test_dry_air_mass_soft_constraint_requires_input():
     scaling = _dry_air_scaling()
     mod = DryAirMassSoftConstraint(channels=channels, scaling=scaling)
     pred = torch.randn(1, 1, 2, 2, 2, 2)
+    with pytest.raises(TypeError):
+        mod.constraint_loss(pred, pred)
     with pytest.raises(ValueError, match="requires prognostic input"):
         mod.constraint_loss(pred, pred, input=None)
 
@@ -145,6 +147,7 @@ def test_loss_with_soft_constraints_no_constraints():
     weights = [1.0, 2.0]
     data_loss = WeightedMSE(weights=weights)
     wrapper = LossWithSoftConstraints(data_loss=data_loss, constraints=[])
+    assert wrapper.needs_input is False
     trainer = _DummyTrainer(device=torch.device("cpu"), output_variables=["a", "b"])
     wrapper.setup(trainer)
     pred = torch.randn(1, 1, 1, 2, 4, 4)
@@ -152,6 +155,8 @@ def test_loss_with_soft_constraints_no_constraints():
     assert torch.allclose(wrapper(pred, target), data_loss(pred, target))
     per = wrapper(pred, target, average_channels=False)
     assert per.shape == (2,)
+    with pytest.raises(TypeError):
+        wrapper(pred, target, input=pred)
 
 
 def test_hydrostasy_soft_constraint_matches_loss_with_hydrostasy(tmp_path):
@@ -246,11 +251,14 @@ def test_loss_with_soft_constraints_composes_dry_air():
     data_loss = WeightedMSE(weights=[1.0, 1.0])
     dry = DryAirMassSoftConstraint(channels=channels, scaling=scaling, weight=1.0)
     wrapper = LossWithSoftConstraints(data_loss=data_loss, constraints=[dry])
+    assert wrapper.needs_input is True
     trainer = _DummyTrainer(device=torch.device("cpu"), output_variables=channels)
     wrapper.setup(trainer)
 
     inp, pred = _make_conserved_batch(channels, scaling, T=2, H=3, W=3)
     target = pred + 0.1
+    with pytest.raises(ValueError, match="requires prognostic input"):
+        wrapper(pred, target)
     out = wrapper(pred, target, input=inp)
     assert out.shape == ()
     assert torch.allclose(out, data_loss(pred, target), rtol=1e-3, atol=1e-4)

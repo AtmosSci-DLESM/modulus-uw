@@ -40,7 +40,12 @@ def _error_tolerant(error: torch.Tensor) -> torch.Tensor:
 
 
 class SoftConstraint(torch.nn.Module):
-    """Base class for soft constraints composed by :class:`LossWithSoftConstraints`."""
+    """Base class for soft constraints composed by :class:`LossWithSoftConstraints`.
+
+    Subclasses set ``needs_input`` and must match that flag in ``constraint_loss``:
+    if ``needs_input`` is False, do not accept an ``input`` argument; if True,
+    require ``input`` as a keyword-only argument.
+    """
 
     needs_input: bool = False
 
@@ -53,7 +58,6 @@ class SoftConstraint(torch.nn.Module):
         prediction: torch.Tensor,
         target: torch.Tensor,
         *,
-        input: Optional[torch.Tensor] = None,
         average_channels: bool = True,
     ) -> torch.Tensor:
         raise NotImplementedError
@@ -239,7 +243,6 @@ class HydrostasySoftConstraint(SoftConstraint):
         prediction: torch.Tensor,
         target: torch.Tensor,
         *,
-        input: Optional[torch.Tensor] = None,
         average_channels: bool = True,
     ) -> torch.Tensor:
         with torch.amp.autocast("cuda", enabled=False):
@@ -351,7 +354,7 @@ class DryAirMassSoftConstraint(SoftConstraint):
         prediction: torch.Tensor,
         target: torch.Tensor,
         *,
-        input: Optional[torch.Tensor] = None,
+        input: torch.Tensor,
         average_channels: bool = True,
     ) -> torch.Tensor:
         if input is None:
@@ -392,10 +395,10 @@ class LossWithSoftConstraints(torch.nn.Module):
 
     Compatible with the DLWP trainer ``setup`` / ``average_channels`` conventions.
 
-    ``needs_input`` is True if any child soft constraint requires the prognostic
-    input tensor. Trainers should use that flag (rather than unconditionally
-    forwarding ``input=``) so ordinary data losses can keep a plain
-    ``(prediction, target, average_channels=...)`` signature.
+    ``needs_input`` is True iff any child soft constraint requires prognostic
+    input. When True, ``forward`` accepts required keyword ``input=``; when
+    False, ``forward`` does not accept ``input``. Trainers should gate passing
+    prognostic tensors solely on ``needs_input``.
     """
 
     def __init__(
@@ -408,11 +411,16 @@ class LossWithSoftConstraints(torch.nn.Module):
         if constraints is None:
             constraints = []
         self.constraints = torch.nn.ModuleList(list(constraints))
-
-    @property
-    def needs_input(self) -> bool:
-        """Whether any attached soft constraint requires prognostic input."""
-        return any(getattr(c, "needs_input", False) for c in self.constraints)
+        # Instance attribute (not a property) so trainers can use getattr(..., False).
+        self.needs_input = any(
+            getattr(c, "needs_input", False) for c in self.constraints
+        )
+        # Bind a forward whose signature matches needs_input: include ``input``
+        # only when at least one soft constraint requires it.
+        if self.needs_input:
+            self.forward = self._forward_with_input
+        else:
+            self.forward = self._forward_without_input
 
     def setup(self, trainer) -> None:
         if hasattr(self.data_loss, "setup"):
@@ -420,38 +428,86 @@ class LossWithSoftConstraints(torch.nn.Module):
         for constraint in self.constraints:
             constraint.setup(trainer)
 
-    def forward(
+    def _constraint_parts(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        average_channels: bool,
+        input: Optional[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        parts = []
+        for constraint in self.constraints:
+            if constraint.needs_input:
+                parts.append(
+                    constraint.constraint_loss(
+                        prediction,
+                        target,
+                        input=input,
+                        average_channels=average_channels,
+                    )
+                )
+            else:
+                parts.append(
+                    constraint.constraint_loss(
+                        prediction,
+                        target,
+                        average_channels=average_channels,
+                    )
+                )
+        return parts
+
+    def _combine(
+        self,
+        data: torch.Tensor,
+        parts: list[torch.Tensor],
+        average_channels: bool,
+    ) -> torch.Tensor:
+        if not parts:
+            return data
+        if average_channels:
+            total = data
+            for p in parts:
+                total = total + p
+            return total
+        pieces = [data]
+        for p in parts:
+            pieces.append(p if p.dim() > 0 else p.unsqueeze(0))
+        return torch.cat(pieces)
+
+    def _forward_without_input(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        average_channels: bool = True,
+    ) -> torch.Tensor:
+        data = self.data_loss(
+            prediction,
+            target,
+            average_channels=average_channels,
+        )
+        parts = self._constraint_parts(
+            prediction, target, average_channels, input=None
+        )
+        return self._combine(data, parts, average_channels)
+
+    def _forward_with_input(
         self,
         prediction: torch.Tensor,
         target: torch.Tensor,
         average_channels: bool = True,
         input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Call the data loss with the standard criterion signature only.
+        if input is None:
+            raise ValueError(
+                "LossWithSoftConstraints requires prognostic input because a "
+                "soft constraint has needs_input=True (pass input=inputs[0])."
+            )
         data = self.data_loss(
             prediction,
             target,
             average_channels=average_channels,
         )
-        if len(self.constraints) == 0:
-            return data
-
-        parts = [
-            c.constraint_loss(
-                prediction,
-                target,
-                input=input,
-                average_channels=average_channels,
-            )
-            for c in self.constraints
-        ]
-        if average_channels:
-            total = data
-            for p in parts:
-                total = total + p
-            return total
-
-        pieces = [data]
-        for p in parts:
-            pieces.append(p if p.dim() > 0 else p.unsqueeze(0))
-        return torch.cat(pieces)
+        parts = self._constraint_parts(
+            prediction, target, average_channels, input=input
+        )
+        return self._combine(data, parts, average_channels)
