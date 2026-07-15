@@ -55,7 +55,6 @@ class SoftConstraint(torch.nn.Module):
         *,
         input: Optional[torch.Tensor] = None,
         average_channels: bool = True,
-        **kwargs,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -242,7 +241,6 @@ class HydrostasySoftConstraint(SoftConstraint):
         *,
         input: Optional[torch.Tensor] = None,
         average_channels: bool = True,
-        **kwargs,
     ) -> torch.Tensor:
         with torch.amp.autocast("cuda", enabled=False):
             prediction = prediction.float()
@@ -355,7 +353,6 @@ class DryAirMassSoftConstraint(SoftConstraint):
         *,
         input: Optional[torch.Tensor] = None,
         average_channels: bool = True,
-        **kwargs,
     ) -> torch.Tensor:
         if input is None:
             raise ValueError(
@@ -394,6 +391,10 @@ class LossWithSoftConstraints(torch.nn.Module):
     Loss-agnostic wrapper that adds zero or more soft constraints to a data loss.
 
     Compatible with the DLWP trainer ``setup`` / ``average_channels`` conventions.
+
+    ``needs_input`` is True if any child soft constraint requires the prognostic
+    input tensor. Trainers should use that flag (rather than unconditionally
+    forwarding ``input=``) so ordinary data losses need not accept ``**kwargs``.
     """
 
     def __init__(
@@ -407,6 +408,11 @@ class LossWithSoftConstraints(torch.nn.Module):
             constraints = []
         self.constraints = torch.nn.ModuleList(list(constraints))
 
+    @property
+    def needs_input(self) -> bool:
+        """Whether any attached soft constraint requires prognostic input."""
+        return any(getattr(c, "needs_input", False) for c in self.constraints)
+
     def setup(self, trainer) -> None:
         if hasattr(self.data_loss, "setup"):
             self.data_loss.setup(trainer)
@@ -419,13 +425,13 @@ class LossWithSoftConstraints(torch.nn.Module):
         target: torch.Tensor,
         average_channels: bool = True,
         input: Optional[torch.Tensor] = None,
-        **kwargs,
     ) -> torch.Tensor:
+        # Call the data loss with the standard criterion signature only. Do not
+        # forward soft-constraint kwargs into unrelated losses.
         data = self.data_loss(
             prediction,
             target,
             average_channels=average_channels,
-            **kwargs,
         )
         if len(self.constraints) == 0:
             return data
@@ -436,7 +442,6 @@ class LossWithSoftConstraints(torch.nn.Module):
                 target,
                 input=input,
                 average_channels=average_channels,
-                **kwargs,
             )
             for c in self.constraints
         ]
