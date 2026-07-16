@@ -278,3 +278,77 @@ def test_nonnegative_torch_compile_forward():
         pytest.skip("torch.compile not available or failed to compile")
     out = compiled(prediction, prediction)
     assert torch.allclose(out, ref)
+
+
+def test_nonnegative_keep_grad_through_clamp_forward_unchanged():
+    """STE must not change forward values; only the backward path."""
+    channels = ["x"]
+    # Physical zero is at normalized (0 - 0) / 1 = 0
+    scaling = {"x": {"mean": 0.0, "std": 1.0}}
+    plain = NonnegativeConstraint(
+        variables=["x"],
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+        keep_grad_through_clamp=False,
+    )
+    ste = NonnegativeConstraint(
+        variables=["x"],
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+        keep_grad_through_clamp=True,
+    )
+    prediction = torch.tensor([[[[[[-2.0, 0.5, 3.0]]]]]])
+    assert torch.equal(plain(prediction, prediction), ste(prediction, prediction))
+    assert torch.equal(
+        ste(prediction, prediction),
+        torch.tensor([[[[[[0.0, 0.5, 3.0]]]]]]),
+    )
+
+
+def test_nonnegative_keep_grad_through_clamp_passes_gradient():
+    """Below-threshold cells get zero grad with plain clamp, identity with STE."""
+    channels = ["x"]
+    scaling = {"x": {"mean": 0.0, "std": 1.0}}
+    # One saturated-negative cell and one interior cell
+    raw = torch.tensor([[[[[[-2.0, 1.0]]]]]])
+
+    plain = NonnegativeConstraint(
+        variables=["x"],
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+        keep_grad_through_clamp=False,
+    )
+    x_plain = raw.clone().requires_grad_(True)
+    plain(x_plain, x_plain).sum().backward()
+    torch.testing.assert_close(
+        x_plain.grad, torch.tensor([[[[[[0.0, 1.0]]]]]])
+    )
+
+    ste = NonnegativeConstraint(
+        variables=["x"],
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+        keep_grad_through_clamp=True,
+    )
+    x_ste = raw.clone().requires_grad_(True)
+    out = ste(x_ste, x_ste)
+    torch.testing.assert_close(out, torch.tensor([[[[[[0.0, 1.0]]]]]]))
+    out.sum().backward()
+    torch.testing.assert_close(x_ste.grad, torch.ones_like(raw))
+
+
+def test_replace_value_keep_gradient_identity_backward():
+    from physicsnemo.models.dlwp_healpix_layers.healpix_constraints import (
+        replace_value_keep_gradient,
+    )
+
+    x = torch.tensor([-1.0, 0.5, 2.0], requires_grad=True)
+    new_value = torch.clamp(x, min=0.0)
+    out = replace_value_keep_gradient(x, new_value)
+    torch.testing.assert_close(out, torch.tensor([0.0, 0.5, 2.0]))
+    out.sum().backward()
+    torch.testing.assert_close(x.grad, torch.ones_like(x))

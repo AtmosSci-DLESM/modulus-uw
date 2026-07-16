@@ -21,6 +21,20 @@ The input tensor may not be used for some constraints but is always expected as
 an input argument for consistency.
 '''
 
+
+def replace_value_keep_gradient(
+    x: torch.Tensor, new_value: torch.Tensor
+) -> torch.Tensor:
+    """
+    Use ``new_value`` in the forward pass but keep ``x``'s gradient in the backward pass.
+
+    Straight-through estimator for hard corrections (e.g. nonnegative clamps): the
+    forward value is the projected ``new_value``, while backward treats the op as
+    identity so saturated cells still receive a learning signal.
+    """
+    return x + (new_value - x).detach()
+
+
 class NonnegativeConstraint(torch.nn.Module):
     def __init__(
         self,
@@ -28,6 +42,7 @@ class NonnegativeConstraint(torch.nn.Module):
         in_channels: list[str],
         out_channels: list[str],
         scaling: dict[str, dict[str, float]],
+        keep_grad_through_clamp: bool = False,
     ):
         """
         Parameters
@@ -40,6 +55,11 @@ class NonnegativeConstraint(torch.nn.Module):
             List of all output channel names in the model.
         scaling: dict[str, dict[str, float]]
             Dictionary containing the mean and std for each variable.
+        keep_grad_through_clamp: bool, optional
+            If True, apply the nonnegative clamp with a straight-through
+            estimator: forward values are still clamped to physical zero, but
+            gradients flow as if the clamp were identity so below-threshold
+            predictions still get a learning signal. Default False.
         """
         super().__init__()
         self.variables = variables
@@ -48,6 +68,7 @@ class NonnegativeConstraint(torch.nn.Module):
         else:
             self.channels = in_channels
         self.scaling = scaling
+        self.keep_grad_through_clamp = keep_grad_through_clamp
 
         # Only apply constraint to variables that are used by model
         self.variables = [var for var in self.variables if var in self.channels]
@@ -74,9 +95,11 @@ class NonnegativeConstraint(torch.nn.Module):
         '''
         Tensors are expected to be in the shape [B, F, T, C, H, W]
         '''
-        return torch.maximum(
-            prediction, self.thresholds.to(dtype=prediction.dtype)
-        )
+        thresholds = self.thresholds.to(dtype=prediction.dtype)
+        clamped = torch.maximum(prediction, thresholds)
+        if self.keep_grad_through_clamp:
+            return replace_value_keep_gradient(prediction, clamped)
+        return clamped
 
 class DryAirMassConstraint(torch.nn.Module):
     def __init__(
