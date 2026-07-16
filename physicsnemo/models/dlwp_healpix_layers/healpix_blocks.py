@@ -14,8 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Sequence, Tuple, Union, Callable
+from typing import Callable, Sequence, Tuple, Union
 
+import math
 import torch
 import torch as th
 from .healpix_layers import HEALPixLayer
@@ -131,7 +132,6 @@ class ConvGRUBlock(th.nn.Module):
         """Reset the update gates"""
         self.h = th.zeros_like(self.h)
 
-
 #
 # CONV BLOCKS
 #
@@ -178,6 +178,7 @@ class BasicConvBlock(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         """
         super().__init__()
+
         if latent_channels is None:
             latent_channels = max(in_channels, out_channels)
         convblock = []
@@ -211,7 +212,6 @@ class BasicConvBlock(th.nn.Module):
             result of the forward pass
         """
         return self.convblock(x)
-
 
 class ConvNeXtBlock(th.nn.Module):
     """Class implementing a modified ConvNeXt network as described in https://arxiv.org/pdf/2201.03545.pdf
@@ -750,13 +750,13 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         self.activation = activation
         self.dropout = dropout > 0.0
         self.cln_enabled = conditional_layer_norm is not None
-
+        
         if use_block_skip_connection:
             if in_channels == int(out_channels):
                 self.skip_module = lambda x: x
             else:
                 self.skip_module = geometry_layer(
-                    layer=th.nn.Conv2d,
+                    layer=torch.nn.Conv2d,
                     in_channels=in_channels,
                     out_channels=out_channels,
                     kernel_size=1,
@@ -785,7 +785,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 3x3: in → latent
         convblock.append(
             geometry_layer(
-                layer=th.nn.Conv2d,
+                layer=torch.nn.Conv2d,
                 in_channels=in_channels,
                 out_channels=int(latent_channels),
                 kernel_size=kernel_size,
@@ -807,7 +807,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 1x1: latent → latent * upscale
         convblock.append(
             geometry_layer(
-                layer=th.nn.Conv2d,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels),
                 out_channels=int(latent_channels * upscale_factor),
                 kernel_size=1,
@@ -833,7 +833,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 1x1: upscale → latent
         convblock.append(
             geometry_layer(
-                layer=th.nn.Conv2d,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels * upscale_factor),
                 out_channels=int(latent_channels),
                 kernel_size=1,
@@ -858,7 +858,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # 3x3: latent → out (no norm on this one, following convnext)
         convblock.append(
             geometry_layer(
-                layer=th.nn.Conv2d,
+                layer=torch.nn.Conv2d,
                 in_channels=int(latent_channels),
                 out_channels=out_channels,
                 kernel_size=kernel_size,
@@ -971,6 +971,7 @@ class AvgPool(th.nn.Module):
     def __init__(
         self,
         geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels: int = 3,
         pooling: int = 2,
         enable_nhwc: bool = False,
         enable_healpixpad: bool = False,
@@ -980,6 +981,8 @@ class AvgPool(th.nn.Module):
         ----------
         geometry_layer: torch.nn.Module, optional
             The wrapper for the geometry of the tensor being bassed to MaxPool2d
+        in_channels: int, optional
+            Not used, but required for hydra instantiation
         pooling: int, optional
             Pooling kernel size passed to geometry layer
         enable_nhwc: bool, optional
@@ -988,6 +991,7 @@ class AvgPool(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         """
         super().__init__()
+
         self.avgpool = geometry_layer(
             layer=torch.nn.AvgPool2d,
             kernel_size=pooling,
@@ -1010,6 +1014,78 @@ class AvgPool(th.nn.Module):
         """
         return self.avgpool(x)
 
+
+class DealiasedDownsample(th.nn.Module):
+    """
+    De-aliased downsampling via fixed depthwise blur stages.
+
+    Builds a 2D kernel as the outer product of a 1D ``resample_filter``, normalized to sum
+    to one, and applies it depthwise with stride ``stride``.
+
+    Typical filters from Zhang et al.: rectangle-2 ``[1, 1]``, triangle-3 ``[1, 2, 1]``,
+    binomial-5 ``[1, 4, 6, 4, 1]``. 
+    """
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels: int = 3,
+        resample_filter: Sequence[float] = (1.0, 2.0, 1.0),
+        stride: int = 2,
+        enable_nhwc: bool = False,
+        enable_healpixpad: bool = False,
+    ):
+        """
+        Parameters
+        ----------
+        geometry_layer: torch.nn.Module, optional
+            Wrapper (default :class:`HEALPixLayer`) for HEALPix tensor geometry.
+        in_channels: int, optional
+            Number of input (and output) channels for depthwise blur.
+        resample_filter: sequence of float, optional
+            1D nonnegative weights; 2D kernel is their outer product, normalized.
+        stride: int, optional
+            Stride of the blur convolution (downsampling factor).
+        enable_nhwc: bool, optional
+            Passed to ``geometry_layer``.
+        enable_healpixpad: bool, optional
+            Passed to ``geometry_layer``.
+        """
+        super().__init__()
+        filt = tuple(float(x) for x in resample_filter)
+        m = len(filt)
+        if m < 1:
+            raise ValueError("resample_filter must be non-empty")
+        if sum(filt) == 0:
+            raise ValueError("resample_filter must not sum to zero")
+        if stride < 1 or (math.log2(stride) % 1) != 0:
+            raise ValueError("stride must be a positive power of 2")
+
+        n_layers = int(math.log2(stride))
+        pool_layers = []
+        for _ in range(n_layers):
+            pool_layers.append(
+                geometry_layer(
+                    layer=DealiasBlurConv2d,
+                    in_channels=in_channels,
+                    out_channels=in_channels,
+                    kernel_size=m,
+                    stride=2,
+                    padding=0,
+                    groups=in_channels,
+                    bias=False,
+                    dilation=1,
+                    resample_filter=filt,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                )
+            )
+
+        self.pool = th.nn.Sequential(*pool_layers)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """Apply de-aliased downsampling along spatial dimensions per HEALPix face."""
+        return self.pool(x)
 
 #
 # UPSAMPLING BLOCKS
@@ -1050,6 +1126,7 @@ class TransposedConvUpsample(th.nn.Module):
             If HEALPixPadding should be enabled, passed to wrapper
         """
         super().__init__()
+                     
         upsampler = []
         # Upsample transpose conv
         upsampler.append(
@@ -1084,10 +1161,112 @@ class TransposedConvUpsample(th.nn.Module):
         return self.upsampler(x)
 
 
+class SmoothedInterpolateConv(th.nn.Module):
+    """
+    Class for sequentially interpolating, applying a smoothing filter which
+    preserves zonally uniform signals, then applying a simple Conv2d on
+    HEALPix tensor data
+    """
+
+    def __init__(
+        self,
+        geometry_layer: th.nn.Module = HEALPixLayer,
+        in_channels = 3,
+        out_channels = 3,
+        kernel_size = 3,
+        dilation = 1,
+        scale_factor = 2,
+        mode = 'nearest',
+        activation: th.nn.Module = None,
+        enable_nhwc = False,
+        enable_healpixpad = True,
+    ):
+        """
+        Parameters
+        ----------
+        geometry_layer: torch.nn.Module, optional
+            The wrapper for the geometry of the tensor being bassed to this module
+        in_channels: int, optional
+            The number of input channels
+        out_channels: int, optional
+            The number of output channels
+        kernel_size: int, optional
+            Size of the convolutional kernel
+        dilation: int, optional
+            Spacing between kernel points, passed to torch.nn.Conv2d
+        scale_factor: int, optional
+            Multiplier for spatial size, passed to torch.nn.functional.interpolate
+        mode: str, optional
+            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
+        activation: torch.nn.Module, optional
+            Activation function used in upsampling
+        enable_nhwc: bool, optional
+            Enable nhwc format, passed to wrapper
+        enable_healpixpad: bool, optional
+            If HEALPixPadding should be enabled, passed to wrapper
+        """
+        super().__init__()
+
+        if dilation > 1:
+            raise ValueError(
+                f"dilation > 1 is not currently supported for hpx resize \
+                convolutions, received dilation = {dilation}"
+            )
+
+        # We pad first before upsampling to prevent edge artifacts at seams
+        # between HPX faces. This means that our final upsampled signal will
+        # have extra padding which we need to trim before passing to conv. We
+        # only require padding=1 before upsampling, so only need to trim 1 row/
+        # column from each side of result.
+        trim_size = 1 
+
+        block = []
+        block += [
+            geometry_layer(
+                layer=SmoothedInterpolate,
+                in_channels=in_channels,
+                scale_factor=scale_factor,
+                mode=mode,
+                trim_size=trim_size,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            ),
+            geometry_layer(
+                layer=torch.nn.Conv2d,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                enable_nhwc=enable_nhwc,
+                enable_healpixpad=enable_healpixpad,
+            )
+        ]
+
+        if activation is not None:
+            block.append(activation)
+        self.block = th.nn.Sequential(*block)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """
+        Forward pass of the ResizeConv layer
+
+        Parameters
+        ----------
+        x: torch.Tensor
+            inputs to the forward pass
+
+        Returns
+        -------
+        torch.Tensor
+            result of the forward pass
+        """
+        x = self.block(x)
+        return x
+
+
 #
 # Helper classes
 #
-
 
 class Interpolate(th.nn.Module):
     """Helper class that handles interpolation
@@ -1122,3 +1301,117 @@ class Interpolate(th.nn.Module):
             the interpolated values
         """
         return self.interp(inputs, scale_factor=self.scale_factor, mode=self.mode)
+
+
+class DealiasBlurConv2d(th.nn.Module):
+    """Depthwise blur with fixed kernel using functional conv2d."""
+
+    @staticmethod
+    def _normalized_depthwise_blur_weights(
+        resample_filter: Sequence[float], in_channels: int
+    ) -> th.Tensor:
+        f = th.as_tensor(list(resample_filter), dtype=th.float32)
+        if f.ndim != 1:
+            raise ValueError("resample_filter must be 1D")
+        m = int(f.numel())
+        f2d = f[:, None] * f[None, :]
+        f2d = f2d / f2d.sum()
+        return f2d.unsqueeze(0).unsqueeze(0).expand(in_channels, 1, m, m).clone()
+
+    def __init__(
+        self,
+        in_channels: int,
+        stride: int = 1,
+        resample_filter: Sequence[float] = (1.0, 2.0, 1.0),
+        **kwargs,
+    ):
+        super().__init__()
+        filt = tuple(float(x) for x in resample_filter)
+        if len(filt) < 1:
+            raise ValueError("resample_filter must be non-empty")
+        if sum(filt) == 0:
+            raise ValueError("resample_filter must not sum to zero")
+
+        self.in_channels = in_channels
+        self.stride = stride
+        self.register_buffer(
+            "weight",
+            self._normalized_depthwise_blur_weights(filt, in_channels),
+        )
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        return th.nn.functional.conv2d(
+            x,
+            self.weight.to(device=x.device, dtype=x.dtype),
+            bias=None,
+            stride=self.stride,
+            padding=0, # Padding is handled by HEALPixLayer if necessary
+            groups=self.in_channels,
+        )
+
+
+class SmoothedInterpolate(th.nn.Module):
+    """
+    Helper class for interpolating a HEALPix signal then applying a four point
+    smoother which preserves zonal uniformity if the upsampling mode is nearest
+    neighbor or bilinear.
+    """
+    
+    def __init__(
+        self,
+        in_channels: int = 3,
+        scale_factor: int = 2,
+        mode: str = 'nearest',
+        trim_size: int = 0,
+    ):
+        """
+        Parameters
+        ----------
+        in_channels: int, optional
+            The number of input channels
+        scale_factor: int, optional
+            Multiplier for spatial size, passed to torch.nn.functional.interpolate
+        mode: str, optional
+            Algorithm used for upsampling, passed to torch.nn.functional.interpolate
+        trim_size: int, optional
+            Amount of padding to trim from final tensor, which is assumed to be
+            square
+        """
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.scale_factor = scale_factor
+        self.mode = mode
+        self.trim_size = trim_size
+        self.interp = th.nn.functional.interpolate
+
+        # Four point smoother specific to HPX grid. This smooths out the specific
+        # type of aliasing that nearest neighbor and bilinear upsampling introduce
+        # into zonally uniform signals
+        self.smoother_kernel = torch.tensor(
+            [[0.,1.,0.],
+             [1.,0.,1.],
+             [0.,1.,0.]]
+        )
+        # Normalize the kernel to sum to 1
+        self.smoother_kernel = self.smoother_kernel / self.smoother_kernel.sum()
+        self.smoother_kernel = self.smoother_kernel.unsqueeze(0).unsqueeze(0)  # shape (1,1,3,3)
+        self.smoother_kernel = self.smoother_kernel.repeat((in_channels,1,1,1))
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        self.smoother_kernel = self.smoother_kernel.to(device=x.device, dtype=x.dtype)
+
+        # Interpolate, smooth, trim in order
+        x = self.interp(x, scale_factor=self.scale_factor, mode=self.mode)
+
+        x = torch.nn.functional.conv2d(
+            x,
+            self.smoother_kernel,
+            padding=0,
+            groups=self.in_channels
+        )
+
+        if self.trim_size > 0:
+            x = x[..., self.trim_size:-self.trim_size, self.trim_size:-self.trim_size]
+
+        return x

@@ -582,16 +582,16 @@ class HEALPixLayer(th.nn.Module):
             del kwargs["enable_healpixpad"]
         else:
             enable_healpixpad = False
+        
+        kernel_size = 3 if "kernel_size" not in kwargs else kwargs["kernel_size"]
+        dilation = 1 if "dilation" not in kwargs else kwargs["dilation"]
+        padding = ((kernel_size - 1) // 2) * dilation
+        
+        # Define a HEALPixPadding layer if padding is necessary
+        if padding > 0:
+            if layer.__bases__[0] is th.nn.modules.conv._ConvNd:
+                kwargs["padding"] = 0 # Disable native padding
 
-        # Define a HEALPixPadding layer if the given layer is a convolution layer
-        if (
-            layer.__bases__[0] is th.nn.modules.conv._ConvNd
-            and kwargs["kernel_size"] > 1
-        ):
-            kwargs["padding"] = 0  # Disable native padding
-            kernel_size = 3 if "kernel_size" not in kwargs else kwargs["kernel_size"]
-            dilation = 1 if "dilation" not in kwargs else kwargs["dilation"]
-            padding = ((kernel_size - 1) // 2) * dilation
             if (
                 enable_healpixpad
                 and have_healpixpad
