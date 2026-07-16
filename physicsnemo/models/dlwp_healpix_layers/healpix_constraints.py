@@ -1,4 +1,3 @@
-import logging
 import numpy as np
 import torch
 import xarray as xr
@@ -6,9 +5,11 @@ import xarray as xr
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.launch.logging import PythonLogger, RankZeroLoggingWrapper
 
-logger = logging.getLogger(__name__)
+logger = PythonLogger(name="physicsnemo.models.dlwp_healpix_layers.healpix_constraints")
 if DistributedManager.is_initialized():
-    logger = RankZeroLoggingWrapper(logger, DistributedManager())
+    logger0 = RankZeroLoggingWrapper(logger, DistributedManager())
+else:
+    logger0 = logger
 
 '''
 Constraints for the DLWP HEALPix model. All constraints should take two arguments:
@@ -51,7 +52,7 @@ class NonnegativeConstraint(torch.nn.Module):
         # Only apply constraint to variables that are used by model
         self.variables = [var for var in self.variables if var in self.channels]
 
-        logger.warning(
+        logger0.warning(
             f"Requested non-negative constrained variables "
             f"{[v for v in variables if v not in self.variables]} not found in "
             f"model channels and will be ignored."
