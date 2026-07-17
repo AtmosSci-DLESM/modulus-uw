@@ -1320,6 +1320,7 @@ class TransposedConvUpsample(th.nn.Module):
         """
         return self.upsampler(x)
 
+
 class SmoothedInterpolateConv(th.nn.Module):
     """
     Class for sequentially interpolating, applying a smoothing filter which
@@ -1377,7 +1378,7 @@ class SmoothedInterpolateConv(th.nn.Module):
         super().__init__()
         warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         if dilation > 1:
-            raise ValueError(
+            raise Exception(
                 f"dilation > 1 is not currently supported for hpx resize \
                 convolutions, received dilation = {dilation}"
             )
