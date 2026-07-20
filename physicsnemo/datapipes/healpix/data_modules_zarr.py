@@ -322,7 +322,6 @@ class TimeSeriesDataModuleZarr:
         DataLoader: The configured dataloader
         """
         sampler = None
-        drop_last = False
         if num_shards > 1:
             sampler = DistributedSampler(
                 dataset,
@@ -332,7 +331,6 @@ class TimeSeriesDataModuleZarr:
                 drop_last=drop_last,
             )
             shuffle = False
-            drop_last = False
 
         dataloader_kwargs = {
             "dataset": dataset,
@@ -373,7 +371,7 @@ class TimeSeriesDataModuleZarr:
             num_shards=num_shards,
             shard_id=shard_id,
             shuffle=self.shuffle,
-            drop_last=True,
+            drop_last=self.drop_last,
         )
 
     def val_dataloader(self, num_shards=1, shard_id=0) -> DataLoader:
@@ -396,7 +394,7 @@ class TimeSeriesDataModuleZarr:
             num_shards=num_shards,
             shard_id=shard_id,
             shuffle=False,
-            drop_last=True,
+            drop_last=self.drop_last,
         )
 
     def test_dataloader(self, num_shards=1, shard_id=0) -> DataLoader:
@@ -419,7 +417,7 @@ class TimeSeriesDataModuleZarr:
             num_shards=num_shards,
             shard_id=shard_id,
             shuffle=False,
-            drop_last=True,
+            drop_last=False,
         )
 
 
