@@ -932,7 +932,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         enable_nhwc: bool = True,
         nside: int | None = None,
         patch_weight_sigma: float = None,
-        channel_chunk_size: int | None = 8,
+        channel_chunk_size: int | None = None,
     ):
         """
         Parameters
@@ -969,7 +969,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             If None, no spatial weighting within the patch (default).
         channel_chunk_size: int or None, optional
             Pad/unfold this many channels at a time to reduce peak memory.
-            Default ``8``. ``None`` processes all channels in one pass.
+            Default ``None`` processes all channels in one pass.
         """
         super().__init__()
         if n_members < 2:
@@ -1073,6 +1073,13 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         returns: [Cond, B*T*F*C, D, H*W]
         """
         n, b, f, t, c, h, w = prediction.shape
+
+        if self.hpx_padding_mode == "isolatitude" and self.nside != h:
+            raise ValueError(
+                f"hpx_padding_mode=isolatitude requires nside={self.nside} to match h={h}. "
+                f"Got hpx_padding_mode={self.hpx_padding_mode}, nside={self.nside}, h={h}."
+            )
+
         x = prediction.permute(0, 1, 3, 2, 4, 5, 6).reshape(n * b * t * f, c, h, w)
         unfolded = self._pad_and_unfold(x)
         return unfolded.view(n, b * t * f * c, self.patch_size ** 2, h * w)
