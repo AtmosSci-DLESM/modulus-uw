@@ -1015,7 +1015,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         enable_nhwc: bool = True,
         nside: int | None = None,
         patch_weight_sigma: float = None,
-        channel_chunk_size: int | None = 8,
+        channel_chunk_size: int | None = None,
     ):
         """
         Parameters
@@ -1049,7 +1049,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             If None, no spatial weighting within the patch (default).
         channel_chunk_size: int or None, optional
             Pad/unfold this many channels at a time to reduce peak memory.
-            Default ``8``. ``None`` processes all channels in one pass.
+            Default ``None`` processes all channels in one pass.
         """
         super().__init__()
         if n_members < 2:
