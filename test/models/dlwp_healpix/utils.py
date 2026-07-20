@@ -14,30 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .healpix_blocks import (
-    AvgPool,
-    BasicConvBlock,
-    ConvGRUBlock,
-    ConvNeXtBlock,
-    DealiasedDownsample,
-    DoubleConvNeXtBlock,
-    Interpolate,
-    MaxPool,
-    Multi_SymmetricConvNeXtBlock,
-    SymmetricConvNeXtBlock,
-    TransposedConvUpsample,
-    SmoothedInterpolateConv,
-)
-from .healpix_decoder import UNetDecoder
-from .healpix_encoder import UNetEncoder
-from .healpix_layers import HEALPixLayer
-from .healpix_paddings import (
-    HEALPixFoldFaces,
-    HEALPixPadding,
-    HEALPixPaddingIsolatitude,
-    HEALPixPaddingv2,
-    HEALPixUnfoldFaces,
-    have_earth2grid,
-    make_hpx_padding_layer,
-    warn_deprecated_enable_healpixpad,
-)
+import numpy as np
+import torch
+
+def fix_random_seeds(seed=0):
+    """Fix random seeds for reproducibility"""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
