@@ -357,10 +357,6 @@ class ConstantCoupler(BaseCoupler):
             the right side of a averaging_window window.
             This is highly recommended for training, default True
         """
-        # It doesn't make sense to have more than one input time for a constant coupler
-        if len(input_times) != 1:
-            raise ValueError("ConstantCoupler only supports one input time")
-
         super().__init__(
             dataset=dataset,
             batch_size=batch_size,
