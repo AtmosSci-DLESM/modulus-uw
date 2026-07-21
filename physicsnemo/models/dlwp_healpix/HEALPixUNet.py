@@ -27,6 +27,9 @@ from physicsnemo.models.dlwp_healpix_layers import (
     HEALPixUnfoldFaces,
     warn_deprecated_enable_healpixpad,
 )
+from physicsnemo.models.dlwp_healpix_layers.coupled_partial_conv import (
+    build_coupled_partial_conv_stem,
+)
 from physicsnemo.models.meta import ModelMetaData
 from physicsnemo.models.module import Module
 
@@ -80,6 +83,7 @@ class HEALPixUNet(Module):
         constants: Sequence[str] = None,
         scaling: dict[str, dict[str, float]] = None,
         enable_healpixpad: bool | None = None,
+        coupled_partial_conv: dict | DictConfig | None = None,
     ):
         """
         Parameters
@@ -129,6 +133,10 @@ class HEALPixUNet(Module):
         enable_healpixpad: bool, optional
             Deprecated. When ``hpx_padding_mode`` is omitted, ``False`` maps to ``karlbauer``
             and ``True`` to ``earth2grid`` (legacy configs). Prefer ``hpx_padding_mode``.
+        coupled_partial_conv: dict or DictConfig, optional
+            Opt-in partial-convolution stem for coupled inputs. ``None`` (default)
+            leaves coupled fields unchanged. See
+            ``physicsnemo.models.dlwp_healpix_layers.coupled_partial_conv``.
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
@@ -246,6 +254,14 @@ class HEALPixUNet(Module):
             nside=self.nside,
         )
 
+        self.coupled_partial_conv_stem = build_coupled_partial_conv_stem(
+            coupled_partial_conv,
+            couplings=self.couplings,
+            hpx_padding_mode=self.hpx_padding_mode,
+            nside=int(self.nside[0]) if self.nside is not None else None,
+            compile_padding=self.compile_padding,
+        )
+
         self.constraints = None
         self.set_constraints(constraints)
 
@@ -293,6 +309,13 @@ class HEALPixUNet(Module):
         """
 
         if len(self.couplings) > 0:
+            coupled = (
+                inputs[3].permute(0, 2, 1, 3, 4)
+                if self.couplings_time_first
+                else inputs[3]
+            )
+            if self.coupled_partial_conv_stem is not None:
+                coupled = self.coupled_partial_conv_stem(coupled)
             result = [
                 inputs[0].flatten(
                     start_dim=self.channel_dim, end_dim=self.channel_dim + 1
@@ -308,7 +331,7 @@ class HEALPixUNet(Module):
                 inputs[2].expand(
                     *tuple([inputs[0].shape[0]] + len(inputs[2].shape) * [-1])
                 ),  # constants
-                inputs[3].permute(0, 2, 1, 3, 4) if self.couplings_time_first else inputs[3],  # coupled inputs
+                coupled,
             ]
             res = th.cat(result, dim=self.channel_dim)
 

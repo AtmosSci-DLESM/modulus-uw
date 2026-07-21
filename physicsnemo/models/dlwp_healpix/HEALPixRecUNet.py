@@ -28,6 +28,9 @@ from physicsnemo.models.dlwp_healpix_layers import (
     HEALPixUnfoldFaces,
     warn_deprecated_enable_healpixpad,
 )
+from physicsnemo.models.dlwp_healpix_layers.coupled_partial_conv import (
+    build_coupled_partial_conv_stem,
+)
 from physicsnemo.models.dlwp_healpix_layers.reflection_ops import (
     apply_channel_order,
     bank_sizes,
@@ -95,6 +98,7 @@ class HEALPixRecUNet(Module):
         constants: Sequence[str] = None,
         scaling: dict[str, dict[str, float]] = None,
         enable_healpixpad: bool | None = None,
+        coupled_partial_conv: dict | DictConfig | None = None,
     ):
         """
         Parameters
@@ -164,6 +168,10 @@ class HEALPixRecUNet(Module):
             Fraction of latent channels typed odd under reflection (structural mode).
         odd_prognostic_variables / odd_constants / odd_coupled_variables:
             Physical channel names that flip sign under equatorial reflection.
+        coupled_partial_conv: dict or DictConfig, optional
+            Opt-in partial-convolution stem for coupled inputs. ``None`` (default)
+            leaves coupled fields unchanged. See
+            ``physicsnemo.models.dlwp_healpix_layers.coupled_partial_conv``.
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
@@ -275,6 +283,16 @@ class HEALPixRecUNet(Module):
 
         self.encoder = instantiate(**encoder_kwargs)
         self.decoder = instantiate(**decoder_kwargs)
+
+        # Opt-in stem: partial-conv over coupled SST/SIC (etc.) before channel concat.
+        # Default None preserves historical behavior. nside[0] is full-res face size.
+        self.coupled_partial_conv_stem = build_coupled_partial_conv_stem(
+            coupled_partial_conv,
+            couplings=self.couplings,
+            hpx_padding_mode=self.hpx_padding_mode,
+            nside=int(self.nside[0]) if self.nside is not None else None,
+            compile_padding=self.compile_padding,
+        )
 
         if self.reflection_equivariance_mode == "structural":
             # Only materialize sin_lat gates when some layer opts into cross-parity 1×1.
@@ -461,6 +479,14 @@ class HEALPixRecUNet(Module):
         """
 
         if len(self.couplings) > 0:
+            coupled = (
+                inputs[3].permute(0, 2, 1, 3, 4)
+                if self.couplings_time_first
+                else inputs[3]
+            )
+            if self.coupled_partial_conv_stem is not None:
+                # Stem expects [B, F, C, H, W]; preserves C so encoder channel math is unchanged.
+                coupled = self.coupled_partial_conv_stem(coupled)
             result = [
                 inputs[0].flatten(
                     start_dim=self.channel_dim, end_dim=self.channel_dim + 1
@@ -476,7 +502,7 @@ class HEALPixRecUNet(Module):
                 inputs[2].expand(
                     *tuple([inputs[0].shape[0]] + len(inputs[2].shape) * [-1])
                 ),  # constants
-                inputs[3].permute(0, 2, 1, 3, 4) if self.couplings_time_first else inputs[3],  # coupled inputs
+                coupled,
             ]
             res = th.cat(result, dim=self.channel_dim)
 
