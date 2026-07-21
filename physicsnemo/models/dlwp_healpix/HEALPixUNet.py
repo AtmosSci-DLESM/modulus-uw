@@ -404,13 +404,20 @@ class HEALPixUNet(Module):
                 else:
                     input_tensor = self._reshape_inputs(inputs, step)
             else:
+                # Autoregressive steps only feed prognostics back; diagnostic
+                # channels (e.g. tp6, msl) are outputs-only, matching RecUNet.
                 if len(self.couplings) > 0:
                     input_tensor = self._reshape_inputs(
-                        [outputs[-1]] + list(inputs[1:3]) + [inputs[3][step]], step
+                        [outputs[-1][:, :, :, : self.input_channels]]
+                        + list(inputs[1:3])
+                        + [inputs[3][step]],
+                        step,
                     )
                 else:
                     input_tensor = self._reshape_inputs(
-                        [outputs[-1]] + list(inputs[1:]), step
+                        [outputs[-1][:, :, :, : self.input_channels]]
+                        + list(inputs[1:]),
+                        step,
                     )
 
             kwargs = {}
@@ -422,21 +429,23 @@ class HEALPixUNet(Module):
             encodings = self.encoder(input_tensor, **kwargs)
             decodings = self.decoder(encodings, **kwargs)
 
+            # Residual prediction applies only to prognostics; diagnostics are
+            # absolute (same split as HEALPixRecUNet).
+            combined = self._reshape_outputs(decodings)
+            prognostics = combined[:, :, :, : self.input_channels]
             if self.residual_prediction:
-                prediction = input_tensor[:, : self.input_channels * self.input_time_dim] + decodings
-            else:
-                prediction = decodings
-            
-            reshaped = self._reshape_outputs(
-                prediction
-            )
+                prognostics += self._reshape_outputs(
+                    input_tensor[:, : self.input_channels * self.input_time_dim]
+                )
+            diagnostics = combined[:, :, :, self.input_channels :]
+            out = th.cat([prognostics, diagnostics], dim=3)
 
             # Apply constraints
             if self.constraints is not None:
                 for constraint in self.constraints:
-                    reshaped = constraint(reshaped)
+                    out = constraint(out)
 
-            outputs.append(reshaped)
+            outputs.append(out)
 
         if output_only_last:
             res = outputs[-1]
