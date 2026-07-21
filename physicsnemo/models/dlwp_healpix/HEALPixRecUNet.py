@@ -170,7 +170,8 @@ class HEALPixRecUNet(Module):
             Physical channel names that flip sign under equatorial reflection.
         coupled_partial_conv: dict or DictConfig, optional
             Opt-in partial-convolution stem for coupled inputs. ``None`` (default)
-            leaves coupled fields unchanged. See
+            leaves coupled fields unchanged. Configure ``masks`` plus an optional
+            Hydra-instantiable ``stem`` (default ``CoupledPartialConvStem``). See
             ``physicsnemo.models.dlwp_healpix_layers.coupled_partial_conv``.
         """
         super().__init__()

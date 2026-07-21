@@ -49,6 +49,7 @@ from .healpix_paddings import (
     warn_deprecated_enable_healpixpad,
 )
 from .coupled_partial_conv import (
+    DEFAULT_COUPLED_PARTIAL_CONV_STEM_TARGET,
     CoupledPartialConvStem,
     PartialHEALPixConv2d,
     build_coupled_partial_conv_stem,

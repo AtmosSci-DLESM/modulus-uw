@@ -23,6 +23,11 @@ forward pass or gradients.
 
 Padding uses the same ``HEALPixLayer`` / ``make_hpx_padding_layer`` path as the
 rest of the atmosphere model.
+
+The stem itself is Hydra-instantiable via ``coupled_partial_conv.stem`` (default
+:class:`CoupledPartialConvStem`). Custom stems must accept ``channel_masks`` plus
+the HEALPix padding kwargs and map ``[B, F, C, H, W] → [B, F, C, H, W]`` (channel
+count preserved for encoder / reflection layouts).
 """
 
 from __future__ import annotations
@@ -33,10 +38,15 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import xarray as xr
+from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
 from .healpix_layers import HEALPixLayer
 from .healpix_paddings import HEALPixFoldFaces, HEALPixUnfoldFaces
+
+DEFAULT_COUPLED_PARTIAL_CONV_STEM_TARGET = (
+    "physicsnemo.models.dlwp_healpix_layers.coupled_partial_conv.CoupledPartialConvStem"
+)
 
 
 def coupled_variable_channel_names(couplings: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -211,17 +221,19 @@ class PartialHEALPixConv2d(nn.Module):
 
 
 class CoupledPartialConvStem(nn.Module):
-    """Apply a depthwise partial-conv stem to coupled inputs ``[B, F, C, H, W]``.
+    """Default depthwise partial-conv stem for coupled inputs ``[B, F, C, H, W]``.
 
     Channel count is preserved so encoder wiring and reflection channel layouts
-    stay unchanged.
+    stay unchanged. Swap via Hydra ``coupled_partial_conv.stem._target_``.
     """
 
     def __init__(
         self,
         channel_masks: th.Tensor,
         kernel_size: int = 3,
+        dilation: int = 1,
         eps: float = 1.0e-8,
+        bias: bool = True,
         hpx_padding_mode: str | None = None,
         nside: int | None = None,
         compile_padding: bool = False,
@@ -231,6 +243,11 @@ class CoupledPartialConvStem(nn.Module):
         ----------
         channel_masks:
             Tensor ``[C, F, H, W]`` — one spatial mask per coupled channel.
+        kernel_size, dilation, eps, bias:
+            Forwarded to :class:`PartialHEALPixConv2d`.
+        hpx_padding_mode, nside, compile_padding:
+            HEALPix padding options; normally injected by the model builder to
+            match the parent RecUNet/UNet.
         """
         super().__init__()
         if channel_masks.ndim != 4:
@@ -250,11 +267,12 @@ class CoupledPartialConvStem(nn.Module):
         self.pconv = PartialHEALPixConv2d(
             channels=channels,
             kernel_size=kernel_size,
+            dilation=dilation,
             eps=eps,
             hpx_padding_mode=hpx_padding_mode,
             nside=nside,
             compile_padding=compile_padding,
-            bias=True,
+            bias=bias,
         )
 
     def forward(self, coupled: th.Tensor) -> th.Tensor:
@@ -285,19 +303,60 @@ class CoupledPartialConvStem(nn.Module):
         return self.unfold(y)
 
 
+def _resolve_stem_config(cfg: dict) -> Any:
+    """Build a Hydra stem config, defaulting to :class:`CoupledPartialConvStem`.
+
+    Preferred form::
+
+        stem:
+          _target_: ...CoupledPartialConvStem
+          kernel_size: 3
+          eps: 1.0e-8
+
+    Legacy flat keys ``kernel_size`` / ``eps`` / ``dilation`` / ``bias`` at the
+    ``coupled_partial_conv`` root are still accepted when ``stem`` is omitted.
+
+    Returns a ``DictConfig`` for string targets, or a plain dict when ``_target_``
+    is already a class object (OmegaConf cannot store class values).
+    """
+    stem_cfg = cfg.get("stem")
+    if stem_cfg is None:
+        return OmegaConf.create(
+            {
+                "_target_": DEFAULT_COUPLED_PARTIAL_CONV_STEM_TARGET,
+                "kernel_size": cfg.get("kernel_size", 3),
+                "dilation": cfg.get("dilation", 1),
+                "eps": cfg.get("eps", 1.0e-8),
+                "bias": cfg.get("bias", True),
+            }
+        )
+
+    if isinstance(stem_cfg, DictConfig):
+        if "_target_" not in stem_cfg:
+            with OmegaConf.set_struct(stem_cfg, False):
+                stem_cfg._target_ = DEFAULT_COUPLED_PARTIAL_CONV_STEM_TARGET
+        return stem_cfg
+
+    stem_cfg = dict(stem_cfg)
+    target = stem_cfg.get("_target_", DEFAULT_COUPLED_PARTIAL_CONV_STEM_TARGET)
+    stem_cfg["_target_"] = target
+    # Class objects cannot round-trip through OmegaConf.create.
+    if isinstance(target, type):
+        return stem_cfg
+    return OmegaConf.create(stem_cfg)
+
+
 def build_coupled_partial_conv_stem(
     config: Any,
     couplings: Sequence[Mapping[str, Any]],
     hpx_padding_mode: str | None = None,
     nside: int | None = None,
     compile_padding: bool = False,
-) -> CoupledPartialConvStem | None:
+) -> nn.Module | None:
     """Build a stem from a Hydra/dict config, or return ``None`` if disabled.
 
     Expected config::
 
-        kernel_size: 3
-        eps: 1.0e-8
         masks:
           sst:
             dataset_path: ...
@@ -306,6 +365,16 @@ def build_coupled_partial_conv_stem(
             invert: true
             threshold: null   # soft; or e.g. 0.5 for hard
           sic: ...
+        stem:
+          _target_: physicsnemo.models.dlwp_healpix_layers.coupled_partial_conv.CoupledPartialConvStem
+          kernel_size: 3
+          dilation: 1
+          eps: 1.0e-8
+          bias: true
+
+    ``stem`` is Hydra-instantiated with ``channel_masks`` and the parent model's
+    HEALPix padding kwargs injected. Custom ``_target_`` modules must preserve
+    coupled channel count in ``forward``.
     """
     if config is None:
         return None
@@ -342,10 +411,10 @@ def build_coupled_partial_conv_stem(
         )
 
     channel_masks = th.stack(per_channel, dim=0)  # [C, F, H, W]
-    return CoupledPartialConvStem(
+    stem_cfg = _resolve_stem_config(cfg)
+    return instantiate(
+        stem_cfg,
         channel_masks=channel_masks,
-        kernel_size=int(cfg.get("kernel_size", 3)),
-        eps=float(cfg.get("eps", 1.0e-8)),
         hpx_padding_mode=hpx_padding_mode,
         nside=nside,
         compile_padding=compile_padding,

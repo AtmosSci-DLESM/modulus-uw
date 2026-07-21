@@ -23,13 +23,38 @@ import pytest
 import torch as th
 import xarray as xr
 
+import torch.nn as nn
+
 from physicsnemo.models.dlwp_healpix_layers.coupled_partial_conv import (
+    DEFAULT_COUPLED_PARTIAL_CONV_STEM_TARGET,
     CoupledPartialConvStem,
     PartialHEALPixConv2d,
     build_coupled_partial_conv_stem,
     coupled_variable_channel_names,
     load_spatial_mask,
 )
+
+
+class _IdentityCoupledStem(nn.Module):
+    """Minimal custom stem used to verify Hydra ``_target_`` wiring."""
+
+    def __init__(
+        self,
+        channel_masks,
+        hpx_padding_mode=None,
+        nside=None,
+        compile_padding=False,
+        **kwargs,
+    ):
+        super().__init__()
+        self.register_buffer(
+            "channel_masks",
+            channel_masks.permute(1, 0, 2, 3).unsqueeze(0).contiguous(),
+            persistent=True,
+        )
+
+    def forward(self, coupled):
+        return coupled
 
 
 N_FACES = 12
@@ -254,3 +279,58 @@ def test_partial_conv_matches_standard_when_mask_ones():
 def test_disabled_stem_leaves_coupled_tensor_untouched_in_reshape_logic():
     """build(... None) is the disabled path used by RecUNet/UNet."""
     assert build_coupled_partial_conv_stem(None, _toy_couplings()) is None
+
+
+def test_stem_hydra_target_default(tmp_path, ocean_frac):
+    zpath = tmp_path / "mask.zarr"
+    _write_lsm_zarr(zpath, ocean_frac)
+    mask_cfg = {
+        "dataset_path": str(zpath),
+        "data_var": "constants",
+        "selection_dict": {"channel_c": "lsm"},
+        "invert": True,
+        "threshold": 0.5,
+    }
+    stem = build_coupled_partial_conv_stem(
+        {
+            "masks": {"sst": mask_cfg, "sic": mask_cfg},
+            "stem": {
+                "_target_": DEFAULT_COUPLED_PARTIAL_CONV_STEM_TARGET,
+                "kernel_size": 3,
+                "dilation": 1,
+                "eps": 1.0e-8,
+                "bias": True,
+            },
+        },
+        _toy_couplings(),
+        hpx_padding_mode="karlbauer",
+        nside=NSIDE,
+    )
+    assert isinstance(stem, CoupledPartialConvStem)
+    assert stem.pconv.kernel_size == 3
+    assert stem.pconv.dilation == 1
+
+
+def test_custom_stem_target(tmp_path, ocean_frac):
+    zpath = tmp_path / "mask.zarr"
+    _write_lsm_zarr(zpath, ocean_frac)
+    mask_cfg = {
+        "dataset_path": str(zpath),
+        "data_var": "constants",
+        "selection_dict": {"channel_c": "lsm"},
+        "invert": True,
+        "threshold": 0.5,
+    }
+    # Pass the class object so Hydra need not import via a pytest module path.
+    stem = build_coupled_partial_conv_stem(
+        {
+            "masks": {"sst": mask_cfg, "sic": mask_cfg},
+            "stem": {"_target_": _IdentityCoupledStem},
+        },
+        _toy_couplings(),
+        hpx_padding_mode="karlbauer",
+        nside=NSIDE,
+    )
+    assert isinstance(stem, _IdentityCoupledStem)
+    x = th.randn(1, N_FACES, 2, NSIDE, NSIDE)
+    assert th.equal(stem(x), x)
