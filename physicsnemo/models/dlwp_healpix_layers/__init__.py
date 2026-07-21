@@ -48,3 +48,10 @@ from .healpix_paddings import (
     make_hpx_padding_layer,
     warn_deprecated_enable_healpixpad,
 )
+from .coupled_partial_conv import (
+    CoupledPartialConvStem,
+    PartialHEALPixConv2d,
+    build_coupled_partial_conv_stem,
+    coupled_variable_channel_names,
+    load_spatial_mask,
+)
