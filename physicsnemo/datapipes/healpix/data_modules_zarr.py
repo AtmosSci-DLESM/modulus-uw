@@ -62,10 +62,13 @@ class TimeSeriesDataModuleZarr:
         add_insolation: bool = False,
         num_workers: int = 4,
         pin_memory: bool = True,
+        persistent_workers: bool = False,
+        prefetch_factor: Optional[int] = None,
         forecast_init_times: Optional[Sequence] = None,
         add_train_noise: Optional[bool] = False,
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
+        in_order: Optional[bool] = None,
     ):
         """
         Parameters
@@ -113,6 +116,11 @@ class TimeSeriesDataModuleZarr:
             Number of parallel data loading workers, default 4
         pin_memory: bool, optional
             Whether pinned (page locked) memory should be used to store the tensors, improves GPU I/O, default True
+        persistent_workers: bool, optional
+            Keep dataloader workers alive between epochs, default False
+        prefetch_factor: int, optional
+            Number of batches loaded in advance by each worker. Only used when
+            num_workers > 0. If not provided, PyTorch default is used.
         forecast_init_times: Sequence, optional
             A Sequence of pandas Timestamps dictating the specific initialization times
             to produce inputs for. default None
@@ -126,6 +134,9 @@ class TimeSeriesDataModuleZarr:
             Dictionary containing parameters for adding noise to the training data
         train_noise_seed: int, optional
             Seed for the random number generator for adding noise to the training data, default 42
+        in_order: bool, optional
+            Passed to torch.utils.data.DataLoader when set (requires PyTorch with ``in_order`` support).
+            If None, DataLoader default applies.
         """
         super().__init__()
         self.dataset_path = Path(dataset_path)
@@ -147,10 +158,13 @@ class TimeSeriesDataModuleZarr:
         self.add_insolation = add_insolation
         self.num_workers = num_workers
         self.pin_memory = pin_memory
+        self.persistent_workers = persistent_workers
+        self.prefetch_factor = prefetch_factor
         self.forecast_init_times = forecast_init_times
         self.add_train_noise = add_train_noise
         self.train_noise_params = train_noise_params
         self.train_noise_seed = train_noise_seed
+        self.in_order = in_order
 
         self.train_dataset = None
         self.val_dataset = None
@@ -308,7 +322,6 @@ class TimeSeriesDataModuleZarr:
         DataLoader: The configured dataloader
         """
         sampler = None
-        drop_last = False
         if num_shards > 1:
             sampler = DistributedSampler(
                 dataset,
@@ -318,18 +331,23 @@ class TimeSeriesDataModuleZarr:
                 drop_last=drop_last,
             )
             shuffle = False
-            drop_last = False
 
-        loader = DataLoader(
-            dataset=dataset,
-            pin_memory=self.pin_memory,
-            num_workers=self.num_workers,
-            shuffle=shuffle,
-            drop_last=drop_last,
-            sampler=sampler,
-            collate_fn=self.collate_fn,
-            batch_size=self.dataloader_batch_size,
-        )
+        dataloader_kwargs = {
+            "dataset": dataset,
+            "pin_memory": self.pin_memory,
+            "num_workers": self.num_workers,
+            "persistent_workers": (self.persistent_workers and self.num_workers > 0),
+            "shuffle": shuffle,
+            "drop_last": drop_last,
+            "sampler": sampler,
+            "collate_fn": self.collate_fn,
+            "batch_size": self.dataloader_batch_size,
+        }
+        if self.prefetch_factor is not None and self.num_workers > 0:
+            dataloader_kwargs["prefetch_factor"] = self.prefetch_factor
+        if self.in_order is not None:
+            dataloader_kwargs["in_order"] = self.in_order
+        loader = DataLoader(**dataloader_kwargs)
 
         return loader, sampler
 
@@ -353,7 +371,7 @@ class TimeSeriesDataModuleZarr:
             num_shards=num_shards,
             shard_id=shard_id,
             shuffle=self.shuffle,
-            drop_last=True,
+            drop_last=self.drop_last,
         )
 
     def val_dataloader(self, num_shards=1, shard_id=0) -> DataLoader:
@@ -376,7 +394,7 @@ class TimeSeriesDataModuleZarr:
             num_shards=num_shards,
             shard_id=shard_id,
             shuffle=False,
-            drop_last=True,
+            drop_last=self.drop_last,
         )
 
     def test_dataloader(self, num_shards=1, shard_id=0) -> DataLoader:
@@ -399,7 +417,7 @@ class TimeSeriesDataModuleZarr:
             num_shards=num_shards,
             shard_id=shard_id,
             shuffle=False,
-            drop_last=True,
+            drop_last=False,
         )
 
 
@@ -430,11 +448,14 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         add_insolation: bool = False,
         num_workers: int = 4,
         pin_memory: bool = True,
+        persistent_workers: bool = False,
+        prefetch_factor: Optional[int] = None,
         forecast_init_times: Optional[Sequence] = None,
         couplings: Sequence = None,
         add_train_noise: Optional[bool] = False,
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
+        in_order: Optional[bool] = None,
     ):
         """
         Parameters
@@ -482,6 +503,11 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             Number of parallel data loading workers, default 4
         pin_memory: bool, optional
             Whether pinned (page locked) memory should be used to store the tensors, improves GPU I/O, default True
+        persistent_workers: bool, optional
+            Keep dataloader workers alive between epochs, default False
+        prefetch_factor: int, optional
+            Number of batches loaded in advance by each worker. Only used when
+            num_workers > 0. If not provided, PyTorch default is used.
         forecast_init_times: Sequence, optional
             A Sequence of pandas Timestamps dictating the specific initialization times
             to produce inputs for. default None
@@ -498,6 +524,8 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             Dictionary containing parameters for adding noise to the training data
         train_noise_seed: int, optional
             Seed for the random number generator for adding noise to the training data, default 42
+        in_order: bool, optional
+            Passed to torch.utils.data.DataLoader when set. If None, DataLoader default applies.
         """
         self.couplings = couplings
 
@@ -521,10 +549,13 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             add_insolation,
             num_workers,
             pin_memory,
+            persistent_workers,
+            prefetch_factor,
             forecast_init_times,
             add_train_noise,
             train_noise_params,
             train_noise_seed,
+            in_order,
         )
 
     def _get_coupled_vars(self):
