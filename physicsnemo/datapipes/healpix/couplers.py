@@ -105,14 +105,19 @@ class BaseCoupler(ABC):
             self.use_zarr = False
         elif type(self.ds) == zr.Group:
             self.use_zarr = True
+            # Iterate over self.variables in the outer loop so selected indices
+            # follow the order of self.variables (matching the xarray path's
+            # `.sel(channel_in=self.variables)`), not the dataset's native
+            # channel_in order. Downstream code (e.g. coupled_scaling built
+            # from self.variables in set_scaling) assumes the coupled channel
+            # axis is ordered by self.variables.
+            # Use `[:]` so zarr v3 yields hashable scalar strings, not Array views.
+            channel_in = list(self.ds["channel_in"][:])
             self.ds_variable_indices = [
-                i
-                for i, ic in enumerate(self.ds["channel_in"])
-                for v in self.variables
-                if ic == v
+                i for v in self.variables for i, ic in enumerate(channel_in) if ic == v
             ]
             # Check if any of the requested variables are not in the dataset
-            missing_variables = set(self.variables) - set(list(self.ds["channel_in"][:]))
+            missing_variables = set(self.variables) - set(channel_in)
             if len(missing_variables) > 0:
                 raise ValueError(f"Missing variables in dataset for coupling: {missing_variables}")
         else:
