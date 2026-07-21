@@ -28,6 +28,15 @@ from physicsnemo.models.dlwp_healpix_layers import (
     HEALPixUnfoldFaces,
     warn_deprecated_enable_healpixpad,
 )
+from physicsnemo.models.dlwp_healpix_layers.reflection_ops import (
+    apply_channel_order,
+    bank_sizes,
+    compute_sin_lat_faces,
+    expand_sin_lat_folded,
+    hpx_reflect_typed,
+    reorder_channels_even_odd,
+    resolve_reflection_equivariance_mode,
+)
 from physicsnemo.models.meta import ModelMetaData
 from physicsnemo.models.module import Module
 
@@ -77,8 +86,11 @@ class HEALPixRecUNet(Module):
         compile_padding: bool = False,
         nside: Sequence[int] = (64, 32, 16),
         enforce_reflectional_equivariance: bool = False,
+        reflection_equivariance_mode: str | None = None,
         odd_prognostic_variables: Sequence[str] = None,
         odd_constants: Sequence[str] = None,
+        odd_coupled_variables: Sequence[str] = None,
+        odd_fraction: float = 0.25,
         channels: Sequence[str] = None,
         constants: Sequence[str] = None,
         scaling: dict[str, dict[str, float]] = None,
@@ -137,6 +149,21 @@ class HEALPixRecUNet(Module):
         enable_healpixpad: bool, optional
             Deprecated. When ``hpx_padding_mode`` is omitted, ``False`` maps to ``karlbauer``
             and ``True`` to ``earth2grid`` (legacy configs). Prefer ``hpx_padding_mode``.
+        reflection_equivariance_mode: str, optional
+            Hard Z₂ equatorial reflection equivariance:
+
+            * ``off`` — no hard equivariance (default when omitted).
+            * ``structural`` — ReflectionSteerable layers (even/odd banks, constrained
+              kernels); one forward per step. Legacy alias: ``steerable``.
+            * ``averaged`` — twin-forward Reynolds projector on outputs and GRU
+              state. Legacy alias: ``reynolds``. Legacy
+              ``enforce_reflectional_equivariance=True`` also selects ``averaged``.
+        enforce_reflectional_equivariance: bool, optional
+            Legacy flag; ``True`` maps to ``averaged`` when mode is omitted/``off``.
+        odd_fraction: float, optional
+            Fraction of latent channels typed odd under reflection (structural mode).
+        odd_prognostic_variables / odd_constants / odd_coupled_variables:
+            Physical channel names that flip sign under equatorial reflection.
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
@@ -182,9 +209,17 @@ class HEALPixRecUNet(Module):
         self.enforce_reflectional_equivariance = enforce_reflectional_equivariance
         self.odd_prognostic_variables = odd_prognostic_variables
         self.odd_constants = odd_constants
+        self.odd_coupled_variables = odd_coupled_variables
+        self.odd_fraction = odd_fraction
         self.channels = channels
         self.constants = constants
         self.scaling = scaling
+
+        self.reflection_equivariance_mode = resolve_reflection_equivariance_mode(
+            reflection_equivariance_mode, enforce_reflectional_equivariance
+        )
+        # Keep legacy flag aligned with resolved mode for existing Reynolds code paths.
+        self.enforce_reflectional_equivariance = self.reflection_equivariance_mode == "averaged"
 
         if len(encoder["n_channels"]) != len(decoder["n_channels"]):
             raise ValueError(
@@ -200,43 +235,6 @@ class HEALPixRecUNet(Module):
         # Setting variables which are used for enforcing reflectional equivariance
         self.register_buffer("refl_face_order", th.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=th.long), persistent=False)
 
-        if self.enforce_reflectional_equivariance:
-
-            odd_out_var_idx = th.tensor([self.channels.index(v) for v in self.odd_prognostic_variables], dtype=th.long) \
-                if self.odd_prognostic_variables is not None else None
-            self.register_buffer("odd_out_var_idx", odd_out_var_idx, persistent=False)
-
-            odd_in_vars = []
-            odd_in_var_idx = []
-            if self.odd_prognostic_variables is not None:
-                odd_in_vars += self.odd_prognostic_variables
-                odd_in_var_idx = [self.channels.index(v) for v in odd_in_vars]
-            if self.odd_constants is not None:
-                odd_in_vars += self.odd_constants
-                odd_const_idx = [
-                    self.input_time_dim * (self.input_channels + self.decoder_input_channels) + self.constants.index(c)
-                    for c in self.odd_constants
-                ]
-                odd_in_var_idx += odd_const_idx
-
-            odd_in_var_idx = th.tensor(odd_in_var_idx, dtype=th.long) if len(odd_in_vars) > 0 else None
-            self.register_buffer("odd_in_var_idx", odd_in_var_idx, persistent=False)
-            
-            odd_in_var_mean = th.tensor([self.scaling[var]['mean'] for var in odd_in_vars]) if len(odd_in_vars) > 0 else None
-            for i, mean in enumerate(odd_in_var_mean):
-                if mean != 0.0:
-                    raise ValueError(
-                        f"Reflectional equivariance can only be enforced if all odd variables have zero mean. "
-                        f"Odd variable {odd_in_vars[i]} has mean {mean.item()}"
-                    )
-
-            if len(odd_in_vars) == 0:
-                logger.warning(
-                    "Reflectional equivariance is enabled but no odd variables "
-                    "were specified. The model will be reflectionally equivariant "
-                    "only if all input variables are even scalars."
-                )
-
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
         if not self.is_diagnostic and (self.output_time_dim % self.input_time_dim != 0):
@@ -245,10 +243,14 @@ class HEALPixRecUNet(Module):
                 f"{self.output_time_dim} and {self.input_time_dim})"
             )
 
+        if self.reflection_equivariance_mode in ("averaged", "structural"):
+            self._setup_reflection_channel_indices()
+
         # Build the model layers
         self.fold = HEALPixFoldFaces()
         self.unfold = HEALPixUnfoldFaces(num_faces=12)
-        self.encoder = instantiate(
+
+        encoder_kwargs = dict(
             config=encoder,
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
@@ -256,7 +258,7 @@ class HEALPixRecUNet(Module):
             compile_padding=self.compile_padding,
             nside=self.nside,
         )
-        self.decoder = instantiate(
+        decoder_kwargs = dict(
             config=decoder,
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
@@ -264,6 +266,31 @@ class HEALPixRecUNet(Module):
             compile_padding=self.compile_padding,
             nside=self.nside,
         )
+        if self.reflection_equivariance_mode == "structural":
+            encoder_kwargs["structural_input_even"] = int(self.structural_input_n_even)
+            decoder_kwargs["structural_output_even"] = int(self.structural_output_n_even)
+
+        encoder_kwargs["odd_fraction"] = self.odd_fraction
+        decoder_kwargs["odd_fraction"] = self.odd_fraction
+
+        self.encoder = instantiate(**encoder_kwargs)
+        self.decoder = instantiate(**decoder_kwargs)
+
+        if self.reflection_equivariance_mode == "structural":
+            # Only materialize sin_lat gates when some layer opts into cross-parity 1×1.
+            self._structural_needs_sin_lat_gate = any(
+                getattr(m, "needs_sin_lat", False)
+                for m in list(self.encoder.modules()) + list(self.decoder.modules())
+            )
+            if self._structural_needs_sin_lat_gate:
+                for ns in self.nside:
+                    self.register_buffer(
+                        f"sin_lat_nside_{ns}",
+                        compute_sin_lat_faces(int(ns)),
+                        persistent=False,
+                    )
+        else:
+            self._structural_needs_sin_lat_gate = False
 
         self.constraints = None
         self.set_constraints(constraints)
@@ -272,6 +299,122 @@ class HEALPixRecUNet(Module):
     def integration_steps(self):
         """Number of integration steps"""
         return max(self.output_time_dim // self.input_time_dim, 1)
+
+    def _setup_reflection_channel_indices(self) -> None:
+        """Build odd-channel index buffers for averaged and/or structural modes."""
+        if self.channels is None:
+            raise ValueError("channels must be provided when reflection equivariance is enabled")
+
+        odd_prog = list(self.odd_prognostic_variables or [])
+        odd_out_var_idx = th.tensor([self.channels.index(v) for v in odd_prog], dtype=th.long) if odd_prog else None
+        self.register_buffer("odd_out_var_idx", odd_out_var_idx, persistent=False)
+
+        # Full concatenated encoder input layout after _reshape_inputs (per face batch):
+        # [T * prognostics | T * decoder_inputs | constants | couplings]
+        odd_in_vars = []
+        odd_in_var_idx = []
+        T = self.input_time_dim
+        n_prog = self.input_channels
+        n_di = self.decoder_input_channels
+
+        for t in range(T):
+            for v in odd_prog:
+                odd_in_vars.append(v)
+                odd_in_var_idx.append(t * n_prog + self.channels.index(v))
+
+        # Decoder inputs (TISR etc.) are even — no indices.
+        const_offset = T * (n_prog + n_di)
+        if self.odd_constants is not None and self.constants is not None:
+            for c in self.odd_constants:
+                odd_in_vars.append(c)
+                odd_in_var_idx.append(const_offset + self.constants.index(c))
+
+        coup_offset = const_offset + self.n_constants
+        if self.odd_coupled_variables and self.couplings:
+            # Coupled block is concatenated as provided by coupler; mark listed vars if present
+            coup_vars = []
+            for c in self.couplings:
+                for v in c["params"]["variables"]:
+                    for _ in c["params"]["input_times"]:
+                        coup_vars.append(v)
+            for v in self.odd_coupled_variables:
+                for i, name in enumerate(coup_vars):
+                    if name == v:
+                        odd_in_vars.append(v)
+                        odd_in_var_idx.append(coup_offset + i)
+
+        odd_in_var_idx_t = th.tensor(odd_in_var_idx, dtype=th.long) if odd_in_var_idx else None
+        self.register_buffer("odd_in_var_idx", odd_in_var_idx_t, persistent=False)
+
+        if self.scaling is not None and odd_in_vars:
+            for var in odd_in_vars:
+                # Only check vars that appear in scaling (prognostics/constants)
+                if var in self.scaling and self.scaling[var]["mean"] != 0.0:
+                    raise ValueError(
+                        f"Reflectional equivariance can only be enforced if all odd variables have zero mean. "
+                        f"Odd variable {var} has mean {self.scaling[var]['mean']}"
+                    )
+
+        if not odd_in_vars:
+            logger.warning(
+                "Reflectional equivariance is enabled but no odd variables "
+                "were specified. The model will be reflectionally equivariant "
+                "only if all input variables are even scalars."
+            )
+
+        # Steerable layout: even channels first, then odd
+        total_in = self._compute_input_channels()
+        odd_set = set(odd_in_var_idx)
+        even_idx = [i for i in range(total_in) if i not in odd_set]
+        order = even_idx + odd_in_var_idx
+        inverse = [0] * total_in
+        for new_i, old_i in enumerate(order):
+            inverse[old_i] = new_i
+        self.register_buffer("structural_in_order", th.tensor(order, dtype=th.long), persistent=False)
+        self.register_buffer("structural_in_inverse", th.tensor(inverse, dtype=th.long), persistent=False)
+        self.structural_input_n_even = len(even_idx)
+
+        # Output channel reorder for one time step of output_channels vars
+        # Output layout from decoder: T * output_channels (same var order as channels for prognostics part)
+        out_ch = self._compute_output_channels()
+        # Per time slice of length output_channels
+        t_out = 1 if self.is_diagnostic else self.input_time_dim
+        per = self.output_channels
+        odd_out = []
+        for t in range(t_out):
+            for v in odd_prog:
+                if v in self.channels:
+                    # output variables typically match channels naming for prognostics
+                    try:
+                        # Prefer index in channels for prognostic outputs
+                        local = list(self.channels).index(v) if v in self.channels else None
+                    except ValueError:
+                        local = None
+                    if local is not None and local < per:
+                        odd_out.append(t * per + local)
+        odd_out_set = set(odd_out)
+        even_out = [i for i in range(out_ch) if i not in odd_out_set]
+        out_order = even_out + odd_out
+        out_inverse = [0] * out_ch
+        for new_i, old_i in enumerate(out_order):
+            out_inverse[old_i] = new_i
+        self.register_buffer("structural_out_order", th.tensor(out_order, dtype=th.long), persistent=False)
+        self.register_buffer("structural_out_inverse", th.tensor(out_inverse, dtype=th.long), persistent=False)
+        self.structural_output_n_even = len(even_out)
+
+    def _sin_lat_gates_for_batch(self, batch_faces: int) -> list | None:
+        """sin_lat folded tensors at each encoder nside (shallow → deep).
+
+        Returns ``None`` when no ReflectionSteerable layer sets ``needs_sin_lat``
+        (default fast path: same-parity 1×1, no sin_lat buffers).
+        """
+        if not getattr(self, "_structural_needs_sin_lat_gate", False):
+            return None
+        gates = []
+        for ns in self.nside:
+            faces = getattr(self, f"sin_lat_nside_{ns}")
+            gates.append(expand_sin_lat_folded(faces, batch_faces))
+        return gates
 
     def _compute_input_channels(self) -> int:
         """Calculate total number of input channels in the model"""
@@ -548,7 +691,17 @@ class HEALPixRecUNet(Module):
                 ]
             
             # Forward the data through the model to initialize hidden states
-            self.decoder(self.encoder(input_tensor, conditions_cln=conditions_cln), conditions_cln=conditions_cln)
+            if self.reflection_equivariance_mode == "structural":
+                input_tensor = apply_channel_order(input_tensor, self.structural_in_order)
+                enc_gates = self._sin_lat_gates_for_batch(input_tensor.shape[0])
+                dec_gates = list(reversed(enc_gates)) if enc_gates is not None else None
+                self.decoder(
+                    self.encoder(input_tensor, conditions_cln=conditions_cln, sin_lat_gate=enc_gates),
+                    conditions_cln=conditions_cln,
+                    sin_lat_gate=dec_gates,
+                )
+            else:
+                self.decoder(self.encoder(input_tensor, conditions_cln=conditions_cln), conditions_cln=conditions_cln)
 
             if self.enforce_reflectional_equivariance:
 
@@ -665,8 +818,18 @@ class HEALPixRecUNet(Module):
             else:
                 kwargs = {}
 
-            encodings = self.encoder(input_tensor, **kwargs)
-            decodings = self.decoder(encodings, **kwargs)
+            structural = self.reflection_equivariance_mode == "structural"
+            input_for_residual = input_tensor
+            if structural:
+                input_tensor = apply_channel_order(input_tensor, self.structural_in_order)
+                enc_gates = self._sin_lat_gates_for_batch(input_tensor.shape[0])
+                dec_gates = list(reversed(enc_gates)) if enc_gates is not None else None
+                encodings = self.encoder(input_tensor, sin_lat_gate=enc_gates, **kwargs)
+                decodings = self.decoder(encodings, sin_lat_gate=dec_gates, **kwargs)
+                decodings = apply_channel_order(decodings, self.structural_out_inverse)
+            else:
+                encodings = self.encoder(input_tensor, **kwargs)
+                decodings = self.decoder(encodings, **kwargs)
 
             # Forward through model again with reflected input and original hidden states
             if self.enforce_reflectional_equivariance:
@@ -683,7 +846,7 @@ class HEALPixRecUNet(Module):
                                 else orig_hidden_states[n]
 
                 # Forward through model with reflected input
-                input_tensor_refl = self.hpx_reflect(input_tensor, includes_constants=True)
+                input_tensor_refl = self.hpx_reflect(input_for_residual, includes_constants=True)
                 encodings_refl = self.encoder(input_tensor_refl, **kwargs)
                 decodings_refl = self.decoder(encodings_refl, **kwargs)               
 
@@ -702,7 +865,7 @@ class HEALPixRecUNet(Module):
             # Residual prediction
             combined = self._reshape_outputs(decodings) # [B*F, T*C, H, W] -> [B, F, T, C, H, W]
             prognostics = combined[:, :, :, :self.input_channels]
-            orig_input = self._reshape_outputs(input_tensor[:, : self.input_channels * self.input_time_dim])
+            orig_input = self._reshape_outputs(input_for_residual[:, : self.input_channels * self.input_time_dim])
             if self.residual_prediction:
                 prognostics += orig_input
             diagnostics = combined[:, :, :, self.input_channels:]

@@ -18,11 +18,13 @@ from typing import Sequence
 
 import torch as th
 from hydra.utils import instantiate
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from torch.utils.checkpoint import checkpoint
 
 from .healpix_paddings import warn_deprecated_enable_healpixpad
+from .reflection_ops import bank_sizes, strip_nested_odd_fraction
+from .reflection_steerable_blocks import parity_skip_concat
 
 
 class UNetDecoder(th.nn.Module):
@@ -45,6 +47,8 @@ class UNetDecoder(th.nn.Module):
         per_level_cln: list[bool] = None,
         per_level_checkpointing: list[bool] = None,
         enable_healpixpad: bool | None = None,
+        structural_output_even: int | None = None,
+        odd_fraction: float = 0.25,
     ):
         """
         Parameters
@@ -85,9 +89,13 @@ class UNetDecoder(th.nn.Module):
             If None, the checkpointing will not be applied
         enable_healpixpad: bool, optional
             Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
+        odd_fraction: float, optional
+            Global even|odd bank split for ReflectionSteerable blocks. Set on
+            ``HEALPixRecUNet`` and propagated here; do not set per block.
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        self.odd_fraction = float(odd_fraction)
         self.channel_dim = 1  # 1 in previous layout
         if len(nside) != len(n_channels):
             raise ValueError(
@@ -120,14 +128,22 @@ class UNetDecoder(th.nn.Module):
             if n == 0:
                 up_sample_module = None
             else:
+                up_config = strip_nested_odd_fraction(
+                    up_sampling_block, self.odd_fraction, label="decoder.up_sampling_block"
+                )
+                up_extra = {}
+                up_target = str(OmegaConf.select(up_config, "_target_", default=""))
+                if "ReflectionSteerable" in up_target:
+                    up_extra["odd_fraction"] = self.odd_fraction
                 up_sample_module = instantiate(
-                    config=up_sampling_block,
+                    config=up_config,
                     in_channels=curr_channel,
                     out_channels=curr_channel,
                     enable_nhwc=enable_nhwc,
                     hpx_padding_mode=hpx_padding_mode,
                     compile_padding=compile_padding,
                     nside=nside[len(n_channels) - n],
+                    **up_extra,
                 )
 
             next_channel = (
@@ -135,13 +151,26 @@ class UNetDecoder(th.nn.Module):
             )
 
             # apply conditional layer norm if enabled for this level
-            block_config = conv_block.copy()
+            block_config = strip_nested_odd_fraction(
+                conv_block, self.odd_fraction, label="decoder.conv_block"
+            )
             if "conditional_layer_norm" in block_config and block_config.conditional_layer_norm is not None:
                 if not per_level_cln[n]:
                     block_config.conditional_layer_norm = None
 
+            target = str(OmegaConf.select(block_config, "_target_", default=""))
+            is_reflection_steerable = "ReflectionSteerable" in target
+            conv_extra = {}
+            if is_reflection_steerable:
+                conv_extra["odd_fraction"] = self.odd_fraction
+                if n > 0:
+                    ne, _ = bank_sizes(curr_channel, self.odd_fraction)
+                    conv_extra["in_even"] = 2 * ne
+                ne_out, _ = bank_sizes(next_channel, self.odd_fraction)
+                conv_extra["out_even"] = ne_out
+
             conv_module = instantiate(
-                config=conv_block,
+                config=block_config,
                 in_channels=curr_channel * 2
                 if n > 0
                 else curr_channel,  # Considering skip connection
@@ -153,17 +182,26 @@ class UNetDecoder(th.nn.Module):
                 hpx_padding_mode=hpx_padding_mode,
                 compile_padding=compile_padding,
                 nside=nside[len(n_channels) - 1 - n],
+                **conv_extra,
             )
 
             # Recurrent module
             if recurrent_block is not None:
+                rec_config = strip_nested_odd_fraction(
+                    recurrent_block, self.odd_fraction, label="decoder.recurrent_block"
+                )
+                rec_extra = {}
+                rec_target = str(OmegaConf.select(rec_config, "_target_", default=""))
+                if "ReflectionSteerable" in rec_target:
+                    rec_extra["odd_fraction"] = self.odd_fraction
                 rec_module = instantiate(
-                    config=recurrent_block,
+                    config=rec_config,
                     in_channels=next_channel,
                     enable_nhwc=enable_nhwc,
                     hpx_padding_mode=hpx_padding_mode,
                     compile_padding=compile_padding,
                     nside=nside[len(n_channels) - 1 - n],
+                    **rec_extra,
                 )
             else:
                 rec_module = None
@@ -180,8 +218,19 @@ class UNetDecoder(th.nn.Module):
 
         self.decoder = th.nn.ModuleList(self.decoder)
         # (Linear) Output layer
+        out_config = strip_nested_odd_fraction(
+            output_layer, self.odd_fraction, label="decoder.output_layer"
+        )
+        out_extra = {}
+        out_target = str(OmegaConf.select(out_config, "_target_", default=""))
+        if "ReflectionSteerable" in out_target:
+            out_extra["odd_fraction"] = self.odd_fraction
+            if structural_output_even is not None:
+                out_extra["out_even"] = structural_output_even
+            ne_in, _ = bank_sizes(curr_channel, self.odd_fraction)
+            out_extra["in_even"] = ne_in
         self.output_layer = instantiate(
-            config=output_layer,
+            config=out_config,
             in_channels=curr_channel,
             out_channels=output_channels,
             dilation=dilations[-1],
@@ -189,28 +238,48 @@ class UNetDecoder(th.nn.Module):
             hpx_padding_mode=hpx_padding_mode,
             compile_padding=compile_padding,
             nside=nside[0],
+            **out_extra,
+        )
+        # Detect ReflectionSteerable Hydra targets (vs baseline SymmetricConvNeXt blocks).
+        self.reflection_steerable = "ReflectionSteerable" in str(
+            OmegaConf.select(conv_block, "_target_", default="")
         )
 
-    def _forward_layer_pass(self, layer: th.nn.Module, x: th.Tensor, skip_connection: th.Tensor=None, conditions_cln: th.Tensor=None) -> th.Tensor:
+    def _forward_layer_pass(
+        self,
+        layer: th.nn.Module,
+        x: th.Tensor,
+        skip_connection: th.Tensor = None,
+        conditions_cln: th.Tensor = None,
+        sin_lat_gate: th.Tensor = None,
+    ) -> th.Tensor:
         """
         Forward pass of a single layer of the decoder
         Handled seperately to allow for checkpointing of the layer
         """
-        
+
         if layer["upsamp"] is not None:
             up = layer["upsamp"](x)
-            x = th.cat([up, skip_connection], dim=self.channel_dim)
-        # apply the conv block, check if the layer accepts conditional inputs
+            if self.reflection_steerable:
+                x = parity_skip_concat(up, skip_connection, self.odd_fraction)
+            else:
+                x = th.cat([up, skip_connection], dim=self.channel_dim)
         if hasattr(layer["conv"], "cln_enabled") and layer["conv"].cln_enabled:
             if conditions_cln is not None:
-                x = layer["conv"](x, conditions_cln=conditions_cln)
+                if getattr(layer["conv"], "reflection_steerable", False):
+                    x = layer["conv"](x, conditions_cln=conditions_cln, sin_lat_gate=sin_lat_gate)
+                else:
+                    x = layer["conv"](x, conditions_cln=conditions_cln)
             else:
                 raise ValueError("Conditional inputs are required for layers with cln_enabled=True")
+        elif getattr(layer["conv"], "reflection_steerable", False):
+            x = layer["conv"](x, sin_lat_gate=sin_lat_gate)
         else:
             x = layer["conv"](x)
 
         return x
-    def forward(self, inputs: Sequence, conditions_cln: Sequence = None) -> th.Tensor:
+
+    def forward(self, inputs: Sequence, conditions_cln: Sequence = None, sin_lat_gate=None) -> th.Tensor:
         """
         Forward pass of the HEALPix Unet decoder
 
@@ -220,25 +289,43 @@ class UNetDecoder(th.nn.Module):
             The inputs to decode
         conditions_cln: Sequence, optional
             The conditional inputs for the normalization layers.
-
-        Returns
-        -------
-        torch.Tensor: The decoded values
+        sin_lat_gate: optional
+            Odd geometric gate (sin_lat). Sequence uses one tensor per decoder level
+            (deepest-first), or a single tensor for all levels.
         """
         x = inputs[-1]
         for n, layer in enumerate(self.decoder):
             skip_connection = inputs[-1 - n] if layer["upsamp"] is not None else None
+            gate_n = None
+            if sin_lat_gate is not None:
+                gate_n = sin_lat_gate[n] if isinstance(sin_lat_gate, (list, tuple)) else sin_lat_gate
             if self.per_level_checkpointing[n]:
-                x = checkpoint(self._forward_layer_pass, layer, x, skip_connection, conditions_cln, use_reentrant=False)
+                x = checkpoint(
+                    self._forward_layer_pass,
+                    layer,
+                    x,
+                    skip_connection,
+                    conditions_cln,
+                    gate_n,
+                    use_reentrant=False,
+                )
             else:
-                x = self._forward_layer_pass(layer, x, skip_connection, conditions_cln)
+                x = self._forward_layer_pass(layer, x, skip_connection, conditions_cln, gate_n)
 
             # apply the recurrent block if it exists
             # NOTE: this should be done after the checkpointing to avoid issues with
             # the recurrent block changing during reinitialization
             if layer["recurrent"] is not None:
-                x = layer["recurrent"](x)
+                if getattr(layer["recurrent"], "reflection_steerable", False):
+                    x = layer["recurrent"](x, sin_lat_gate=gate_n)
+                else:
+                    x = layer["recurrent"](x)
 
+        if getattr(self.output_layer, "reflection_steerable", False):
+            gate_out = None
+            if sin_lat_gate is not None:
+                gate_out = sin_lat_gate[-1] if isinstance(sin_lat_gate, (list, tuple)) else sin_lat_gate
+            return self.output_layer(x, sin_lat_gate=gate_out)
         return self.output_layer(x)
 
     def reset(self):

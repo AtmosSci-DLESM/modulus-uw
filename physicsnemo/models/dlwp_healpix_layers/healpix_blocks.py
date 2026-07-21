@@ -26,6 +26,7 @@ from .normalization import ConditionalLayerNorm
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
+from hydra.utils import get_class
 
 #
 # Helper: standard LayerNorm over channel dimension for (B, C, H, W)
@@ -1446,7 +1447,12 @@ class Interpolate(th.nn.Module):
     This is done as a class so that scale and mode can be stored
     """
 
-    def __init__(self, scale_factor: Union[int, Tuple], mode: str = "nearest"):
+    def __init__(
+        self,
+        scale_factor: Union[int, Tuple],
+        mode: str = "nearest",
+        **kwargs,
+    ):
         """
         Parameters:
         ----------
@@ -1454,6 +1460,8 @@ class Interpolate(th.nn.Module):
             Multiplier for spatial size, passed to torch.nn.functional.interpolate
         mode: str, optional
             Interpolation mode used for upsampling, passed to torch.nn.functional.interpolate
+        **kwargs:
+            Ignored extras (e.g. ``in_channels``/``out_channels`` passed by UNetDecoder).
         """
         super().__init__()
         self.interp = th.nn.functional.interpolate
