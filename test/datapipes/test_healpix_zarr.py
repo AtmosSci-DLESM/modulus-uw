@@ -745,6 +745,8 @@ def test_TimeSeriesDataModule_get_dataloaders(
 
     # use the prebuilt dataset
     # Internally initializes DistributedManager
+    # drop_last=True + dataloader_batch_size=None is the dlesym-aq default and
+    # must not raise when constructing the DataLoader.
     timeseries_dm = TimeSeriesDataModuleZarr(
         dataset_path=dataset_path,
         input_variables=input_variables,
@@ -752,16 +754,21 @@ def test_TimeSeriesDataModule_get_dataloaders(
         scaling=scaling_double_dict,
         splits=splits,
         shuffle=False,
+        drop_last=True,
+        dataloader_batch_size=None,
     )
 
     # with 1 shard should get no sampler
     train_dataloader, train_sampler = timeseries_dm.train_dataloader(num_shards=1)
     assert train_sampler is None
     assert isinstance(train_dataloader, DataLoader)
+    assert train_dataloader.batch_size is None
+    assert train_dataloader.drop_last is False
 
     val_dataloader, val_sampler = timeseries_dm.val_dataloader(num_shards=1)
     assert val_sampler is None
     assert isinstance(val_dataloader, DataLoader)
+    assert val_dataloader.drop_last is False
 
     test_dataloader, test_sampler = timeseries_dm.test_dataloader(num_shards=1)
     assert test_sampler is None

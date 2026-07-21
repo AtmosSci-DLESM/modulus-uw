@@ -332,13 +332,17 @@ class TimeSeriesDataModuleZarr:
             )
             shuffle = False
 
+        # Dataset-level batching uses dataloader_batch_size=None. PyTorch forbids
+        # drop_last=True in that case; the dataset already honors drop_last for
+        # incomplete batches. Keep DataLoader drop_last only when it auto-batches.
+        dl_drop_last = drop_last if self.dataloader_batch_size is not None else False
         dataloader_kwargs = {
             "dataset": dataset,
             "pin_memory": self.pin_memory,
             "num_workers": self.num_workers,
             "persistent_workers": (self.persistent_workers and self.num_workers > 0),
             "shuffle": shuffle,
-            "drop_last": drop_last,
+            "drop_last": dl_drop_last,
             "sampler": sampler,
             "collate_fn": self.collate_fn,
             "batch_size": self.dataloader_batch_size,

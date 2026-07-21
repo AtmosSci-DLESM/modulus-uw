@@ -1032,16 +1032,21 @@ def test_CoupledTimeSeriesDataModuleZarr_get_dataloaders(
         splits=splits,
         shuffle=False,
         couplings=constant_coupler_config,
+        drop_last=True,
+        dataloader_batch_size=None,
     )
 
     # with 1 shard should get no sampler
     train_dataloader, train_sampler = timeseries_dm.train_dataloader(num_shards=1)
     assert train_sampler is None
     assert isinstance(train_dataloader, DataLoader)
+    assert train_dataloader.batch_size is None
+    assert train_dataloader.drop_last is False
 
     val_dataloader, val_sampler = timeseries_dm.val_dataloader(num_shards=1)
     assert val_sampler is None
     assert isinstance(val_dataloader, DataLoader)
+    assert val_dataloader.drop_last is False
 
     test_dataloader, test_sampler = timeseries_dm.test_dataloader(num_shards=1)
     assert test_sampler is None
