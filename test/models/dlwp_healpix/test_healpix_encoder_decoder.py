@@ -411,3 +411,66 @@ def test_UNetDecoder_reset(device, pytestconfig):
 
     del decoder, outvar, invars
     torch.cuda.empty_cache()
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_UNetDecoder_per_level_cln(device, pytestconfig):
+    """Decoder must honor per_level_cln when stripping CLN from conv_block config."""
+    from omegaconf import OmegaConf
+
+    from physicsnemo.models.dlwp_healpix_layers import UNetDecoder
+
+    n_channels = (64, 32, 16)
+    per_level_cln = [True, False, False]
+
+    conv_block = OmegaConf.create(
+        {
+            "_target_": "physicsnemo.models.dlwp_healpix_layers.healpix_blocks.Multi_SymmetricConvNeXtBlock",
+            "kernel_size": 3,
+            "dilation": 1,
+            "upscale_factor": 4,
+            "n_layers": 1,
+            "conditional_layer_norm": {
+                "_target_": "physicsnemo.models.dlwp_healpix_layers.normalization.ConditionalLayerNorm",
+                "_partial_": True,
+                "init_cln_to_zero": True,
+                "scale_center": 1.0,
+                "mlp_hidden_dims": [16, 16],
+                "condition_shape": 8,
+            },
+        }
+    )
+    up_sampling_block = OmegaConf.create(
+        {
+            "_target_": "physicsnemo.models.dlwp_healpix_layers.healpix_blocks.TransposedConvUpsample",
+            "upsampling": 2,
+        }
+    )
+    output_layer = OmegaConf.create(
+        {
+            "_target_": "physicsnemo.models.dlwp_healpix_layers.healpix_blocks.BasicConvBlock",
+            "kernel_size": 1,
+            "dilation": 1,
+            "n_layers": 1,
+        }
+    )
+
+    decoder = UNetDecoder(
+        conv_block=conv_block,
+        up_sampling_block=up_sampling_block,
+        output_layer=output_layer,
+        recurrent_block=None,
+        n_channels=n_channels,
+        per_level_cln=per_level_cln,
+    ).to(device)
+
+    for level_idx, expected_cln in enumerate(per_level_cln):
+        conv = decoder.decoder[level_idx]["conv"]
+        assert conv.cln_enabled is expected_cln, (
+            f"decoder level {level_idx}: expected cln_enabled={expected_cln}, "
+            f"got {conv.cln_enabled}"
+        )
+
+    del decoder
+    torch.cuda.empty_cache()
