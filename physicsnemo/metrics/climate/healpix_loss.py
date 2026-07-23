@@ -1216,7 +1216,9 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
                 h,
                 w,
             ).squeeze(0)  # [B,F,T,C,H,W]
-            return self.averaging_coeff * (diff_target - self.coeff_eps * diff_ensemble)
+            # Collapsed sum counts each member once; pairwise path counts twice.
+            coeff = n * self.averaging_coeff
+            return coeff * (diff_target - self.coeff_eps * diff_ensemble)
 
         diff_i = diff_to_target  # [Cond,B,F,T,C,H,W]
         diff_i_i = diff_i.unsqueeze(0)  # [1,Cond,B,F,T,C,H,W]

@@ -491,6 +491,60 @@ def test_PatchedEnergyScoreLoss_two_members_zero_and_symmetry(device, patch_size
 
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+@pytest.mark.parametrize("patch_size", [3])
+@pytest.mark.parametrize("hpx_padding_mode", ["karlbauer"])
+@pytest.mark.parametrize("enable_nhwc", [False])
+def test_PatchedEnergyScoreLoss_two_member_fast_matches_pairwise(
+    device, patch_size, hpx_padding_mode, enable_nhwc
+):
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    b, f, t, c, h, w = 2, 12, 2, 2, 64, 64
+    n_members = 2
+    loss_fn = PatchedEnergyScoreLoss(
+        weights=[1.0] * c,
+        n_members=n_members,
+        alpha=0.95,
+        patch_size=patch_size,
+        hpx_padding_mode=hpx_padding_mode,
+        enable_nhwc=enable_nhwc,
+        nside=h,
+    )
+    trainer = trainer_helper(output_variables=[f"var{i}" for i in range(c)], device=device)
+    loss_fn.setup(trainer)
+
+    torch.manual_seed(0)
+    target = torch.randn(b, f, t, c, h, w, device=device)
+    pred = torch.randn(n_members, b, f, t, c, h, w, device=device)
+
+    fast = loss_fn._energy_score_field(pred, target, n_members, b, f, t, c, h, w).mean()
+
+    with torch.no_grad():
+        tar_unfold = loss_fn._unfold_target(target)
+    pred_unfold = loss_fn._unfold_prediction_members(pred)
+    diff_to_target = loss_fn._reshape_member_norms(
+        loss_fn._weighted_patch_norm(pred_unfold - tar_unfold.unsqueeze(0), patch_dim=-2),
+        b, f, t, c, h, w,
+    )
+    diff_i = diff_to_target
+    pred_i = pred_unfold.unsqueeze(1)
+    pred_j = pred_unfold.unsqueeze(0)
+    dist_ensemble = loss_fn._weighted_patch_norm(pred_i - pred_j, patch_dim=-2)
+    dist_ensemble = dist_ensemble.view(n_members, n_members, b, t, f, c, h, w).permute(
+        0, 1, 2, 4, 3, 5, 6, 7
+    )
+    mask = loss_fn.diag_mask[:, :, None, None, None, None, None, None]
+    diff_terms = mask * (diff_i.unsqueeze(0) + diff_i.unsqueeze(1))
+    dist_terms = mask * dist_ensemble
+    pairwise = (
+        loss_fn.averaging_coeff * (diff_terms - loss_fn.coeff_eps * dist_terms).sum(dim=(0, 1))
+    ).mean()
+
+    assert torch.isclose(fast, pairwise, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 @pytest.mark.parametrize("patch_size", [3, 5])
 @pytest.mark.parametrize("hpx_padding_mode", ["earth2grid", "karlbauer", "isolatitude"])
 @pytest.mark.parametrize("enable_nhwc", [True, False])
