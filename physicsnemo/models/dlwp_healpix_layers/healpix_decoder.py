@@ -141,7 +141,7 @@ class UNetDecoder(th.nn.Module):
                     block_config.conditional_layer_norm = None
 
             conv_module = instantiate(
-                config=conv_block,
+                config=block_config,
                 in_channels=curr_channel * 2
                 if n > 0
                 else curr_channel,  # Considering skip connection
