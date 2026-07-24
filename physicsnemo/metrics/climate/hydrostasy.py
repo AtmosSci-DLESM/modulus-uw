@@ -26,8 +26,13 @@ from physicsnemo.distributed import DistributedManager
 from physicsnemo.launch.logging import RankZeroLoggingWrapper
 
 logger = logging.getLogger(__name__)
-if DistributedManager.is_initialized():
-    logger = RankZeroLoggingWrapper(logger, DistributedManager())
+
+
+def _logger0():
+    """Rank-0-only logging when distributed training is active."""
+    if DistributedManager.is_initialized():
+        return RankZeroLoggingWrapper(logger, DistributedManager())
+    return logger
 
 _LEGACY_PATH_DEPRECATION = (
     "src_directory, dst_directory, dataset_name, and data_format are deprecated for "
@@ -107,19 +112,18 @@ def _load_topography(
     topography = torch.tensor(
         topography[np.newaxis, :, np.newaxis, :, :], dtype=torch.float
     )
-    logger.info(
+    logger0 = _logger0()
+    logger0.info(
         f"Min/Max topography (m): {topography.min()}/{topography.max()}"
     )
     # Warn rather than raise so legacy configs/checkpoints with unusual scaling
     # still train; callers can inspect logs if topography looks wrong.
     if topography.min() < -1000.0 or topography.max() > 10000.0:
-        warnings.warn(
+        logger0.warning(
             "Topography values fall outside the expected range "
             f"[-1000, 10000] m (min={float(topography.min())}, "
             f"max={float(topography.max())}). Check surface_geopotential_* "
-            "scaling and convert_topography_to_meters.",
-            UserWarning,
-            stacklevel=3,
+            "scaling and convert_topography_to_meters."
         )
     return topography
 
