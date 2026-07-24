@@ -68,6 +68,7 @@ class TimeSeriesDataModuleZarr:
         add_train_noise: Optional[bool] = False,
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
+        in_order: Optional[bool] = None,
     ):
         """
         Parameters
@@ -133,6 +134,9 @@ class TimeSeriesDataModuleZarr:
             Dictionary containing parameters for adding noise to the training data
         train_noise_seed: int, optional
             Seed for the random number generator for adding noise to the training data, default 42
+        in_order: bool, optional
+            Passed to torch.utils.data.DataLoader when set (requires PyTorch with ``in_order`` support).
+            If None, DataLoader default applies.
         """
         super().__init__()
         self.dataset_path = Path(dataset_path)
@@ -160,6 +164,7 @@ class TimeSeriesDataModuleZarr:
         self.add_train_noise = add_train_noise
         self.train_noise_params = train_noise_params
         self.train_noise_seed = train_noise_seed
+        self.in_order = in_order
 
         self.train_dataset = None
         self.val_dataset = None
@@ -317,7 +322,6 @@ class TimeSeriesDataModuleZarr:
         DataLoader: The configured dataloader
         """
         sampler = None
-        drop_last = False
         if num_shards > 1:
             sampler = DistributedSampler(
                 dataset,
@@ -327,21 +331,26 @@ class TimeSeriesDataModuleZarr:
                 drop_last=drop_last,
             )
             shuffle = False
-            drop_last = False
 
+        # Dataset-level batching uses dataloader_batch_size=None. PyTorch forbids
+        # drop_last=True in that case; the dataset already honors drop_last for
+        # incomplete batches. Keep DataLoader drop_last only when it auto-batches.
+        dl_drop_last = drop_last if self.dataloader_batch_size is not None else False
         dataloader_kwargs = {
             "dataset": dataset,
             "pin_memory": self.pin_memory,
             "num_workers": self.num_workers,
             "persistent_workers": (self.persistent_workers and self.num_workers > 0),
             "shuffle": shuffle,
-            "drop_last": drop_last,
+            "drop_last": dl_drop_last,
             "sampler": sampler,
             "collate_fn": self.collate_fn,
             "batch_size": self.dataloader_batch_size,
         }
         if self.prefetch_factor is not None and self.num_workers > 0:
             dataloader_kwargs["prefetch_factor"] = self.prefetch_factor
+        if self.in_order is not None:
+            dataloader_kwargs["in_order"] = self.in_order
         loader = DataLoader(**dataloader_kwargs)
 
         return loader, sampler
@@ -366,7 +375,7 @@ class TimeSeriesDataModuleZarr:
             num_shards=num_shards,
             shard_id=shard_id,
             shuffle=self.shuffle,
-            drop_last=True,
+            drop_last=self.drop_last,
         )
 
     def val_dataloader(self, num_shards=1, shard_id=0) -> DataLoader:
@@ -389,7 +398,7 @@ class TimeSeriesDataModuleZarr:
             num_shards=num_shards,
             shard_id=shard_id,
             shuffle=False,
-            drop_last=True,
+            drop_last=self.drop_last,
         )
 
     def test_dataloader(self, num_shards=1, shard_id=0) -> DataLoader:
@@ -412,7 +421,7 @@ class TimeSeriesDataModuleZarr:
             num_shards=num_shards,
             shard_id=shard_id,
             shuffle=False,
-            drop_last=True,
+            drop_last=False,
         )
 
 
@@ -450,6 +459,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         add_train_noise: Optional[bool] = False,
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
+        in_order: Optional[bool] = None,
     ):
         """
         Parameters
@@ -518,6 +528,8 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             Dictionary containing parameters for adding noise to the training data
         train_noise_seed: int, optional
             Seed for the random number generator for adding noise to the training data, default 42
+        in_order: bool, optional
+            Passed to torch.utils.data.DataLoader when set. If None, DataLoader default applies.
         """
         self.couplings = couplings
 
@@ -547,6 +559,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             add_train_noise,
             train_noise_params,
             train_noise_seed,
+            in_order,
         )
 
     def _get_coupled_vars(self):
