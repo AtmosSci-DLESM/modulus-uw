@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ruff: noqa: E402
+import logging
 import os
 import sys
 
@@ -238,6 +239,33 @@ def test_nonnegative_variables_not_in_channels_ignored():
     flat = mod.thresholds.view(-1)
     assert flat.numel() == 1
     assert flat[0].item() == pytest.approx((0.0 - 2.0) / 1.0)
+
+
+def test_nonnegative_no_warning_when_all_variables_in_channels(caplog):
+    channels = ["q400", "sp", "tcwv"]
+    scaling = {name: {"mean": 0.0, "std": 1.0} for name in channels}
+    with caplog.at_level(logging.WARNING):
+        NonnegativeConstraint(
+            variables=channels,
+            in_channels=channels,
+            out_channels=channels,
+            scaling=scaling,
+        )
+    assert "not found in model channels" not in caplog.text
+
+
+def test_nonnegative_warning_when_variables_missing(caplog):
+    channels = ["only"]
+    scaling = {"only": {"mean": 2.0, "std": 1.0}}
+    with caplog.at_level(logging.WARNING):
+        NonnegativeConstraint(
+            variables=["only", "missing"],
+            in_channels=channels,
+            out_channels=channels,
+            scaling=scaling,
+        )
+    assert "missing" in caplog.text
+    assert "not found in model channels" in caplog.text
 
 
 def test_nonnegative_no_constrained_variables_all_neg_inf():

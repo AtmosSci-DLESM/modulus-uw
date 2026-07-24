@@ -71,13 +71,14 @@ class NonnegativeConstraint(torch.nn.Module):
         self.keep_grad_through_clamp = keep_grad_through_clamp
 
         # Only apply constraint to variables that are used by model
+        missing = [var for var in self.variables if var not in self.channels]
         self.variables = [var for var in self.variables if var in self.channels]
 
-        logger0.warning(
-            f"Requested non-negative constrained variables "
-            f"{[v for v in variables if v not in self.variables]} not found in "
-            f"model channels and will be ignored."
-        )
+        if missing:
+            logger0.warning(
+                f"Requested non-negative constrained variables "
+                f"{missing} not found in model channels and will be ignored."
+            )
 
         constrained_set = set(self.variables)
         per_channel = [
