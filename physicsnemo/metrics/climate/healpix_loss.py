@@ -1310,3 +1310,237 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             loss = es.mean(dim=(0, 1, 2, 4, 5))
 
         return loss
+
+
+class GlobalEnergyScoreLoss(th.nn.MSELoss):
+    """
+    Global multivariate energy score on HEALPix grids.
+
+    For each channel, the full spatial field (F, H, W) is treated as one vector
+    and the almost-fair ensemble energy score is computed with Euclidean (L2)
+    norms. Optional land-sea masking weights the norm via sqrt(lsm) scaling before
+    flattening so that ||v||_2^2 = sum(lsm * v^2) over valid pixels.
+    """
+
+    def __init__(
+        self,
+        weights: Sequence = [],
+        n_members: int = 2,
+        alpha: float = 0.95,
+        lsm_file: str = None,
+        open_dict: dict = {"engine": "zarr"},
+        selection_dict: dict = {"channel_c": "land_sea_mask"},
+        channel_chunk_size: int | None = None,
+    ):
+        super().__init__()
+        if n_members < 2:
+            raise ValueError("n_members must be at least 2 for energy score to be defined")
+        self.n_members = n_members
+        self.loss_weights = th.tensor(weights)
+        self.device = None
+        self.alpha = alpha
+        self.channel_chunk_size = channel_chunk_size
+
+        self.coeff_eps = 1 - ((1 - alpha) / n_members)
+        self.averaging_coeff = 1 / (2 * n_members * (n_members - 1))
+
+        if lsm_file is not None:
+            self.lsm_ds = xr.open_dataset(lsm_file, **open_dict).constants.sel(selection_dict)
+            self.lsm_tensor = 1 - th.tensor(np.expand_dims(self.lsm_ds.values, (0, 2, 3)))
+            self._use_lsm = True
+        else:
+            self.lsm_tensor = th.ones(1, 1, 1, 1, 1, 1)
+            self._use_lsm = False
+
+        self.diag_mask = th.ones(self.n_members, self.n_members) - th.eye(self.n_members)
+
+    def setup(self, trainer):
+        if len(trainer.output_variables) != len(self.loss_weights):
+            raise ValueError(
+                f"Length of outputs {len(trainer.output_variables)} and "
+                f"loss_weights {len(self.loss_weights)} is not the same!"
+            )
+
+        self.loss_weights = self.loss_weights.to(device=trainer.device)
+        self.averaging_coeff = th.tensor(self.averaging_coeff, device=trainer.device)
+        self.coeff_eps = th.tensor(self.coeff_eps, device=trainer.device)
+        self.diag_mask = self.diag_mask.to(device=trainer.device)
+        self.lsm_tensor = self.lsm_tensor.to(device=trainer.device)
+
+    def _lsm_sqrt_broadcast(self, f: int, h: int, w: int) -> th.Tensor:
+        """Return sqrt(lsm) shaped [1, 1, 1, F, H, W] for field masking."""
+        if not self._use_lsm:
+            return None
+        lsm_sqrt = self.lsm_tensor.sqrt()
+        if lsm_sqrt.numel() == 1:
+            return None
+        return lsm_sqrt.reshape(1, 1, 1, f, h, w)
+
+    def _energy_score_channels(
+        self,
+        prediction: th.Tensor,
+        target: th.Tensor,
+        n: int,
+        b: int,
+        f: int,
+        t: int,
+        c: int,
+        h: int,
+        w: int,
+    ) -> th.Tensor:
+        """Per-(B,T,channel) energy score for a channel slice; returns [B, T, c]."""
+        pred = prediction.permute(0, 1, 3, 4, 2, 5, 6)  # [N, B, T, c, F, H, W]
+        tar = target.permute(0, 2, 3, 1, 4, 5)  # [B, T, c, F, H, W]
+
+        lsm_sqrt = self._lsm_sqrt_broadcast(f, h, w)
+        if lsm_sqrt is not None:
+            pred = pred * lsm_sqrt
+            tar = tar * lsm_sqrt.squeeze(0)
+
+        pred_flat = pred.reshape(n, b * t * c, f * h * w)
+        with th.no_grad():
+            tar_flat = tar.reshape(b * t * c, f * h * w)
+
+        diff_to_target = th.linalg.vector_norm(
+            pred_flat - tar_flat.unsqueeze(0), dim=-1
+        )  # [N, B*T*c]
+
+        if n == 2:
+            diff_target = diff_to_target.sum(dim=0)
+            diff_ensemble = th.linalg.vector_norm(pred_flat[0] - pred_flat[1], dim=-1)
+            es = self.averaging_coeff * (diff_target - self.coeff_eps * diff_ensemble)
+        else:
+            diff_i = diff_to_target.view(n, b, t, c)
+            diff_i_i = diff_i.unsqueeze(0)
+            diff_j_i = diff_i.unsqueeze(1)
+
+            pred_i = pred_flat.unsqueeze(1)
+            pred_j = pred_flat.unsqueeze(0)
+            dist_ensemble = th.linalg.vector_norm(pred_i - pred_j, dim=-1).view(
+                n, n, b, t, c
+            )
+
+            mask = self.diag_mask[:, :, None, None, None]
+            diff_terms = mask * (diff_i_i + diff_j_i)
+            dist_terms = mask * dist_ensemble
+            es = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_terms).sum(
+                dim=(0, 1)
+            )
+
+        return es.reshape(b, t, c)
+
+    def forward(self, prediction, target, average_channels: bool = True):
+        """
+        Forward pass of the global energy score loss.
+
+        prediction: [Cond*B, F, T, C, H, W]
+        target: [B, F, T, C, H, W]
+        """
+        b, f, t, c, h, w = target.shape
+        if prediction.shape[0] % b != 0:
+            raise ValueError(
+                f"Leading prediction dimension must be divisible by batch size, "
+                f"got prediction.shape[0]={prediction.shape[0]} and batch={b}"
+            )
+        n = prediction.shape[0] // b
+        prediction = prediction.view(n, b, f, t, c, h, w)
+
+        if prediction.shape[1:] != target.shape:
+            raise ValueError(
+                f"Shape of prediction should match shape of target along non-ensemble "
+                f"dimensions, got {prediction.shape} and {target.shape}"
+            )
+
+        if n != self.n_members:
+            raise ValueError(
+                f"Shape of prediction should have ensemble dimension of size "
+                f"{self.n_members}, got {n}"
+            )
+
+        prediction = prediction.to(th.float32)
+        target = target.to(th.float32)
+
+        chunk = self.channel_chunk_size
+        if chunk is None or chunk >= c:
+            es = self._energy_score_channels(prediction, target, n, b, f, t, c, h, w)
+        else:
+            es = th.empty(b, t, c, device=prediction.device, dtype=prediction.dtype)
+            for c0 in range(0, c, chunk):
+                c_end = min(c0 + chunk, c)
+                es[:, :, c0:c_end] = self._energy_score_channels(
+                    prediction[:, :, :, :, c0:c_end],
+                    target[:, :, :, c0:c_end],
+                    n,
+                    b,
+                    f,
+                    t,
+                    c_end - c0,
+                    h,
+                    w,
+                )
+
+        es *= self.loss_weights[None, None, :]
+
+        if average_channels:
+            return es.mean()
+        return es.mean(dim=(0, 1))
+
+
+class WeightedCompositeLoss(th.nn.Module):
+    """
+    Linear combination of DLWP-compatible loss callables with scalar weights.
+
+    Each child loss must implement ``setup(trainer)`` and
+    ``forward(prediction, target, average_channels=...)``. When
+    ``average_channels=False``, children are expected to return per-channel
+    tensors of the same shape so the weighted sum remains per-channel.
+    """
+
+    def __init__(
+        self,
+        weights: Sequence[float],
+        losses: Sequence[th.nn.Module],
+    ):
+        super().__init__()
+        if len(weights) != len(losses):
+            raise ValueError(
+                f"weights and losses must have the same length, got "
+                f"{len(weights)} and {len(losses)}"
+            )
+        if len(weights) == 0:
+            raise ValueError("WeightedCompositeLoss requires at least one loss")
+        self.weights = list(weights)
+        self.losses = th.nn.ModuleList(losses)
+        self.needs_input = any(
+            getattr(loss, "needs_input", False) for loss in self.losses
+        )
+
+    def setup(self, trainer) -> None:
+        for loss in self.losses:
+            if hasattr(loss, "setup"):
+                loss.setup(trainer)
+
+    def forward(
+        self,
+        prediction: th.Tensor,
+        target: th.Tensor,
+        average_channels: bool = True,
+        input: th.Tensor | None = None,
+        **kwargs,
+    ) -> th.Tensor:
+        total = None
+        for weight, loss in zip(self.weights, self.losses):
+            call_kwargs = dict(kwargs)
+            if getattr(loss, "needs_input", False):
+                call_kwargs["input"] = input
+            elif "input" in call_kwargs:
+                call_kwargs.pop("input")
+            part = loss(
+                prediction,
+                target,
+                average_channels=average_channels,
+                **call_kwargs,
+            )
+            weighted = weight * part
+            total = weighted if total is None else total + weighted
+        return total
