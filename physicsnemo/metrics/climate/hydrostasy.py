@@ -128,6 +128,18 @@ def _load_topography(
     return topography
 
 
+def _validate_topography_masking_config(
+    topography_masking: bool,
+    convert_topography_to_meters: bool,
+) -> None:
+    if topography_masking and not convert_topography_to_meters:
+        raise ValueError(
+            "topography_masking requires convert_topography_to_meters=True: "
+            "masking compares geopotential heights converted to meters against "
+            "surface topography."
+        )
+
+
 def _average_virtual_temperature_from_geopotential_height(z1, z2, p1, p2, R, g0):
     return g0 / (R * np.log(p1 / p2)) * (z2 - z1)
 
@@ -374,6 +386,9 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.g0 = g0
         self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
+        _validate_topography_masking_config(
+            self.topography_masking, self.convert_topography_to_meters
+        )
 
         # Get channel index to pressure level mapping
         self.pressure_levels = sorted(hPa_levels)
@@ -730,6 +745,9 @@ class LossWithHydrostasy(torch.nn.MSELoss):
         self.g0 = g0
         self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
+        _validate_topography_masking_config(
+            self.topography_masking, self.convert_topography_to_meters
+        )
 
         # Get channel index to pressure level mapping
         self.pressure_levels = sorted(hPa_levels)
