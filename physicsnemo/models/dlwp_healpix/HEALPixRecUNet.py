@@ -23,7 +23,11 @@ import torch as th
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
-from physicsnemo.models.dlwp_healpix_layers import HEALPixFoldFaces, HEALPixUnfoldFaces
+from physicsnemo.models.dlwp_healpix_layers import (
+    HEALPixFoldFaces,
+    HEALPixUnfoldFaces,
+    warn_deprecated_enable_healpixpad,
+)
 from physicsnemo.models.meta import ModelMetaData
 from physicsnemo.models.module import Module
 
@@ -65,11 +69,14 @@ class HEALPixRecUNet(Module):
         reset_cycle: str = "24h",
         presteps: int = 1,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
         couplings: list = [],
         residual_prediction: bool = True,
         couplings_time_first: bool = True,
         constraints: list[DictConfig] = None,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: Sequence[int] = (64, 32, 16),
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -102,16 +109,31 @@ class HEALPixRecUNet(Module):
             number of model steps to initialize recurrent states.
         enable_nhwc: bool, optional
             Model with [N, H, W, C] instead of [N, C, H, W]
-        enable_healpixpad: bool, optional
-            Enable CUDA HEALPixPadding if installed
         couplings: list, optional
             sequence of dictionaries that describe coupling mechanisms
         residual_prediction: bool, optional
             If the model should predict the residual between the input and the output. Default: True
         couplings_time_first: bool, optional
             Whether coupled data is in [T, B, C, F, H, W] rather than [B, F, T, C, H, W] format
+        constraints: list[DictConfig], optional
+            List of hydra instantiable DictConfigs specifying constraints 
+            (e.g., nonnegativity) to be applied to the model outputs
+        hpx_padding_mode: str, optional
+            Padding strategy: ``earth2grid``, ``karlbauer``, or ``isolatitude``.
+            ``None`` (omitted) defaults to ``earth2grid`` unless deprecated ``enable_healpixpad``
+            is set without an explicit ``hpx_padding_mode``.
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside : Sequence[int], optional
+            Face height/width per UNet level (shallowest to deepest).
+            Length must match the encoder/decoder ``n_channels`` list length.
+            Default ``(64, 32, 16)``.
+        enable_healpixpad: bool, optional
+            Deprecated. When ``hpx_padding_mode`` is omitted, ``False`` maps to ``karlbauer``
+            and ``True`` to ``earth2grid`` (legacy configs). Prefer ``hpx_padding_mode``.
         """
         super().__init__()
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.channel_dim = 2  # Now 2 with [B, F, T*C, H, W]. Was 1 in old data format with [B, T*C, F, H, W]
 
         self.input_channels = input_channels
@@ -140,12 +162,28 @@ class HEALPixRecUNet(Module):
         self.input_time_dim = input_time_dim
         self.output_time_dim = output_time_dim
         self.delta_t = int(pd.Timedelta(delta_time).total_seconds() // 3600)
-        self.reset_cycle = int(pd.Timedelta(reset_cycle).total_seconds() // 3600)
+        if reset_cycle == float('inf'):
+            self.reset_cycle = reset_cycle
+        else:
+            self.reset_cycle = int(pd.Timedelta(reset_cycle).total_seconds() // 3600)
         self.presteps = presteps
         self.enable_nhwc = enable_nhwc
-        self.enable_healpixpad = enable_healpixpad
         self.residual_prediction = residual_prediction
         self.couplings_time_first = couplings_time_first
+        self.hpx_padding_mode = hpx_padding_mode
+        self.compile_padding = compile_padding
+        self.nside = nside
+
+        if len(encoder["n_channels"]) != len(decoder["n_channels"]):
+            raise ValueError(
+                "encoder and decoder must have the same number of UNet levels; "
+                f"got {len(encoder['n_channels'])} for encoder and {len(decoder['n_channels'])} for decoder"
+            )
+        if len(self.nside) != len(encoder["n_channels"]):
+            raise ValueError(
+                f"nside must have same length as n_channels; got {len(self.nside)} "
+                f"for nside and {len(encoder['n_channels'])} for n_channels"
+            )
 
         # Number of passes through the model, or a diagnostic model with only one output time
         self.is_diagnostic = self.output_time_dim == 1 and self.input_time_dim > 1
@@ -162,14 +200,17 @@ class HEALPixRecUNet(Module):
             config=encoder,
             input_channels=self._compute_input_channels(),
             enable_nhwc=self.enable_nhwc,
-            enable_healpixpad=self.enable_healpixpad,
+            hpx_padding_mode=self.hpx_padding_mode,
+            compile_padding=self.compile_padding,
+            nside=self.nside,
         )
-        self.encoder_depth = len(self.encoder.n_channels)
         self.decoder = instantiate(
             config=decoder,
             output_channels=self._compute_output_channels(),
             enable_nhwc=self.enable_nhwc,
-            enable_healpixpad=self.enable_healpixpad,
+            hpx_padding_mode=self.hpx_padding_mode,
+            compile_padding=self.compile_padding,
+            nside=self.nside,
         )
 
         self.constraints = None
@@ -444,7 +485,7 @@ class HEALPixRecUNet(Module):
         self.reset()
         outputs = []
         for step in range(self.integration_steps):
-            th.cuda.nvtx.range_push(f"Integration step: {step}")
+            # th.cuda.nvtx.range_push(f"Integration step: {step}")
             # (Re-)initialize recurrent hidden states
             if (step * (self.delta_t * self.input_time_dim)) % self.reset_cycle == 0:
                 if conditions_cln is not None:
@@ -493,7 +534,7 @@ class HEALPixRecUNet(Module):
                         inputs=[outputs[-1][:, :, :, :self.input_channels]] + list(inputs[1:]),
                         step=step + self.presteps,
                     )
-            th.cuda.nvtx.range_pop()
+            # th.cuda.nvtx.range_pop()
 
             # Forward through model, with or without conditions
             if conditions_cln is not None:
@@ -501,12 +542,12 @@ class HEALPixRecUNet(Module):
             else:
                 kwargs = {}
 
-            th.cuda.nvtx.range_push("Encoder")
+            # th.cuda.nvtx.range_push("Encoder")
             encodings = self.encoder(input_tensor, **kwargs)
-            th.cuda.nvtx.range_pop()
-            th.cuda.nvtx.range_push("Dencoder")
+            # th.cuda.nvtx.range_pop()
+            # th.cuda.nvtx.range_push("Dencoder")
             decodings = self.decoder(encodings, **kwargs)
-            th.cuda.nvtx.range_pop()
+            # th.cuda.nvtx.range_pop()
 
             # Residual prediction
             combined = self._reshape_outputs(decodings)
@@ -523,7 +564,7 @@ class HEALPixRecUNet(Module):
                     out = constraint(out, orig_input)
 
             outputs.append(out)
-            th.cuda.nvtx.range_pop()
+            # th.cuda.nvtx.range_pop()
 
         if output_only_last:
             return outputs[-1]

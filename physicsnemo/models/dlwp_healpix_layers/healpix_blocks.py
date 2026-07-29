@@ -20,6 +20,7 @@ import math
 import torch
 import torch as th
 from .healpix_layers import HEALPixLayer
+from .healpix_paddings import warn_deprecated_enable_healpixpad
 from .normalization import ConditionalLayerNorm
 
 from hydra.utils import instantiate
@@ -45,7 +46,6 @@ class _LayerNormOverChannels(th.nn.Module):
 # RECURRENT BLOCKS
 #
 
-
 class ConvGRUBlock(th.nn.Module):
     """Class that implements a Convolutional GRU
     Code modified from
@@ -58,7 +58,10 @@ class ConvGRUBlock(th.nn.Module):
         in_channels: int = 3,
         kernel_size: int = 1,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: int | None = None,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -71,11 +74,19 @@ class ConvGRUBlock(th.nn.Module):
             Size of the convolutioonal kernel
         enable_nhwc: bool, optional
             Enable nhwc format, passed to wrapper
+        hpx_padding_mode: str, optional
+            HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
+            ``karlbauer``, or ``isolatitude``).
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
-            If HEALPixPadding should be enabled, passed to wrapper
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.channels = in_channels
         self.conv_gates = geometry_layer(
             layer=torch.nn.Conv2d,
@@ -84,7 +95,9 @@ class ConvGRUBlock(th.nn.Module):
             kernel_size=kernel_size,
             padding="same",
             enable_nhwc=enable_nhwc,
-            enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
+            compile_padding=compile_padding,
+            nside=nside,
         )
         self.conv_can = geometry_layer(
             layer=torch.nn.Conv2d,
@@ -93,7 +106,9 @@ class ConvGRUBlock(th.nn.Module):
             kernel_size=kernel_size,
             padding="same",
             enable_nhwc=enable_nhwc,
-            enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
+            compile_padding=compile_padding,
+            nside=nside,
         )
         self.h = th.zeros(1, 1, 1, 1)
 
@@ -136,7 +151,6 @@ class ConvGRUBlock(th.nn.Module):
 # CONV BLOCKS
 #
 
-
 class BasicConvBlock(th.nn.Module):
     """Convolution block consisting of n subsequent convolutions and activations"""
 
@@ -151,7 +165,10 @@ class BasicConvBlock(th.nn.Module):
         latent_channels: int = None,
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: int | None = None,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -174,11 +191,19 @@ class BasicConvBlock(th.nn.Module):
             Activation function to use
         enable_nhwc: bool, optional
             Enable nhwc format, passed to wrapper
+        hpx_padding_mode: str, optional
+            HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
+            ``karlbauer``, or ``isolatitude``).
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
-            If HEALPixPadding should be enabled, passed to wrapper
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         if latent_channels is None:
             latent_channels = max(in_channels, out_channels)
         convblock = []
@@ -191,7 +216,9 @@ class BasicConvBlock(th.nn.Module):
                     kernel_size=kernel_size,
                     dilation=dilation,
                     enable_nhwc=enable_nhwc,
-                    enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
+                    compile_padding=compile_padding,
+                    nside=nside,
                 )
             )
             if activation is not None:
@@ -230,7 +257,10 @@ class ConvNeXtBlock(th.nn.Module):
         upscale_factor: int = 4,
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: int | None = None,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -253,11 +283,19 @@ class ConvNeXtBlock(th.nn.Module):
             Activation function to use between layers
         enable_nhwc: bool, optional
             Enable nhwc format, passed to wrapper
+        hpx_padding_mode: str, optional
+            HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
+            ``karlbauer``, or ``isolatitude``).
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
-            If HEALPixPadding should be enabled, passed to wrapper
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         # Instantiate 1x1 conv to increase/decrease channel depth if necessary
         if in_channels == out_channels:
             self.skip_module = lambda x: x  # Identity-function required in forward pass
@@ -268,7 +306,9 @@ class ConvNeXtBlock(th.nn.Module):
                 out_channels=out_channels,
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         # Convolution block
         convblock = []
@@ -281,7 +321,9 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         )
         if activation is not None:
@@ -295,7 +337,9 @@ class ConvNeXtBlock(th.nn.Module):
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         )
         if activation is not None:
@@ -308,7 +352,9 @@ class ConvNeXtBlock(th.nn.Module):
                 out_channels=out_channels,
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         )
         self.convblock = th.nn.Sequential(*convblock)
@@ -347,10 +393,13 @@ class DoubleConvNeXtBlock(th.nn.Module):
         latent_channels: int = 1,
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: int | None = None,
         conditional_layer_norm: Callable = None,
         conditional_layer_norm_once: bool = False,
         dropout: float = 0.0,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters:
@@ -373,11 +422,19 @@ class DoubleConvNeXtBlock(th.nn.Module):
             Activation function to use between layers
         enable_nhwc: bool, optional
             Enable nhwc format, passed to wrapper
+        hpx_padding_mode: str, optional
+            HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
+            ``karlbauer``, or ``isolatitude``).
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
-            If HEALPixPadding should be enabled, passed to wrapper
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.cln_enabled = conditional_layer_norm is not None
         
         if in_channels == int(latent_channels):
@@ -391,7 +448,9 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 out_channels=int(latent_channels),
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         if out_channels == int(latent_channels):
             self.skip_module2 = (
@@ -404,7 +463,9 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 out_channels=out_channels,
                 kernel_size=1,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
 
         # check if we're applying a layer norm at the beginning 
@@ -437,7 +498,9 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         )
 
@@ -460,7 +523,9 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         )
 
@@ -485,7 +550,9 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         )
         if activation is not None:
@@ -505,7 +572,9 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         )
         # Apply batch norm and conditional layer norm if needed
@@ -527,7 +596,9 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         )
         # Apply layer norm if needed
@@ -551,7 +622,8 @@ class DoubleConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                nside=nside,
             )
         )
         if activation is not None:
@@ -631,10 +703,13 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         n_layers: int = 1,
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: int | None = None,
         dropout: float = 0.0,
         conditional_layer_norm: Callable = None,
         conditional_layer_norm_once: bool = False,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -649,9 +724,19 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
             Whether or not to apply conditional layer normalization only once. If True,
             the conditional layer normalization is applied only once, otherwise it is applied
             for each block.
+        hpx_padding_mode: str, optional
+            HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
+            ``karlbauer``, or ``isolatitude``).
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
+        enable_healpixpad: bool, optional
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         # Create a ModuleList to store complete blocks
         self.blocks = th.nn.ModuleList()
         # flag for conditional layer normalization
@@ -670,7 +755,9 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                     upscale_factor=upscale_factor,
                     activation=activation,
                     enable_nhwc=enable_nhwc,
-                    enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
+                    compile_padding=compile_padding,
+                    nside=nside,
                     dropout=dropout,
                     conditional_layer_norm=conditional_layer_norm if conditional_layer_norm is not None else None,
                     conditional_layer_norm_once=conditional_layer_norm_once,
@@ -703,10 +790,13 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
         use_block_skip_connection: bool = True,
-        enable_healpixpad: bool = False,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: int | None = None,
         dropout: float = 0.0,
         conditional_layer_norm: th.nn.Module = None,
         conditional_layer_norm_once: bool = False,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -729,10 +819,16 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             Activation function to use between layers
         enable_nhwc: bool, optional
             Enable nhwc format, passed to wrapper
-        enable_healpixpad: bool, optional
-            If HEALPixPadding should be enabled, passed to wrapper
         use_block_skip_connection: bool, optional
             Whether or not to use block-level skip connection
+        hpx_padding_mode: str, optional
+            HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
+            ``karlbauer``, or ``isolatitude``).
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         dropout: float, optional
             Dropout probability to apply after the first convolution
         conditional_layer_norm: th.nn.Module, optional
@@ -742,10 +838,12 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             Whether or not to apply conditional layer normalization only once. If True,
             the conditional layer normalization is applied only once, otherwise it is applied
             for each block.
+        enable_healpixpad: bool, optional
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
 
         super().__init__()
-
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.use_block_skip_connection = use_block_skip_connection
         self.activation = activation
         self.dropout = dropout > 0.0
@@ -761,7 +859,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                     out_channels=out_channels,
                     kernel_size=1,
                     enable_nhwc=enable_nhwc,
-                    enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
+                    compile_padding=compile_padding,
+                    nside=nside,
                 )
 
         # check if we're applying a layer norm at the beginning
@@ -791,7 +891,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         )
         # Apply layer norm if needed
@@ -813,7 +915,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         )
 
@@ -839,7 +943,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 kernel_size=1,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         )
 
@@ -864,7 +970,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         )
         if activation is not None:
@@ -909,11 +1017,9 @@ class SymmetricConvNeXtBlock(th.nn.Module):
 
         return x + residual
 
-
 #
 # DOWNSAMPLING BLOCKS
 #
-
 
 class MaxPool(th.nn.Module):
     """This class provides a wrapper for a HEALPix (or other) tensor data
@@ -925,7 +1031,10 @@ class MaxPool(th.nn.Module):
         geometry_layer: th.nn.Module = HEALPixLayer,
         pooling: int = 2,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: int | None = None,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -936,15 +1045,26 @@ class MaxPool(th.nn.Module):
             Pooling kernel size passed to geometry layer
         enable_nhwc: bool, optional
             Enable nhwc format, passed to wrapper
+        hpx_padding_mode: str, optional
+            HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
+            ``karlbauer``, or ``isolatitude``).
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
-            If HEALPixPadding should be enabled, passed to wrapper
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.maxpool = geometry_layer(
             layer=torch.nn.MaxPool2d,
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
-            enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
+            compile_padding=compile_padding,
+            nside=nside,
         )
 
     def forward(self, x):
@@ -974,7 +1094,10 @@ class AvgPool(th.nn.Module):
         in_channels: int = 3,
         pooling: int = 2,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: int | None = None,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -987,16 +1110,26 @@ class AvgPool(th.nn.Module):
             Pooling kernel size passed to geometry layer
         enable_nhwc: bool, optional
             Enable nhwc format, passed to wrapper
+        hpx_padding_mode: str, optional
+            HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
+            ``karlbauer``, or ``isolatitude``).
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
-            If HEALPixPadding should be enabled, passed to wrapper
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.avgpool = geometry_layer(
             layer=torch.nn.AvgPool2d,
             kernel_size=pooling,
             enable_nhwc=enable_nhwc,
-            enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
+            compile_padding=compile_padding,
+            nside=nside,
         )
 
     def forward(self, x):
@@ -1033,7 +1166,10 @@ class DealiasedDownsample(th.nn.Module):
         resample_filter: Sequence[float] = (1.0, 2.0, 1.0),
         stride: int = 2,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: int | None = None,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -1047,11 +1183,20 @@ class DealiasedDownsample(th.nn.Module):
         stride: int, optional
             Stride of the blur convolution (downsampling factor).
         enable_nhwc: bool, optional
-            Passed to ``geometry_layer``.
+            Enable nhwc format, passed to wrapper
+        hpx_padding_mode: str, optional
+            HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
+            ``karlbauer``, or ``isolatitude``).
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
-            Passed to ``geometry_layer``.
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         filt = tuple(float(x) for x in resample_filter)
         m = len(filt)
         if m < 1:
@@ -1077,7 +1222,9 @@ class DealiasedDownsample(th.nn.Module):
                     dilation=1,
                     resample_filter=filt,
                     enable_nhwc=enable_nhwc,
-                    enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
+                    compile_padding=compile_padding,
+                    nside=nside,
                 )
             )
 
@@ -1090,7 +1237,6 @@ class DealiasedDownsample(th.nn.Module):
 #
 # UPSAMPLING BLOCKS
 #
-
 
 class TransposedConvUpsample(th.nn.Module):
     """This class provides a wrapper for a HEALPix (or other) tensor data
@@ -1105,7 +1251,10 @@ class TransposedConvUpsample(th.nn.Module):
         upsampling: int = 2,
         activation: th.nn.Module = None,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: int | None = None,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -1122,11 +1271,19 @@ class TransposedConvUpsample(th.nn.Module):
             Activation function used in upsampling
         enable_nhwc: bool, optional
             Enable nhwc format, passed to wrapper
+        hpx_padding_mode: str, optional
+            HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
+            ``karlbauer``, or ``isolatitude``).
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
-            If HEALPixPadding should be enabled, passed to wrapper
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-                     
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         upsampler = []
         # Upsample transpose conv
         upsampler.append(
@@ -1138,7 +1295,9 @@ class TransposedConvUpsample(th.nn.Module):
                 stride=upsampling,
                 padding=0,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             )
         )
         if activation is not None:
@@ -1179,7 +1338,10 @@ class SmoothedInterpolateConv(th.nn.Module):
         mode = 'nearest',
         activation: th.nn.Module = None,
         enable_nhwc = False,
-        enable_healpixpad = True,
+        hpx_padding_mode: str = 'earth2grid',
+        compile_padding: bool = False,
+        nside: int = 64,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -1202,13 +1364,20 @@ class SmoothedInterpolateConv(th.nn.Module):
             Activation function used in upsampling
         enable_nhwc: bool, optional
             Enable nhwc format, passed to wrapper
+        hpx_padding_mode: str, optional
+            HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
+            ``karlbauer``, or ``isolatitude``).
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: int, optional
+            HEALPix face resolution.
         enable_healpixpad: bool, optional
-            If HEALPixPadding should be enabled, passed to wrapper
+            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         """
         super().__init__()
-
+        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         if dilation > 1:
-            raise ValueError(
+            raise Exception(
                 f"dilation > 1 is not currently supported for hpx resize \
                 convolutions, received dilation = {dilation}"
             )
@@ -1229,7 +1398,9 @@ class SmoothedInterpolateConv(th.nn.Module):
                 mode=mode,
                 trim_size=trim_size,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside,
             ),
             geometry_layer(
                 layer=torch.nn.Conv2d,
@@ -1238,7 +1409,9 @@ class SmoothedInterpolateConv(th.nn.Module):
                 kernel_size=kernel_size,
                 dilation=dilation,
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside*scale_factor,
             )
         ]
 
