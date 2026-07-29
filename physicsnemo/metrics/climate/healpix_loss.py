@@ -23,8 +23,7 @@ import xarray as xr
 import earth2grid
 from cuhpx import SHTCUDA, iSHTCUDA
 from earth2grid.healpix import HEALPIX_PAD_XY, PixelOrder
-from physicsnemo.models.dlwp_healpix_layers.healpix_layers import HEALPixPadding, HEALPixPaddingv2
-
+from physicsnemo.models.dlwp_healpix_layers.healpix_paddings import make_hpx_padding_layer
 """
 Custom dlwp compatible loss classes that allow for more sophisticated training optimization.
 
@@ -1012,8 +1011,9 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         open_dict: dict = {"engine": "zarr"},
         selection_dict: dict = {"channel_c": "land_sea_mask"},
         patch_size: int = 3,
-        use_earth2grid_padding: bool = True,
+        hpx_padding_mode: str = "earth2grid",
         enable_nhwc: bool = True,
+        nside: int | None = None,
         patch_weight_sigma: float = None,
     ):
         """
@@ -1032,10 +1032,14 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             dictionary of keyword arguments for xarray.open_dataset. Default is {"channel_c": "land_sea_mask"}.
         patch_size: int
             size of the patch. Default is 3.
-        use_earth2grid_padding: bool
-            whether to use earth2grid hpx padding. Default is False.
+        hpx_padding_mode: str
+            HPX padding scheme to use. Options are "earth2grid", "karlbauer", and "isolatitude".
+            Default is "earth2grid". More info about padding schemes can be found in
+            physicsnemo.models.dlwp_healpix_layers.healpix_paddings.
         enable_nhwc: bool
-            whether to enable nhwc for the hpx padding. Default is False.
+            whether to enable nhwc for the hpx padding. Default is True.
+        nside: int or None, optional
+            Native HEALPix face height/width; default ``None``.
         patch_weight_sigma : float, optional
             If provided, patch-vector norms are weighted by a Gaussian in
             distance from the patch center (weights sum to 1, center gets highest weight).
@@ -1054,8 +1058,9 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             raise ValueError("patch_size must be a positive odd integer")
         self.patch_size = patch_size
         self.patch_radius = (patch_size - 1) // 2
-        self.use_earth2grid_padding = use_earth2grid_padding
+        self.hpx_padding_mode = hpx_padding_mode
         self.enable_nhwc = enable_nhwc
+        self.nside = nside
 
         # Gaussian weights for patch positions (row-major, center-weighted, sum=1)
         if patch_weight_sigma is not None and patch_weight_sigma > 0:
@@ -1082,13 +1087,12 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         self.diag_mask = th.ones(self.n_members, self.n_members) - th.eye(self.n_members)
         # HEALPix padding module (expects [..., F, H, W])
         if self.patch_radius > 0:
-            if self.use_earth2grid_padding:
-                self.hpx_pad = HEALPixPaddingv2(padding=self.patch_radius)
-            else:
-                self.hpx_pad = HEALPixPadding(
-                    padding=self.patch_radius,
-                    enable_nhwc=self.enable_nhwc,
-                )
+            self.hpx_pad = make_hpx_padding_layer(
+                padding=self.patch_radius,
+                hpx_padding_mode=self.hpx_padding_mode,
+                enable_nhwc=self.enable_nhwc,
+                nside=self.nside,
+            )
         else:
             self.hpx_pad = None
 
@@ -1123,6 +1127,13 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         returns: [Cond, B, F, T, C, H, W, D]
         """
         n, b, f, t, c, h, w = prediction.shape
+
+        if self.hpx_padding_mode == "isolatitude" and self.nside != h:
+            raise ValueError(
+                f"hpx_padding_mode=isolatitude requires nside={self.nside} to match h={h}. "
+                f"Got hpx_padding_mode={self.hpx_padding_mode}, nside={self.nside}, h={h}."
+            )
+
         # Move faces to last spatial block and fold leading dims
         x = prediction.permute(0, 1, 3, 2, 4, 5, 6)  # [Cond, B, T, F, C, H, W]
         x = x.reshape(n * b * t * f, c, h, w)  # [Cond*B*T*F, C, H, W]

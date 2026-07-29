@@ -22,6 +22,8 @@ from omegaconf import DictConfig
 
 from torch.utils.checkpoint import checkpoint
 
+from .healpix_paddings import warn_deprecated_enable_healpixpad
+
 
 class UNetDecoder(th.nn.Module):
     """Generic UNetDecoder that can be applied to arbitrary meshes."""
@@ -37,9 +39,12 @@ class UNetDecoder(th.nn.Module):
         output_channels: int = 1,
         dilations: list = None,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: Sequence[int] = (64, 32, 16),
         per_level_cln: list[bool] = None,
         per_level_checkpointing: list[bool] = None,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -63,17 +68,32 @@ class UNetDecoder(th.nn.Module):
             List of dialtions to use for the the convolutional blocks
         enable_nhwc: bool, optional
             If channel last format should be used
-        enable_healpixpad, bool, optional
-            If the healpixpad library should be used if installed
+        hpx_padding_mode: str, optional
+            Passed through to HEALPix blocks. ``None`` (omitted) defaults to ``earth2grid``
+            unless deprecated ``enable_healpixpad`` is set without an explicit mode.
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: Sequence[int], optional
+            Per-level face size from full resolution (``nside[0]``) to deepest (``nside[-1]``),
+            same convention as the encoder. ``len(nside)`` must equal ``len(n_channels)``.
+            Default ``(64, 32, 16)`` for the default three-level decoder.
         per_level_cln: list[bool], optional
             If the CLN should be applied to each level of the decoder
             If None, the CLN will based on the conv_block.conditional_layer_norm attribute
         per_level_checkpointing: list[bool], optional
             If the checkpointing should be applied to each level of the decoder
             If None, the checkpointing will not be applied
+        enable_healpixpad: bool, optional
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         self.channel_dim = 1  # 1 in previous layout
+        if len(nside) != len(n_channels):
+            raise ValueError(
+                f"nside must have the same length as n_channels; got {len(nside)} "
+                f"for nside and {len(n_channels)} for n_channels"
+            )
 
         if per_level_cln is not None and len(per_level_cln) != len(n_channels):
             raise ValueError(
@@ -105,7 +125,9 @@ class UNetDecoder(th.nn.Module):
                     in_channels=curr_channel,
                     out_channels=curr_channel,
                     enable_nhwc=enable_nhwc,
-                    enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
+                    compile_padding=compile_padding,
+                    nside=nside[len(n_channels) - n],
                 )
 
             next_channel = (
@@ -128,7 +150,9 @@ class UNetDecoder(th.nn.Module):
                 dilation=dilations[n],
                 n_layers=n_layers[n],
                 enable_nhwc=enable_nhwc,
-                enable_healpixpad=enable_healpixpad,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=nside[len(n_channels) - 1 - n],
             )
 
             # Recurrent module
@@ -136,7 +160,10 @@ class UNetDecoder(th.nn.Module):
                 rec_module = instantiate(
                     config=recurrent_block,
                     in_channels=next_channel,
-                    enable_healpixpad=enable_healpixpad,
+                    enable_nhwc=enable_nhwc,
+                    hpx_padding_mode=hpx_padding_mode,
+                    compile_padding=compile_padding,
+                    nside=nside[len(n_channels) - 1 - n],
                 )
             else:
                 rec_module = None
@@ -159,7 +186,9 @@ class UNetDecoder(th.nn.Module):
             out_channels=output_channels,
             dilation=dilations[-1],
             enable_nhwc=enable_nhwc,
-            enable_healpixpad=enable_healpixpad,
+            hpx_padding_mode=hpx_padding_mode,
+            compile_padding=compile_padding,
+            nside=nside[0],
         )
 
     def _forward_layer_pass(self, layer: th.nn.Module, x: th.Tensor, skip_connection: th.Tensor=None, conditions_cln: th.Tensor=None) -> th.Tensor:

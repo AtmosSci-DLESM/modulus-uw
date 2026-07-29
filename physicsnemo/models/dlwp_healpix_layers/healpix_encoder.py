@@ -21,6 +21,8 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 from torch.utils.checkpoint import checkpoint
 
+from .healpix_paddings import warn_deprecated_enable_healpixpad
+
 
 class UNetEncoder(th.nn.Module):
     """Generic UNetEncoder that can be applied to arbitrary meshes."""
@@ -35,9 +37,12 @@ class UNetEncoder(th.nn.Module):
         n_layers: Sequence = (2, 2, 1),
         dilations: list = None,
         enable_nhwc: bool = False,
-        enable_healpixpad: bool = False,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: Sequence[int] = (64, 32, 16),
         per_level_cln: Sequence[bool] = None,
         per_level_checkpointing: Sequence[bool] = None,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -59,17 +64,31 @@ class UNetEncoder(th.nn.Module):
             List of dialtions to use for the the convolutional blocks
         enable_nhwc: bool, optional
             If channel last format should be used
-        enable_healpixpad, bool, optional
-            If the healpixpad library should be used (if installed)
+        hpx_padding_mode: str, optional
+            Passed through to HEALPix blocks. ``None`` (omitted) defaults to ``earth2grid``
+            unless deprecated ``enable_healpixpad`` is set without an explicit mode.
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: Sequence[int], optional
+            Native HEALPix face height/width (``H == W``) per encoder level, shallowest
+            (full resolution) to deepest. ``len(nside)`` must equal ``len(n_channels)``.
+            Default ``(64, 32, 16)`` for the default three-level encoder.
         per_level_cln: list[bool] | None, optional
             If the CLN should be applied to each level of the encoder
             If None, the CLN will based on the conv_block.conditional_layer_norm attribute
         per_level_checkpointing: list[bool] | None, optional
             If the checkpointing should be applied to each level of the encoder
             If None, the checkpointing will not be applied
+        enable_healpixpad: bool, optional
+            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
         super().__init__()
-        self.n_channels = n_channels
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        if len(nside) != len(n_channels):
+            raise ValueError(
+                f"nside must have the same length as n_channels ({len(n_channels)}), "
+                f"got {len(nside)}: {nside!r}"
+            )
 
         if per_level_cln is not None and len(per_level_cln) != len(n_channels):
             raise ValueError(
@@ -101,7 +120,9 @@ class UNetEncoder(th.nn.Module):
                         config=down_sampling_block,
                         in_channels=old_channels,
                         enable_nhwc=enable_nhwc,
-                        enable_healpixpad=enable_healpixpad,
+                        hpx_padding_mode=hpx_padding_mode,
+                        compile_padding=compile_padding,
+                        nside=nside[n - 1],
                     )
                 )
 
@@ -120,7 +141,9 @@ class UNetEncoder(th.nn.Module):
                     dilation=dilations[n],
                     n_layers=n_layers[n],
                     enable_nhwc=enable_nhwc,
-                    enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
+                    compile_padding=compile_padding,
+                    nside=nside[n],
                 )
             )
             old_channels = curr_channel
