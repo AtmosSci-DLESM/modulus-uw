@@ -1338,9 +1338,9 @@ class SmoothedInterpolateConv(th.nn.Module):
         mode = 'nearest',
         activation: th.nn.Module = None,
         enable_nhwc = False,
-        hpx_padding_mode: str | None = None,
+        hpx_padding_mode: str = 'earth2grid',
         compile_padding: bool = False,
-        nside: int | None = None,
+        nside: int = 64,
         enable_healpixpad: bool | None = None,
     ):
         """
@@ -1369,16 +1369,15 @@ class SmoothedInterpolateConv(th.nn.Module):
             ``karlbauer``, or ``isolatitude``).
         compile_padding: bool, optional
             If True, apply torch compile to the padding module.
-        nside: int or None, optional
-            Native face height/width; required when ``hpx_padding_mode`` is
-            ``"isolatitude"``, otherwise ignored. Default ``None``.
+        nside: int, optional
+            HEALPix face resolution.
         enable_healpixpad: bool, optional
-            Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
+            Deprecated; ignored. Use ``hpx_padding_mode`` instead.
         """
         super().__init__()
-        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
         if dilation > 1:
-            raise ValueError(
+            raise Exception(
                 f"dilation > 1 is not currently supported for hpx resize \
                 convolutions, received dilation = {dilation}"
             )
@@ -1412,7 +1411,7 @@ class SmoothedInterpolateConv(th.nn.Module):
                 enable_nhwc=enable_nhwc,
                 hpx_padding_mode=hpx_padding_mode,
                 compile_padding=compile_padding,
-                nside=scale_factor*nside,
+                nside=nside*scale_factor,
             )
         ]
 
