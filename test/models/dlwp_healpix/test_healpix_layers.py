@@ -115,6 +115,19 @@ HEALPixPadding_testdata = [
 ]
 
 
+def _healpix_layer_forward_cases():
+    """Param combos for test_HEALPixLayer_forward; earth2grid needs CUDA only."""
+    cases = []
+    for padding_mode in ("karlbauer", "isolatitude", "earth2grid"):
+        for device in ("cuda:0", "cpu"):
+            for multiplier in (2, 3, 4):
+                if padding_mode == "earth2grid":
+                    if device != "cuda:0" or not torch.cuda.is_available():
+                        continue
+                cases.append((padding_mode, device, multiplier))
+    return cases
+
+
 @import_or_fail("hydra")
 @pytest.mark.parametrize("device,padding", HEALPixPadding_testdata)
 def test_HEALPixPadding_initialization(device, padding, pytestconfig):
@@ -163,30 +176,43 @@ def test_HEALPixPadding_forward(device, padding, pytestconfig):
     assert outvar.shape == out_size
 
 
-HEALPixLayer_testdata = [
-    ("cuda:0", 2),
-    ("cuda:0", 3),
-    ("cuda:0", 4),
-    ("cpu", 2),
-    ("cpu", 3),
-    ("cpu", 4),
-]
+@import_or_fail("hydra")
+def test_HEALPixLayer_isolatitude_requires_nside(pytestconfig):
+    """Isolatitude padding needs nside to build gather indices."""
+    from physicsnemo.models.dlwp_healpix_layers import HEALPixLayer
+
+    with pytest.raises(ValueError, match="isolatitude"):
+        HEALPixLayer(
+            layer=torch.nn.Conv2d,
+            hpx_padding_mode="isolatitude",
+            in_channels=2,
+            out_channels=2,
+            kernel_size=3,
+        )
 
 
 @import_or_fail("hydra")
-@pytest.mark.parametrize("device,multiplier", HEALPixLayer_testdata)
-def test_HEALPixLayer_initialization(device, multiplier, pytestconfig):
+@pytest.mark.parametrize("padding_mode", ["karlbauer", "isolatitude", "earth2grid"])
+@pytest.mark.parametrize("multiplier", [2, 3, 4])
+def test_HEALPixLayer_initialization(padding_mode, multiplier, pytestconfig):
     from physicsnemo.models.dlwp_healpix_layers import (
         HEALPixLayer,
     )
 
-    layer = HEALPixLayer(layer=MulX, multiplier=multiplier)
+    layer = HEALPixLayer(
+        layer=MulX,
+        hpx_padding_mode=padding_mode,
+        multiplier=multiplier,
+    )
     assert isinstance(layer, HEALPixLayer)
 
 
 @import_or_fail("hydra")
-@pytest.mark.parametrize("device,multiplier", HEALPixLayer_testdata)
-def test_HEALPixLayer_forward(device, multiplier, pytestconfig):
+@pytest.mark.parametrize(
+    "padding_mode,device,multiplier",
+    _healpix_layer_forward_cases(),
+)
+def test_HEALPixLayer_forward(padding_mode, device, multiplier, pytestconfig):
 
     from physicsnemo.models.dlwp_healpix_layers import (
         HEALPixLayer,
@@ -199,25 +225,34 @@ def test_HEALPixLayer_forward(device, multiplier, pytestconfig):
     in_channels = 4
     out_channels = 8
 
-    tensor_size = torch.randint(low=2, high=4, size=(1,)).tolist()
+    tensor_size = torch.randint(low=16, high=64, size=(1,)).tolist()
     tensor_size = [24, in_channels, *tensor_size, *tensor_size]
     invar = torch.rand(tensor_size, device=device)
     outvar = layer(invar)
 
     assert common.compare_output(outvar, invar * multiplier)
 
-    layer = HEALPixLayer(
+    if padding_mode == "earth2grid" and (
+        device != "cuda:0" or not torch.cuda.is_available()
+    ):
+        pytest.skip("earth2grid hpx_padding_mode requires a CUDA device")
+
+    conv_kwargs = dict(
         layer=torch.nn.Conv2d,
+        hpx_padding_mode=padding_mode,
         in_channels=in_channels,
         out_channels=out_channels,
         kernel_size=kernel_size,
         device=device,
         dilation=dilation,
-        enable_healpixpad=True,
-        enable_nhwc=True,
+        enable_nhwc=False,
     )
+    if padding_mode == "isolatitude":
+        conv_kwargs["nside"] = tensor_size[-1]
 
-    # size of the padding added byu HEALPixLayer
+    layer = HEALPixLayer(**conv_kwargs)
+
+    # size of the padding added by HEALPixLayer
     expected_shape = [24, out_channels, tensor_size[-1], tensor_size[-1]]
     expected_shape = torch.Size(expected_shape)
 
