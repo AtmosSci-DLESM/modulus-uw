@@ -15,13 +15,129 @@
 # limitations under the License.
 
 import logging
-from typing import Dict, Sequence
+import warnings
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 import torch
 import xarray as xr
 
+from physicsnemo.distributed import DistributedManager
+from physicsnemo.launch.logging import RankZeroLoggingWrapper
+
 logger = logging.getLogger(__name__)
+
+
+def _logger0():
+    """Rank-0-only logging when distributed training is active."""
+    if DistributedManager.is_initialized():
+        return RankZeroLoggingWrapper(logger, DistributedManager())
+    return logger
+
+_LEGACY_PATH_DEPRECATION = (
+    "src_directory, dst_directory, dataset_name, and data_format are deprecated for "
+    "hydrostatic losses; prefer dataset_path (full path to the .zarr store). "
+    "dst_directory and data_format were never used when loading topography."
+)
+
+
+def _resolve_dataset_path(
+    dataset_path: Optional[str] = None,
+    src_directory: Optional[str] = None,
+    dataset_name: Optional[str] = None,
+    dst_directory: Optional[str] = None,
+    data_format: Optional[str] = None,
+) -> str:
+    """
+    Resolve the zarr path used to load surface geopotential / topography.
+
+    New configs should pass ``dataset_path``. Legacy configs that pass
+    ``src_directory`` + ``dataset_name`` (and optionally unused ``dst_directory`` /
+    ``data_format``) still work, with a deprecation warning.
+    """
+    legacy_provided = [
+        name
+        for name, value in (
+            ("src_directory", src_directory),
+            ("dataset_name", dataset_name),
+            ("dst_directory", dst_directory),
+            ("data_format", data_format),
+        )
+        if value is not None
+    ]
+
+    if dataset_path is not None:
+        if legacy_provided:
+            warnings.warn(
+                f"{_LEGACY_PATH_DEPRECATION} Ignoring deprecated kwargs: "
+                f"{legacy_provided}; using dataset_path={dataset_path!r}.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+        return dataset_path
+
+    if src_directory is not None and dataset_name is not None:
+        warnings.warn(
+            f"{_LEGACY_PATH_DEPRECATION} Constructing path from "
+            f"src_directory={src_directory!r} and dataset_name={dataset_name!r}.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return f"{src_directory}{dataset_name}.zarr"
+
+    raise ValueError(
+        "Must provide dataset_path, or deprecated src_directory and dataset_name, "
+        "to load topography for hydrostatic losses."
+    )
+
+
+def _load_topography(
+    dataset_path: str,
+    surface_geopotential_name: str,
+    surface_geopotential_mean: float,
+    surface_geopotential_std: float,
+    g0: float,
+    convert_topography_to_meters: bool,
+) -> torch.Tensor:
+    """Load denormalized topography [1, F, 1, H, W] from a constants zarr store."""
+    ds = xr.open_zarr(dataset_path)
+    topography = (
+        surface_geopotential_std
+        * ds["constants"].sel(channel_c=surface_geopotential_name).values
+        + surface_geopotential_mean
+    )
+    if convert_topography_to_meters:
+        topography = topography / g0
+
+    topography = torch.tensor(
+        topography[np.newaxis, :, np.newaxis, :, :], dtype=torch.float
+    )
+    logger0 = _logger0()
+    logger0.info(
+        f"Min/Max topography (m): {topography.min()}/{topography.max()}"
+    )
+    # Warn rather than raise so legacy configs/checkpoints with unusual scaling
+    # still train; callers can inspect logs if topography looks wrong.
+    if topography.min() < -1000.0 or topography.max() > 10000.0:
+        logger0.warning(
+            "Topography values fall outside the expected range "
+            f"[-1000, 10000] m (min={float(topography.min())}, "
+            f"max={float(topography.max())}). Check surface_geopotential_* "
+            "scaling and convert_topography_to_meters."
+        )
+    return topography
+
+
+def _validate_topography_masking_config(
+    topography_masking: bool,
+    convert_topography_to_meters: bool,
+) -> None:
+    if topography_masking and not convert_topography_to_meters:
+        raise ValueError(
+            "topography_masking requires convert_topography_to_meters=True: "
+            "masking compares geopotential heights converted to meters against "
+            "surface topography."
+        )
 
 
 def _average_virtual_temperature_from_geopotential_height(z1, z2, p1, p2, R, g0):
@@ -231,15 +347,19 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         weights: Sequence,
         alpha: Sequence[float],  # K
         scaling: Dict[str, Dict[str, float]],
-        src_directory: str,
-        dst_directory: str,
-        dataset_name: str,
-        data_format: str,
+        dataset_path: Optional[str] = None,
+        surface_geopotential_name: str = "z",
         surface_geopotential_mean: float = -597.7115478515625,
         surface_geopotential_std: float = 55658.21484375,
+        convert_topography_to_meters: bool = True,
         R: float = 287,  # J K^{-1} kg^{-1}
         g0: float = 9.81,  # m s^{-2}
         topography_masking: bool = True,
+        # Deprecated path kwargs (still accepted for existing Hydra configs)
+        src_directory: Optional[str] = None,
+        dst_directory: Optional[str] = None,
+        dataset_name: Optional[str] = None,
+        data_format: Optional[str] = None,
     ):
         """
         Parameters
@@ -247,12 +367,28 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         weights: Sequence
             list of floats that determine weighting of variable loss, assumed to be
             in order consistent with order of model output channels
+        dataset_path: str, optional
+            Path to the constants zarr store used for surface geopotential /
+            topography. Prefer this over the deprecated path kwargs below.
+        surface_geopotential_name: str, optional
+            Name of the constants channel holding surface geopotential (default ``z``).
+        convert_topography_to_meters: bool, optional
+            If True (default), divide denormalized geopotential by ``g0`` to get
+            height in meters (legacy behavior).
+        src_directory, dst_directory, dataset_name, data_format: str, optional
+            Deprecated. If ``dataset_path`` is omitted, topography is loaded from
+            ``f"{src_directory}{dataset_name}.zarr"``. ``dst_directory`` and
+            ``data_format`` are ignored.
         """
         super().__init__()
         self.loss_weights = torch.tensor(weights)
         self.device = None
         self.g0 = g0
+        self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
+        _validate_topography_masking_config(
+            self.topography_masking, self.convert_topography_to_meters
+        )
 
         # Get channel index to pressure level mapping
         self.pressure_levels = sorted(hPa_levels)
@@ -346,17 +482,20 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         self.q_level_mapping = torch.tensor(list(self.q_pressure_levels.keys()))
 
         # Get topography information
-        ds = xr.open_zarr(f"{src_directory}{dataset_name}.zarr")
-        self.topography = (
-            surface_geopotential_std * ds.constants[1, :, :, :].values
-            + surface_geopotential_mean
-        ) / self.g0
-
-        self.topography = torch.tensor(
-            self.topography[np.newaxis, :, np.newaxis, :, :], dtype=torch.float
+        resolved_dataset_path = _resolve_dataset_path(
+            dataset_path=dataset_path,
+            src_directory=src_directory,
+            dataset_name=dataset_name,
+            dst_directory=dst_directory,
+            data_format=data_format,
         )
-        logger.info(
-            f"Min/Max topography (m): {self.topography.min()}/{self.topography.max()}"
+        self.topography = _load_topography(
+            resolved_dataset_path,
+            surface_geopotential_name,
+            surface_geopotential_mean,
+            surface_geopotential_std,
+            self.g0,
+            self.convert_topography_to_meters,
         )
 
     def setup(self, trainer):
@@ -430,7 +569,7 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         # Combine N and B dimensions and return
         return x_scaled.reshape((-1, F, C_scaled, H, W))
 
-    def error_histogram(self, prediction, bins, accumulator=None):
+    def error_histogram(self, prediction, bins, accumulator=None, exclude_masked: bool = False):
         N, F, B, C, H, W = tuple(prediction.shape)
 
         if not (prediction.ndim == 6):
@@ -440,9 +579,16 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
         x = self.scale(prediction)
         Tv_avg, Tv_model_avg = self.constraint(x)
         Tv_error = Tv_avg - Tv_model_avg
+
+        valid_mask = torch.ones_like(Tv_error, dtype=torch.bool, device=Tv_error.device)
         # Mask out error in regions below the surface
         if self.topography_masking:
-            Tv_error[x[:, :, 1 : self.num_z_levels, :, :] < self.topography] = 0.0
+            valid_mask[:, :, :Tv_error.shape[2]] = (
+                x[:, :, 1 : self.num_z_levels, :, :] >= self.topography
+            )
+            Tv_error[:, :, :Tv_error.shape[2]][
+                ~valid_mask[:, :, :Tv_error.shape[2]]
+            ] = 0.0
 
         vlevels = Tv_error.shape[2]
         if accumulator is None:
@@ -466,14 +612,36 @@ class WeightedMSEWithHydrostasy(torch.nn.MSELoss):
             bin_edges = bins
 
         for l in range(vlevels):
+            if exclude_masked:
+                values = torch.absolute(Tv_error[:, :, l, :, :][valid_mask[:, :, l, :, :]])
+            else:
+                values = torch.absolute(Tv_error[:, :, l, :, :])
             hist, be = torch.histogram(
-                torch.absolute(Tv_error[:, :, l, :, :]),
+                values,
                 bins=bins if isinstance(bins, int) else bin_edges[l, :],
             )
             accumulator[l, :] += hist
             bin_edges[l, :] = be
 
         return accumulator, bin_edges
+
+    def get_tv_error(self, prediction):
+        N, F, B, C, H, W = tuple(prediction.shape)
+
+        if not (prediction.ndim == 6):
+            raise AssertionError("Expected predictions to have 6 dimensions")
+
+        # Scale to physical units and compute virtual temperature
+        x = self.scale(prediction)
+        Tv_avg, Tv_model_avg = self.constraint(x)
+        Tv_error = Tv_avg - Tv_model_avg
+        # Mask out error in regions below the surface
+        if self.topography_masking:
+            Tv_error[:, :, :Tv_error.shape[2]][
+                x[:, :, 1 : self.num_z_levels, :, :] < self.topography
+            ] = 0.0
+
+        return Tv_error
 
     def forward(self, prediction, target, average_channels=True):
         """
@@ -537,15 +705,19 @@ class LossWithHydrostasy(torch.nn.MSELoss):
         weights: Sequence,
         alpha: Sequence[float],  # K
         scaling: Dict[str, Dict[str, float]],
-        src_directory: str,
-        dst_directory: str,
-        dataset_name: str,
-        data_format: str,
+        dataset_path: Optional[str] = None,
+        surface_geopotential_name: str = "z",
         surface_geopotential_mean: float = -597.7115478515625,
         surface_geopotential_std: float = 55658.21484375,
+        convert_topography_to_meters: bool = True,
         R: float = 287,  # J K^{-1} kg^{-1}
         g0: float = 9.81,  # m s^{-2}
         topography_masking: bool = True,
+        # Deprecated path kwargs (still accepted for existing Hydra configs)
+        src_directory: Optional[str] = None,
+        dst_directory: Optional[str] = None,
+        dataset_name: Optional[str] = None,
+        data_format: Optional[str] = None,
     ):
         """
         Parameters
@@ -553,13 +725,29 @@ class LossWithHydrostasy(torch.nn.MSELoss):
         weights: Sequence
             list of floats that determine weighting of hydrostatic loss terms, assumed to be
             in order of increasing pressure levels
+        dataset_path: str, optional
+            Path to the constants zarr store used for surface geopotential /
+            topography. Prefer this over the deprecated path kwargs below.
+        surface_geopotential_name: str, optional
+            Name of the constants channel holding surface geopotential (default ``z``).
+        convert_topography_to_meters: bool, optional
+            If True (default), divide denormalized geopotential by ``g0`` to get
+            height in meters (legacy behavior).
+        src_directory, dst_directory, dataset_name, data_format: str, optional
+            Deprecated. If ``dataset_path`` is omitted, topography is loaded from
+            ``f"{src_directory}{dataset_name}.zarr"``. ``dst_directory`` and
+            ``data_format`` are ignored.
         """
         super().__init__()
         self.data_loss = data_loss
         self.loss_weights = torch.tensor(weights)
         self.device = None
         self.g0 = g0
+        self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
+        _validate_topography_masking_config(
+            self.topography_masking, self.convert_topography_to_meters
+        )
 
         # Get channel index to pressure level mapping
         self.pressure_levels = sorted(hPa_levels)
@@ -653,17 +841,20 @@ class LossWithHydrostasy(torch.nn.MSELoss):
         self.q_level_mapping = torch.tensor(list(self.q_pressure_levels.keys()))
 
         # Get topography information
-        ds = xr.open_zarr(f"{src_directory}{dataset_name}.zarr")
-        self.topography = (
-            surface_geopotential_std * ds.constants.sel(channel_c='z').values
-            + surface_geopotential_mean
-        ) / self.g0
-
-        self.topography = torch.tensor(
-            self.topography[np.newaxis, :, np.newaxis, :, :], dtype=torch.float
+        resolved_dataset_path = _resolve_dataset_path(
+            dataset_path=dataset_path,
+            src_directory=src_directory,
+            dataset_name=dataset_name,
+            dst_directory=dst_directory,
+            data_format=data_format,
         )
-        logger.info(
-            f"Min/Max topography (m): {self.topography.min()}/{self.topography.max()}"
+        self.topography = _load_topography(
+            resolved_dataset_path,
+            surface_geopotential_name,
+            surface_geopotential_mean,
+            surface_geopotential_std,
+            self.g0,
+            self.convert_topography_to_meters,
         )
 
     def setup(self, trainer):
