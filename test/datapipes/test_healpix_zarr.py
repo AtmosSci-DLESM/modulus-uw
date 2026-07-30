@@ -89,6 +89,65 @@ def scaling_double_dict():
     return omegaconf.DictConfig(scaling)
 
 
+def test_object_store_path_helpers(tmp_path):
+    from physicsnemo.datapipes.healpix.base_timeseries_dataset_zarr import (
+        _check_availability,
+        _is_object_store_path,
+    )
+
+    assert _is_object_store_path("s3://bucket/data.zarr")
+    assert _is_object_store_path("simplecache::s3://bucket/data.zarr")
+    assert not _is_object_store_path(str(tmp_path / "local.zarr"))
+
+    existing_path = tmp_path / "exists.zarr"
+    existing_path.mkdir()
+    _check_availability(str(existing_path))
+
+    with pytest.raises(FileNotFoundError, match=("Dataset not found at")):
+        _check_availability(str(tmp_path / "missing.zarr"))
+
+    if importlib.util.find_spec("fsspec"):
+        _check_availability("s3://bucket-that-does-not-exist/missing.zarr")
+    else:
+        with pytest.raises(
+            ImportError, match=("fsspec is required to access object store paths")
+        ):
+            _check_availability("s3://bucket-that-does-not-exist/missing.zarr")
+
+
+def test_TimeSeriesDataset_missing_time(tmp_path):
+    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
+        TimeSeriesDatasetZarr,
+    )
+
+    no_time_ds = xr.Dataset(
+        data_vars={
+            "inputs": (
+                ("t", "channel_in", "face", "height", "width"),
+                np.zeros((3, 1, 1, 2, 2), dtype="float32"),
+            ),
+            "targets": (
+                ("t", "channel_out", "face", "height", "width"),
+                np.zeros((3, 1, 1, 2, 2), dtype="float32"),
+            ),
+        },
+        coords={
+            "channel_in": ["z500"],
+            "channel_out": ["z500"],
+        },
+    )
+    dataset_path = tmp_path / "no_time.zarr"
+    no_time_ds.to_zarr(dataset_path)
+
+    with pytest.raises(KeyError, match=("Dataset missing time")):
+        TimeSeriesDatasetZarr(
+            dataset_path=str(dataset_path),
+            input_variables=["z500"],
+            start_date="1979-01-01",
+            end_date="1979-01-02",
+        )
+
+
 @import_or_fail("omegaconf")
 @import_or_fail("netCDF4")
 @nfsdata_or_fail
