@@ -21,9 +21,32 @@ script_path = os.path.abspath(__file__)
 sys.path.append(os.path.join(os.path.dirname(script_path), ".."))
 
 import common
+import omegaconf
 import pytest
 import torch
 from pytest_utils import import_or_fail
+
+
+def _cln_conv_block(in_channels: int, cond_dim: int) -> omegaconf.DictConfig:
+    """Hydra-instantiable ``Multi_SymmetricConvNeXtBlock`` config with an
+    always-on conditional layer norm, used to exercise the ``per_level_cln``
+    and ``conditions_cln`` wiring in ``UNetEncoder``/``UNetDecoder``.
+
+    Must be an ``omegaconf.DictConfig`` (not a plain ``dict``) because
+    ``UNetEncoder``/``UNetDecoder`` access ``block_config.conditional_layer_norm``
+    via attribute lookup when deciding whether to disable CLN for a given level.
+    """
+    return omegaconf.DictConfig(
+        {
+            "_target_": "physicsnemo.models.dlwp_healpix_layers.healpix_blocks.Multi_SymmetricConvNeXtBlock",
+            "in_channels": in_channels,
+            "conditional_layer_norm": {
+                "_target_": "physicsnemo.models.dlwp_healpix_layers.normalization.ConditionalLayerNorm",
+                "_partial_": True,
+                "condition_shape": cond_dim,
+            },
+        }
+    )
 
 
 @import_or_fail("hydra")
@@ -415,45 +438,287 @@ def test_UNetDecoder_reset(device, pytestconfig):
 
 @import_or_fail("hydra")
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
-def test_UNetDecoder_per_level_cln(device, pytestconfig):
-    """Decoder must honor per_level_cln when stripping CLN from conv_block config."""
-    from omegaconf import OmegaConf
+def test_UNetDecoder_per_level_cln_length_mismatch(device, pytestconfig):
+    from physicsnemo.models.dlwp_healpix_layers import (
+        BasicConvBlock,
+        ConvNeXtBlock,
+        TransposedConvUpsample,
+        UNetDecoder,
+    )
 
-    from physicsnemo.models.dlwp_healpix_layers import UNetDecoder
-
+    in_channels = 2
+    out_channels = 1
     n_channels = (64, 32, 16)
-    per_level_cln = [True, False, False]
 
-    conv_block = OmegaConf.create(
-        {
-            "_target_": "physicsnemo.models.dlwp_healpix_layers.healpix_blocks.Multi_SymmetricConvNeXtBlock",
-            "kernel_size": 3,
-            "dilation": 1,
-            "upscale_factor": 4,
-            "n_layers": 1,
-            "conditional_layer_norm": {
-                "_target_": "physicsnemo.models.dlwp_healpix_layers.normalization.ConditionalLayerNorm",
-                "_partial_": True,
-                "init_cln_to_zero": True,
-                "scale_center": 1.0,
-                "mlp_hidden_dims": [16, 16],
-                "condition_shape": 8,
-            },
-        }
+    conv_block = {
+        "_target_": ConvNeXtBlock,
+        "in_channels": in_channels,
+    }
+    up_sampling_block = {
+        "_target_": TransposedConvUpsample,
+        "in_channels": in_channels,
+        "out_channels": out_channels,
+        "upsampling": 2,
+    }
+    output_layer = {
+        "_target_": BasicConvBlock,
+        "in_channels": in_channels,
+        "out_channels": out_channels,
+        "kernel_size": 1,
+        "dilation": 1,
+        "n_layers": 1,
+    }
+
+    with pytest.raises(ValueError, match="per_level_cln must be a list of booleans"):
+        UNetDecoder(
+            conv_block=conv_block,
+            up_sampling_block=up_sampling_block,
+            output_layer=output_layer,
+            recurrent_block=None,
+            n_channels=n_channels,
+            # wrong length: 2 entries for 3 levels
+            per_level_cln=[True, False],
+        )
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_UNetDecoder_per_level_checkpointing_length_mismatch(device, pytestconfig):
+    from physicsnemo.models.dlwp_healpix_layers import (
+        BasicConvBlock,
+        ConvNeXtBlock,
+        TransposedConvUpsample,
+        UNetDecoder,
     )
-    up_sampling_block = OmegaConf.create(
-        {
-            "_target_": "physicsnemo.models.dlwp_healpix_layers.healpix_blocks.TransposedConvUpsample",
-            "upsampling": 2,
-        }
+
+    in_channels = 2
+    out_channels = 1
+    n_channels = (64, 32, 16)
+
+    conv_block = {
+        "_target_": ConvNeXtBlock,
+        "in_channels": in_channels,
+    }
+    up_sampling_block = {
+        "_target_": TransposedConvUpsample,
+        "in_channels": in_channels,
+        "out_channels": out_channels,
+        "upsampling": 2,
+    }
+    output_layer = {
+        "_target_": BasicConvBlock,
+        "in_channels": in_channels,
+        "out_channels": out_channels,
+        "kernel_size": 1,
+        "dilation": 1,
+        "n_layers": 1,
+    }
+
+    with pytest.raises(
+        ValueError, match="per_level_checkpointing must be a list of booleans"
+    ):
+        UNetDecoder(
+            conv_block=conv_block,
+            up_sampling_block=up_sampling_block,
+            output_layer=output_layer,
+            recurrent_block=None,
+            n_channels=n_channels,
+            # wrong length: 2 entries for 3 levels
+            per_level_checkpointing=[True, False],
+        )
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+@pytest.mark.parametrize(
+    "mask", [[True, False, True], [False, True, False]], ids=["tft", "ftf"]
+)
+def test_UNetDecoder_per_level_cln_disables_expected_levels(device, mask, pytestconfig):
+    """Verify per_level_cln is honored independently at each level, not applied
+    uniformly to all levels of the decoder.
+    """
+    from physicsnemo.models.dlwp_healpix_layers import (
+        BasicConvBlock,
+        TransposedConvUpsample,
+        UNetDecoder,
     )
-    output_layer = OmegaConf.create(
-        {
-            "_target_": "physicsnemo.models.dlwp_healpix_layers.healpix_blocks.BasicConvBlock",
-            "kernel_size": 1,
-            "dilation": 1,
-            "n_layers": 1,
-        }
+
+    cond_dim = 8
+    n_cond = 2
+    hw_size = 8
+    n_channels = (8, 8, 8)
+    out_channels = 4
+
+    conv_block = _cln_conv_block(n_channels[0], cond_dim)
+    up_sampling_block = {
+        "_target_": TransposedConvUpsample,
+        "in_channels": n_channels[0],
+        "out_channels": n_channels[0],
+        "upsampling": 2,
+    }
+    output_layer = {
+        "_target_": BasicConvBlock,
+        "in_channels": n_channels[0],
+        "out_channels": out_channels,
+        "kernel_size": 1,
+        "dilation": 1,
+        "n_layers": 1,
+    }
+
+    decoder = UNetDecoder(
+        conv_block=conv_block,
+        up_sampling_block=up_sampling_block,
+        output_layer=output_layer,
+        recurrent_block=None,
+        n_channels=n_channels,
+        output_channels=out_channels,
+        per_level_cln=mask,
+    ).to(device)
+
+    # instantiation-time check: every level's cln_enabled flag must exactly
+    # match the requested mask at that index
+    for n in range(len(n_channels)):
+        conv_module = decoder.decoder[n]["conv"]
+        assert conv_module.cln_enabled == mask[n], (
+            f"level {n}: expected cln_enabled={mask[n]}, got {conv_module.cln_enabled}"
+        )
+
+    # forward-time check: call each level's conv module directly (bypassing
+    # the decoder's sequential level-to-level dependency, since an earlier
+    # CLN-sensitive level would otherwise contaminate the input to every
+    # later level regardless of that later level's own per_level_cln value)
+    for n in range(len(n_channels)):
+        conv_module = decoder.decoder[n]["conv"]
+        # level 0 has no skip-connection concat, so its conv sees n_channels[0]
+        # input channels; every subsequent level concatenates the upsampled
+        # skip connection, doubling the channel count
+        in_ch = n_channels[n] * 2 if n > 0 else n_channels[n]
+        fixed_input = torch.rand([12 * n_cond, in_ch, hw_size, hw_size]).to(device)
+        cond_a = torch.randn(n_cond, cond_dim).to(device)
+        cond_b = torch.randn(n_cond, cond_dim).to(device)
+
+        with torch.no_grad():
+            out_a = conv_module(fixed_input, conditions_cln=cond_a)
+            out_b = conv_module(fixed_input, conditions_cln=cond_b)
+
+        same = common.compare_output(out_a, out_b)
+        if mask[n]:
+            assert not same, f"level {n} should be sensitive to conditions_cln"
+        else:
+            assert same, f"level {n} should be unaffected by conditions_cln"
+
+    del decoder
+    torch.cuda.empty_cache()
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_UNetDecoder_forward_conditions_cln_required(device, pytestconfig):
+    from physicsnemo.models.dlwp_healpix_layers import (
+        BasicConvBlock,
+        TransposedConvUpsample,
+        UNetDecoder,
+    )
+
+    cond_dim = 8
+    hw_size = 16
+    n_channels = (8, 8, 8)
+    out_channels = 4
+
+    conv_block = _cln_conv_block(n_channels[0], cond_dim)
+    up_sampling_block = {
+        "_target_": TransposedConvUpsample,
+        "in_channels": n_channels[0],
+        "out_channels": n_channels[0],
+        "upsampling": 2,
+    }
+    output_layer = {
+        "_target_": BasicConvBlock,
+        "in_channels": n_channels[0],
+        "out_channels": out_channels,
+        "kernel_size": 1,
+        "dilation": 1,
+        "n_layers": 1,
+    }
+
+    # default per_level_cln (None) enables CLN at every level
+    decoder = UNetDecoder(
+        conv_block=conv_block,
+        up_sampling_block=up_sampling_block,
+        output_layer=output_layer,
+        recurrent_block=None,
+        n_channels=n_channels,
+        output_channels=out_channels,
+    ).to(device)
+
+    invars = []
+    size = hw_size
+    for idx in range(len(n_channels) - 1, -1, -1):
+        invars.append(torch.rand([12, n_channels[idx], size, size]).to(device))
+        size = size // 2
+
+    with pytest.raises(ValueError, match="Conditional inputs are required"):
+        decoder(invars, conditions_cln=None)
+
+    del decoder, invars
+    torch.cuda.empty_cache()
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+@pytest.mark.parametrize(
+    ("mask", "expected_calls"),
+    [([True, False, True], 2), ([False, True, False], 1)],
+    ids=["tft-2calls", "ftf-1call"],
+)
+def test_UNetDecoder_per_level_checkpointing_applied_only_at_configured_levels(
+    device, monkeypatch, mask, expected_calls, pytestconfig
+):
+    """Verify per_level_checkpointing routes only the configured levels through
+    torch.utils.checkpoint.checkpoint(), not all (or none) of the decoder levels.
+    """
+    from torch.utils.checkpoint import checkpoint as real_checkpoint
+
+    from physicsnemo.models.dlwp_healpix_layers import (
+        BasicConvBlock,
+        ConvNeXtBlock,
+        TransposedConvUpsample,
+        UNetDecoder,
+    )
+
+    in_channels = 2
+    out_channels = 1
+    hw_size = 16
+    n_channels = (8, 8, 8)
+
+    conv_block = {
+        "_target_": ConvNeXtBlock,
+        "in_channels": in_channels,
+    }
+    up_sampling_block = {
+        "_target_": TransposedConvUpsample,
+        "in_channels": in_channels,
+        "out_channels": in_channels,
+        "upsampling": 2,
+    }
+    output_layer = {
+        "_target_": BasicConvBlock,
+        "in_channels": in_channels,
+        "out_channels": out_channels,
+        "kernel_size": 1,
+        "dilation": 1,
+        "n_layers": 1,
+    }
+
+    call_count = {"n": 0}
+
+    def spy_checkpoint(*args, **kwargs):
+        call_count["n"] += 1
+        return real_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "physicsnemo.models.dlwp_healpix_layers.healpix_decoder.checkpoint",
+        spy_checkpoint,
     )
 
     decoder = UNetDecoder(
@@ -462,15 +727,104 @@ def test_UNetDecoder_per_level_cln(device, pytestconfig):
         output_layer=output_layer,
         recurrent_block=None,
         n_channels=n_channels,
-        per_level_cln=per_level_cln,
+        per_level_checkpointing=mask,
     ).to(device)
 
-    for level_idx, expected_cln in enumerate(per_level_cln):
-        conv = decoder.decoder[level_idx]["conv"]
-        assert conv.cln_enabled is expected_cln, (
-            f"decoder level {level_idx}: expected cln_enabled={expected_cln}, "
-            f"got {conv.cln_enabled}"
-        )
+    invars = []
+    size = hw_size
+    for idx in range(len(n_channels) - 1, -1, -1):
+        invars.append(torch.rand([12, n_channels[idx], size, size]).to(device))
+        size = size // 2
 
-    del decoder
+    decoder(invars)
+
+    assert call_count["n"] == expected_calls, (
+        f"mask={mask}: expected {expected_calls} checkpoint() call(s), "
+        f"got {call_count['n']}"
+    )
+
+    del decoder, invars
+    torch.cuda.empty_cache()
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_UNetDecoder_per_level_checkpointing_matches_no_checkpointing(
+    device, pytestconfig
+):
+    """A mixed (non-uniform) per_level_checkpointing pattern must produce the
+    same forward output and gradients as no checkpointing at all, using the
+    exact same model weights.
+    """
+    from physicsnemo.models.dlwp_healpix_layers import (
+        BasicConvBlock,
+        ConvNeXtBlock,
+        TransposedConvUpsample,
+        UNetDecoder,
+    )
+
+    in_channels = 2
+    out_channels = 1
+    hw_size = 16
+    b_size = 12
+    n_channels = (8, 8, 8)
+
+    conv_block = {
+        "_target_": ConvNeXtBlock,
+        "in_channels": in_channels,
+    }
+    up_sampling_block = {
+        "_target_": TransposedConvUpsample,
+        "in_channels": in_channels,
+        "out_channels": in_channels,
+        "upsampling": 2,
+    }
+    output_layer = {
+        "_target_": BasicConvBlock,
+        "in_channels": in_channels,
+        "out_channels": out_channels,
+        "kernel_size": 1,
+        "dilation": 1,
+        "n_layers": 1,
+    }
+
+    decoder = UNetDecoder(
+        conv_block=conv_block,
+        up_sampling_block=up_sampling_block,
+        output_layer=output_layer,
+        recurrent_block=None,
+        n_channels=n_channels,
+        per_level_checkpointing=[False, False, False],
+    ).to(device)
+
+    invars = []
+    size = hw_size
+    for idx in range(len(n_channels) - 1, -1, -1):
+        invar = torch.rand([b_size, n_channels[idx], size, size]).to(device)
+        invar.requires_grad_(True)
+        invars.append(invar)
+        size = size // 2
+
+    baseline = decoder(invars)
+    baseline.sum().backward()
+    baseline_grads = [v.grad.clone() for v in invars]
+    baseline_out = baseline.detach().clone()
+
+    for v in invars:
+        v.grad = None
+    decoder.zero_grad()
+
+    # mixed pattern applied to the *same* model instance/weights
+    decoder.per_level_checkpointing = [True, False, True]
+
+    checkpointed = decoder(invars)
+    checkpointed.sum().backward()
+
+    assert common.compare_output(baseline_out, checkpointed)
+
+    for v, baseline_grad in zip(invars, baseline_grads):
+        assert torch.isfinite(v.grad).all()
+        assert torch.allclose(baseline_grad, v.grad, rtol=1e-4, atol=1e-5)
+
+    del decoder, invars, baseline, checkpointed
     torch.cuda.empty_cache()
