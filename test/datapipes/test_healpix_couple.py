@@ -184,8 +184,19 @@ def test_ConstantCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
     expected = np.expand_dims(coupled_scaling["std"].to_numpy(), (0, 2, 3, 4))
     assert np.array_equal(expected, coupler.coupled_scaling["std"])
 
-    # test incorrect batch size
-    # coupler.coupled_channel_indices = [0, 1]
+    # set_coupled_fields sizes its buffer from the provided field batch dim
+    coupled_fields_batch_size = batch_size * 2
+    coupled_fields_timedim = 2
+    coupled_fields = th.rand(
+        coupled_fields_batch_size,
+        coupler.spatial_dims[0],
+        coupled_fields_timedim,
+        len(coupler.coupled_channel_indices),
+        coupler.spatial_dims[1],
+        coupler.spatial_dims[2],
+    )
+    coupler.set_coupled_fields(coupled_fields)
+    assert coupler.preset_coupled_fields.shape[1] == coupled_fields_batch_size
 
     coupled_fields_batch_size = batch_size
     coupled_fields_timedim = 4
@@ -206,20 +217,20 @@ def test_ConstantCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
     assert coupler.coupled_mode
     assert list(coupler.construct_integrated_couplings().shape) == expected_shape
 
-    # verify that the data is being properly transformed
-    expected = coupled_fields[:, :, :, coupler.coupled_channel_indices, :, :].permute(
-        2, 0, 3, 1, 4, 5
-    )
-    expected = expected[0, :, -1:, :, :, :]
-    expected = expected.unsqueeze(0)
-    expected = expected.repeat(
-        coupler.coupled_integration_dim, 1, coupled_fields_batch_size, 1, 1, 1
-    )
+    # broadcast the first time step of every channel across the integration dim
+    expected = coupled_fields[:, :, :, coupler.coupled_channel_indices, :, :]
+    expected = expected[:, :, :1, :, :, :]
+    expected = expected.permute(2, 0, 3, 1, 4, 5)
     assert th.equal(expected, coupler.construct_integrated_couplings())
 
     # test coupler reset
     coupler.reset_coupler()
     assert coupler.coupled_mode is False
+
+    with pytest.raises(
+        ValueError, match=("batch and bsize must be provided when not in coupled_mode")
+    ):
+        coupler.construct_integrated_couplings()
 
     # test loading from the dataset
     coupled_scaling = {
@@ -232,6 +243,12 @@ def test_ConstantCoupler(data_dir, dataset_name, scaling_dict, pytestconfig):
         batch=batch, bsize=batch_size
     )
     assert np.array_equal(expected, coupled_field[0])
+
+    scaling_missing_var = scaling_da.drop_sel(index="z1000")
+    with pytest.raises(
+        KeyError, match=("Coupled variable\\(s\\) not found in scaling values")
+    ):
+        coupler.set_scaling(scaling_missing_var)
 
     zarr_ds.close()
     DistributedManager.cleanup()
@@ -371,6 +388,19 @@ def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconf
     coupler.averaging_slices = averaging_slices
     coupler.coupled_channel_indices = [0, 1]
 
+    coupled_fields_batch_size = batch_size * 2
+    coupled_fields_timedim = 4
+    coupled_fields = th.rand(
+        coupled_fields_batch_size,
+        coupler.spatial_dims[0],
+        coupled_fields_timedim,
+        len(coupler.coupled_channel_indices),
+        coupler.spatial_dims[1],
+        coupler.spatial_dims[2],
+    )
+    coupler.set_coupled_fields(coupled_fields)
+    assert coupler.preset_coupled_fields.shape[1] == coupled_fields_batch_size
+
     coupled_fields_batch_size = batch_size
     coupled_fields_timedim = 4
     expected_shape = [
@@ -393,6 +423,122 @@ def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconf
     assert coupler.coupled_mode
     coupler.reset_coupler()
     assert coupler.coupled_mode is False
+
+    zarr_ds.close()
+    DistributedManager.cleanup()
+
+
+@import_or_fail("omegaconf")
+@import_or_fail("netCDF4")
+@import_or_fail("pandas")
+@import_or_fail("xarray")
+@nfsdata_or_fail
+def test_TrailingAverageCoupler_multiple_variables(data_dir, dataset_name, pytestconfig):
+    from physicsnemo.datapipes.healpix.couplers import TrailingAverageCoupler
+
+    variables = ["z500", "z1000", "z250"]
+    input_times = ["6h", "12h"]
+    input_time_dim = 2
+    output_time_dim = 2
+    batch_size = 2
+    averaging_window = "6h"
+    ds_path = Path(data_dir, dataset_name + ".zarr")
+    zarr_ds = xr.open_zarr(ds_path)
+
+    coupler = TrailingAverageCoupler(
+        dataset=zarr_ds,
+        batch_size=batch_size,
+        variables=variables,
+        presteps=0,
+        averaging_window=averaging_window,
+        input_times=input_times,
+        input_time_dim=input_time_dim,
+        output_time_dim=output_time_dim,
+    )
+    coupler.coupled_channel_indices = list(range(len(variables)))
+
+    data_time_step = "3h"
+    averaging_window_max_indices = [
+        i // pd.Timedelta(data_time_step) for i in input_times
+    ]
+    di = averaging_window_max_indices[0]
+    averaging_slices = []
+    for j in range(coupler.coupled_integration_dim):
+        averaging_slices.append([])
+        for i, r in enumerate(averaging_window_max_indices):
+            averaging_slices[j].append(
+                slice(
+                    coupler.input_time_dim * j * di + i * di,
+                    coupler.input_time_dim * j * di + r,
+                )
+            )
+    coupler.averaging_slices = averaging_slices
+
+    channel_values = [100.0, 200.0, 300.0]
+    coupled_fields = th.empty(
+        batch_size,
+        coupler.spatial_dims[0],
+        4,
+        len(variables),
+        coupler.spatial_dims[1],
+        coupler.spatial_dims[2],
+    )
+    for i, value in enumerate(channel_values):
+        coupled_fields[:, :, :, i, :, :] = value
+
+    coupler.set_coupled_fields(coupled_fields)
+    result = coupler.construct_integrated_couplings()
+    assert list(result.shape) == [
+        coupler.coupled_integration_dim,
+        batch_size,
+        coupler.timevar_dim,
+    ] + list(coupler.spatial_dims)
+
+    for period in range(len(input_times)):
+        for var_idx, value in enumerate(channel_values):
+            timevar_idx = period * len(variables) + var_idx
+            slice_result = result[:, :, timevar_idx, :, :, :]
+            assert th.allclose(slice_result, th.full_like(slice_result, value))
+
+    zarr_ds.close()
+    DistributedManager.cleanup()
+
+
+@import_or_fail("omegaconf")
+@import_or_fail("netCDF4")
+@import_or_fail("pandas")
+@import_or_fail("xarray")
+@nfsdata_or_fail
+def test_ConstantCoupler_multiple_variables_order(data_dir, dataset_name, pytestconfig):
+    from physicsnemo.datapipes.healpix.couplers import ConstantCoupler
+
+    ds_path = Path(data_dir, dataset_name + ".zarr")
+    zarr_ds = xr.open_zarr(ds_path)
+
+    native_order = list(zarr_ds.channel_in.values)
+    variables = ["z250", "z1000", "z500"]
+    assert [native_order.index(v) for v in variables] == sorted(
+        [native_order.index(v) for v in variables], reverse=True
+    )
+
+    batch_size = 2
+    batch = {"time": slice(0, 2)}
+    coupler = ConstantCoupler(
+        dataset=zarr_ds,
+        batch_size=batch_size,
+        variables=variables,
+        input_times=["0h"],
+        input_time_dim=1,
+        output_time_dim=1,
+    )
+    coupler.compute_coupled_indices(interval=2, data_time_step="3h")
+
+    coupled_field = coupler.construct_integrated_couplings(
+        batch=batch, bsize=batch_size
+    )
+    for i, var in enumerate(variables):
+        expected_var = zarr_ds.sel(channel_in=var).inputs[:2].values
+        assert np.array_equal(expected_var, coupled_field[0][:, i])
 
     zarr_ds.close()
     DistributedManager.cleanup()
@@ -1182,7 +1328,9 @@ def test_CoupledTimeSeriesDataset_next_integration(
 
     spatial_dims = [12, 32, 32]
     input_variables = ["z500", "z1000"]
-    coupled_channel_indices = [0, 1]
+    # length must match len(coupled_variables) (i.e. the coupler's timevar_dim);
+    # values are arbitrary since this synthetic setup bypasses setup_coupling()
+    coupled_channel_indices = [0]
     coupled_variables = ["z250"]
     num_variables = len(input_variables)
     input_time_dim = 1
@@ -1245,12 +1393,11 @@ def test_CoupledTimeSeriesDataset_next_integration(
         spatial_dims[2],
     )
 
-    expected_coupling = coupled_fields[:, :, :, coupled_channel_indices, :, :].permute(
-        2, 0, 3, 1, 4, 5
-    )
-    expected_coupling = expected_coupling[0, :, -1, :, :, :]
-    expected_coupling = expected_coupling.unsqueeze(0).unsqueeze(0)
-    expected_coupling = expected_coupling.repeat(1, batch_size, 1, 1, 1, 1)
+    # mirrors set_coupled_fields: broadcast the first time step across the
+    # integration dim and permute to [integration_dim, batch, timevar, face, height, width]
+    expected_coupling = coupled_fields[:, :, :, coupled_channel_indices, :, :]
+    expected_coupling = expected_coupling[:, :, :1, :, :, :]
+    expected_coupling = expected_coupling.permute(2, 0, 3, 1, 4, 5)
 
     # need to grab at least 1 sample to properly intialize everything
     timeseries_ds[0]
