@@ -52,13 +52,19 @@ from omegaconf import DictConfig, OmegaConf
 
 from .healpix_layers import HEALPixLayer
 from .healpix_paddings import HEALPixFoldFaces, HEALPixUnfoldFaces
-from .reflection_ops import project_even_kernel
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_COUPLED_PARTIAL_CONV_STEM_TARGET = (
     "physicsnemo.models.dlwp_healpix_layers.coupled_partial_conv.CoupledPartialConvStem"
 )
+
+
+def _project_even_kernel(weight: th.Tensor) -> th.Tensor:
+    """Lazy import: reflection_ops lives on reflectional_equivariance, not coupled tip."""
+    from .reflection_ops import project_even_kernel
+
+    return project_even_kernel(weight)
 
 
 def coupled_variable_channel_names(couplings: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -225,8 +231,8 @@ class PartialHEALPixConv2d(nn.Module):
         # keep Adam on-manifold via grad hooks (same pattern as ReflectionSteerable).
         feat_weight = self._conv_weight(self.feature_conv)
         with th.no_grad():
-            feat_weight.copy_(project_even_kernel(feat_weight))
-        feat_weight.register_hook(lambda g: project_even_kernel(g))
+            feat_weight.copy_(_project_even_kernel(feat_weight))
+        feat_weight.register_hook(lambda g: _project_even_kernel(g))
 
         if bias:
             self.bias = nn.Parameter(th.zeros(channels))
@@ -264,7 +270,7 @@ class PartialHEALPixConv2d(nn.Module):
         """Backward-compatible alias for kernel-only projection."""
         w = self._conv_weight(self.feature_conv)
         with th.no_grad():
-            w.copy_(project_even_kernel(w))
+            w.copy_(_project_even_kernel(w))
 
     def _project_parity_params_(self) -> None:
         self._project_feature_kernel_()
