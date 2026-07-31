@@ -23,11 +23,13 @@ from typing import Dict, Optional, Sequence
 
 import numpy as np
 import torch
-import xarray as xr
 
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.launch.logging import RankZeroLoggingWrapper
-from physicsnemo.metrics.climate.hydrostasy import DifferentialHydrostaticBalanceConstraint
+from physicsnemo.metrics.climate.hydrostasy import (
+    DifferentialHydrostaticBalanceConstraint,
+    _load_topography,
+)
 
 logger = logging.getLogger(__name__)
 if DistributedManager.is_initialized():
@@ -174,19 +176,13 @@ class HydrostasySoftConstraint(SoftConstraint):
         self.T_level_mapping = torch.tensor(list(self.T_pressure_levels.keys()))
         self.q_level_mapping = torch.tensor(list(self.q_pressure_levels.keys()))
 
-        ds = xr.open_zarr(dataset_path)
-        self.topography = (
-            surface_geopotential_std
-            * ds["constants"].sel(channel_c=surface_geopotential_name).values
-            + surface_geopotential_mean
-        )
-        if self.convert_topography_to_meters:
-            self.topography /= self.g0
-        self.topography = torch.tensor(
-            self.topography[np.newaxis, :, np.newaxis, :, :], dtype=torch.float
-        )
-        logger.info(
-            f"Min/Max topography (m): {self.topography.min()}/{self.topography.max()}"
+        self.topography = _load_topography(
+            dataset_path,
+            surface_geopotential_name,
+            surface_geopotential_mean,
+            surface_geopotential_std,
+            self.g0,
+            self.convert_topography_to_meters,
         )
         if self.topography.min() < -1000.0 or self.topography.max() > 10000.0:
             raise ValueError("Topography values fall outside realistic range!")
