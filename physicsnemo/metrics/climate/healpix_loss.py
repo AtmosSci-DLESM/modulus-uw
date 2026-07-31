@@ -24,6 +24,13 @@ import earth2grid
 from cuhpx import SHTCUDA, iSHTCUDA
 from earth2grid.healpix import HEALPIX_PAD_XY, PixelOrder
 from physicsnemo.models.dlwp_healpix_layers.healpix_paddings import make_hpx_padding_layer
+
+
+def _collapsed_two_member_coeff(n_members: int, pairwise_averaging_coeff):
+    """Scale collapsed 2-member afCRPS/ES to match the pairwise (i≠j) reduction."""
+    return n_members * pairwise_averaging_coeff
+
+
 """
 Custom dlwp compatible loss classes that allow for more sophisticated training optimization.
 
@@ -399,7 +406,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
     def _2member_crps(self, prediction, target, lsm_tensor):
         diff_target = th.abs(prediction - target.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
         diff_ensemble = th.abs(prediction[0] - prediction[1]) # [B, F, T, C, H, W]
-        crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
+        coeff = _collapsed_two_member_coeff(self.n_members, self.averaging_coeff)
+        crps = coeff * (diff_target - self.coeff_eps * diff_ensemble)  # [B, F, T, C, H, W]
         crps *= lsm_tensor
         return crps
 
@@ -768,7 +776,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
             # Use faster explicit implementation
             diff_target = th.abs(prediction - target.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
             diff_ensemble = th.abs(prediction[0] - prediction[1]) # [B, F, T, C, H, W]
-            crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
+            coeff = _collapsed_two_member_coeff(self.n_members, self.averaging_coeff)
+            crps = coeff * (diff_target - self.coeff_eps * diff_ensemble)  # [B, F, T, C, H, W]
 
             if average_channels:
                 loss = crps.mean()
@@ -795,7 +804,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
                     diff_sht_target = th.abs(sht_pred - sht_tar.unsqueeze(0)).sum(dim=(0, 4, 5)) # [B, T, C]
                     diff_sht_ensemble = th.abs(sht_pred[0] - sht_pred[1]).sum(dim=(-1,-2)) # [B, T, C] 
-                    crps_sht = self.averaging_coeff * (diff_sht_target - self.coeff_eps * diff_sht_ensemble) # [B, T, C]
+                    coeff = _collapsed_two_member_coeff(self.n_members, self.averaging_coeff)
+                    crps_sht = coeff * (diff_sht_target - self.coeff_eps * diff_sht_ensemble)  # [B, T, C]
 
                     # Compute spectral afCRPS
                     if average_channels:
@@ -820,7 +830,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
                         diff_target = th.abs(pred_smooth - tar_smooth.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
                         diff_ensemble = th.abs(pred_smooth[0] - pred_smooth[1]) # [B, F, T, C, H, W]
-                        crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
+                        coeff = _collapsed_two_member_coeff(self.n_members, self.averaging_coeff)
+            crps = coeff * (diff_target - self.coeff_eps * diff_ensemble)  # [B, F, T, C, H, W]
 
                         crps *= self.lsm_tensor
 
@@ -1216,8 +1227,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
                 h,
                 w,
             ).squeeze(0)  # [B,F,T,C,H,W]
-            # Collapsed sum counts each member once; pairwise path counts twice.
-            coeff = n * self.averaging_coeff
+            coeff = _collapsed_two_member_coeff(n, self.averaging_coeff)
             return coeff * (diff_target - self.coeff_eps * diff_ensemble)
 
         diff_i = diff_to_target  # [Cond,B,F,T,C,H,W]
