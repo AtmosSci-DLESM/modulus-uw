@@ -83,38 +83,6 @@ def _open_mask_dataset(dataset_path: str) -> xr.Dataset:
     return xr.open_dataset(path)
 
 
-def _resolve_mask_field(
-    ds: xr.Dataset,
-    data_var: str,
-    selection_dict: Mapping[str, Any] | None,
-) -> xr.DataArray:
-    """Resolve a mask field for monolithic or named-array healpix stores."""
-    sel = dict(selection_dict or {})
-    if data_var in ds.data_vars:
-        field = ds[data_var]
-        if sel:
-            field = field.sel(**sel)
-        return field
-
-    # named_arrays_healpix: constants are top-level arrays; channel_c names the field.
-    if data_var == "constants" and "channel_c" in sel:
-        field_name = str(sel.pop("channel_c"))
-        if field_name not in ds.data_vars:
-            raise KeyError(
-                f"Mask field {field_name!r} not found in dataset; "
-                "named_arrays_healpix stores expose constants as top-level arrays."
-            )
-        field = ds[field_name]
-        if sel:
-            field = field.sel(**sel)
-        return field
-
-    raise KeyError(
-        f"No variable named {data_var!r} in dataset"
-        + (f" (available: {list(ds.data_vars)!r})" if hasattr(ds, "data_vars") else "")
-    )
-
-
 def load_spatial_mask(
     dataset_path: str,
     data_var: str = "constants",
@@ -140,7 +108,9 @@ def load_spatial_mask(
     """
     ds = _open_mask_dataset(dataset_path)
     try:
-        field = _resolve_mask_field(ds, data_var, selection_dict)
+        field = ds[data_var]
+        if selection_dict:
+            field = field.sel(**dict(selection_dict))
         values = np.asarray(field.values, dtype=np.float32)
     finally:
         ds.close()
