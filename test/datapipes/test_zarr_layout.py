@@ -32,6 +32,7 @@ from physicsnemo.datapipes.healpix.zarr_layout import (
     load_channel_data,
     load_constant_fields,
     load_windowed_channel_data,
+    resolve_mask_field,
 )
 
 
@@ -174,3 +175,36 @@ def test_load_windowed_channel_data_named_store(tmp_path):
 
 def test_enable_zarrs_pipeline_when_installed():
     assert enable_zarrs_pipeline() is True
+
+
+def test_resolve_mask_field_named_arrays_and_coupled_stem_loader(tmp_path):
+    """named_arrays_healpix LSM feeds coupled_partial_conv.load_spatial_mask."""
+    from physicsnemo.models.dlwp_healpix_layers.coupled_partial_conv import (
+        load_spatial_mask,
+    )
+
+    f, h, w = 12, 4, 4
+    ocean = np.zeros((f, h, w), dtype=np.float32)
+    ocean[0::2] = 1.0
+    land = 1.0 - ocean
+    ds = xr.Dataset(
+        {"lsm": (("face", "height", "width"), land)},
+        coords=_spatial_coords(f=f, h=h, w=w),
+        attrs={"layout": "named_arrays_healpix"},
+    )
+    path = tmp_path / "mask_named.zarr"
+    ds.to_zarr(path, mode="w")
+
+    opened = xr.open_zarr(path)
+    field = resolve_mask_field(opened, "constants", {"channel_c": "lsm"})
+    np.testing.assert_allclose(field.values, land)
+    opened.close()
+
+    soft = load_spatial_mask(
+        str(path),
+        data_var="constants",
+        selection_dict={"channel_c": "lsm"},
+        invert=True,
+        threshold=None,
+    )
+    np.testing.assert_allclose(soft.numpy(), ocean)

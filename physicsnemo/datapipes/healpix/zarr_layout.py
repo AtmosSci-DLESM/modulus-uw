@@ -6,7 +6,7 @@ import atexit
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -122,6 +122,43 @@ def is_per_variable_layout(ds) -> bool:
     if layout == "per_variable_healpix" or str(layout).startswith("per_variable"):
         return True
     return True
+
+
+def resolve_mask_field(
+    ds,
+    data_var: str,
+    selection_dict: Mapping[str, Any] | None = None,
+):
+    """Resolve a spatial mask field from monolithic or named_arrays_healpix stores.
+
+    Monolithic stores use ``data_var`` (e.g. ``constants``) with optional
+    ``selection_dict`` (e.g. ``channel_c``). Named-array stores expose each
+    constant as a top-level array; configs still use ``data_var: constants`` and
+    ``selection_dict.channel_c`` to pick the field name.
+    """
+    sel = dict(selection_dict or {})
+    if data_var in ds.data_vars:
+        field = ds[data_var]
+        if sel:
+            field = field.sel(**sel)
+        return field
+
+    if is_named_arrays_layout(ds) and data_var == "constants" and "channel_c" in sel:
+        field_name = str(sel.pop("channel_c"))
+        if field_name not in ds.data_vars:
+            raise KeyError(
+                f"Mask field {field_name!r} not found in dataset; "
+                "named_arrays_healpix stores expose constants as top-level arrays."
+            )
+        field = ds[field_name]
+        if sel:
+            field = field.sel(**sel)
+        return field
+
+    raise KeyError(
+        f"No variable named {data_var!r} in dataset"
+        + (f" (available: {list(ds.data_vars)!r})" if hasattr(ds, "data_vars") else "")
+    )
 
 
 def available_field_names(ds) -> set[str]:
