@@ -23,9 +23,9 @@ import torch
 from omegaconf import DictConfig
 
 from physicsnemo.datapipes.meta import DatapipeMetaData
-from physicsnemo.utils.insolation import insolation
 
 from .base_timeseries_dataset_zarr import BaseTimeSeriesDatasetZarr
+from .zarr_layout import load_windowed_channel_data, maybe_collect_worker_gc
 
 logger = logging.getLogger(__name__)
 
@@ -155,78 +155,46 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         # remark: load first then normalize
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_batch")
         time_index, this_batch = self._get_time_index(item)
+        time_sl = slice(*time_index)
+        input_time_idx = self._input_indices_np[:this_batch]
+        output_time_idx = (
+            None if self.forecast_mode else self._output_indices_np[:this_batch]
+        )
 
-        torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_staging_data")
-        # data from the input and target arrays overlap, to avoid 2 seperate loads
-        # we load both and then slice it later
-        staging_ds = self.ds["inputs"][slice(*time_index)]
-        staging_ds = staging_ds[:, self.all_variable_indices]
+        torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_windows")
+        # Decode each field once and scatter directly into sample windows
+        # (per-variable: threaded fills; monolithic: joint read + gather).
+        inputs, targets = load_windowed_channel_data(
+            self.ds,
+            time_sl,
+            input_names=self.input_variables,
+            input_time_idx=input_time_idx,
+            output_names=None if self.forecast_mode else self.output_variables,
+            output_time_idx=output_time_idx,
+            input_scaling=self.input_scaling,
+            output_scaling=self.target_scaling,
+        )
         torch.cuda.nvtx.range_pop()
-
-        # we scale this dataset to avoid doing twice the work when we scale as both
-        # input and output
-        # we do the scaling as in place operations to avoid creating temp arrays
-        # that result in a lot of data movement. This is around 4x faster than using
-        # standard operations
-        torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:scale_batch")
-        if self.all_scaling is not None:
-            staging_ds -= self.all_scaling["mean"]
-            staging_ds /= self.all_scaling["std"]
-
-        torch.cuda.nvtx.range_pop()
-
-        torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_input")
-        input_array = staging_ds[:, self.input_variable_indices]
-        torch.cuda.nvtx.range_pop()
-
-        if not self.forecast_mode:
-            torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_target")
-            target_array = staging_ds[:, self.output_variable_indices]
-            torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:process_batch")
-
-        # Calculate insolation if needed
-        if self.add_insolation:
-            sol = insolation(
-                self._get_forecast_sol_times(item),
-                self.lat,
-                self.lon,
-            )[:, None]
-            decoder_inputs = np.empty(
-                (this_batch, self.input_time_dim + self.output_time_dim, 1)
-                + self.spatial_dims,
-                dtype="float32",
-            )
-
-        # Get buffers for the batches, which we'll fill in iteratively.
-        inputs = np.empty(
-            (this_batch, self.input_time_dim, len(self.input_variables))
-            + self.spatial_dims,
-            dtype="float32",
-        )
-        if not self.forecast_mode:
-            targets = np.empty(
-                (this_batch, self.output_time_dim, len(self.output_variables))
-                + self.spatial_dims,
-                dtype="float32",
-            )
-
-        # Iterate over valid sample windows
         torch.cuda.nvtx.range_push(
             "TimeSeriesDataset:__getitem__:copy_inputs_targets_insolation"
         )
-        for sample in range(this_batch):
-            inputs[sample] = input_array[self._input_indices[sample]]
-            if not self.forecast_mode:
-                targets[sample] = target_array[self._output_indices[sample]]
-            if self.add_insolation:
-                decoder_inputs[sample] = (
-                    sol
-                    if self.forecast_mode
-                    else sol[self._input_indices[sample] + self._output_indices[sample]]
+        if self.add_insolation:
+            sol = self.insolation_for_dates(self._get_forecast_sol_times(item))[
+                :, None
+            ]
+            if self.forecast_mode:
+                # sol is already the (T_in+T_out, ...) sequence for the IC.
+                decoder_inputs = np.empty(
+                    (this_batch, self.input_time_dim + self.output_time_dim, 1)
+                    + self.spatial_dims,
+                    dtype="float32",
                 )
+                decoder_inputs[:] = sol
+            else:
+                decoder_inputs = sol[self._sol_indices_np[:this_batch]]
         torch.cuda.nvtx.range_pop()
 
         if not self.forecast_mode and self.add_train_noise:
@@ -261,11 +229,13 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         torch.cuda.nvtx.range_pop()
 
         if self.forecast_mode:
+            maybe_collect_worker_gc()
             torch.cuda.nvtx.range_pop()
             return inputs_result
 
         # Transpose targets to match input format
         targets = np.transpose(targets, axes=(0, 3, 1, 2, 4, 5))
 
+        maybe_collect_worker_gc()
         torch.cuda.nvtx.range_pop()
         return inputs_result, targets

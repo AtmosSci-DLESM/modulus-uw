@@ -36,6 +36,28 @@ from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
 logger = logging.getLogger(__name__)
 
 
+def _zarr_dataloader_worker_init(n_threads: int):
+    """Install a persistent per-worker thread pool for per-variable Zarr reads.
+
+    Also disables cyclic GC in the worker process. Per-variable getitem allocates
+    many large arrays; periodic GC pauses show up as rare multi-hundred-ms
+    DataLoader stalls under 7-rank training even when mean IO is fine.
+    """
+
+    def _init(_worker_id: int) -> None:
+        import gc
+
+        from .zarr_layout import enable_zarrs_pipeline, init_worker_pool
+
+        enable_zarrs_pipeline()
+        init_worker_pool(n_threads)
+        # Rely on refcounting for large numpy buffers. Periodic gc.collect() on
+        # the getitem path caused multi-hundred-ms jitter under training.
+        gc.disable()
+
+    return _init
+
+
 class TimeSeriesDataModuleZarr:
     """Module for complete model train, validation, and test data loading. Uses
     dlwp.data.data_loading.TimeSeriesDataset under-the-hood.
@@ -69,6 +91,7 @@ class TimeSeriesDataModuleZarr:
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
+        dataloader_io_threads: int = 8,
     ):
         """
         Parameters
@@ -137,6 +160,10 @@ class TimeSeriesDataModuleZarr:
         in_order: bool, optional
             Passed to torch.utils.data.DataLoader when set (requires PyTorch with ``in_order`` support).
             If None, DataLoader default applies.
+        dataloader_io_threads: int, optional
+            Threads per DataLoader worker for per-variable Zarr reads. When >1 and
+            num_workers > 0, workers reuse a persistent thread pool instead of
+            creating a new pool on every batch.
         """
         super().__init__()
         self.dataset_path = Path(dataset_path)
@@ -165,6 +192,7 @@ class TimeSeriesDataModuleZarr:
         self.train_noise_params = train_noise_params
         self.train_noise_seed = train_noise_seed
         self.in_order = in_order
+        self.dataloader_io_threads = dataloader_io_threads
 
         self.train_dataset = None
         self.val_dataset = None
@@ -351,6 +379,10 @@ class TimeSeriesDataModuleZarr:
             dataloader_kwargs["prefetch_factor"] = self.prefetch_factor
         if self.in_order is not None:
             dataloader_kwargs["in_order"] = self.in_order
+        if self.num_workers > 0 and self.dataloader_io_threads > 1:
+            dataloader_kwargs["worker_init_fn"] = _zarr_dataloader_worker_init(
+                self.dataloader_io_threads
+            )
         loader = DataLoader(**dataloader_kwargs)
 
         return loader, sampler
@@ -460,6 +492,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
+        dataloader_io_threads: int = 8,
     ):
         """
         Parameters
@@ -560,6 +593,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             train_noise_params,
             train_noise_seed,
             in_order,
+            dataloader_io_threads,
         )
 
     def _get_coupled_vars(self):

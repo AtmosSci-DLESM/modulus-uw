@@ -25,7 +25,6 @@ import zarr
 from omegaconf import DictConfig, OmegaConf
 
 from physicsnemo.datapipes.meta import DatapipeMetaData
-from physicsnemo.utils.insolation import insolation
 
 from . import couplers
 from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
@@ -286,10 +285,8 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
             Insolation tensor
         """
         sol = torch.tensor(
-            insolation(
-                self._get_forecast_sol_times(self.curr_item) + time_offset,
-                self.lat,
-                self.lon,
+            self.insolation_for_dates(
+                self._get_forecast_sol_times(self.curr_item) + time_offset
             )[:, None]
         )
         decoder_inputs = np.empty(
