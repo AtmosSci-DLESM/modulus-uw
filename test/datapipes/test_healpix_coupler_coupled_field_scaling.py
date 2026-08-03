@@ -125,8 +125,10 @@ def _make_trailing_coupler(
         output_time_dim=1,
     )
     # Simulate setup_coupling without a full coupled module.
+    # Post-index order follows incoming_variables; pair sink names the same way.
     coupler.coupled_channel_indices = list(range(len(incoming_variables)))
     coupler.incoming_variables = incoming_variables
+    coupler.outgoing_variable_order = list(variables)
     if incoming is not None or outgoing is not None:
         coupler.set_coupled_scaling(incoming, outgoing)
     _configure_trailing_average(coupler, input_times, data_time_step="3h")
@@ -156,6 +158,7 @@ def _make_constant_coupler(
     )
     coupler.coupled_channel_indices = list(range(len(incoming_variables)))
     coupler.incoming_variables = incoming_variables
+    coupler.outgoing_variable_order = list(variables)
     if incoming is not None or outgoing is not None:
         coupler.set_coupled_scaling(incoming, outgoing)
     return coupler
@@ -275,6 +278,7 @@ def test_setup_coupling_sets_incoming_variables():
     )
     coupler.setup_coupling(_FakeModule())
     assert coupler.incoming_variables == ["z1000", "ws10m"]
+    assert coupler.outgoing_variable_order == ["z1000-48H", "ws10m-48H"]
     assert coupler.coupled_channel_indices == [1, 2]
     coupler.set_coupled_scaling(scaling, scaling)
     assert abs(
@@ -292,6 +296,70 @@ def test_setup_coupling_sets_incoming_variables():
 # ---------------------------------------------------------------------------
 # 2. Backward compatibility
 # ---------------------------------------------------------------------------
+
+
+def test_scaling_follows_post_index_channel_order():
+    """If source channel order differs from self.variables, scaling must follow indices."""
+    scaling = _yaml_scaling()
+    scaling["ws10m-48H"] = dict(scaling["ws10-48H"])
+
+    class _FakeModule:
+        # ws10m appears *before* z1000 in the source output
+        output_variables = ["sst", "ws10m", "z1000", "t2m"]
+        time_step = "3h"
+
+    # Coupler variables listed z1000-first (opposite of source order).
+    coupler = TrailingAverageCoupler(
+        dataset=_make_dataset(["z1000-48H", "ws10m-48H"], n_time=64),
+        batch_size=_BATCH,
+        variables=["z1000-48H", "ws10m-48H"],
+        averaging_window="48h",
+        input_times=["48h"],
+        input_time_dim=1,
+        output_time_dim=1,
+    )
+    coupler.setup_coupling(_FakeModule())
+    assert coupler.coupled_channel_indices == [1, 2]  # ws10m, z1000 in source order
+    assert coupler.incoming_variables == ["ws10m", "z1000"]
+    assert coupler.outgoing_variable_order == ["ws10m-48H", "z1000-48H"]
+    coupler.set_coupled_scaling(scaling, scaling)
+
+    # Build a full source-shaped tensor and fill only the matched channels.
+    # Channel layout matches FakeModule.output_variables.
+    timedim = 20
+    full = torch.zeros(_BATCH, _FACE, timedim, 4, _HEIGHT, _WIDTH, dtype=torch.float32)
+    # After index [1,2] → [ws10m, z1000]. Plant distinct z-scores.
+    full[:, :, :, 1, :, :] = 1.0   # ws10m = +1σ
+    full[:, :, :, 2, :, :] = 2.0   # z1000 = +2σ
+    # setup_coupling already set averaging_slices; do not call
+    # _configure_trailing_average (it would reset coupled_channel_indices).
+    coupler.set_coupled_fields(full)
+    out = coupler.construct_integrated_couplings()  # [I,B,timevar,F,H,W]
+
+    # Denorm with outgoing order [ws10m-48H, z1000-48H] should recover
+    # physical = μ + σ * z for each post-index channel.
+    means_o = torch.tensor(
+        [scaling["ws10m-48H"]["mean"], scaling["z1000-48H"]["mean"]],
+        dtype=torch.float64,
+    )
+    stds_o = torch.tensor(
+        [scaling["ws10m-48H"]["std"], scaling["z1000-48H"]["std"]],
+        dtype=torch.float64,
+    )
+    means_i = torch.tensor(
+        [scaling["ws10m"]["mean"], scaling["z1000"]["mean"]],
+        dtype=torch.float64,
+    )
+    stds_i = torch.tensor(
+        [scaling["ws10m"]["std"], scaling["z1000"]["std"]],
+        dtype=torch.float64,
+    )
+    phys = means_i + stds_i * torch.tensor([1.0, 2.0], dtype=torch.float64)
+    expected_z = ((phys - means_o) / stds_o).to(torch.float32)
+    got = out[0, 0, :, 0, 0, 0]  # [timevar]
+    assert torch.allclose(got, expected_z, rtol=0, atol=1e-4), (
+        f"order mismatch: got {got.tolist()}, expected {expected_z.tolist()}"
+    )
 
 
 def test_trailing_average_without_scaling_unchanged():

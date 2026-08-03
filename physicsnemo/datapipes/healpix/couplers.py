@@ -238,8 +238,10 @@ class BaseCoupler(ABC):
         self.time_first = time_first
         self.incoming_coupled_scaling = None
         self.outgoing_coupled_scaling = None
-        # Set by setup_coupling: source-module channel names for denorm lookups.
+        # Set by setup_coupling: source-module channel names for denorm lookups,
+        # and sink-side names in the same post-index order for renorm lookups.
         self.incoming_variables = None
+        self.outgoing_variable_order = None
 
         if not prepared_coupled_data:
             raise NotImplementedError("Data preparation not yet implemented")
@@ -330,8 +332,10 @@ class BaseCoupler(ABC):
 
         * **Incoming** (denorm): ``self.incoming_variables``, populated by
           :meth:`setup_coupling` from the coupled module's matched
-          ``output_variables``.
-        * **Outgoing** (renorm): ``self.variables`` duplicated once per
+          ``output_variables`` in the same order as
+          ``coupled_channel_indices`` (post-index channel order).
+        * **Outgoing** (renorm): ``self.outgoing_variable_order`` (sink names
+          paired to those same post-index channels) duplicated once per
           ``input_times`` entry, length ``self.output_channels`` (period-major).
 
         When set, ``set_coupled_fields`` denormalizes with incoming stats,
@@ -352,15 +356,16 @@ class BaseCoupler(ABC):
                 "Both incoming_coupled_scaling and outgoing_coupled_scaling "
                 "must be provided together (or omit set_coupled_scaling)."
             )
-        if self.incoming_variables is None:
+        if self.incoming_variables is None or self.outgoing_variable_order is None:
             raise RuntimeError(
                 "setup_coupling must be called before set_coupled_scaling "
-                "so incoming_variables are available from the coupled module."
+                "so incoming/outgoing variable order is available from the "
+                "coupled module."
             )
 
         incoming_variables = list(self.incoming_variables)
-        # Period-major: [v0, v1, ..., v0, v1, ...] across input_times.
-        outgoing_variables = list(self.variables) * len(self.input_times)
+        # Period-major, matching post-index channel order from setup_coupling.
+        outgoing_variables = list(self.outgoing_variable_order) * len(self.input_times)
         if len(outgoing_variables) != self.output_channels:
             raise RuntimeError(
                 "outgoing_variables length "
@@ -392,6 +397,18 @@ class BaseCoupler(ABC):
 
     # Backwards-compatible alias used briefly during the API rename.
     set_coupled_field_scaling = set_coupled_scaling
+
+    def _coupled_variable_for_source_channel(self, source_channel: str) -> str:
+        """Map a source ``output_variables`` name to the matching coupler variable."""
+        for v in self.variables:
+            if ("-" not in v and source_channel == v) or (
+                source_channel == "-".join(v.split("-")[:-1])
+            ):
+                return v
+        raise ValueError(
+            f"No coupler variable in {list(self.variables)} matches "
+            f"source channel {source_channel!r}"
+        )
 
     @staticmethod
     def _coupled_scaling_to_mean_std(scaling, keys: Sequence[str], name: str):
@@ -579,9 +596,16 @@ class BaseCoupler(ABC):
             missing_channels = set(self.variables) - set(found_channels)
             raise ValueError(f"Missing variables in coupled module: {missing_channels}")
         self.coupled_channel_indices = channel_indices
-        # Source-module channel names in the same order as coupled_channel_indices;
-        # used by set_coupled_scaling as incoming (denorm) keys.
+        # Channel names after ``coupled_fields[..., coupled_channel_indices, ...]``.
+        # Order follows the source module's output_variables (via the index list),
+        # which may differ from ``self.variables`` order.
         self.incoming_variables = [output_channels[i] for i in channel_indices]
+        # Sink-side names paired 1:1 with incoming_variables / post-index channels,
+        # so outgoing scaling stays aligned after set_coupled_fields indexing.
+        self.outgoing_variable_order = [
+            self._coupled_variable_for_source_channel(oc)
+            for oc in self.incoming_variables
+        ]
 
     def reset_coupler(self):
         self.coupled_mode = False
@@ -791,29 +815,29 @@ class ConstantCoupler(BaseCoupler):
         ]
 
         def _broadcast_first_time(fields: th.Tensor) -> th.Tensor:
-            # Keep layout [B, F, T, C, H, W]; expand T to coupled_integration_dim.
-            return fields[:, :, :1, :, :, :].expand(
-                -1, -1, self.coupled_integration_dim, -1, -1, -1
+            # Allocate a fresh buffer and copy time 0 into every integration
+            # step. Using expand() would share storage with ``fields``, so later
+            # mutations of the source tensor could silently change the preset.
+            out = th.empty(
+                [
+                    fields.shape[0],
+                    fields.shape[1],
+                    self.coupled_integration_dim,
+                    fields.shape[3],
+                    *fields.shape[4:],
+                ],
+                dtype=fields.dtype,
+                device=fields.device,
             )
+            out[:, :, :, :, :, :] = fields[:, :, :1, :, :, :]
+            return out
 
         if self.use_coupled_field_rescaling:
             self.preset_coupled_fields = self.rescale_coupled_fields_through_physical(
                 coupled_fields, _broadcast_first_time
             )
         else:
-            self.preset_coupled_fields = th.empty(
-                [
-                    coupled_fields.shape[0],
-                    self.spatial_dims[0],
-                    self.coupled_integration_dim,
-                    self.timevar_dim,
-                ]
-                + list(self.spatial_dims[1:])
-            )
-            # Broadcast the first time step across the coupled integration dim.
-            self.preset_coupled_fields[:, :, :, :, :, :] = coupled_fields[
-                :, :, :1, :, :, :
-            ]
+            self.preset_coupled_fields = _broadcast_first_time(coupled_fields)
 
         if self.time_first:
             self.preset_coupled_fields = self.preset_coupled_fields.permute(
