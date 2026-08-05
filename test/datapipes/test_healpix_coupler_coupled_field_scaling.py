@@ -20,7 +20,7 @@ When instantaneous model outputs are z-scored with ``z1000`` / ``ws10m`` but the
 coupled training target uses trailing-window stats (``z1000-48H``, …), averaging
 in z-space and denorming with trailing stats is systematically wrong.
 
-``set_coupled_scaling(incoming, outgoing)`` fixes this by denormalizing →
+``set_coupled_scaling(incoming)`` (outgoing from ``coupled_scaling``) fixes this by denormalizing →
 operating in physical space → renormalizing inside ``set_coupled_fields``.
 """
 
@@ -95,13 +95,20 @@ def _scaling_da(keys=None):
     )
 
 
+def _scaling_da_from_mapping(scaling_map):
+    """xarray scaling_da from an already-built ``{name: {mean, std}}`` dict."""
+    import pandas as pd
+
+    return pd.DataFrame.from_dict(scaling_map).T.to_xarray().astype("float32")
+
+
 def _make_trailing_coupler(
     *,
     incoming=None,
-    outgoing=None,
     variables=None,
     incoming_variables=None,
     input_times=None,
+    install_coupled_scaling=True,
 ):
     """Build a TrailingAverageCoupler.
 
@@ -109,6 +116,9 @@ def _make_trailing_coupler(
     ``incoming_variables`` are source-module names from setup_coupling
     (default instant keys). Tensor channels are still length
     ``len(incoming_variables)`` with indices ``range(n)``.
+
+    When ``incoming`` is set, ``set_scaling`` is called first (outgoing base),
+    then ``set_coupled_scaling(incoming)``.
     """
     variables = list(variables or TRAILING_48H_VARS)
     incoming_variables = list(incoming_variables or INSTANT_VARS)
@@ -125,14 +135,14 @@ def _make_trailing_coupler(
         output_time_dim=1,
     )
     # Simulate setup_coupling without a full coupled module.
-    # Post-index order follows incoming_variables; pair sink names the same way.
     coupler.coupled_channel_indices = list(range(len(incoming_variables)))
     coupler.incoming_variables = incoming_variables
     coupler.outgoing_variable_order = list(variables)
-    if incoming is not None or outgoing is not None:
-        coupler.set_coupled_scaling(incoming, outgoing)
+    if install_coupled_scaling:
+        coupler.set_scaling(_scaling_da(variables))
+    if incoming is not None:
+        coupler.set_coupled_scaling(incoming)
     _configure_trailing_average(coupler, input_times, data_time_step="3h")
-    # Keep indices after configure helper (it resets them to len(variables)).
     coupler.coupled_channel_indices = list(range(len(incoming_variables)))
     return coupler
 
@@ -140,9 +150,9 @@ def _make_trailing_coupler(
 def _make_constant_coupler(
     *,
     incoming=None,
-    outgoing=None,
     variables=None,
     incoming_variables=None,
+    install_coupled_scaling=True,
 ):
     variables = list(variables or TRAILING_48H_VARS)
     incoming_variables = list(incoming_variables or INSTANT_VARS)
@@ -159,8 +169,10 @@ def _make_constant_coupler(
     coupler.coupled_channel_indices = list(range(len(incoming_variables)))
     coupler.incoming_variables = incoming_variables
     coupler.outgoing_variable_order = list(variables)
-    if incoming is not None or outgoing is not None:
-        coupler.set_coupled_scaling(incoming, outgoing)
+    if install_coupled_scaling:
+        coupler.set_scaling(_scaling_da(variables))
+    if incoming is not None:
+        coupler.set_coupled_scaling(incoming)
     return coupler
 
 
@@ -176,17 +188,10 @@ def _renorm_timevar_physical(physical_avg, keys, dtype=torch.float32):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "incoming,outgoing",
-    [
-        (_yaml_scaling(INSTANT_VARS), None),
-        (None, _yaml_scaling(TRAILING_48H_VARS)),
-    ],
-)
-def test_only_one_scaling_raises(incoming, outgoing):
+def test_set_coupled_scaling_none_raises():
     coupler = _make_trailing_coupler()
-    with pytest.raises(ValueError, match="must be provided together"):
-        coupler.set_coupled_scaling(incoming, outgoing)
+    with pytest.raises(ValueError, match="incoming_coupled_scaling must be provided"):
+        coupler.set_coupled_scaling(None)
 
 
 def test_set_coupled_scaling_requires_setup_coupling():
@@ -199,15 +204,21 @@ def test_set_coupled_scaling_requires_setup_coupling():
         input_time_dim=1,
         output_time_dim=1,
     )
+    coupler.set_scaling(_scaling_da(TRAILING_48H_VARS))
     with pytest.raises(RuntimeError, match="setup_coupling must be called"):
-        coupler.set_coupled_scaling(_yaml_scaling(), _yaml_scaling())
+        coupler.set_coupled_scaling(_yaml_scaling())
+
+
+def test_set_coupled_scaling_requires_set_scaling():
+    coupler = _make_trailing_coupler(install_coupled_scaling=False)
+    with pytest.raises(RuntimeError, match="set_scaling must be called"):
+        coupler.set_coupled_scaling(_yaml_scaling())
 
 
 def test_flat_mean_std_arrays_rejected():
     with pytest.raises(TypeError, match="variable-keyed"):
         _make_trailing_coupler(
             incoming={"mean": [0.0, 0.0], "std": [1.0, 1.0]},
-            outgoing=_yaml_scaling(),
         )
 
 
@@ -215,7 +226,6 @@ def test_missing_variable_keys_raises():
     with pytest.raises(KeyError, match="missing variables"):
         _make_trailing_coupler(
             incoming={"z1000": {"mean": 0.0, "std": 1.0}},  # missing ws10m
-            outgoing=_yaml_scaling(),
         )
 
 
@@ -226,7 +236,6 @@ def test_entry_missing_mean_or_std_raises():
                 "z1000": {"mean": 0.0},  # missing std
                 "ws10m": {"mean": 0.0, "std": 1.0},
             },
-            outgoing=_yaml_scaling(),
         )
 
 
@@ -234,28 +243,30 @@ def test_zero_std_raises():
     bad = _yaml_scaling(INSTANT_VARS)
     bad["ws10m"]["std"] = 0.0
     with pytest.raises(ValueError, match="std must be non-zero"):
-        _make_trailing_coupler(incoming=bad, outgoing=_yaml_scaling())
+        _make_trailing_coupler(incoming=bad)
 
 
 def test_use_coupled_field_rescaling_property():
     bare = _make_trailing_coupler()
     assert bare.use_coupled_field_rescaling is False
-    scaled = _make_trailing_coupler(
-        incoming=_yaml_scaling(),
-        outgoing=_yaml_scaling(),
-    )
+    scaled = _make_trailing_coupler(incoming=_yaml_scaling())
     assert scaled.use_coupled_field_rescaling is True
-    # Outgoing is variables duplicated across input_times.
     assert scaled.outgoing_coupled_scaling["mean"].shape[3] == scaled.output_channels
 
 
 def test_scaling_da_xarray_form_accepted():
-    coupler = _make_trailing_coupler(
-        incoming=_scaling_da(),
-        outgoing=_scaling_da(),
-    )
+    coupler = _make_trailing_coupler(incoming=_scaling_da())
     assert coupler.use_coupled_field_rescaling is True
     assert coupler.outgoing_coupled_scaling["mean"].shape[3] == coupler.output_channels
+
+
+def test_outgoing_comes_from_coupled_scaling():
+    """Outgoing renorm stats must match set_scaling / coupled_scaling, tiled."""
+    coupler = _make_trailing_coupler(incoming=_yaml_scaling())
+    cs_mean = coupler.coupled_scaling["mean"].reshape(-1)
+    out_mean = coupler.outgoing_coupled_scaling["mean"].flatten().numpy()
+    expected = np.tile(cs_mean, len(INPUT_TIMES))
+    assert np.allclose(out_mean, expected)
 
 
 def test_setup_coupling_sets_incoming_variables():
@@ -280,7 +291,8 @@ def test_setup_coupling_sets_incoming_variables():
     assert coupler.incoming_variables == ["z1000", "ws10m"]
     assert coupler.outgoing_variable_order == ["z1000-48H", "ws10m-48H"]
     assert coupler.coupled_channel_indices == [1, 2]
-    coupler.set_coupled_scaling(scaling, scaling)
+    coupler.set_scaling(_scaling_da_from_mapping(scaling))
+    coupler.set_coupled_scaling(scaling)
     assert abs(
         coupler.incoming_coupled_scaling["mean"].flatten()[0].item()
         - SCALING["z1000"][0]
@@ -322,7 +334,8 @@ def test_scaling_follows_post_index_channel_order():
     assert coupler.coupled_channel_indices == [1, 2]  # ws10m, z1000 in source order
     assert coupler.incoming_variables == ["ws10m", "z1000"]
     assert coupler.outgoing_variable_order == ["ws10m-48H", "z1000-48H"]
-    coupler.set_coupled_scaling(scaling, scaling)
+    coupler.set_scaling(_scaling_da_from_mapping(scaling))
+    coupler.set_coupled_scaling(scaling)
 
     # Build a full source-shaped tensor and fill only the matched channels.
     # Channel layout matches FakeModule.output_variables.
@@ -416,7 +429,6 @@ def test_rescaling_recovers_physical_trailing_mean():
     outgoing_keys = TRAILING_48H_VARS * len(INPUT_TIMES)
     coupler = _make_trailing_coupler(
         incoming=_yaml_scaling(),
-        outgoing=_yaml_scaling(),
     )
     slices = coupler.averaging_slices
     coupler.set_coupled_fields(znorm_instant)
@@ -467,8 +479,7 @@ def test_rescaling_with_tiled_48h_outgoing():
     znorm_instant = _normalize_with(physical, INSTANT_VARS, dtype=torch.float32)
 
     coupler = _make_trailing_coupler(
-        incoming=_yaml_scaling(),
-        outgoing=_yaml_scaling(),  # length 2 → tiled
+        incoming=_yaml_scaling(),  # length 2 → tiled
     )
     slices = coupler.averaging_slices
     coupler.set_coupled_fields(znorm_instant)
@@ -494,12 +505,10 @@ def test_tiled_vs_explicit_timevar_outgoing_identical():
     incoming = _yaml_scaling()
 
     tiled = _make_trailing_coupler(
-        incoming=incoming,
-        outgoing=incoming,  # len 2
+        incoming=incoming,  # len 2
     )
     explicit = _make_trailing_coupler(
-        incoming=incoming,
-        outgoing=incoming,  # len 4 explicit repeat
+        incoming=incoming,  # len 4 explicit repeat
     )
     tiled.set_coupled_fields(znorm.clone())
     explicit.set_coupled_fields(znorm.clone())
@@ -537,7 +546,6 @@ def test_constant_coupler_affine_transform_across_integration():
 
     coupler = _make_constant_coupler(
         incoming=incoming,
-        outgoing=outgoing,
     )
     assert coupler.use_coupled_field_rescaling
     coupler.set_coupled_fields(znorm)
@@ -573,7 +581,6 @@ def test_stability_denorm_mean_renorm_vs_float64_reference():
 
     coupler = _make_trailing_coupler(
         incoming=_yaml_scaling(),
-        outgoing=_yaml_scaling(),
     )
     slices = coupler.averaging_slices
     coupler.set_coupled_fields(znorm)
@@ -626,7 +633,6 @@ def test_optional_figure_mismatch_vs_api(tmp_path=None):
 
     scaled = _make_trailing_coupler(
         incoming=_yaml_scaling(),
-        outgoing=_yaml_scaling(),
     )
     scaled.set_coupled_fields(znorm.clone())
     recovered = _denorm_timevar_with(
@@ -692,7 +698,6 @@ def test_channel_order_period_major_multi_variable():
     outgoing_keys = TRAILING_48H_VARS * len(INPUT_TIMES)
     coupler = _make_trailing_coupler(
         incoming=_yaml_scaling(),
-        outgoing=_yaml_scaling(),
     )
     coupler.set_coupled_fields(znorm)
     out = coupler.construct_integrated_couplings().to(torch.float64)
@@ -719,7 +724,6 @@ def test_set_coupled_scaling():
 
     coupler = _make_trailing_coupler(
         incoming=_yaml_scaling(),
-        outgoing=_yaml_scaling(),
     )
     assert coupler.use_coupled_field_rescaling
     slices = coupler.averaging_slices
@@ -743,7 +747,6 @@ def test_float32_cpu_dtype_and_device():
     outgoing_keys = TRAILING_48H_VARS * len(INPUT_TIMES)
     coupler = _make_trailing_coupler(
         incoming=_yaml_scaling(),
-        outgoing=_yaml_scaling(),
     )
     # Exercise denormalize / renormalize helpers directly.
     denormed = coupler.denormalize_coupled_fields(znorm)
@@ -757,10 +760,30 @@ def test_float32_cpu_dtype_and_device():
     assert out.shape[2] == len(INSTANT_VARS) * len(INPUT_TIMES)
 
 
+def test_rescale_promotes_float16_to_float32_then_restores():
+    """Physical denorm of z1000 exceeds float16 range; path must use float32 mid-flight."""
+    generator = torch.Generator().manual_seed(_SEED + 72)
+    physical = _sample_instant_physical(TIMEDIM, generator)
+    znorm_f32 = _normalize_with(physical, INSTANT_VARS, dtype=torch.float32)
+    znorm_f16 = znorm_f32.to(torch.float16)
+
+    coupler_f16 = _make_trailing_coupler(incoming=_yaml_scaling())
+    coupler_f16.set_coupled_fields(znorm_f16)
+    out_f16 = coupler_f16.construct_integrated_couplings()
+    assert out_f16.dtype == torch.float16
+    assert torch.isfinite(out_f16.float()).all()
+
+    coupler_f32 = _make_trailing_coupler(incoming=_yaml_scaling())
+    coupler_f32.set_coupled_fields(znorm_f32)
+    out_f32 = coupler_f32.construct_integrated_couplings()
+
+    # Restored float16 should track the float32 path within float16 eps.
+    assert _max_abs_err(out_f16.float(), out_f32) < 5e-2
+
+
 def test_rescale_coupled_fields_through_physical_callable():
     coupler = _make_trailing_coupler(
         incoming=_yaml_scaling(),
-        outgoing=_yaml_scaling(),
     )
     # Minimal [B,F,T,C,H,W] with known z values.
     fields = torch.zeros(
