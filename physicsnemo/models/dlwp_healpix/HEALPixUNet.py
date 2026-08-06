@@ -78,9 +78,11 @@ class HEALPixUNet(Module):
         nside: Sequence[int] = (64, 32, 16),
         enforce_reflectional_equivariance: bool = False,
         odd_prognostic_variables: Sequence[str] = None,
+        odd_diagnostic_variables: Sequence[str] = None,
         odd_constants: Sequence[str] = None,
         odd_coupled_variables: Sequence[str] = None,
         channels: Sequence[str] = None,
+        output_channel_names: Sequence[str] = None,
         constants: Sequence[str] = None,
         scaling: dict[str, dict[str, float]] = None,
         enable_healpixpad: bool | None = None,
@@ -139,6 +141,14 @@ class HEALPixUNet(Module):
         odd_coupled_variables: sequence of str, optional
             Coupled variable names that flip sign under equatorial reflection; wired
             into the partial-conv stem as odd channels (even kernel, zero bias).
+        odd_diagnostic_variables: sequence of str, optional
+            Output-only (diagnostic) channel names that flip sign under equatorial
+            reflection. Diagnostics remain absolute predictions (no residual); only
+            their parity typing for ``hpx_reflect`` changes. Requires
+            ``output_channel_names``.
+        output_channel_names: sequence of str, optional
+            Names of decoder output channels in tensor order. Defaults to ``channels``
+            when omitted. Required when ``odd_diagnostic_variables`` is non-empty.
         coupled_partial_conv: dict or DictConfig, optional
             Opt-in partial-convolution stem for coupled inputs. ``None`` (default)
             leaves coupled fields unchanged. Configure ``masks`` plus an optional
@@ -177,9 +187,11 @@ class HEALPixUNet(Module):
         self.nside = nside
         self.enforce_reflectional_equivariance = enforce_reflectional_equivariance
         self.odd_prognostic_variables = odd_prognostic_variables
+        self.odd_diagnostic_variables = odd_diagnostic_variables
         self.odd_constants = odd_constants
         self.odd_coupled_variables = odd_coupled_variables
         self.channels = channels
+        self.output_channel_names = output_channel_names
         self.constants = constants
         self.scaling = scaling
 
@@ -198,36 +210,71 @@ class HEALPixUNet(Module):
         self.register_buffer("refl_face_order", th.tensor([8,9,10,11,4,5,6,7,0,1,2,3], dtype=th.long), persistent=False)
 
         if self.enforce_reflectional_equivariance:
+            if self.channels is None:
+                raise ValueError("channels must be provided when reflection equivariance is enabled")
 
-            odd_out_var_idx = th.tensor([self.channels.index(v) for v in self.odd_prognostic_variables], dtype=th.long) \
-                if self.odd_prognostic_variables is not None else None
+            odd_prog = list(self.odd_prognostic_variables or [])
+            odd_diag = list(self.odd_diagnostic_variables or [])
+            out_names = list(
+                self.output_channel_names if self.output_channel_names is not None else self.channels
+            )
+            if odd_diag:
+                if self.output_channel_names is None:
+                    raise ValueError(
+                        "output_channel_names must be provided when odd_diagnostic_variables is non-empty"
+                    )
+                channel_set = set(self.channels)
+                for v in odd_diag:
+                    if v in channel_set:
+                        raise ValueError(
+                            f"Odd diagnostic variable {v!r} is also an input/prognostic channel; "
+                            f"list it under odd_prognostic_variables instead"
+                        )
+                    if v not in out_names:
+                        raise ValueError(
+                            f"Odd diagnostic variable {v!r} not found in output_channel_names {out_names}"
+                        )
+
+            # Decoder outputs are T * output_channels; expand odd indices over time.
+            t_out = 1 if (self.output_time_dim == 1 and self.input_time_dim > 1) else self.input_time_dim
+            per = self.output_channels
+            odd_out = []
+            for t in range(t_out):
+                for v in odd_prog + odd_diag:
+                    if v not in out_names:
+                        continue
+                    local = out_names.index(v)
+                    if local < per:
+                        odd_out.append(t * per + local)
+            odd_out_var_idx = th.tensor(odd_out, dtype=th.long) if odd_out else None
             self.register_buffer("odd_out_var_idx", odd_out_var_idx, persistent=False)
 
             odd_in_vars = []
             odd_in_var_idx = []
-            if self.odd_prognostic_variables is not None:
-                odd_in_vars += self.odd_prognostic_variables
-                odd_in_var_idx = [self.channels.index(v) for v in odd_in_vars]
+            if odd_prog:
+                odd_in_vars += odd_prog
+                odd_in_var_idx = [self.channels.index(v) for v in odd_prog]
             if self.odd_constants is not None:
-                odd_in_vars += self.odd_constants
+                odd_in_vars += list(self.odd_constants)
                 odd_const_idx = [
                     self.input_time_dim * (self.input_channels + self.decoder_input_channels) + self.constants.index(c)
                     for c in self.odd_constants
                 ]
                 odd_in_var_idx += odd_const_idx
 
-            odd_in_var_idx = th.tensor(odd_in_var_idx, dtype=th.long) if len(odd_in_vars) > 0 else None
+            odd_in_var_idx = th.tensor(odd_in_var_idx, dtype=th.long) if len(odd_in_var_idx) > 0 else None
             self.register_buffer("odd_in_var_idx", odd_in_var_idx, persistent=False)
-            
-            odd_in_var_mean = th.tensor([self.scaling[var]['mean'] for var in odd_in_vars]) if len(odd_in_vars) > 0 else None
-            for i, mean in enumerate(odd_in_var_mean):
-                if mean != 0.0:
-                    raise ValueError(
-                        f"Reflectional equivariance can only be enforced if all odd variables have zero mean. "
-                        f"Odd variable {odd_in_vars[i]} has mean {mean.item()}"
-                    )
 
-            if len(odd_in_vars) == 0:
+            odd_mean_vars = list(odd_in_vars) + odd_diag
+            if self.scaling is not None and odd_mean_vars:
+                for var in odd_mean_vars:
+                    if var in self.scaling and self.scaling[var]["mean"] != 0.0:
+                        raise ValueError(
+                            f"Reflectional equivariance can only be enforced if all odd variables have zero mean. "
+                            f"Odd variable {var} has mean {self.scaling[var]['mean']}"
+                        )
+
+            if len(odd_in_vars) == 0 and not odd_diag:
                 logger.warning(
                     "Reflectional equivariance is enabled but no odd variables "
                     "were specified. The model will be reflectionally equivariant "

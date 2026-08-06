@@ -285,3 +285,87 @@ def test_structural_symmetric_input_symmetric_output():
         y = model([prog_s, di_s, const_s])
     y0 = y[:, :, 0]
     th.testing.assert_close(y0, _reflect_bftchw(y0, [2]), rtol=1e-3, atol=1e-4)
+
+
+def _build_structural_model_with_odd_diagnostic():
+    """Prognostics t,u,v plus absolute odd diagnostic v_diag."""
+    encoder, decoder = _structural_encoder_decoder()
+    channels = ["t", "u", "v"]
+    output_channel_names = ["t", "u", "v", "v_diag"]
+    constants = ["sin_lat", "lsm"]
+    scaling = {k: {"mean": 0.0, "std": 1.0} for k in channels + ["v_diag"] + constants}
+    return HEALPixRecUNet(
+        encoder=encoder,
+        decoder=decoder,
+        input_channels=3,
+        output_channels=4,
+        n_constants=2,
+        decoder_input_channels=1,
+        input_time_dim=1,
+        output_time_dim=1,
+        delta_time="6h",
+        reset_cycle="24h",
+        presteps=0,
+        residual_prediction=True,
+        hpx_padding_mode="isolatitude",
+        compile_padding=False,
+        nside=[8, 4],
+        reflection_equivariance_mode="structural",
+        enforce_reflectional_equivariance=False,
+        odd_prognostic_variables=["v"],
+        odd_diagnostic_variables=["v_diag"],
+        odd_constants=["sin_lat"],
+        odd_fraction=0.25,
+        channels=channels,
+        output_channel_names=output_channel_names,
+        constants=constants,
+        scaling=scaling,
+    )
+
+
+def test_structural_odd_diagnostic_bank_and_equivariance():
+    th.manual_seed(2)
+    model = _build_structural_model_with_odd_diagnostic()
+    # Output layout [t, u, v, v_diag]: even = t,u (2); odd = v, v_diag (2)
+    assert model.structural_output_n_even == 2
+    odd_out = set(model.odd_out_var_idx.tolist())
+    assert odd_out == {2, 3}
+
+    model.eval()
+    batch = _make_batch()
+    with th.no_grad():
+        y = model(batch)
+        y_r = model(_reflect_batch(batch))
+    assert y.shape[3] == 4
+    # ρ flips sign on both odd prognostic (v) and odd diagnostic (v_diag)
+    y_rho = _reflect_bftchw(y[:, :, 0], [2, 3]).unsqueeze(2)
+    th.testing.assert_close(y_r, y_rho, rtol=1e-3, atol=1e-4)
+
+
+def test_odd_diagnostic_requires_output_channel_names():
+    encoder, decoder = _structural_encoder_decoder()
+    try:
+        HEALPixRecUNet(
+            encoder=encoder,
+            decoder=decoder,
+            input_channels=3,
+            output_channels=4,
+            n_constants=2,
+            decoder_input_channels=1,
+            input_time_dim=1,
+            output_time_dim=1,
+            presteps=0,
+            hpx_padding_mode="isolatitude",
+            compile_padding=False,
+            nside=[8, 4],
+            reflection_equivariance_mode="structural",
+            odd_prognostic_variables=["v"],
+            odd_diagnostic_variables=["v_diag"],
+            odd_constants=["sin_lat"],
+            channels=["t", "u", "v"],
+            constants=["sin_lat", "lsm"],
+            scaling={k: {"mean": 0.0, "std": 1.0} for k in ["t", "u", "v", "v_diag", "sin_lat", "lsm"]},
+        )
+        raise AssertionError("expected ValueError for missing output_channel_names")
+    except ValueError as e:
+        assert "output_channel_names" in str(e)

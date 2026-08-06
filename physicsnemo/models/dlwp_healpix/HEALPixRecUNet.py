@@ -91,10 +91,12 @@ class HEALPixRecUNet(Module):
         enforce_reflectional_equivariance: bool = False,
         reflection_equivariance_mode: str | None = None,
         odd_prognostic_variables: Sequence[str] = None,
+        odd_diagnostic_variables: Sequence[str] = None,
         odd_constants: Sequence[str] = None,
         odd_coupled_variables: Sequence[str] = None,
         odd_fraction: float = 0.25,
         channels: Sequence[str] = None,
+        output_channel_names: Sequence[str] = None,
         constants: Sequence[str] = None,
         scaling: dict[str, dict[str, float]] = None,
         enable_healpixpad: bool | None = None,
@@ -170,6 +172,14 @@ class HEALPixRecUNet(Module):
             Fraction of latent channels typed odd under reflection (structural mode).
         odd_prognostic_variables / odd_constants / odd_coupled_variables:
             Physical channel names that flip sign under equatorial reflection.
+        odd_diagnostic_variables: sequence of str, optional
+            Output-only (diagnostic) channel names that flip sign under equatorial
+            reflection. Diagnostics remain absolute predictions (no residual); only
+            their even/odd bank typing changes. Requires ``output_channel_names``.
+        output_channel_names: sequence of str, optional
+            Names of decoder output channels in tensor order. Defaults to ``channels``
+            when omitted (prognostic-only layouts). Required when
+            ``odd_diagnostic_variables`` is non-empty.
         coupled_partial_conv: dict or DictConfig, optional
             Opt-in partial-convolution stem for coupled inputs. ``None`` (default)
             leaves coupled fields unchanged. Configure ``masks`` plus an optional
@@ -219,10 +229,12 @@ class HEALPixRecUNet(Module):
         self.nside = nside
         self.enforce_reflectional_equivariance = enforce_reflectional_equivariance
         self.odd_prognostic_variables = odd_prognostic_variables
+        self.odd_diagnostic_variables = odd_diagnostic_variables
         self.odd_constants = odd_constants
         self.odd_coupled_variables = odd_coupled_variables
         self.odd_fraction = odd_fraction
         self.channels = channels
+        self.output_channel_names = output_channel_names
         self.constants = constants
         self.scaling = scaling
 
@@ -329,8 +341,27 @@ class HEALPixRecUNet(Module):
             raise ValueError("channels must be provided when reflection equivariance is enabled")
 
         odd_prog = list(self.odd_prognostic_variables or [])
-        odd_out_var_idx = th.tensor([self.channels.index(v) for v in odd_prog], dtype=th.long) if odd_prog else None
-        self.register_buffer("odd_out_var_idx", odd_out_var_idx, persistent=False)
+        odd_diag = list(self.odd_diagnostic_variables or [])
+        out_names = list(
+            self.output_channel_names if self.output_channel_names is not None else self.channels
+        )
+
+        if odd_diag:
+            if self.output_channel_names is None:
+                raise ValueError(
+                    "output_channel_names must be provided when odd_diagnostic_variables is non-empty"
+                )
+            channel_set = set(self.channels)
+            for v in odd_diag:
+                if v in channel_set:
+                    raise ValueError(
+                        f"Odd diagnostic variable {v!r} is also an input/prognostic channel; "
+                        f"list it under odd_prognostic_variables instead"
+                    )
+                if v not in out_names:
+                    raise ValueError(
+                        f"Odd diagnostic variable {v!r} not found in output_channel_names {out_names}"
+                    )
 
         # Full concatenated encoder input layout after _reshape_inputs (per face batch):
         # [T * prognostics | T * decoder_inputs | constants | couplings]
@@ -369,16 +400,17 @@ class HEALPixRecUNet(Module):
         odd_in_var_idx_t = th.tensor(odd_in_var_idx, dtype=th.long) if odd_in_var_idx else None
         self.register_buffer("odd_in_var_idx", odd_in_var_idx_t, persistent=False)
 
-        if self.scaling is not None and odd_in_vars:
-            for var in odd_in_vars:
-                # Only check vars that appear in scaling (prognostics/constants)
+        # Zero-mean check for odd inputs and odd diagnostics (when present in scaling).
+        odd_mean_vars = list(odd_in_vars) + odd_diag
+        if self.scaling is not None and odd_mean_vars:
+            for var in odd_mean_vars:
                 if var in self.scaling and self.scaling[var]["mean"] != 0.0:
                     raise ValueError(
                         f"Reflectional equivariance can only be enforced if all odd variables have zero mean. "
                         f"Odd variable {var} has mean {self.scaling[var]['mean']}"
                     )
 
-        if not odd_in_vars:
+        if not odd_in_vars and not odd_diag:
             logger.warning(
                 "Reflectional equivariance is enabled but no odd variables "
                 "were specified. The model will be reflectionally equivariant "
@@ -397,24 +429,24 @@ class HEALPixRecUNet(Module):
         self.register_buffer("structural_in_inverse", th.tensor(inverse, dtype=th.long), persistent=False)
         self.structural_input_n_even = len(even_idx)
 
-        # Output channel reorder for one time step of output_channels vars
-        # Output layout from decoder: T * output_channels (same var order as channels for prognostics part)
+        # Output layout from decoder: T * output_channels in out_names order.
+        # Prognostics use residual prediction; diagnostics stay absolute — parity typing only.
         out_ch = self._compute_output_channels()
-        # Per time slice of length output_channels
         t_out = 1 if self.is_diagnostic else self.input_time_dim
         per = self.output_channels
+        odd_out_names = odd_prog + odd_diag
         odd_out = []
         for t in range(t_out):
-            for v in odd_prog:
-                if v in self.channels:
-                    # output variables typically match channels naming for prognostics
-                    try:
-                        # Prefer index in channels for prognostic outputs
-                        local = list(self.channels).index(v) if v in self.channels else None
-                    except ValueError:
-                        local = None
-                    if local is not None and local < per:
-                        odd_out.append(t * per + local)
+            for v in odd_out_names:
+                if v not in out_names:
+                    continue
+                local = out_names.index(v)
+                if local < per:
+                    odd_out.append(t * per + local)
+        # Averaged hpx_reflect on decoder outputs uses the full time-expanded odd indices.
+        odd_out_var_idx = th.tensor(odd_out, dtype=th.long) if odd_out else None
+        self.register_buffer("odd_out_var_idx", odd_out_var_idx, persistent=False)
+
         odd_out_set = set(odd_out)
         even_out = [i for i in range(out_ch) if i not in odd_out_set]
         out_order = even_out + odd_out
