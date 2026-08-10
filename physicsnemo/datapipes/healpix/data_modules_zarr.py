@@ -35,25 +35,40 @@ from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
 
 logger = logging.getLogger(__name__)
 
+_VALID_MP_SHARING_STRATEGIES = frozenset({"file_descriptor", "file_system"})
 
-def _zarr_dataloader_worker_init(n_threads: int):
-    """Install a persistent per-worker thread pool for per-variable Zarr reads.
 
-    Also disables cyclic GC in the worker process. Per-variable getitem allocates
-    many large arrays; periodic GC pauses show up as rare multi-hundred-ms
-    DataLoader stalls under 7-rank training even when mean IO is fine.
-    """
+def _configure_torch_mp_sharing_strategy(strategy: str) -> None:
+    """Set PyTorch tensor sharing for DataLoader worker processes."""
+    if strategy not in _VALID_MP_SHARING_STRATEGIES:
+        raise ValueError(
+            "mp_sharing_strategy must be one of "
+            f"{sorted(_VALID_MP_SHARING_STRATEGIES)}, got {strategy!r}"
+        )
+    import torch
 
-    def _init(_worker_id: int) -> None:
-        import gc
+    torch.multiprocessing.set_sharing_strategy(strategy)
 
-        from .zarr_layout import enable_zarrs_pipeline, init_worker_pool
 
-        enable_zarrs_pipeline()
-        init_worker_pool(n_threads)
-        # Rely on refcounting for large numpy buffers. Periodic gc.collect() on
-        # the getitem path caused multi-hundred-ms jitter under training.
-        gc.disable()
+def _zarr_dataloader_worker_init(
+    n_threads: int,
+    mp_sharing_strategy: Optional[str] = None,
+):
+    """Per-worker init: sharing strategy (required) and optional Zarr IO pool."""
+
+    def _init(worker_id: int) -> None:
+        if mp_sharing_strategy is not None:
+            _configure_torch_mp_sharing_strategy(mp_sharing_strategy)
+        if n_threads > 1:
+            import gc
+
+            from .zarr_layout import enable_zarrs_pipeline, init_worker_pool
+
+            enable_zarrs_pipeline()
+            init_worker_pool(n_threads)
+            # Rely on refcounting for large numpy buffers. Periodic gc.collect() on
+            # the getitem path caused multi-hundred-ms jitter under training.
+            gc.disable()
 
     return _init
 
@@ -92,6 +107,7 @@ class TimeSeriesDataModuleZarr:
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
         dataloader_io_threads: int = 8,
+        mp_sharing_strategy: Optional[str] = None,
     ):
         """
         Parameters
@@ -193,6 +209,7 @@ class TimeSeriesDataModuleZarr:
         self.train_noise_seed = train_noise_seed
         self.in_order = in_order
         self.dataloader_io_threads = dataloader_io_threads
+        self.mp_sharing_strategy = mp_sharing_strategy
 
         self.train_dataset = None
         self.val_dataset = None
@@ -379,9 +396,10 @@ class TimeSeriesDataModuleZarr:
             dataloader_kwargs["prefetch_factor"] = self.prefetch_factor
         if self.in_order is not None:
             dataloader_kwargs["in_order"] = self.in_order
-        if self.num_workers > 0 and self.dataloader_io_threads > 1:
+        if self.num_workers > 0:
             dataloader_kwargs["worker_init_fn"] = _zarr_dataloader_worker_init(
-                self.dataloader_io_threads
+                self.dataloader_io_threads,
+                self.mp_sharing_strategy,
             )
         loader = DataLoader(**dataloader_kwargs)
 
@@ -493,6 +511,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
         dataloader_io_threads: int = 8,
+        mp_sharing_strategy: Optional[str] = None,
     ):
         """
         Parameters
@@ -594,6 +613,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             train_noise_seed,
             in_order,
             dataloader_io_threads,
+            mp_sharing_strategy,
         )
 
     def _get_coupled_vars(self):
