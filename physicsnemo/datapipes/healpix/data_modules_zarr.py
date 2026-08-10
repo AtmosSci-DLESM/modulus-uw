@@ -16,6 +16,7 @@
 
 # System modules
 import logging
+import sys
 import warnings
 from pathlib import Path
 from typing import Optional, Sequence, Union
@@ -50,27 +51,49 @@ def _configure_torch_mp_sharing_strategy(strategy: str) -> None:
     torch.multiprocessing.set_sharing_strategy(strategy)
 
 
-def _zarr_dataloader_worker_init(
-    n_threads: int,
-    mp_sharing_strategy: Optional[str] = None,
-):
-    """Per-worker init: sharing strategy (required) and optional Zarr IO pool."""
+class ZarrDataloaderWorkerInit:
+    """Picklable DataLoader worker_init_fn (required for spawn / forkserver workers).
 
-    def _init(worker_id: int) -> None:
-        if mp_sharing_strategy is not None:
-            _configure_torch_mp_sharing_strategy(mp_sharing_strategy)
-        if n_threads > 1:
+    CUDA training must not fork DataLoader workers from a parent that already
+    initialized CUDA; spawn workers run this in a clean interpreter.
+    """
+
+    def __init__(
+        self,
+        n_threads: int,
+        mp_sharing_strategy: Optional[str] = None,
+    ) -> None:
+        self.n_threads = n_threads
+        self.mp_sharing_strategy = mp_sharing_strategy
+
+    def __call__(self, worker_id: int) -> None:
+        if self.mp_sharing_strategy is not None:
+            _configure_torch_mp_sharing_strategy(self.mp_sharing_strategy)
+        if self.n_threads > 1:
             import gc
 
             from .zarr_layout import enable_zarrs_pipeline, init_worker_pool
 
             enable_zarrs_pipeline()
-            init_worker_pool(n_threads)
+            init_worker_pool(self.n_threads)
             # Rely on refcounting for large numpy buffers. Periodic gc.collect() on
             # the getitem path caused multi-hundred-ms jitter under training.
             gc.disable()
 
-    return _init
+
+def _zarr_dataloader_worker_init(
+    n_threads: int,
+    mp_sharing_strategy: Optional[str] = None,
+) -> ZarrDataloaderWorkerInit:
+    """Factory kept for scratch hooks that wrap worker_init_fn."""
+    return ZarrDataloaderWorkerInit(n_threads, mp_sharing_strategy)
+
+
+def _default_dataloader_multiprocessing_context() -> Optional[str]:
+    """Spawn workers after CUDA init; Linux default fork inherits a broken CUDA state."""
+    if sys.platform in ("win32", "darwin"):
+        return None
+    return "spawn"
 
 
 class TimeSeriesDataModuleZarr:
@@ -108,6 +131,7 @@ class TimeSeriesDataModuleZarr:
         in_order: Optional[bool] = None,
         dataloader_io_threads: int = 8,
         mp_sharing_strategy: Optional[str] = None,
+        dataloader_multiprocessing_context: Optional[str] = None,
     ):
         """
         Parameters
@@ -210,6 +234,13 @@ class TimeSeriesDataModuleZarr:
         self.in_order = in_order
         self.dataloader_io_threads = dataloader_io_threads
         self.mp_sharing_strategy = mp_sharing_strategy
+        if dataloader_multiprocessing_context is None:
+            dataloader_multiprocessing_context = (
+                _default_dataloader_multiprocessing_context()
+                if num_workers > 0
+                else None
+            )
+        self.dataloader_multiprocessing_context = dataloader_multiprocessing_context
 
         self.train_dataset = None
         self.val_dataset = None
@@ -397,10 +428,14 @@ class TimeSeriesDataModuleZarr:
         if self.in_order is not None:
             dataloader_kwargs["in_order"] = self.in_order
         if self.num_workers > 0:
-            dataloader_kwargs["worker_init_fn"] = _zarr_dataloader_worker_init(
+            dataloader_kwargs["worker_init_fn"] = ZarrDataloaderWorkerInit(
                 self.dataloader_io_threads,
                 self.mp_sharing_strategy,
             )
+            if self.dataloader_multiprocessing_context is not None:
+                dataloader_kwargs["multiprocessing_context"] = (
+                    self.dataloader_multiprocessing_context
+                )
         loader = DataLoader(**dataloader_kwargs)
 
         return loader, sampler
@@ -512,6 +547,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         in_order: Optional[bool] = None,
         dataloader_io_threads: int = 8,
         mp_sharing_strategy: Optional[str] = None,
+        dataloader_multiprocessing_context: Optional[str] = None,
     ):
         """
         Parameters
@@ -614,6 +650,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             in_order,
             dataloader_io_threads,
             mp_sharing_strategy,
+            dataloader_multiprocessing_context,
         )
 
     def _get_coupled_vars(self):
