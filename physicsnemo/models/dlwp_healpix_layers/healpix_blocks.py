@@ -709,6 +709,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         dropout: float = 0.0,
         conditional_layer_norm: Callable = None,
         conditional_layer_norm_once: bool = False,
+        use_initial_one_conv: bool = False,
         enable_healpixpad: bool | None = None,
     ):
         """
@@ -732,6 +733,9 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         nside: int or None, optional
             Native face height/width; required when ``hpx_padding_mode`` is
             ``"isolatitude"``, otherwise ignored. Default ``None``.
+        use_initial_one_conv: bool, optional
+            If True, each block inserts an optional 1x1 conv before the first 3x3 conv
+            (independent of cln_once_per_block).
         enable_healpixpad: bool, optional
             Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
@@ -761,6 +765,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
                     dropout=dropout,
                     conditional_layer_norm=conditional_layer_norm if conditional_layer_norm is not None else None,
                     conditional_layer_norm_once=conditional_layer_norm_once,
+                    use_initial_one_conv=use_initial_one_conv,
                 ),
             )
 
@@ -797,6 +802,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         conditional_layer_norm: th.nn.Module = None,
         conditional_layer_norm_once: bool = False,
         enable_healpixpad: bool | None = None,
+        use_initial_one_conv: bool = False,
     ):
         """
         Parameters
@@ -838,6 +844,10 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             Whether or not to apply conditional layer normalization only once. If True,
             the conditional layer normalization is applied only once, otherwise it is applied
             for each block.
+        use_initial_one_conv: bool, optional
+            If True, insert a 1x1 conv (in_channels → in_channels) before the first 3x3 conv.
+            When cln_once_per_block is True this is after entry norm; otherwise it is the first
+            layer in the main path. Independent of cln_once_per_block. Default False (current behavior).
         enable_healpixpad: bool, optional
             Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
         """
@@ -881,7 +891,20 @@ class SymmetricConvNeXtBlock(th.nn.Module):
 
         # Collect conv->norm->activation->dropout operations in list for sequential execution
         convblock = []
-
+        # 1x1: in → in
+        if use_initial_one_conv:
+            convblock.append(
+                geometry_layer(
+                    layer=th.nn.Conv2d,
+                    in_channels=in_channels,
+                    out_channels=in_channels,
+                    kernel_size=1,
+                    dilation=dilation,
+                    enable_nhwc=enable_nhwc,
+                    enable_healpixpad=enable_healpixpad,
+                    hpx_padding_mode=hpx_padding_mode,
+                )
+            )
         # 3x3: in → latent
         convblock.append(
             geometry_layer(
@@ -1338,7 +1361,10 @@ class SmoothedInterpolateConv(th.nn.Module):
         mode = 'nearest',
         activation: th.nn.Module = None,
         enable_nhwc = False,
-        enable_healpixpad = True,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: int | None = None,
+        enable_healpixpad: bool | None = None,
     ):
         """
         Parameters
@@ -1363,6 +1389,14 @@ class SmoothedInterpolateConv(th.nn.Module):
             Enable nhwc format, passed to wrapper
         enable_healpixpad: bool, optional
             If HEALPixPadding should be enabled, passed to wrapper
+        hpx_padding_mode: str, optional
+            HEALPix padding strategy passed to ``HEALPixLayer`` (e.g. ``earth2grid``,
+            ``karlbauer``, or ``isolatitude``).
+        compile_padding: bool, optional
+            If True, apply torch compile to the padding module.
+        nside: int or None, optional
+            Native face height/width; required when ``hpx_padding_mode`` is
+            ``"isolatitude"``, otherwise ignored. Default ``None``.
         """
         super().__init__()
 
