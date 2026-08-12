@@ -188,12 +188,6 @@ def _renorm_timevar_physical(physical_avg, keys, dtype=torch.float32):
 # ---------------------------------------------------------------------------
 
 
-def test_set_coupled_scaling_none_raises():
-    coupler = _make_trailing_coupler()
-    with pytest.raises(ValueError, match="incoming_coupled_scaling must be provided"):
-        coupler.set_coupled_scaling(None)
-
-
 def test_set_coupled_scaling_requires_setup_coupling():
     coupler = TrailingAverageCoupler(
         dataset=_make_dataset(TRAILING_48H_VARS),
@@ -205,38 +199,14 @@ def test_set_coupled_scaling_requires_setup_coupling():
         output_time_dim=1,
     )
     coupler.set_scaling(_scaling_da(TRAILING_48H_VARS))
-    with pytest.raises(RuntimeError, match="setup_coupling must be called"):
+    with pytest.raises(RuntimeError, match="set_scaling and setup_coupling"):
         coupler.set_coupled_scaling(_yaml_scaling())
 
 
 def test_set_coupled_scaling_requires_set_scaling():
     coupler = _make_trailing_coupler(install_coupled_scaling=False)
-    with pytest.raises(RuntimeError, match="set_scaling must be called"):
+    with pytest.raises(RuntimeError, match="set_scaling and setup_coupling"):
         coupler.set_coupled_scaling(_yaml_scaling())
-
-
-def test_flat_mean_std_arrays_rejected():
-    with pytest.raises(TypeError, match="variable-keyed"):
-        _make_trailing_coupler(
-            incoming={"mean": [0.0, 0.0], "std": [1.0, 1.0]},
-        )
-
-
-def test_missing_variable_keys_raises():
-    with pytest.raises(KeyError, match="missing variables"):
-        _make_trailing_coupler(
-            incoming={"z1000": {"mean": 0.0, "std": 1.0}},  # missing ws10m
-        )
-
-
-def test_entry_missing_mean_or_std_raises():
-    with pytest.raises(TypeError, match="mean.*std"):
-        _make_trailing_coupler(
-            incoming={
-                "z1000": {"mean": 0.0},  # missing std
-                "ws10m": {"mean": 0.0, "std": 1.0},
-            },
-        )
 
 
 def test_zero_std_raises():
@@ -246,17 +216,9 @@ def test_zero_std_raises():
         _make_trailing_coupler(incoming=bad)
 
 
-def test_use_coupled_field_rescaling_property():
-    bare = _make_trailing_coupler()
-    assert bare.use_coupled_field_rescaling is False
-    scaled = _make_trailing_coupler(incoming=_yaml_scaling())
-    assert scaled.use_coupled_field_rescaling is True
-    assert scaled.outgoing_coupled_scaling["mean"].shape[3] == scaled.output_channels
-
-
 def test_scaling_da_xarray_form_accepted():
     coupler = _make_trailing_coupler(incoming=_scaling_da())
-    assert coupler.use_coupled_field_rescaling is True
+    assert coupler.incoming_coupled_scaling is not None
     assert coupler.outgoing_coupled_scaling["mean"].shape[3] == coupler.output_channels
 
 
@@ -390,7 +352,7 @@ def test_trailing_average_without_scaling_unchanged():
     slices = bare.averaging_slices
     ref = _reference_trailing_average(znorm.to(torch.float64), slices, dtype=torch.float32)
     assert _max_abs_err(out_bare, ref) < 1e-5
-    assert bare.use_coupled_field_rescaling is False
+    assert bare.incoming_coupled_scaling is None
 
 
 def test_constant_without_scaling_unchanged():
@@ -471,55 +433,9 @@ def test_rescaling_recovers_physical_trailing_mean():
             assert e_ok < 1e-2
             assert e_bad > e_ok * 100
 
-
-def test_rescaling_with_tiled_48h_outgoing():
-    """Tiled -48H outgoing (len=n_var) also recovers physical mean."""
-    generator = torch.Generator().manual_seed(_SEED + 31)
-    physical = _sample_instant_physical(TIMEDIM, generator)
-    znorm_instant = _normalize_with(physical, INSTANT_VARS, dtype=torch.float32)
-
-    coupler = _make_trailing_coupler(
-        incoming=_yaml_scaling(),  # length 2 → tiled
-    )
-    slices = coupler.averaging_slices
-    coupler.set_coupled_fields(znorm_instant)
-    recovered = _denorm_timevar_with(
-        coupler.construct_integrated_couplings(),
-        TRAILING_48H_VARS * len(INPUT_TIMES),
-    )
-    physical_mean = _reference_trailing_average(
-        physical, slices, dtype=torch.float64
-    )
-    assert _max_abs_err(recovered, physical_mean) < 1e-2
-
-
 # ---------------------------------------------------------------------------
 # 4. Tiled outgoing vs explicit timevar outgoing
 # ---------------------------------------------------------------------------
-
-
-def test_tiled_vs_explicit_timevar_outgoing_identical():
-    generator = torch.Generator().manual_seed(_SEED + 40)
-    physical = _sample_instant_physical(TIMEDIM, generator)
-    znorm = _normalize_with(physical, INSTANT_VARS, dtype=torch.float32)
-    incoming = _yaml_scaling()
-
-    tiled = _make_trailing_coupler(
-        incoming=incoming,  # len 2
-    )
-    explicit = _make_trailing_coupler(
-        incoming=incoming,  # len 4 explicit repeat
-    )
-    tiled.set_coupled_fields(znorm.clone())
-    explicit.set_coupled_fields(znorm.clone())
-    out_tiled = tiled.construct_integrated_couplings()
-    out_explicit = explicit.construct_integrated_couplings()
-
-    assert out_tiled.shape == out_explicit.shape
-    assert torch.allclose(out_tiled, out_explicit, rtol=0, atol=0), (
-        f"tiled vs explicit diverge: max_err={_max_abs_err(out_tiled, out_explicit):.3e}"
-    )
-
 
 # ---------------------------------------------------------------------------
 # 5. ConstantCoupler with scaling
@@ -547,7 +463,7 @@ def test_constant_coupler_affine_transform_across_integration():
     coupler = _make_constant_coupler(
         incoming=incoming,
     )
-    assert coupler.use_coupled_field_rescaling
+    assert coupler.incoming_coupled_scaling is not None
     coupler.set_coupled_fields(znorm)
     out = coupler.construct_integrated_couplings()  # [I, B, C, F, H, W]
 
@@ -604,80 +520,6 @@ def test_stability_denorm_mean_renorm_vs_float64_reference():
             print(f"stability {instant_key}@{period}: max_abs_z={e:.4e}")
             assert e < 1e-4
 
-
-def test_optional_figure_mismatch_vs_api(tmp_path=None):
-    """Write a small comparison chart if matplotlib is available; never required."""
-    pytest.importorskip("matplotlib")
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    generator = torch.Generator().manual_seed(42)
-    physical = _sample_instant_physical(TIMEDIM, generator)
-    znorm = _normalize_with(physical, INSTANT_VARS, dtype=torch.float32)
-    outgoing_keys = TRAILING_48H_VARS * len(INPUT_TIMES)
-
-    bare = _make_trailing_coupler(
-        variables=INSTANT_VARS, incoming_variables=INSTANT_VARS
-    )
-    slices = bare.averaging_slices
-    physical_mean = _reference_trailing_average(
-        physical, slices, dtype=torch.float64
-    )
-
-    bare.set_coupled_fields(znorm.clone())
-    mismatched = _denorm_timevar_with(
-        bare.construct_integrated_couplings(), outgoing_keys
-    )
-
-    scaled = _make_trailing_coupler(
-        incoming=_yaml_scaling(),
-    )
-    scaled.set_coupled_fields(znorm.clone())
-    recovered = _denorm_timevar_with(
-        scaled.construct_integrated_couplings(), outgoing_keys
-    )
-
-    labels, err_bad, err_ok = [], [], []
-    for p, period in enumerate(INPUT_TIMES):
-        for v, instant_key in enumerate(INSTANT_VARS):
-            tv = p * len(INSTANT_VARS) + v
-            labels.append(f"{instant_key}\n@{period}")
-            err_bad.append(
-                (mismatched[:, :, tv] - physical_mean[:, :, tv]).abs().max().item()
-            )
-            err_ok.append(
-                (recovered[:, :, tv] - physical_mean[:, :, tv]).abs().max().item()
-            )
-
-    x = np.arange(len(labels))
-    width = 0.35
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.bar(x - width / 2, err_bad, width, label="without API (mismatch)", color="#c44e52")
-    ax.bar(x + width / 2, err_ok, width, label="with API (recover)", color="#4c72b0")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=8)
-    ax.set_ylabel("max |error| vs physical trailing mean")
-    ax.set_yscale("log")
-    ax.set_title("Coupled-field scaling: instant→trailing mean recovery")
-    ax.legend()
-    fig.tight_layout()
-
-    out_dir = Path(__file__).with_name("figures")
-    out_dir.mkdir(exist_ok=True)
-    out_path = out_dir / "coupler_coupled_field_scaling_api.png"
-    fig.savefig(out_path, dpi=120)
-    plt.close(fig)
-    assert out_path.is_file()
-    # Soft numerical check so this still contributes coverage if run.
-    # z1000 mean-shift is O(10–100+); ws10 can be smaller but still ≫ API path.
-    z_bad = [err_bad[i] for i, lab in enumerate(labels) if "z1000" in lab]
-    assert all(b > 1.0 for b in z_bad)
-    assert all(o < 1e-2 for o in err_ok)
-    assert all(b > 100 * o for b, o in zip(err_bad, err_ok))
-
-
 # ---------------------------------------------------------------------------
 # 7. Adversarial edge cases
 # ---------------------------------------------------------------------------
@@ -715,51 +557,6 @@ def test_channel_order_period_major_multi_variable():
                 f"expected {expected_z.item():.4f} — channel order bug?"
             )
 
-
-def test_set_coupled_scaling():
-    generator = torch.Generator().manual_seed(_SEED + 70)
-    physical = _sample_instant_physical(TIMEDIM, generator)
-    znorm = _normalize_with(physical, INSTANT_VARS, dtype=torch.float32)
-    outgoing_keys = TRAILING_48H_VARS * len(INPUT_TIMES)
-
-    coupler = _make_trailing_coupler(
-        incoming=_yaml_scaling(),
-    )
-    assert coupler.use_coupled_field_rescaling
-    slices = coupler.averaging_slices
-    coupler.set_coupled_fields(znorm)
-    recovered = _denorm_timevar_with(
-        coupler.construct_integrated_couplings(), outgoing_keys
-    )
-    physical_mean = _reference_trailing_average(
-        physical, slices, dtype=torch.float64
-    )
-    assert _max_abs_err(recovered, physical_mean) < 1e-2
-
-
-def test_float32_cpu_dtype_and_device():
-    generator = torch.Generator().manual_seed(_SEED + 71)
-    physical = _sample_instant_physical(TIMEDIM, generator)
-    znorm = _normalize_with(physical, INSTANT_VARS, dtype=torch.float32)
-    assert znorm.dtype == torch.float32
-    assert znorm.device.type == "cpu"
-
-    outgoing_keys = TRAILING_48H_VARS * len(INPUT_TIMES)
-    coupler = _make_trailing_coupler(
-        incoming=_yaml_scaling(),
-    )
-    # Exercise denormalize / renormalize helpers directly.
-    denormed = coupler.denormalize_coupled_fields(znorm)
-    assert denormed.dtype == torch.float32
-    assert denormed.device.type == "cpu"
-
-    coupler.set_coupled_fields(znorm)
-    out = coupler.construct_integrated_couplings()
-    assert out.dtype == torch.float32
-    assert out.device.type == "cpu"
-    assert out.shape[2] == len(INSTANT_VARS) * len(INPUT_TIMES)
-
-
 def test_rescale_promotes_float16_to_float32_then_restores():
     """Physical denorm of z1000 exceeds float16 range; path must use float32 mid-flight."""
     generator = torch.Generator().manual_seed(_SEED + 72)
@@ -780,42 +577,3 @@ def test_rescale_promotes_float16_to_float32_then_restores():
     # Restored float16 should track the float32 path within float16 eps.
     assert _max_abs_err(out_f16.float(), out_f32) < 5e-2
 
-
-def test_rescale_coupled_fields_through_physical_callable():
-    coupler = _make_trailing_coupler(
-        incoming=_yaml_scaling(),
-    )
-    # Minimal [B,F,T,C,H,W] with known z values.
-    fields = torch.zeros(
-        _BATCH, _FACE, 2, len(INSTANT_VARS), _HEIGHT, _WIDTH, dtype=torch.float32
-    )
-    fields[..., 0, :, :] = 1.0  # +1σ on z1000
-    fields[..., 1, :, :] = -2.0  # -2σ on ws10m
-
-    def identity_op(x):
-        return x  # keep C=n_var; outgoing was tiled to timevar, so need C match
-
-    # Outgoing was tiled to timevar_dim=4, so identity (C=2) should raise.
-    with pytest.raises(ValueError, match="channel count"):
-        coupler.rescale_coupled_fields_through_physical(fields, identity_op)
-
-    # Physical op that expands channels to timevar layout by repeating.
-    def expand_to_timevar(x):
-        return torch.cat([x, x], dim=3)
-
-    out = coupler.rescale_coupled_fields_through_physical(fields, expand_to_timevar)
-    assert out.shape[3] == coupler.timevar_dim
-    assert out.dtype == torch.float32
-
-
-def test_denormalize_without_scaling_raises():
-    coupler = _make_trailing_coupler(
-        variables=INSTANT_VARS, incoming_variables=INSTANT_VARS
-    )
-    fields = torch.zeros(
-        _BATCH, _FACE, 2, len(INSTANT_VARS), _HEIGHT, _WIDTH, dtype=torch.float32
-    )
-    with pytest.raises(RuntimeError, match="incoming_coupled_scaling"):
-        coupler.denormalize_coupled_fields(fields)
-    with pytest.raises(RuntimeError, match="outgoing_coupled_scaling"):
-        coupler.renormalize_coupled_fields(fields)

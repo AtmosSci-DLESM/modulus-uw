@@ -44,103 +44,13 @@ Example for ``variables=["z1000", "ws10m"]``, ``input_times=["48h", "96h"]``::
 
     [z1000@48h, ws10m@48h, z1000@96h, ws10m@96h]
 
-Coupled-field scaling (denorm → operate → renorm)
--------------------------------------------------
-During inference, coupled fields are usually already z-scored with the *source*
-component's instantaneous stats (e.g. ``z1000``, ``ws10m``). The *sink*
-component, however, often has trailing-window fields with different statistical
-distributions due to operations such as averaging (e.g. ``z1000-48H``, ``ws10-48H``).
-
-Averaging in the wrong z-score space is an affine mismatch, not float noise::
-
-    # Wrong: average already-normalized with instant μ/σ, then treat as trailing
-    denorm_trailing( mean( norm_instant(x) ) )
-        ≠  mean(x)     # bias on the order of tens of meters for z1000
-
-When ``set_coupled_scaling(incoming)`` has been called (after ``set_scaling``
-and ``setup_coupling``), ``set_coupled_fields`` instead works in physical units::
-
-    source (instant z-score)          sink (trailing z-score)
-    ------------------------          -----------------------
-    x_z = (x - μ_in) / σ_in
-              │
-              ▼
-        denorm with μ_in, σ_in   ──►  x_phys
-              │
-              ▼
-        ConstantCoupler: broadcast t=0
-        TrailingAverageCoupler: mean over windows
-              │
-              ▼
-        renorm with μ_out, σ_out ──►  y_z = (y_phys - μ_out) / σ_out
-
-ASCII flow for ``TrailingAverageCoupler``::
-
-    set_coupled_fields(x_z)          # [B, F, T, C, H, W], C = len(variables)
-            │
-            ├─► denormalize:  x_phys = x_z * σ_in + μ_in
-            │
-            ├─► trailing mean over each input_times window
-            │         └── concat period-major → [B, F, I, timevar, H, W]
-            │
-            └─► renormalize:  y_z = (x_avg - μ_out) / σ_out
-
-Omit both scalings to keep the legacy path (operate directly in whatever space
-the caller already provided).
-
-Examples
---------
-**1. Instant → trailing (typical atmos → ocean forcing)**
-
-``set_scaling`` (usually via CoupledDataset) installs sink-side stats as
-``coupled_scaling``. ``setup_coupling`` records source channel names.
-``set_coupled_scaling`` then only needs the *incoming* (source) scaling map;
-outgoing renorm stats are ``coupled_scaling`` duplicated across
-``input_times`` (length ``output_channels``)::
-
-    from omegaconf import OmegaConf
-
-    scaling = OmegaConf.load("configs/data/scaling/hpx64.yaml")
-    # or: scaling = cfg.data.scaling
-
-    coupler = TrailingAverageCoupler(
-        dataset=ocean_ds,
-        batch_size=1,
-        variables=["z1000-48H", "ws10m-48H"],
-        input_times=["48h", "96h"],
-        averaging_window="48h",
-    )
-    coupler.set_scaling(scaling_da)       # builds coupled_scaling from self.variables
-    coupler.setup_coupling(atmos_module)  # saves incoming names, e.g. z1000, ws10m
-    coupler.set_coupled_scaling(scaling)  # incoming denorm; outgoing from coupled_scaling
-    # outgoing keys (period-major): [z1000-48H, ws10m-48H, z1000-48H, ws10m-48H]
-
-**2. ConstantCoupler**
-
-Same pattern; the physical-space op broadcasts time 0 instead of averaging::
-
-    coupler = ConstantCoupler(
-        dataset=ds,
-        batch_size=1,
-        variables=["sst"],
-        input_times=["0h"],
-    )
-    coupler.set_scaling(scaling_da)
-    coupler.setup_coupling(ocean_module)
-    coupler.set_coupled_scaling(scaling)
-
-Related tests
--------------
-* ``test_healpix_coupler_coupled_field_scaling.py`` — API, recovery of physical
-  trailing means, adversarial edge cases.
-* ``test_healpix_coupler_instant_vs_trailing_scaling.py`` — quantifies the
-  mismatch when averaging in the wrong z-score space.
-* ``test_healpix_coupler_znorm_stability.py`` — matched-stats float32 stability.
+Call ``set_coupled_scaling(incoming)`` after ``set_scaling`` / ``setup_coupling``
+to denorm→operate→renorm (float32 mid-flight); omit it for the legacy path.
 """
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Mapping, Optional, Sequence, Union
+from typing import Sequence
 
 import cftime
 import numpy as np
@@ -150,10 +60,6 @@ import xarray as xr
 import zarr as zr
 
 logger = logging.getLogger(__name__)
-
-# Variable-keyed scaling (hpx64.yaml / cfg.data.scaling), OmegaConf, or
-# the xarray Dataset produced by ``pd.DataFrame.from_dict(scaling).T.to_xarray()``.
-CoupledFieldScaling = Union[Mapping, xr.Dataset, xr.DataArray, None]
 
 
 class BaseCoupler(ABC):
@@ -205,11 +111,6 @@ class BaseCoupler(ABC):
         time_first: boolean, optional
             Whether the coupled data should be permuted to have the time dimension first 
             [T, B, C, F, H, W] rather than [B, F, T, C, H, W]
-
-        Notes
-        -----
-        Optional denorm/renorm stats for ``set_coupled_fields`` are configured
-        separately via :meth:`set_coupled_scaling`.
         """
         # extract important meta data from ds
         self.ds = dataset
@@ -310,267 +211,75 @@ class BaseCoupler(ABC):
             "std": np.expand_dims(coupled_scaling["std"].to_numpy(), (0, 2, 3, 4)),
         }
 
-    def set_coupled_scaling(
-        self,
-        incoming_coupled_scaling: CoupledFieldScaling,
-    ):
-        """Configure denorm/renorm stats used inside ``set_coupled_fields``.
+    def set_coupled_scaling(self, incoming_coupled_scaling):
+        """Set incoming denorm stats; outgoing renorm uses ``coupled_scaling`` tiled.
 
-        Incoming stats come from ``incoming_coupled_scaling`` (hpx64.yaml /
-        ``cfg.data.scaling`` / xarray ``scaling_da``). Outgoing stats are taken
-        from ``self.coupled_scaling`` (set by :meth:`set_scaling`) and duplicated
-        once per ``input_times`` entry so the channel axis length is
-        ``self.output_channels``.
-
-        Requires :meth:`set_scaling` and :meth:`setup_coupling` first:
-
-        * **Incoming** (denorm): keys from ``self.incoming_variables`` (source
-          ``output_variables`` in ``coupled_channel_indices`` order).
-        * **Outgoing** (renorm): ``self.coupled_scaling`` values for
-          ``self.outgoing_variable_order``, tiled across ``input_times``.
-
-        Parameters
-        ----------
-        incoming_coupled_scaling:
-            Variable-keyed scaling mapping ``{name: {"mean": ..., "std": ...}}``
-            (YAML / OmegaConf / dict) or an xarray Dataset/DataArray with an
-            ``index`` coordinate (same object passed to :meth:`set_scaling`).
+        Requires :meth:`set_scaling` and :meth:`setup_coupling`. Incoming keys
+        follow ``incoming_variables``; outgoing is reordered to
+        ``outgoing_variable_order`` and tiled across ``input_times``.
         """
-        if incoming_coupled_scaling is None:
-            raise ValueError(
-                "incoming_coupled_scaling must be provided "
-                "(or omit set_coupled_scaling for the legacy path)."
-            )
-        if self.coupled_scaling is None:
+        if self.coupled_scaling is None or self.incoming_variables is None:
             raise RuntimeError(
                 "set_scaling must be called before set_coupled_scaling "
                 "so coupled_scaling is available for outgoing renorm."
             )
-        if self.incoming_variables is None or self.outgoing_variable_order is None:
-            raise RuntimeError(
-                "setup_coupling must be called before set_coupled_scaling "
-                "so incoming/outgoing variable order is available from the "
-                "coupled module."
+        self.incoming_coupled_scaling = self._broadcast_stats(
+            *self._coupled_scaling_to_mean_std(
+                incoming_coupled_scaling, self.incoming_variables
             )
-
-        incoming_variables = list(self.incoming_variables)
-        if len(incoming_variables) != len(self.variables):
-            raise ValueError(
-                "incoming_variables from setup_coupling must have length "
-                f"{len(self.variables)}; got {len(incoming_variables)}"
-            )
-
-        in_mean, in_std = self._coupled_scaling_to_mean_std(
-            incoming_coupled_scaling,
-            incoming_variables,
-            name="incoming_coupled_scaling",
         )
-        self.incoming_coupled_scaling = self._mean_std_to_broadcast_tensors(
-            in_mean, in_std, name="incoming_coupled_scaling"
-        )
-        self.outgoing_coupled_scaling = self._outgoing_scaling_from_coupled_scaling()
-
-    def _outgoing_scaling_from_coupled_scaling(self) -> dict:
-        """Tile ``coupled_scaling`` across ``input_times`` in post-index order."""
-        cs_mean = np.asarray(self.coupled_scaling["mean"], dtype=np.float32).reshape(-1)
-        cs_std = np.asarray(self.coupled_scaling["std"], dtype=np.float32).reshape(-1)
-        if cs_mean.size != len(self.variables) or cs_std.size != len(self.variables):
-            raise RuntimeError(
-                "coupled_scaling channel count "
-                f"{cs_mean.size} does not match len(variables)={len(self.variables)}"
-            )
         var_idx = {v: i for i, v in enumerate(self.variables)}
-        try:
-            order = [var_idx[v] for v in self.outgoing_variable_order]
-        except KeyError as exc:
-            raise KeyError(
-                "outgoing_variable_order entry not in self.variables: "
-                f"{exc}; variables={list(self.variables)}"
-            ) from exc
-        # Period-major: [v0, v1, ..., v0, v1, ...] across input_times.
-        out_mean = np.tile(cs_mean[order], len(self.input_times))
-        out_std = np.tile(cs_std[order], len(self.input_times))
-        if out_mean.size != self.output_channels:
-            raise RuntimeError(
-                "outgoing scaling length "
-                f"{out_mean.size} != output_channels {self.output_channels}"
-            )
-        return self._mean_std_to_broadcast_tensors(
-            out_mean, out_std, name="outgoing_coupled_scaling"
-        )
-
-    # Backwards-compatible alias used briefly during the API rename.
-    set_coupled_field_scaling = set_coupled_scaling
-
-    def _coupled_variable_for_source_channel(self, source_channel: str) -> str:
-        """Map a source ``output_variables`` name to the matching coupler variable."""
-        for v in self.variables:
-            if ("-" not in v and source_channel == v) or (
-                source_channel == "-".join(v.split("-")[:-1])
-            ):
-                return v
-        raise ValueError(
-            f"No coupler variable in {list(self.variables)} matches "
-            f"source channel {source_channel!r}"
+        order = [var_idx[v] for v in self.outgoing_variable_order]
+        cs_mean = np.asarray(self.coupled_scaling["mean"], dtype=np.float32).ravel()
+        cs_std = np.asarray(self.coupled_scaling["std"], dtype=np.float32).ravel()
+        n = len(self.input_times)
+        self.outgoing_coupled_scaling = self._broadcast_stats(
+            np.tile(cs_mean[order], n), np.tile(cs_std[order], n)
         )
 
     @staticmethod
-    def _coupled_scaling_to_mean_std(scaling, keys: Sequence[str], name: str):
-        """Extract ordered mean/std arrays from YAML-style or scaling_da input."""
-        try:
-            from omegaconf import OmegaConf, DictConfig, ListConfig
-
-            if isinstance(scaling, (DictConfig, ListConfig)) or (
-                hasattr(OmegaConf, "is_config") and OmegaConf.is_config(scaling)
-            ):
-                scaling = OmegaConf.to_object(scaling)
-        except ImportError:
-            pass
-
+    def _coupled_scaling_to_mean_std(scaling, keys: Sequence[str]):
         if isinstance(scaling, (xr.Dataset, xr.DataArray)):
-            if "index" not in scaling.coords and "index" not in getattr(
-                scaling, "dims", ()
-            ):
-                # DataFrame.to_xarray() uses the frame index as a dimension named
-                # after the index; CoupledDataset always renames via .sel(index=...).
-                index_name = scaling.dims[0] if scaling.dims else None
-                if index_name is None:
-                    raise TypeError(
-                        f"{name}: xarray scaling object has no index coordinate"
-                    )
-                scaling = scaling.rename({index_name: "index"})
-            available = set(np.asarray(scaling["index"].values).tolist())
-            missing = [k for k in keys if k not in available]
-            if missing:
-                raise KeyError(
-                    f"{name} missing variables {missing}; "
-                    f"available={sorted(available)}"
-                )
             selected = scaling.sel(index=list(keys))
-            mean = np.asarray(selected["mean"].to_numpy(), dtype=np.float32).reshape(-1)
-            std = np.asarray(selected["std"].to_numpy(), dtype=np.float32).reshape(-1)
-            return mean, std
-
-        if not isinstance(scaling, Mapping):
-            raise TypeError(
-                f"{name} must be a variable-keyed scaling mapping "
-                f"(hpx64.yaml / cfg.data.scaling) or an xarray scaling_da; "
-                f"got {type(scaling)}"
+            return (
+                np.asarray(selected["mean"].to_numpy(), dtype=np.float32).ravel(),
+                np.asarray(selected["std"].to_numpy(), dtype=np.float32).ravel(),
             )
-
-        # Reject the old flat {"mean": [...], "std": [...]} form with a clear error.
-        if (
-            "mean" in scaling
-            and "std" in scaling
-            and not isinstance(scaling.get("mean"), Mapping)
-        ):
-            sample_vals = [
-                v for v in scaling.values() if isinstance(v, Mapping) and "mean" in v
-            ]
-            if not sample_vals:
-                raise TypeError(
-                    f"{name} must be variable-keyed like hpx64.yaml "
-                    f"(e.g. {{'z1000': {{'mean': ..., 'std': ...}}, ...}}) "
-                    f"or an xarray scaling_da; flat mean/std arrays are not supported."
-                )
-
-        missing = [k for k in keys if k not in scaling]
-        if missing:
-            raise KeyError(
-                f"{name} missing variables {missing}; "
-                f"available={sorted(scaling.keys())}"
-            )
-        try:
-            mean = np.asarray(
-                [scaling[k]["mean"] for k in keys], dtype=np.float32
-            ).reshape(-1)
-            std = np.asarray(
-                [scaling[k]["std"] for k in keys], dtype=np.float32
-            ).reshape(-1)
-        except (KeyError, TypeError) as exc:
-            raise TypeError(
-                f"{name} entries must be mappings with 'mean' and 'std' "
-                f"(hpx64.yaml style); error on keys {list(keys)}: {exc}"
-            ) from exc
-        return mean, std
+        return (
+            np.asarray([scaling[k]["mean"] for k in keys], dtype=np.float32),
+            np.asarray([scaling[k]["std"] for k in keys], dtype=np.float32),
+        )
 
     @staticmethod
-    def _mean_std_to_broadcast_tensors(mean, std, name: str) -> dict:
-        if mean.size != std.size:
-            raise ValueError(
-                f"{name} mean and std lengths differ: {mean.size} vs {std.size}"
-            )
+    def _broadcast_stats(mean, std) -> dict:
+        mean = np.asarray(mean, dtype=np.float32).ravel()
+        std = np.asarray(std, dtype=np.float32).ravel()
         if np.any(std == 0):
-            raise ValueError(f"{name} std must be non-zero for all channels")
-        # Broadcast over [B, F, T, C, H, W]
+            raise ValueError("scaling std must be non-zero for all channels")
+        # Broadcast to channel dimension [B, F, T, C, H, W] to match the shape of the coupled fields
         return {
             "mean": th.as_tensor(mean).view(1, 1, 1, -1, 1, 1),
             "std": th.as_tensor(std).view(1, 1, 1, -1, 1, 1),
         }
 
-    @property
-    def use_coupled_field_rescaling(self) -> bool:
-        return (
-            self.incoming_coupled_scaling is not None
-            and self.outgoing_coupled_scaling is not None
-        )
-
-    def denormalize_coupled_fields(self, coupled_fields: th.Tensor) -> th.Tensor:
-        """Undo incoming z-score: ``x * std_in + mean_in``."""
-        if self.incoming_coupled_scaling is None:
-            raise RuntimeError("incoming_coupled_scaling has not been set")
-        mean = self.incoming_coupled_scaling["mean"].to(
-            device=coupled_fields.device, dtype=coupled_fields.dtype
-        )
-        std = self.incoming_coupled_scaling["std"].to(
-            device=coupled_fields.device, dtype=coupled_fields.dtype
-        )
-        return coupled_fields * std + mean
-
-    def renormalize_coupled_fields(self, coupled_fields: th.Tensor) -> th.Tensor:
-        """Apply outgoing z-score: ``(x - mean_out) / std_out``."""
-        if self.outgoing_coupled_scaling is None:
-            raise RuntimeError("outgoing_coupled_scaling has not been set")
-        mean = self.outgoing_coupled_scaling["mean"].to(
-            device=coupled_fields.device, dtype=coupled_fields.dtype
-        )
-        std = self.outgoing_coupled_scaling["std"].to(
-            device=coupled_fields.device, dtype=coupled_fields.dtype
-        )
-        # Outgoing tensors may be [B, F, T, C, H, W] with C == timevar_dim.
-        if mean.shape[3] != coupled_fields.shape[3]:
-            raise ValueError(
-                "outgoing_coupled_scaling channel count "
-                f"{mean.shape[3]} does not match field channels "
-                f"{coupled_fields.shape[3]}"
-            )
-        return (coupled_fields - mean) / std
+    @staticmethod
+    def _apply_scaling(x: th.Tensor, scaling: dict, *, denorm: bool) -> th.Tensor:
+        mean = scaling["mean"].to(device=x.device, dtype=x.dtype)
+        std = scaling["std"].to(device=x.device, dtype=x.dtype)
+        return x * std + mean if denorm else (x - mean) / std
 
     def rescale_coupled_fields_through_physical(
         self, coupled_fields: th.Tensor, physical_op
     ) -> th.Tensor:
-        """Denormalize → apply ``physical_op`` in physical space → renormalize.
-
-        Physical values (e.g. geopotential) often exceed the range of low-precision
-        dtypes such as float16. The pipeline therefore promotes to float32 for
-        denorm / ``physical_op`` / renorm, then casts the result back to the
-        input dtype.
-
-        Parameters
-        ----------
-        coupled_fields:
-            Incoming fields already channel-selected, layout ``[B, F, T, C, H, W]``.
-        physical_op:
-            Callable ``(Tensor) -> Tensor`` operating in physical units. Output
-            must keep layout ``[B, F, T', C', H, W]`` where ``C'`` matches
-            ``outgoing_coupled_scaling``.
-        """
+        """Denorm → ``physical_op`` → renorm in float32; restore input dtype."""
         orig_dtype = coupled_fields.dtype
-        fields_f32 = coupled_fields.to(dtype=th.float32)
-        physical = self.denormalize_coupled_fields(fields_f32)
-        transformed = physical_op(physical)
-        renormalized = self.renormalize_coupled_fields(transformed)
-        return renormalized.to(dtype=orig_dtype)
+        x = coupled_fields.to(dtype=th.float32)
+        physical = physical_op(
+            self._apply_scaling(x, self.incoming_coupled_scaling, denorm=True)
+        )
+        return self._apply_scaling(
+            physical, self.outgoing_coupled_scaling, denorm=False
+        ).to(dtype=orig_dtype)
 
     def setup_coupling(self, coupled_module):
         """
@@ -589,35 +298,33 @@ class BaseCoupler(ABC):
         # with a time increment suach as a trailing average increment e.g. 'z1000-48H'.
         # Some variables may have an additional suffix, e.g. 'z1000-3H-48H'. The final
         # suffix (if it exists) is used to determine the coupling increment.
-        channel_indices = [
-            i
-            for i, oc in enumerate(output_channels)
-            for v in self.variables
-            # extract everthing before the last "-" if there is one in the name
-            if (("-" not in v and oc == v) or (oc == "-".join(v.split("-")[:-1])))
-        ]
-        # check for missing variables
+        # Order follows source output_channels (may differ from self.variables).
+        channel_indices = []
+        incoming_variables = []
+        outgoing_variable_order = []
+        for i, oc in enumerate(output_channels):
+            for v in self.variables:
+                if ("-" not in v and oc == v) or (
+                    oc == "-".join(v.split("-")[:-1])
+                ):
+                    channel_indices.append(i)
+                    incoming_variables.append(oc)
+                    outgoing_variable_order.append(v)
+                    break
         if len(self.variables) != len(channel_indices):
-            found_channels = [
-                oc
-                for oc in output_channels
+            found = set(incoming_variables)
+            missing_channels = {
+                v
                 for v in self.variables
-                # extract everthing before the last -
-                if (("-" not in v and oc == v) or (oc == "-".join(v.split("-")[:-1])))
-            ]
-            missing_channels = set(self.variables) - set(found_channels)
+                if not (
+                    (v in found)
+                    or (("-" in v) and ("-".join(v.split("-")[:-1]) in found))
+                )
+            }
             raise ValueError(f"Missing variables in coupled module: {missing_channels}")
         self.coupled_channel_indices = channel_indices
-        # Channel names after ``coupled_fields[..., coupled_channel_indices, ...]``.
-        # Order follows the source module's output_variables (via the index list),
-        # which may differ from ``self.variables`` order.
-        self.incoming_variables = [output_channels[i] for i in channel_indices]
-        # Sink-side names paired 1:1 with incoming_variables / post-index channels,
-        # so outgoing scaling stays aligned after set_coupled_fields indexing.
-        self.outgoing_variable_order = [
-            self._coupled_variable_for_source_channel(oc)
-            for oc in self.incoming_variables
-        ]
+        self.incoming_variables = incoming_variables
+        self.outgoing_variable_order = outgoing_variable_order
 
     def reset_coupler(self):
         self.coupled_mode = False
@@ -827,24 +534,14 @@ class ConstantCoupler(BaseCoupler):
         ]
 
         def _broadcast_first_time(fields: th.Tensor) -> th.Tensor:
-            # Allocate a fresh buffer and copy time 0 into every integration
-            # step. Using expand() would share storage with ``fields``, so later
-            # mutations of the source tensor could silently change the preset.
-            out = th.empty(
-                [
-                    fields.shape[0],
-                    fields.shape[1],
-                    self.coupled_integration_dim,
-                    fields.shape[3],
-                    *fields.shape[4:],
-                ],
-                dtype=fields.dtype,
-                device=fields.device,
+            # Clone so later mutations of coupled_fields cannot alter presets.
+            return (
+                fields[:, :, :1]
+                .expand(-1, -1, self.coupled_integration_dim, -1, -1, -1)
+                .clone()
             )
-            out[:, :, :, :, :, :] = fields[:, :, :1, :, :, :]
-            return out
 
-        if self.use_coupled_field_rescaling:
+        if self.incoming_coupled_scaling is not None:
             self.preset_coupled_fields = self.rescale_coupled_fields_through_physical(
                 coupled_fields, _broadcast_first_time
             )
@@ -1025,7 +722,7 @@ class TrailingAverageCoupler(BaseCoupler):
                 coupled_averaging_periods.append(th.concat(averaging_periods, dim=3))
             return th.concat(coupled_averaging_periods, dim=2)
 
-        if self.use_coupled_field_rescaling:
+        if self.incoming_coupled_scaling is not None:
             self.preset_coupled_fields = self.rescale_coupled_fields_through_physical(
                 coupled_fields, _trailing_average
             )
