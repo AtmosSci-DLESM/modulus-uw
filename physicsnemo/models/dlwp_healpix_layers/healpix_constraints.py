@@ -102,6 +102,97 @@ class NonnegativeConstraint(torch.nn.Module):
             return replace_value_keep_gradient(prediction, clamped)
         return clamped
 
+class BoundConstraint(torch.nn.Module):
+    def __init__(
+        self,
+        bounds: dict[str, list[float]],
+        in_channels: list[str],
+        out_channels: list[str],
+        scaling: dict[str, dict[str, float]],
+        keep_grad_through_clamp: bool = False,
+    ):
+        """
+        Parameters
+        ----------
+        bounds: dict[str, list[float]]
+            Dictionary mapping variable names to [min, max] limits in physical units.
+            Use None for unbounded limits.
+            Example: {'sic': [0.0, 1.0], 'sit': [0.0, None]}
+        in_channels: list[str]
+            List of all input channel names in the model.
+        out_channels: list[str]
+            List of all output channel names in the model.
+        scaling: dict[str, dict[str, float]]
+            Dictionary containing the mean and std for each variable.
+        keep_grad_through_clamp: bool, optional
+            If True, apply the bounds with a straight-through estimator: forward
+            values are still clamped to the physical limits, but gradients flow as
+            if the clamp were identity so out-of-bounds predictions still get a
+            learning signal. Default False.
+        """
+        super().__init__()
+        self.bounds = bounds
+        if out_channels is not None:
+            self.channels = out_channels
+        else:
+            self.channels = in_channels
+        self.scaling = scaling
+        self.keep_grad_through_clamp = keep_grad_through_clamp
+
+        # Only apply constraint to variables that are used by model
+        missing = [var for var in self.bounds if var not in self.channels]
+        self.variables = [var for var in self.bounds if var in self.channels]
+
+        if missing:
+            logger0.warning(
+                f"Requested bound constrained variables "
+                f"{missing} not found in model channels and will be ignored."
+            )
+
+        # Normalize the physical bounds into z-scored space, leaving unconstrained
+        # channels and open-ended limits at +/-inf so the clamp is a no-op there.
+        constrained_set = set(self.variables)
+        min_per_channel = []
+        max_per_channel = []
+        for name in self.channels:
+            phys_min, phys_max = (
+                self.bounds[name] if name in constrained_set else (None, None)
+            )
+            if phys_min is None:
+                min_per_channel.append(float("-inf"))
+            else:
+                min_per_channel.append(
+                    (phys_min - scaling[name]["mean"]) / scaling[name]["std"]
+                )
+            if phys_max is None:
+                max_per_channel.append(float("inf"))
+            else:
+                max_per_channel.append(
+                    (phys_max - scaling[name]["mean"]) / scaling[name]["std"]
+                )
+
+        min_thresholds = torch.tensor(min_per_channel, dtype=torch.float32).view(
+            1, 1, 1, -1, 1, 1
+        )
+        max_thresholds = torch.tensor(max_per_channel, dtype=torch.float32).view(
+            1, 1, 1, -1, 1, 1
+        )
+        self.register_buffer("min_thresholds", min_thresholds, persistent=False)
+        self.register_buffer("max_thresholds", max_thresholds, persistent=False)
+
+    def forward(self, prediction, input):
+        '''
+        Tensors are expected to be in the shape [B, F, T, C, H, W]
+        '''
+        min_thresholds = self.min_thresholds.to(dtype=prediction.dtype)
+        max_thresholds = self.max_thresholds.to(dtype=prediction.dtype)
+        clamped = torch.minimum(
+            torch.maximum(prediction, min_thresholds), max_thresholds
+        )
+        if self.keep_grad_through_clamp:
+            return replace_value_keep_gradient(prediction, clamped)
+        return clamped
+
 class DryAirMassConstraint(torch.nn.Module):
     def __init__(
         self,
