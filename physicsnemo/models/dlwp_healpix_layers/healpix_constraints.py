@@ -40,8 +40,8 @@ class NonnegativeConstraint(torch.nn.Module):
         self,
         variables: list[str],
         in_channels: list[str],
-        out_channels: list[str],
-        scaling: dict[str, dict[str, float]],
+        out_channels: list[str] = None,
+        scaling: dict[str, dict[str, float]] = None,
         keep_grad_through_clamp: bool = False,
     ):
         """
@@ -67,7 +67,10 @@ class NonnegativeConstraint(torch.nn.Module):
             self.channels = out_channels
         else:
             self.channels = in_channels
-        self.scaling = scaling
+        if scaling is not None:
+            self.scaling = scaling
+        else:
+            self.scaling = {var: {'mean': 0.0, 'std': 1.0} for var in self.variables}
         self.keep_grad_through_clamp = keep_grad_through_clamp
 
         # Only apply constraint to variables that are used by model
@@ -107,8 +110,8 @@ class BoundConstraint(torch.nn.Module):
         self,
         bounds: dict[str, list[float]],
         in_channels: list[str],
-        out_channels: list[str],
-        scaling: dict[str, dict[str, float]],
+        out_channels: list[str] = None,
+        scaling: dict[str, dict[str, float]] = None,
         keep_grad_through_clamp: bool = False,
     ):
         """
@@ -136,7 +139,10 @@ class BoundConstraint(torch.nn.Module):
             self.channels = out_channels
         else:
             self.channels = in_channels
-        self.scaling = scaling
+        if scaling is not None:
+            self.scaling = scaling
+        else:
+            self.scaling = {var: {'mean': 0.0, 'std': 1.0} for var in self.variables}
         self.keep_grad_through_clamp = keep_grad_through_clamp
 
         # Only apply constraint to variables that are used by model
