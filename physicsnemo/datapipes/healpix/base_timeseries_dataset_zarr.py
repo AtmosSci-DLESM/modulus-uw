@@ -177,6 +177,14 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         self.all_variables = list(
             set(self.input_variables).union(self.output_variables)
         )
+        # Channels jointly loaded/scaled from the store. Forecast/inference only
+        # reads ICs, so output-only diagnostics need not exist in the dataset;
+        # training still stages input ∪ output for supervised targets.
+        self.staging_variables = (
+            list(self.input_variables)
+            if self.forecast_mode
+            else self.all_variables
+        )
         self.all_scaling = None
 
         # Check if for fsspec if necessary and make sure path exist
@@ -191,9 +199,8 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                 "Either start and end date or forecast_init_times must be provided"
             )
 
-        # Validate channels exist
-        channels = set(self.input_variables).union(self.output_variables)
-        missing_channels = channels - set(self.ds["channel_in"][:])
+        # Validate channels that will actually be read from the store.
+        missing_channels = set(self.staging_variables) - set(self.ds["channel_in"][:])
         if len(missing_channels) > 0:
             raise KeyError(
                 f"Requested Input, coupled, or output variables not found in dataset: {missing_channels}"
@@ -203,7 +210,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
 
         self.all_variable_indices = [
             int(np.where(self.ds["channel_in"][:] == ch)[0][0])
-            for ch in self.all_variables
+            for ch in self.staging_variables
         ]
 
         # Validate constants exist
@@ -223,11 +230,17 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             else None
         )
         self.input_variable_indices = [
-            self.all_variables.index(inp_ch) for inp_ch in self.input_variables
+            self.staging_variables.index(inp_ch) for inp_ch in self.input_variables
         ]
-        self.output_variable_indices = [
-            self.all_variables.index(out_ch) for out_ch in self.output_variables
-        ]
+        # Output indices are only used when loading supervised targets.
+        self.output_variable_indices = (
+            None
+            if self.forecast_mode
+            else [
+                self.staging_variables.index(out_ch)
+                for out_ch in self.output_variables
+            ]
+        )
 
         # Length of the data window needed for one sample
         if self.forecast_mode:
@@ -451,7 +464,8 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                 f"Target channels {missing} not found in the scaling config dict data.scaling ({list(self.scaling.keys())})"
             )
 
-        self.all_scaling = scaling_da.sel(index=self.all_variables).rename(
+        # Align mean/std with the staged channel axis used in __getitem__.
+        self.all_scaling = scaling_da.sel(index=self.staging_variables).rename(
             {"index": "channel_in"}
         )
         self.all_scaling = {
