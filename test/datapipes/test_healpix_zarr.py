@@ -28,6 +28,7 @@ from physicsnemo.distributed import DistributedManager
 
 omegaconf = pytest.importorskip("omegaconf")
 np = pytest.importorskip("numpy")
+pd = pytest.importorskip("pandas")
 xr = pytest.importorskip("xarray")
 zarr = pytest.importorskip("zarr")
 
@@ -146,6 +147,88 @@ def test_TimeSeriesDataset_missing_time(tmp_path):
             start_date="1979-01-01",
             end_date="1979-01-02",
         )
+
+
+def _make_minimal_healpix_zarr(path, channel_in, n_time=8):
+    """Write a tiny monolithic HEALPix zarr suitable for TimeSeriesDatasetZarr."""
+    face, height, width = 1, 2, 2
+    times = pd.date_range("1979-01-01", periods=n_time, freq="6h")
+    n_chan = len(channel_in)
+    ds = xr.Dataset(
+        data_vars={
+            "inputs": (
+                ("time", "channel_in", "face", "height", "width"),
+                np.zeros((n_time, n_chan, face, height, width), dtype="float32"),
+            ),
+            "targets": (
+                ("time", "channel_out", "face", "height", "width"),
+                np.zeros((n_time, n_chan, face, height, width), dtype="float32"),
+            ),
+            "lat": (("face", "height", "width"), np.zeros((face, height, width))),
+            "lon": (("face", "height", "width"), np.zeros((face, height, width))),
+        },
+        coords={
+            "time": times,
+            "channel_in": list(channel_in),
+            "channel_out": list(channel_in),
+            "face": np.arange(face),
+            "height": np.arange(height),
+            "width": np.arange(width),
+        },
+    )
+    ds.to_zarr(path)
+    return times
+
+
+def test_TimeSeriesDataset_forecast_skips_missing_diagnostic_channels(tmp_path):
+    """Forecast mode must not require output-only diagnostics in the IC store."""
+    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
+        TimeSeriesDatasetZarr,
+    )
+
+    input_variables = ["z500", "t2m0"]
+    diagnostic = "diag_only"
+    output_variables = input_variables + [diagnostic]
+    dataset_path = tmp_path / "forecast_diag.zarr"
+    times = _make_minimal_healpix_zarr(dataset_path, channel_in=input_variables)
+    scaling = omegaconf.DictConfig(
+        {
+            "z500": {"mean": 0.0, "std": 1.0},
+            "t2m0": {"mean": 0.0, "std": 1.0},
+            diagnostic: {"mean": 0.0, "std": 1.0},
+        }
+    )
+
+    # Training still needs every output variable present in the store.
+    with pytest.raises(
+        KeyError,
+        match=("not found in dataset"),
+    ):
+        TimeSeriesDatasetZarr(
+            dataset_path=str(dataset_path),
+            data_time_step="6h",
+            time_step="6h",
+            scaling=scaling,
+            input_variables=input_variables,
+            output_variables=output_variables,
+            start_date="1979-01-01",
+            end_date="1979-01-02",
+            batch_size=1,
+        )
+
+    forecast_ds = TimeSeriesDatasetZarr(
+        dataset_path=str(dataset_path),
+        data_time_step="6h",
+        time_step="6h",
+        scaling=scaling,
+        input_variables=input_variables,
+        output_variables=output_variables,
+        forecast_init_times=times[:2],
+        batch_size=1,
+    )
+    sample = forecast_ds[0]
+    assert isinstance(sample, list)
+    assert sample[0].shape[3] == len(input_variables)
 
 
 @import_or_fail("omegaconf")
