@@ -177,6 +177,14 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         self.all_variables = list(
             set(self.input_variables).union(self.output_variables)
         )
+        # Channels that must exist in the store. Forecast/inference only reads
+        # ICs, so output-only diagnostics need not be present; training still
+        # requires input ∪ output for supervised targets.
+        self.staging_variables = (
+            list(self.input_variables)
+            if self.forecast_mode
+            else self.all_variables
+        )
 
         # Check if for fsspec if necessary and make sure path exist
         _check_availability(dataset_path)
@@ -193,9 +201,8 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         # Validate requested fields exist in the store.
         from .zarr_layout import available_field_names
 
-        channels = set(self.input_variables).union(self.output_variables)
         available = available_field_names(self.ds)
-        missing_channels = channels - available
+        missing_channels = set(self.staging_variables) - available
         if missing_channels:
             raise KeyError(
                 f"Requested input or output variables not found in dataset: {missing_channels}"
