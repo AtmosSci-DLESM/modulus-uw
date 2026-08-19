@@ -1320,6 +1320,7 @@ class GlobalEnergyScoreLoss(th.nn.MSELoss):
     and the almost-fair ensemble energy score is computed with Euclidean (L2)
     norms. Optional land-sea masking weights the norm via sqrt(lsm) scaling before
     flattening so that ||v||_2^2 = sum(lsm * v^2) over valid pixels.
+    ``cast_to_fp32`` (default True) casts inputs to float32; set False for native AMP.
     """
 
     def __init__(
@@ -1331,6 +1332,7 @@ class GlobalEnergyScoreLoss(th.nn.MSELoss):
         open_dict: dict = {"engine": "zarr"},
         selection_dict: dict = {"channel_c": "land_sea_mask"},
         channel_chunk_size: int | None = None,
+        cast_to_fp32: bool = True,
     ):
         super().__init__()
         if n_members < 2:
@@ -1340,6 +1342,7 @@ class GlobalEnergyScoreLoss(th.nn.MSELoss):
         self.device = None
         self.alpha = alpha
         self.channel_chunk_size = channel_chunk_size
+        self.cast_to_fp32 = cast_to_fp32
 
         self.coeff_eps = 1 - ((1 - alpha) / n_members)
         self.averaging_coeff = 1 / (2 * n_members * (n_members - 1))
@@ -1408,7 +1411,8 @@ class GlobalEnergyScoreLoss(th.nn.MSELoss):
         if n == 2:
             diff_target = diff_to_target.sum(dim=0)
             diff_ensemble = th.linalg.vector_norm(pred_flat[0] - pred_flat[1], dim=-1)
-            es = self.averaging_coeff * (diff_target - self.coeff_eps * diff_ensemble)
+            # n=2 collapsed path; 2 * averaging_coeff matches the pairwise (i≠j) reduction
+            es = 2 * self.averaging_coeff * (diff_target - self.coeff_eps * diff_ensemble)
         else:
             diff_i = diff_to_target.view(n, b, t, c)
             diff_i_i = diff_i.unsqueeze(0)
@@ -1457,8 +1461,9 @@ class GlobalEnergyScoreLoss(th.nn.MSELoss):
                 f"{self.n_members}, got {n}"
             )
 
-        prediction = prediction.to(th.float32)
-        target = target.to(th.float32)
+        if self.cast_to_fp32:
+            prediction = prediction.to(th.float32)
+            target = target.to(th.float32)
 
         chunk = self.channel_chunk_size
         if chunk is None or chunk >= c:
