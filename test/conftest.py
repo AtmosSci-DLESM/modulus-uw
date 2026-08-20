@@ -14,9 +14,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 from collections import defaultdict
 
 import pytest
+
+
+def requires_module(names):
+    """
+    Decorator to skip a test if *any* of the given modules are missing.
+
+    Accepts a single module name or a list/tuple of names. Mirrors the helper
+    of the same name in upstream physicsnemo so tests can be shared verbatim
+    between the two trees.
+    """
+    if isinstance(names, str):
+        names = [names]
+
+    skip = any(importlib.util.find_spec(name) is None for name in names)
+    return pytest.mark.skipif(skip, reason="requires " + ", ".join(names))
+
 
 file_timings = defaultdict(float)
 
