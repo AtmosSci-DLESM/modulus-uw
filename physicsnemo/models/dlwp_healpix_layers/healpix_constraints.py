@@ -109,10 +109,11 @@ class BoundConstraint(torch.nn.Module):
     def __init__(
         self,
         bounds: dict[str, list[float]],
-        in_channels: list[str],
+        in_channels: list[str] = None,
         out_channels: list[str] = None,
         scaling: dict[str, dict[str, float]] = None,
         keep_grad_through_clamp: bool = False,
+        channels: list[str] = None,
     ):
         """
         Parameters
@@ -135,6 +136,13 @@ class BoundConstraint(torch.nn.Module):
         """
         super().__init__()
         self.bounds = bounds
+        if in_channels is None and channels is not None:
+            logger0.warning(
+                "channels is deprecated, use in_channels instead"
+            )
+            in_channels = channels
+        if in_channels is None:
+            raise TypeError("BoundConstraint requires in_channels (or legacy channels)")
         if out_channels is not None:
             self.channels = out_channels
         else:
