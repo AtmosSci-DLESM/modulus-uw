@@ -81,15 +81,15 @@ class NonnegativeConstraint(torch.nn.Module):
             )
 
         constrained_set = set(self.variables)
-        per_channel = [
-            (0.0 - scaling[name]["mean"]) / scaling[name]["std"]
-            if name in constrained_set
-            else float("-inf")
-            for name in self.channels
-        ]
-        thresholds = torch.tensor(per_channel, dtype=torch.float32).view(
-            1, 1, 1, -1, 1, 1
+        from physicsnemo.datapipes.healpix.scaling_utils import stack_normalized_bounds
+
+        thresholds_np = stack_normalized_bounds(
+            self.channels,
+            scaling,
+            {name: 0.0 for name in constrained_set},
+            unconstrained=float("-inf"),
         )
+        thresholds = torch.as_tensor(thresholds_np, dtype=torch.float32)
         self.register_buffer("thresholds", thresholds, persistent=False)
 
     def forward(self, prediction, input):

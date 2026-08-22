@@ -156,12 +156,8 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         - Create scaling parameters for coupled variables
         - Pass scaling info to coupler objects
         """
-        scaling_df = pd.DataFrame.from_dict(self.scaling).T
-        scaling_df.loc["zeros"] = {"mean": 0.0, "std": 1.0}
-        scaling_da = scaling_df.to_xarray().astype("float32")
-
         for c in self.couplings:
-            c.set_scaling(scaling_da)
+            c.set_scaling(self.scaling)
         super()._get_scaling_da()
 
     def __getitem__(
