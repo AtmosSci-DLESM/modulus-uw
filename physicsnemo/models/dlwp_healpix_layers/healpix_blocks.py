@@ -711,6 +711,7 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         conditional_layer_norm_once: bool = False,
         use_initial_one_conv: bool = False,
         enable_healpixpad: bool | None = None,
+        cln_once_per_block: bool = False,
     ):
         """
         Parameters
@@ -741,6 +742,9 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        # Alias for legacy/zie-trained checkpoint configs (cln_once_per_block).
+        if not conditional_layer_norm_once:
+            conditional_layer_norm_once = cln_once_per_block
         # Create a ModuleList to store complete blocks
         self.blocks = th.nn.ModuleList()
         # flag for conditional layer normalization

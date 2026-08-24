@@ -400,7 +400,12 @@ class HEALPixUNet(Module):
             List of hydra instantiable DictConfigs specifying constraints
         """
         if constraints is not None:
-            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
+            if hasattr(constraints, "keys"):
+                # dict-style config: {name: constraint_cfg, ...}
+                self.constraints = [instantiate(constraints[c]) for c in constraints]
+            else:
+                # list-style config (e.g. legacy/zie-trained checkpoints): [constraint_cfg, ...]
+                self.constraints = [instantiate(c) for c in constraints]
 
     def forward(self, inputs: Sequence, output_only_last=False, conditions_cln: Sequence=None) -> th.Tensor:
         """

@@ -142,6 +142,8 @@ def make_hpx_padding_layer(
         Unknown mode, isolatitude without ``nside``, or earth2grid when earth2grid
         is unavailable or CUDA is not available.
     """
+    if hpx_padding_mode == "isolat":  # alias used by legacy/zie-trained checkpoint configs
+        hpx_padding_mode = "isolatitude"
     if hpx_padding_mode == "earth2grid":
         if not have_earth2grid or not th.cuda.is_available():
             raise ValueError(

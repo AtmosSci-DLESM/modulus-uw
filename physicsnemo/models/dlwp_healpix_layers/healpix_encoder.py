@@ -43,6 +43,8 @@ class UNetEncoder(th.nn.Module):
         per_level_cln: Sequence[bool] = None,
         per_level_checkpointing: Sequence[bool] = None,
         enable_healpixpad: bool | None = None,
+        cln_per_level: Sequence[bool] = None,
+        act_ckpt_levels: Sequence[bool] = None,
     ):
         """
         Parameters
@@ -84,6 +86,11 @@ class UNetEncoder(th.nn.Module):
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        # Aliases for legacy/zie-trained checkpoint configs (cln_per_level, act_ckpt_levels).
+        if per_level_cln is None:
+            per_level_cln = cln_per_level
+        if per_level_checkpointing is None:
+            per_level_checkpointing = act_ckpt_levels
         if len(nside) != len(n_channels):
             raise ValueError(
                 f"nside must have the same length as n_channels ({len(n_channels)}), "
