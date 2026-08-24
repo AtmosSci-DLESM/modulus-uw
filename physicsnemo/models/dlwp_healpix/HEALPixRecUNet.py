@@ -16,7 +16,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import pandas as pd
 import torch as th
@@ -30,6 +30,7 @@ from physicsnemo.models.dlwp_healpix_layers import (
 )
 from physicsnemo.models.meta import ModelMetaData
 from physicsnemo.models.module import Module
+from physicsnemo.utils.ocean_land_infill import infill_ocean_over_land
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,7 @@ class HEALPixRecUNet(Module):
         compile_padding: bool = False,
         nside: Sequence[int] = (64, 32, 16),
         enable_healpixpad: bool | None = None,
+        ocean_land_infill: Optional[dict] = None,
     ):
         """
         Parameters
@@ -131,6 +133,11 @@ class HEALPixRecUNet(Module):
         enable_healpixpad: bool, optional
             Deprecated. When ``hpx_padding_mode`` is omitted, ``False`` maps to ``karlbauer``
             and ``True`` to ``earth2grid`` (legacy configs). Prefer ``hpx_padding_mode``.
+        ocean_land_infill: dict, optional
+            Config for ocean-over-land infill (land pixels set to a fixed standardized value).
+            May contain the full buffers (``land_mask``, ``fill_standardized``) or only options
+            (``infill_state``, ``infill_coupling``, ``land_threshold``); in the latter case call
+            ``set_ocean_land_infill_buffers()`` after init to attach the actual mask/fill tensors.
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
@@ -215,6 +222,29 @@ class HEALPixRecUNet(Module):
 
         self.constraints = None
         self.set_constraints(constraints)
+
+        # Optional ocean-over-land infill (land pixels set to standardized -1)
+        # Config may contain full dict (land_mask, fill_standardized) or only options (infill_state, infill_coupling).
+        # When only options are in config (e.g. from Hydra), call set_ocean_land_infill_buffers() after init.
+        self._ocean_land_infill = ocean_land_infill
+        if ocean_land_infill is not None and "land_mask" in ocean_land_infill and "fill_standardized" in ocean_land_infill:
+            self.register_buffer("_infill_land_mask", ocean_land_infill["land_mask"])
+            self.register_buffer("_infill_fill_standardized", ocean_land_infill["fill_standardized"])
+            self._infill_state = ocean_land_infill.get("infill_state", False)
+            self._infill_coupling = ocean_land_infill.get("infill_coupling", False)
+        else:
+            self._infill_land_mask = None
+            self._infill_fill_standardized = None
+            self._infill_state = (ocean_land_infill or {}).get("infill_state", False)
+            self._infill_coupling = (ocean_land_infill or {}).get("infill_coupling", False)
+
+    def set_ocean_land_infill_buffers(self, land_mask: th.Tensor, fill_standardized: th.Tensor) -> None:
+        """Set land mask and fill tensors for ocean-over-land infill (e.g. from dataset constants after init)."""
+        for name in ("_infill_land_mask", "_infill_fill_standardized"):
+            if hasattr(self, name):
+                delattr(self, name)
+        self.register_buffer("_infill_land_mask", land_mask)
+        self.register_buffer("_infill_fill_standardized", fill_standardized)
 
     @property
     def integration_steps(self):
@@ -482,6 +512,26 @@ class HEALPixRecUNet(Module):
         -------
         th.Tensor: Predicted outputs
         """
+        # Infill ocean variables over land at the start of every forward (every coupled step in inference)
+        if self._ocean_land_infill is not None and self._infill_land_mask is not None:
+            land_threshold = self._ocean_land_infill.get("land_threshold", 0.0)
+            if self._infill_state and len(inputs) > 0:
+                infill_ocean_over_land(
+                    inputs[0],
+                    self._infill_land_mask,
+                    self._infill_fill_standardized,
+                    channel_dim=3,
+                    land_threshold=land_threshold,
+                )
+            if self._infill_coupling and len(inputs) > 3:
+                infill_ocean_over_land(
+                    inputs[3],
+                    self._infill_land_mask,
+                    self._infill_fill_standardized,
+                    channel_dim=2,
+                    land_threshold=land_threshold,
+                )
+
         self.reset()
         outputs = []
         for step in range(self.integration_steps):
@@ -562,6 +612,17 @@ class HEALPixRecUNet(Module):
             if self.constraints is not None:
                 for constraint in self.constraints:
                     out = constraint(out, orig_input)
+
+            # Ocean model: infill output over land so recycled state for next step is infilled
+            if self._infill_state and self._infill_land_mask is not None:
+                land_threshold = self._ocean_land_infill.get("land_threshold", 0.0)
+                infill_ocean_over_land(
+                    out,
+                    self._infill_land_mask,
+                    self._infill_fill_standardized,
+                    channel_dim=3,
+                    land_threshold=land_threshold,
+                )
 
             outputs.append(out)
             # th.cuda.nvtx.range_pop()
