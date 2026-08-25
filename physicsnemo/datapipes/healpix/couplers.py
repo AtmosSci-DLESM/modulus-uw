@@ -340,12 +340,16 @@ class BaseCoupler(ABC):
         # with a time increment suach as a trailing average increment e.g. 'z1000-48H'.
         # Some variables may have an additional suffix, e.g. 'z1000-3H-48H'. The final
         # suffix (if it exists) is used to determine the coupling increment.
-        # Order follows source output_channels (may differ from self.variables).
+        # Order follows self.variables (the coupler's declared order), matching how
+        # ds_variable_indices is built in __init__ and how training data is assembled --
+        # NOT source output_channels order, which is incidental to the source model's
+        # own channel layout and can silently permute the coupled tensor if it differs
+        # from self.variables' order.
         channel_indices = []
         incoming_variables = []
         outgoing_variable_order = []
-        for i, oc in enumerate(output_channels):
-            for v in self.variables:
+        for v in self.variables:
+            for i, oc in enumerate(output_channels):
                 if ("-" not in v and oc == v) or (
                     oc == "-".join(v.split("-")[:-1])
                 ):
