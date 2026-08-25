@@ -81,15 +81,15 @@ class NonnegativeConstraint(torch.nn.Module):
             )
 
         constrained_set = set(self.variables)
-        per_channel = [
-            (0.0 - scaling[name]["mean"]) / scaling[name]["std"]
-            if name in constrained_set
-            else float("-inf")
-            for name in self.channels
-        ]
-        thresholds = torch.tensor(per_channel, dtype=torch.float32).view(
-            1, 1, 1, -1, 1, 1
+        from physicsnemo.datapipes.healpix.scaling_utils import stack_normalized_bounds
+
+        thresholds_np = stack_normalized_bounds(
+            self.channels,
+            scaling,
+            {name: 0.0 for name in constrained_set},
+            unconstrained=float("-inf"),
         )
+        thresholds = torch.as_tensor(thresholds_np, dtype=torch.float32)
         self.register_buffer("thresholds", thresholds, persistent=False)
 
     def forward(self, prediction, input):
@@ -98,6 +98,115 @@ class NonnegativeConstraint(torch.nn.Module):
         '''
         thresholds = self.thresholds.to(dtype=prediction.dtype)
         clamped = torch.maximum(prediction, thresholds)
+        if self.keep_grad_through_clamp:
+            return replace_value_keep_gradient(prediction, clamped)
+        return clamped
+
+
+class BoundedConstraint(torch.nn.Module):
+    def __init__(
+        self,
+        lower_bounds: dict[str, float] | None = None,
+        upper_bounds: dict[str, float] | None = None,
+        in_channels: list[str] | None = None,
+        out_channels: list[str] | None = None,
+        scaling: dict[str, dict[str, float]] | None = None,
+        keep_grad_through_clamp: bool = False,
+    ):
+        """
+        Clamp model outputs to optional physical lower and/or upper bounds.
+
+        Bounds are specified in physical units and converted to normalized
+        thresholds using ``scaling``. Channels without a bound on a given side
+        are left unconstrained on that side.
+
+        Parameters
+        ----------
+        lower_bounds: dict[str, float], optional
+            Per-variable physical lower bounds (inclusive).
+        upper_bounds: dict[str, float], optional
+            Per-variable physical upper bounds (inclusive).
+        in_channels: list[str]
+            List of all input channel names in the model.
+        out_channels: list[str]
+            List of all output channel names in the model.
+        scaling: dict[str, dict[str, float]]
+            Dictionary containing the mean and std for each variable.
+        keep_grad_through_clamp: bool, optional
+            If True, apply clamps with a straight-through estimator so
+            saturated cells still receive a learning signal. Default False.
+        """
+        super().__init__()
+        lower_bounds = lower_bounds or {}
+        upper_bounds = upper_bounds or {}
+        if not lower_bounds and not upper_bounds:
+            raise ValueError(
+                "BoundedConstraint requires at least one of lower_bounds or "
+                "upper_bounds."
+            )
+
+        if out_channels is not None:
+            self.channels = out_channels
+        else:
+            self.channels = in_channels
+        self.scaling = scaling
+        self.keep_grad_through_clamp = keep_grad_through_clamp
+
+        requested = set(lower_bounds) | set(upper_bounds)
+        for name in requested:
+            if name in lower_bounds and name in upper_bounds:
+                if lower_bounds[name] > upper_bounds[name]:
+                    raise ValueError(
+                        f"BoundedConstraint for {name!r}: lower bound "
+                        f"{lower_bounds[name]} exceeds upper bound "
+                        f"{upper_bounds[name]}."
+                    )
+
+        missing = [var for var in requested if var not in self.channels]
+        if missing:
+            logger0.warning(
+                f"Requested bounded variables {missing} not found in model "
+                "channels and will be ignored."
+            )
+        self.constrained_variables = {
+            name for name in requested if name in self.channels
+        }
+
+        from physicsnemo.datapipes.healpix.scaling_utils import stack_normalized_bounds
+
+        lower_thresholds_np = stack_normalized_bounds(
+            self.channels,
+            scaling,
+            {
+                name: lower_bounds[name]
+                for name in self.constrained_variables
+                if name in lower_bounds
+            },
+            unconstrained=float("-inf"),
+        )
+        upper_thresholds_np = stack_normalized_bounds(
+            self.channels,
+            scaling,
+            {
+                name: upper_bounds[name]
+                for name in self.constrained_variables
+                if name in upper_bounds
+            },
+            unconstrained=float("inf"),
+        )
+        lower_thresholds = torch.as_tensor(lower_thresholds_np, dtype=torch.float32)
+        upper_thresholds = torch.as_tensor(upper_thresholds_np, dtype=torch.float32)
+        self.register_buffer("lower_thresholds", lower_thresholds, persistent=False)
+        self.register_buffer("upper_thresholds", upper_thresholds, persistent=False)
+
+    def forward(self, prediction, input):
+        '''
+        Tensors are expected to be in the shape [B, F, T, C, H, W]
+        '''
+        lower = self.lower_thresholds.to(dtype=prediction.dtype)
+        upper = self.upper_thresholds.to(dtype=prediction.dtype)
+        clamped = torch.maximum(prediction, lower)
+        clamped = torch.minimum(clamped, upper)
         if self.keep_grad_through_clamp:
             return replace_value_keep_gradient(prediction, clamped)
         return clamped
