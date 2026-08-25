@@ -273,6 +273,9 @@ def test_TimeSeriesDataset_return_ic_diagnostics(tmp_path):
             ),
             "lat": (("face", "height", "width"), np.zeros((face, height, width))),
             "lon": (("face", "height", "width"), np.zeros((face, height, width))),
+            "face": ("face", np.arange(face)),
+            "height": ("height", np.arange(height)),
+            "width": ("width", np.arange(width)),
         },
         coords={
             "time": times,
