@@ -79,7 +79,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         add_train_noise: bool = False,
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
-        return_ic_diagnostics: bool = False,
     ):
         """Initialize coupled time series dataset.
 
@@ -137,7 +136,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
             add_train_noise=add_train_noise,
             train_noise_params=train_noise_params,
             train_noise_seed=train_noise_seed,
-            return_ic_diagnostics=return_ic_diagnostics,
             meta=meta,
         )
 
@@ -221,14 +219,8 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
 
         if self.forecast_mode:
             inputs_result = super().__getitem__(item)
-            ic_diagnostics = None
         else:
-            batch = super().__getitem__(item)
-            if self.return_ic_diagnostics:
-                inputs_result, targets, ic_diagnostics = batch
-            else:
-                inputs_result, targets = batch
-                ic_diagnostics = None
+            inputs_result, targets = super().__getitem__(item)
 
         # used by the couplers to determine what time index to load
         # see method "next_integration()" for details
@@ -278,8 +270,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         if self.forecast_mode:
             return inputs_result
 
-        if self.return_ic_diagnostics:
-            return inputs_result, targets, ic_diagnostics
         return inputs_result, targets
 
     def _get_next_insolation(self, time_offset: int) -> torch.Tensor:
