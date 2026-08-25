@@ -28,6 +28,13 @@ from .healpix_blocks import (
     TransposedConvUpsample,
     SmoothedInterpolateConv,
 )
+from .reflection_steerable_blocks import (
+    ReflectionSteerableBasicConvBlock,
+    ReflectionSteerableConvGRUBlock,
+    ReflectionSteerableMulti_SymmetricConvNeXtBlock,
+    ReflectionSteerableSmoothedInterpolateConv,
+    ReflectionSteerableSymmetricConvNeXtBlock,
+)
 from .healpix_decoder import UNetDecoder
 from .healpix_encoder import UNetEncoder
 from .healpix_layers import HEALPixLayer
@@ -40,4 +47,12 @@ from .healpix_paddings import (
     have_earth2grid,
     make_hpx_padding_layer,
     warn_deprecated_enable_healpixpad,
+)
+from .coupled_partial_conv import (
+    DEFAULT_COUPLED_PARTIAL_CONV_STEM_TARGET,
+    CoupledPartialConvStem,
+    PartialHEALPixConv2d,
+    build_coupled_partial_conv_stem,
+    coupled_variable_channel_names,
+    load_spatial_mask,
 )

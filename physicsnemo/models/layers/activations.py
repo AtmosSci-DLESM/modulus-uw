@@ -169,6 +169,22 @@ class CappedGELU(torch.nn.Module):
         return x
 
 
+class Tanh(nn.Tanh):
+    """Hyperbolic tangent activation.
+
+    Odd nonlinearity (``f(-z) = -f(z)``). Required for ReflectionSteerable /
+    structural reflection-equivariant layers when a single activation is shared
+    across even and odd channel banks. Subclasses ``torch.nn.Tanh`` so Hydra
+    configs can target ``physicsnemo.models.layers.activations.Tanh`` the same
+    way they target ``CappedGELU``.
+    """
+
+    def __init__(self, **kwargs):
+        # ``nn.Tanh`` takes no parameters; accept/ignore Hydra extras for symmetry
+        # with other activation configs.
+        super().__init__()
+
+
 # Dictionary of activation functions
 ACT2FN = {
     "relu": nn.ReLU,
@@ -185,7 +201,7 @@ ACT2FN = {
     "softplus": nn.Softplus,
     "softshrink": nn.Softshrink,
     "softsign": nn.Softsign,
-    "tanh": nn.Tanh,
+    "tanh": Tanh,
     "tanhshrink": nn.Tanhshrink,
     "threshold": (nn.Threshold, {"threshold": 1.0, "value": 1.0}),
     "hardtanh": nn.Hardtanh,
