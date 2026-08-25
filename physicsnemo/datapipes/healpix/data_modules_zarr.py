@@ -132,6 +132,7 @@ class TimeSeriesDataModuleZarr:
         dataloader_io_threads: int = 8,
         mp_sharing_strategy: Optional[str] = None,
         dataloader_multiprocessing_context: Optional[str] = None,
+        return_ic_diagnostics: bool = False,
     ):
         """
         Parameters
@@ -204,6 +205,9 @@ class TimeSeriesDataModuleZarr:
             Threads per DataLoader worker for per-variable Zarr reads. When >1 and
             num_workers > 0, workers reuse a persistent thread pool instead of
             creating a new pool on every batch.
+        return_ic_diagnostics: bool, optional
+            Train mode: return ground-truth output-only channels at input times as a
+            third batch element for soft constraints. default False
         """
         super().__init__()
         self.dataset_path = Path(dataset_path)
@@ -241,6 +245,11 @@ class TimeSeriesDataModuleZarr:
                 else None
             )
         self.dataloader_multiprocessing_context = dataloader_multiprocessing_context
+        self.return_ic_diagnostics = return_ic_diagnostics
+        input_set = set(self.input_variables)
+        self.ic_diagnostic_variables = [
+            name for name in self.output_variables if name not in input_set
+        ]
 
         self.train_dataset = None
         self.val_dataset = None
@@ -281,6 +290,7 @@ class TimeSeriesDataModuleZarr:
             "time_step": self.time_step,
             "gap": self.gap,
             "scaling": self.scaling,
+            "return_ic_diagnostics": self.return_ic_diagnostics,
         }
 
     def _validate_setup_requirements(self) -> None:
@@ -548,6 +558,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         dataloader_io_threads: int = 8,
         mp_sharing_strategy: Optional[str] = None,
         dataloader_multiprocessing_context: Optional[str] = None,
+        return_ic_diagnostics: bool = False,
     ):
         """
         Parameters
@@ -618,6 +629,9 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             Seed for the random number generator for adding noise to the training data, default 42
         in_order: bool, optional
             Passed to torch.utils.data.DataLoader when set. If None, DataLoader default applies.
+        return_ic_diagnostics: bool, optional
+            Train mode: return ground-truth output-only channels at input times as a
+            third batch element for soft constraints. default False
         """
         self.couplings = couplings
 
@@ -651,6 +665,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             dataloader_io_threads,
             mp_sharing_strategy,
             dataloader_multiprocessing_context,
+            return_ic_diagnostics,
         )
 
     def _get_coupled_vars(self):

@@ -160,7 +160,7 @@ def test_load_windowed_channel_data_named_store(tmp_path):
     exp_in = staging[input_time_idx[:, :, None], np.asarray([0, 1])[None, None, :]]
     exp_out = staging[output_time_idx[:, :, None], np.asarray([2, 0])[None, None, :]]
 
-    got_in, got_out = load_windowed_channel_data(
+    got_in, got_out, got_ic = load_windowed_channel_data(
         ds,
         time_sl,
         input_names=input_names,
@@ -171,6 +171,7 @@ def test_load_windowed_channel_data_named_store(tmp_path):
     )
     np.testing.assert_array_equal(got_in, exp_in)
     np.testing.assert_array_equal(got_out, exp_out)
+    assert got_ic is None
 
 
 def test_enable_zarrs_pipeline_when_installed():

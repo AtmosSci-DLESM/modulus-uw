@@ -71,6 +71,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         add_train_noise: bool = False,
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
+        return_ic_diagnostics: bool = False,
         meta: DatapipeMetaData = MetaData(),
     ):
         """Initialize time series dataset.
@@ -98,6 +99,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             add_train_noise=add_train_noise,
             train_noise_params=train_noise_params,
             train_noise_seed=train_noise_seed,
+            return_ic_diagnostics=return_ic_diagnostics,
             meta=meta,
         )
 
@@ -164,7 +166,12 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_windows")
         # Decode each field once and scatter directly into sample windows
         # (per-variable: threaded fills; monolithic: joint read + gather).
-        inputs, targets = load_windowed_channel_data(
+        ic_diag_names = (
+            self.ic_diagnostic_variables
+            if self.return_ic_diagnostics and self.ic_diagnostic_variables
+            else None
+        )
+        inputs, targets, ic_diagnostics = load_windowed_channel_data(
             self.ds,
             time_sl,
             input_names=self.input_variables,
@@ -173,6 +180,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             output_time_idx=output_time_idx,
             input_scaling=self.input_scaling,
             output_scaling=self.target_scaling,
+            ic_diagnostic_names=ic_diag_names,
         )
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()
@@ -238,4 +246,10 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
 
         maybe_collect_worker_gc()
         torch.cuda.nvtx.range_pop()
+        if self.return_ic_diagnostics:
+            if ic_diagnostics is not None:
+                ic_diagnostics = np.transpose(
+                    ic_diagnostics, axes=(0, 3, 1, 2, 4, 5)
+                )
+            return inputs_result, targets, ic_diagnostics
         return inputs_result, targets

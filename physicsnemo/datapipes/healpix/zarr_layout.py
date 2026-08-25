@@ -268,7 +268,8 @@ def load_windowed_channel_data(
     n_threads: int = 8,
     input_scaling: Mapping | None = None,
     output_scaling: Mapping | None = None,
-) -> tuple[np.ndarray, np.ndarray | None]:
+    ic_diagnostic_names: Sequence[str] | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Load and scale fields directly into (B, T, C, F, H, W) sample windows.
 
     For per-variable / named-array stores, each unique field is decoded and
@@ -290,12 +291,17 @@ def load_windowed_channel_data(
     input_scaling, output_scaling :
         Optional ``{"mean", "std"}`` arrays indexed by channel position in
         ``input_names`` / ``output_names`` (same layout as dataset scaling).
+    ic_diagnostic_names :
+        Optional output-only channel names to also gather at ``input_time_idx``
+        (scaled with ``output_scaling``). Used for soft-constraint IC anchors.
 
     Returns
     -------
-    inputs, targets
+    inputs, targets, ic_diagnostics
         ``inputs`` has shape ``(B, T_in, C_in, ...)``. ``targets`` is ``None``
-        when ``output_names`` is omitted.
+        when ``output_names`` is omitted. ``ic_diagnostics`` is ``None`` when
+        ``ic_diagnostic_names`` is empty/omitted; otherwise
+        ``(B, T_in, C_diag, ...)``.
     """
     enable_zarrs_pipeline()
     input_names = list(input_names)
@@ -305,6 +311,7 @@ def load_windowed_channel_data(
         raise ValueError(
             f"input_time_idx must be (B, T), got shape {input_time_idx.shape}"
         )
+    ic_diag_names = list(ic_diagnostic_names or [])
 
     if is_monolithic_layout(ds):
         # Monolithic stores are already a joint array; stage once then gather.
@@ -329,7 +336,26 @@ def load_windowed_channel_data(
             ]
             if output_scaling is not None:
                 targets = (targets - output_scaling["mean"]) / output_scaling["std"]
-        return inputs, targets
+        ic_diagnostics = None
+        if ic_diag_names:
+            if output_names is None or output_scaling is None:
+                raise ValueError(
+                    "ic_diagnostic_names requires output_names and output_scaling"
+                )
+            ic_c = np.asarray([name_to_i[n] for n in ic_diag_names], dtype=np.intp)
+            ic_diagnostics = staging[
+                input_time_idx[:, :, np.newaxis], ic_c[np.newaxis, np.newaxis, :]
+            ]
+            out_idx = [list(output_names).index(n) for n in ic_diag_names]
+            # output_scaling mean/std are broadcastable on channel axis (index 1
+            # after expand to match (B,T,C,...)); select diagnostic channels.
+            mean = output_scaling["mean"]
+            std = output_scaling["std"]
+            # Shapes are typically (1, C, 1, 1, 1) after dataset expand_dims.
+            mean_c = np.take(mean, out_idx, axis=1)
+            std_c = np.take(std, out_idx, axis=1)
+            ic_diagnostics = (ic_diagnostics - mean_c) / std_c
+        return inputs, targets, ic_diagnostics
 
     ref = ds[input_names[0]]
     spatial = ref.shape[1:]
@@ -357,6 +383,14 @@ def load_windowed_channel_data(
             (len(out_names), batch_size, t_out) + spatial, dtype=dtype
         )
 
+    ic_diag_cf = None
+    ic_name_to_c: dict[str, int] = {}
+    if ic_diag_names:
+        ic_diag_cf = np.empty(
+            (len(ic_diag_names), batch_size, t_in) + spatial, dtype=dtype
+        )
+        ic_name_to_c = {n: i for i, n in enumerate(ic_diag_names)}
+
     # Unique fields → destinations in input and/or target channel axes.
     slots: dict[str, tuple[int | None, int | None]] = {}
     for c, name in enumerate(input_names):
@@ -365,6 +399,11 @@ def load_windowed_channel_data(
     for c, name in enumerate(out_names):
         in_c, out_c = slots.get(name, (None, None))
         slots[name] = (in_c, c)
+    # Ensure output-only IC diagnostics are loaded even if somehow omitted
+    # from output_names (should not happen when wired from the dataset).
+    for name in ic_diag_names:
+        if name not in slots:
+            slots[name] = (None, None)
 
     def _fill(name: str, in_c: int | None, out_c: int | None) -> None:
         block = np.asarray(ds[name][time_sl])
@@ -374,10 +413,17 @@ def load_windowed_channel_data(
             block = _apply_channel_scaling(block, input_scaling, in_c)
         elif out_c is not None and output_scaling is not None:
             block = _apply_channel_scaling(block, output_scaling, out_c)
+        elif name in ic_name_to_c and output_scaling is not None and out_names:
+            block = _apply_channel_scaling(
+                block, output_scaling, out_names.index(name)
+            )
         if in_c is not None:
             inputs_cf[in_c] = block[input_time_idx]
         if out_c is not None:
             targets_cf[out_c] = block[output_time_idx]
+        if name in ic_name_to_c:
+            # Same scaled block; gather at input times for soft-constraint ICs.
+            ic_diag_cf[ic_name_to_c[name]] = block[input_time_idx]
 
     loaders = [
         lambda n=n, ic=ic, oc=oc: _fill(n, ic, oc) for n, (ic, oc) in slots.items()
@@ -388,7 +434,10 @@ def load_windowed_channel_data(
     targets = (
         None if targets_cf is None else np.transpose(targets_cf, (1, 2, 0, 3, 4, 5))
     )
-    return inputs, targets
+    ic_diagnostics = (
+        None if ic_diag_cf is None else np.transpose(ic_diag_cf, (1, 2, 0, 3, 4, 5))
+    )
+    return inputs, targets, ic_diagnostics
 
 
 def load_constant_fields(

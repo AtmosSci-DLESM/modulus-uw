@@ -104,6 +104,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         add_train_noise: bool = False,
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
+        return_ic_diagnostics: bool = False,
         meta: DatapipeMetaData = None,
     ):
         """Initialize base time series dataset.
@@ -152,6 +153,10 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             Standard deviation of train noise
         train_noise_seed : int, default=42
             Seed for train noise
+        return_ic_diagnostics : bool, default=False
+            Train mode only: also return ground-truth output-only (diagnostic)
+            channels at input times for soft constraints that need IC anchors
+            (e.g. diagnostic ``sp``). Forecast mode ignores this flag.
         meta : DatapipeMetaData, optional
             Metadata for the datapipe
         """
@@ -184,6 +189,14 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             list(self.input_variables)
             if self.forecast_mode
             else self.all_variables
+        )
+        # Output-only channels in output order (stable for soft-constraint indexing).
+        input_set = set(self.input_variables)
+        self.ic_diagnostic_variables = [
+            name for name in self.output_variables if name not in input_set
+        ]
+        self.return_ic_diagnostics = bool(return_ic_diagnostics) and (
+            not self.forecast_mode
         )
 
         # Check if for fsspec if necessary and make sure path exist
