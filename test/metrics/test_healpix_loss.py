@@ -29,6 +29,8 @@ from physicsnemo.metrics.climate.healpix_loss import (
     WeightedMSE,
     WeightedOceanMSE,
     PatchedEnergyScoreLoss,
+    GlobalEnergyScoreLoss,
+    WeightedCompositeLoss,
 )
 
 xr = pytest.importorskip("xarray")
@@ -491,6 +493,60 @@ def test_PatchedEnergyScoreLoss_two_members_zero_and_symmetry(device, patch_size
 
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+@pytest.mark.parametrize("patch_size", [3])
+@pytest.mark.parametrize("hpx_padding_mode", ["karlbauer"])
+@pytest.mark.parametrize("enable_nhwc", [False])
+def test_PatchedEnergyScoreLoss_two_member_fast_matches_pairwise(
+    device, patch_size, hpx_padding_mode, enable_nhwc
+):
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    b, f, t, c, h, w = 2, 12, 2, 2, 64, 64
+    n_members = 2
+    loss_fn = PatchedEnergyScoreLoss(
+        weights=[1.0] * c,
+        n_members=n_members,
+        alpha=0.95,
+        patch_size=patch_size,
+        hpx_padding_mode=hpx_padding_mode,
+        enable_nhwc=enable_nhwc,
+        nside=h,
+    )
+    trainer = trainer_helper(output_variables=[f"var{i}" for i in range(c)], device=device)
+    loss_fn.setup(trainer)
+
+    torch.manual_seed(0)
+    target = torch.randn(b, f, t, c, h, w, device=device)
+    pred = torch.randn(n_members, b, f, t, c, h, w, device=device)
+
+    fast = loss_fn._energy_score_field(pred, target, n_members, b, f, t, c, h, w).mean()
+
+    with torch.no_grad():
+        tar_unfold = loss_fn._unfold_target(target)
+    pred_unfold = loss_fn._unfold_prediction_members(pred)
+    diff_to_target = loss_fn._reshape_member_norms(
+        loss_fn._weighted_patch_norm(pred_unfold - tar_unfold.unsqueeze(0), patch_dim=-2),
+        b, f, t, c, h, w,
+    )
+    diff_i = diff_to_target
+    pred_i = pred_unfold.unsqueeze(1)
+    pred_j = pred_unfold.unsqueeze(0)
+    dist_ensemble = loss_fn._weighted_patch_norm(pred_i - pred_j, patch_dim=-2)
+    dist_ensemble = dist_ensemble.view(n_members, n_members, b, t, f, c, h, w).permute(
+        0, 1, 2, 4, 3, 5, 6, 7
+    )
+    mask = loss_fn.diag_mask[:, :, None, None, None, None, None, None]
+    diff_terms = mask * (diff_i.unsqueeze(0) + diff_i.unsqueeze(1))
+    dist_terms = mask * dist_ensemble
+    pairwise = (
+        loss_fn.averaging_coeff * (diff_terms - loss_fn.coeff_eps * dist_terms).sum(dim=(0, 1))
+    ).mean()
+
+    assert torch.isclose(fast, pairwise, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 @pytest.mark.parametrize("patch_size", [3, 5])
 @pytest.mark.parametrize("hpx_padding_mode", ["earth2grid", "karlbauer", "isolatitude"])
 @pytest.mark.parametrize("enable_nhwc", [True, False])
@@ -527,3 +583,147 @@ def test_PatchedEnergyScoreLoss_three_members_zero(device, patch_size, hpx_paddi
 
     loss = loss_fn(prediction, target, average_channels=True)
     assert torch.isclose(loss, torch.tensor(0.0, device=device), atol=1e-6)
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_GlobalEnergyScoreLoss_two_members_zero(device):
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    b, f, t, c, h, w = 2, 12, 4, 4, 64, 64
+    n_members = 2
+    weights = [1.0] * c
+
+    loss_fn = GlobalEnergyScoreLoss(weights=weights, n_members=n_members)
+    trainer = trainer_helper(output_variables=[f"var{i}" for i in range(c)], device=device)
+    loss_fn.setup(trainer)
+
+    base = torch.arange(h * w, dtype=torch.float32, device=device).reshape(h, w)
+    target = base.repeat(b, f, t, c, 1, 1)
+
+    pred_members = target.unsqueeze(0).expand(n_members, -1, -1, -1, -1, -1, -1)
+    prediction = pred_members.reshape(n_members * b, f, t, c, h, w)
+
+    loss = loss_fn(prediction, target, average_channels=True)
+    assert torch.isclose(loss, torch.tensor(0.0, device=device), atol=1e-5)
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_GlobalEnergyScoreLoss_three_members_zero(device):
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    b, f, t, c, h, w = 2, 12, 4, 4, 64, 64
+    n_members = 3
+    weights = [1.0] * c
+
+    loss_fn = GlobalEnergyScoreLoss(weights=weights, n_members=n_members)
+    trainer = trainer_helper(output_variables=[f"var{i}" for i in range(c)], device=device)
+    loss_fn.setup(trainer)
+
+    base = torch.randn(h, w, dtype=torch.float32, device=device)
+    target = base.view(1, 1, 1, 1, h, w).repeat(b, f, t, c, 1, 1)
+    pred_members = target.unsqueeze(0).expand(n_members, -1, -1, -1, -1, -1, -1)
+    prediction = pred_members.reshape(n_members * b, f, t, c, h, w)
+
+    loss = loss_fn(prediction, target, average_channels=True)
+    assert torch.isclose(loss, torch.tensor(0.0, device=device), atol=1e-5)
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_GlobalEnergyScoreLoss_two_member_fast_matches_pairwise(device):
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    b, f, t, c, h, w = 2, 12, 2, 2, 64, 64
+    n_members = 2
+    loss_fn = GlobalEnergyScoreLoss(
+        weights=[1.0] * c,
+        n_members=n_members,
+        alpha=0.95,
+    )
+    trainer = trainer_helper(output_variables=[f"var{i}" for i in range(c)], device=device)
+    loss_fn.setup(trainer)
+
+    torch.manual_seed(0)
+    target = torch.randn(b, f, t, c, h, w, device=device)
+    pred = torch.randn(n_members, b, f, t, c, h, w, device=device)
+
+    fast = loss_fn._energy_score_channels(pred, target, n_members, b, f, t, c, h, w).mean()
+
+    pred_flat = pred.permute(0, 1, 3, 4, 2, 5, 6).reshape(n_members, b * t * c, f * h * w)
+    tar_flat = target.permute(0, 2, 3, 1, 4, 5).reshape(b * t * c, f * h * w)
+    diff_to_target = torch.linalg.vector_norm(
+        pred_flat - tar_flat.unsqueeze(0), dim=-1
+    )
+    explicit = loss_fn.averaging_coeff * (
+        diff_to_target.sum(dim=0)
+        - loss_fn.coeff_eps
+        * torch.linalg.vector_norm(pred_flat[0] - pred_flat[1], dim=-1)
+    ).mean()
+
+    assert torch.isclose(fast, explicit, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_GlobalEnergyScoreLoss_channel_chunk_matches_full(device):
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    b, f, t, c, h, w = 2, 12, 2, 6, 64, 64
+    n_members = 2
+    torch.manual_seed(1)
+    target = torch.randn(b, f, t, c, h, w, device=device)
+    pred = torch.randn(n_members, b, f, t, c, h, w, device=device)
+    prediction = pred.reshape(n_members * b, f, t, c, h, w)
+
+    full_fn = GlobalEnergyScoreLoss(weights=[1.0] * c, n_members=n_members)
+    chunk_fn = GlobalEnergyScoreLoss(
+        weights=[1.0] * c, n_members=n_members, channel_chunk_size=2
+    )
+    trainer = trainer_helper(output_variables=[f"var{i}" for i in range(c)], device=device)
+    full_fn.setup(trainer)
+    chunk_fn.setup(trainer)
+
+    full_loss = full_fn(prediction, target, average_channels=True)
+    chunk_loss = chunk_fn(prediction, target, average_channels=True)
+    assert torch.isclose(full_loss, chunk_loss, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_WeightedCompositeLoss_weighted_sum(device):
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    b, f, t, c, h, w = 2, 12, 2, 4, 64, 64
+    n_members = 2
+    weights = [1.0] * c
+    trainer = trainer_helper(output_variables=[f"var{i}" for i in range(c)], device=device)
+
+    pes = PatchedEnergyScoreLoss(
+        weights=weights,
+        n_members=n_members,
+        patch_size=3,
+        use_earth2grid_padding=False,
+        enable_nhwc=False,
+    )
+    ges = GlobalEnergyScoreLoss(weights=weights, n_members=n_members)
+    composite = WeightedCompositeLoss(weights=[0.9, 0.1], losses=[pes, ges])
+    composite.setup(trainer)
+
+    torch.manual_seed(2)
+    target = torch.randn(b, f, t, c, h, w, device=device)
+    pred = torch.randn(n_members, b, f, t, c, h, w, device=device)
+    prediction = pred.reshape(n_members * b, f, t, c, h, w)
+
+    combined = composite(prediction, target, average_channels=True)
+    expected = 0.9 * pes(prediction, target, average_channels=True) + 0.1 * ges(
+        prediction, target, average_channels=True
+    )
+    assert torch.isclose(combined, expected, rtol=1e-5, atol=1e-5)
+
+    per_var = composite(prediction, target, average_channels=False)
+    expected_per_var = 0.9 * pes(prediction, target, average_channels=False) + 0.1 * ges(
+        prediction, target, average_channels=False
+    )
+    assert torch.allclose(per_var, expected_per_var, rtol=1e-5, atol=1e-5)
