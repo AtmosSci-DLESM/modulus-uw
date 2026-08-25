@@ -81,7 +81,15 @@ class BaseCoupler(ABC):
         # extract important meta data from ds
         self.ds = dataset
         self.batch_size = batch_size
-        self.spatial_dims = self.ds["inputs"].shape[2:]
+        # Spatial size from coords when present (works for per-variable and mono stores).
+        if "face" in self.ds and "height" in self.ds and "width" in self.ds:
+            self.spatial_dims = (
+                int(self.ds["face"].shape[0]),
+                int(self.ds["height"].shape[0]),
+                int(self.ds["width"].shape[0]),
+            )
+        else:
+            self.spatial_dims = self.ds["inputs"].shape[2:]
         self.variables = variables
         self.presteps = presteps
         self.input_time_dim = input_time_dim
@@ -105,21 +113,26 @@ class BaseCoupler(ABC):
             self.use_zarr = False
         elif type(self.ds) == zr.Group:
             self.use_zarr = True
-            # Iterate over self.variables in the outer loop so selected indices
-            # follow the order of self.variables (matching the xarray path's
-            # `.sel(channel_in=self.variables)`), not the dataset's native
-            # channel_in order. Downstream code (e.g. coupled_scaling built
-            # from self.variables in set_scaling) assumes the coupled channel
-            # axis is ordered by self.variables.
-            # Use `[:]` so zarr v3 yields hashable scalar strings, not Array views.
-            channel_in = list(self.ds["channel_in"][:])
-            self.ds_variable_indices = [
-                i for v in self.variables for i, ic in enumerate(channel_in) if ic == v
-            ]
-            # Check if any of the requested variables are not in the dataset
-            missing_variables = set(self.variables) - set(channel_in)
-            if len(missing_variables) > 0:
-                raise ValueError(f"Missing variables in dataset for coupling: {missing_variables}")
+            from .zarr_layout import available_field_names, is_monolithic_layout
+
+            available = available_field_names(self.ds)
+            missing_variables = set(self.variables) - available
+            if missing_variables:
+                raise ValueError(
+                    f"Missing variables in dataset for coupling: {missing_variables}"
+                )
+            if is_monolithic_layout(self.ds):
+                # Iterate over self.variables in the outer loop so selected indices
+                # follow the order of self.variables (matching the xarray path's
+                # `.sel(channel_in=self.variables)`), not the dataset's native
+                # channel_in order. Downstream code (e.g. coupled_scaling built
+                # from self.variables in set_scaling) assumes the coupled channel
+                # axis is ordered by self.variables.
+                # Use `[:]` so zarr v3 yields hashable scalar strings, not Array views.
+                channel_in = list(self.ds["channel_in"][:])
+                self.ds_variable_indices = [
+                    i for v in self.variables for i, ic in enumerate(channel_in) if ic == v
+                ]
         else:
             raise TypeError(
                 f"Coupler only supports xarray Datasets or zarr Groups, got {type(self.ds)}"
@@ -233,7 +246,8 @@ class BaseCoupler(ABC):
         """
         # reset integrated couplings
         self.integrated_couplings = np.empty(
-            (bsize, self.coupled_integration_dim, self.timevar_dim) + self.spatial_dims
+            (bsize, self.coupled_integration_dim, self.timevar_dim) + self.spatial_dims,
+            dtype=np.float32,
         )
 
         index_range = slice(
@@ -243,10 +257,15 @@ class BaseCoupler(ABC):
 
         # extract coupled variables
         if self.use_zarr:
-            # Loading the contiguous time slice into memory and then pulling out the semi-random
-            # variable indices is quicker than trying to do this all at once.
-            ds_index_range = self.ds["inputs"][index_range]
-            ds_index_range = ds_index_range[:, self.ds_variable_indices]
+            from .zarr_layout import load_channel_data
+
+            # Monolithic or per-variable (same helper as TimeSeriesDatasetZarr).
+            ds_index_range = load_channel_data(
+                self.ds,
+                index_range,
+                self.variables,
+                scaling=self.coupled_scaling,
+            )
         else:
             ds_index_range = (
                 self.ds["inputs"].sel(channel_in=self.variables)
@@ -288,11 +307,6 @@ class BaseCoupler(ABC):
                 batch, bsize
             )
 
-            # Apply scaling if available
-            if self.coupled_scaling is not None:
-                ds_index_range -= self.coupled_scaling["mean"]
-                ds_index_range /= self.coupled_scaling["std"]
-
             # use static offsets to create integrated coupling array
             for b in range(bsize):
                 for i in range(self.coupled_integration_dim):
@@ -308,11 +322,9 @@ class BaseCoupler(ABC):
                         (self.timevar_dim,) + coupling_temp.shape[2:]
                     )
             if self.time_first:
-                return self.integrated_couplings.transpose((1, 0, 2, 3, 4, 5)).astype(
-                    "float32"
-                )  # cast to float for compatibility
+                return self.integrated_couplings.transpose((1, 0, 2, 3, 4, 5))
             else:
-                return self.integrated_couplings.astype("float32")
+                return self.integrated_couplings
 
 
 class ConstantCoupler(BaseCoupler):
@@ -490,13 +502,19 @@ class TrailingAverageCoupler(BaseCoupler):
         self.averaging_window = pd.Timedelta(averaging_window)
 
         if self.use_zarr:
-            cf_dates = cftime.num2pydate(
-                self.ds["time"][:],
-                units=self.ds["time"].attrs["units"],
-                calendar=self.ds["time"].attrs["calendar"],
-            )
-            dates = [np.datetime64(date.isoformat()) for date in cf_dates]
-            self.time_da = np.asarray(dates)
+            # Named-array / modern catalogs store datetime64 directly; older
+            # monolithic stores encode hours since start via CF units/calendar.
+            time_arr = np.asarray(self.ds["time"][:])
+            if np.issubdtype(time_arr.dtype, np.datetime64):
+                self.time_da = time_arr.astype("datetime64[ns]")
+            else:
+                cf_dates = cftime.num2pydate(
+                    time_arr,
+                    units=self.ds["time"].attrs["units"],
+                    calendar=self.ds["time"].attrs["calendar"],
+                )
+                dates = [np.datetime64(date.isoformat()) for date in cf_dates]
+                self.time_da = np.asarray(dates)
         else:
             self.time_da = self.ds["time"].values
         self._set_time_increments()

@@ -27,6 +27,9 @@ from physicsnemo.models.dlwp_healpix_layers import (
     HEALPixUnfoldFaces,
     warn_deprecated_enable_healpixpad,
 )
+from physicsnemo.models.dlwp_healpix_layers.coupled_partial_conv import (
+    build_coupled_partial_conv_stem,
+)
 from physicsnemo.models.meta import ModelMetaData
 from physicsnemo.models.module import Module
 
@@ -74,6 +77,8 @@ class HEALPixUNet(Module):
         compile_padding: bool = False,
         nside: Sequence[int] = (64, 32, 16),
         enable_healpixpad: bool | None = None,
+        odd_coupled_variables: Sequence[str] = None,
+        coupled_partial_conv: dict | DictConfig | None = None,
     ):
         """
         Parameters
@@ -123,6 +128,14 @@ class HEALPixUNet(Module):
         enable_healpixpad: bool, optional
             Deprecated. When ``hpx_padding_mode`` is omitted, ``False`` maps to ``karlbauer``
             and ``True`` to ``earth2grid`` (legacy configs). Prefer ``hpx_padding_mode``.
+        odd_coupled_variables: sequence of str, optional
+            Coupled variable names that flip sign under equatorial reflection; wired
+            into the partial-conv stem as odd channels (even kernel, zero bias).
+        coupled_partial_conv: dict or DictConfig, optional
+            Opt-in partial-convolution stem for coupled inputs. ``None`` (default)
+            leaves coupled fields unchanged. Configure ``masks`` plus an optional
+            Hydra-instantiable ``stem`` (default ``CoupledPartialConvStem``). See
+            ``physicsnemo.models.dlwp_healpix_layers.coupled_partial_conv``.
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
@@ -154,6 +167,7 @@ class HEALPixUNet(Module):
         self.hpx_padding_mode = hpx_padding_mode
         self.compile_padding = compile_padding
         self.nside = nside
+        self.odd_coupled_variables = odd_coupled_variables
 
         if len(encoder["n_channels"]) != len(decoder["n_channels"]):
             raise ValueError(
@@ -192,6 +206,16 @@ class HEALPixUNet(Module):
             hpx_padding_mode=self.hpx_padding_mode,
             compile_padding=self.compile_padding,
             nside=self.nside,
+        )
+
+        self.coupled_partial_conv_stem = build_coupled_partial_conv_stem(
+            coupled_partial_conv,
+            couplings=self.couplings,
+            hpx_padding_mode=self.hpx_padding_mode,
+            nside=int(self.nside[0]) if self.nside is not None else None,
+            compile_padding=self.compile_padding,
+            enable_nhwc=self.enable_nhwc,
+            odd_coupled_variables=self.odd_coupled_variables,
         )
 
         self.constraints = None
@@ -241,6 +265,13 @@ class HEALPixUNet(Module):
         """
 
         if len(self.couplings) > 0:
+            coupled = (
+                inputs[3].permute(0, 2, 1, 3, 4)
+                if self.couplings_time_first
+                else inputs[3]
+            )
+            if self.coupled_partial_conv_stem is not None:
+                coupled = self.coupled_partial_conv_stem(coupled)
             result = [
                 inputs[0].flatten(
                     start_dim=self.channel_dim, end_dim=self.channel_dim + 1
@@ -256,7 +287,7 @@ class HEALPixUNet(Module):
                 inputs[2].expand(
                     *tuple([inputs[0].shape[0]] + len(inputs[2].shape) * [-1])
                 ),  # constants
-                inputs[3].permute(0, 2, 1, 3, 4) if self.couplings_time_first else inputs[3],  # coupled inputs
+                coupled,
             ]
             res = th.cat(result, dim=self.channel_dim)
 

@@ -104,6 +104,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         add_train_noise: bool = False,
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
+        return_ic_diagnostics: bool = False,
         meta: DatapipeMetaData = None,
     ):
         """Initialize base time series dataset.
@@ -152,6 +153,10 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             Standard deviation of train noise
         train_noise_seed : int, default=42
             Seed for train noise
+        return_ic_diagnostics : bool, default=False
+            Train mode only: also return ground-truth output-only (diagnostic)
+            channels at input times for soft constraints that need IC anchors
+            (e.g. diagnostic ``sp``). Forecast mode ignores this flag.
         meta : DatapipeMetaData, optional
             Metadata for the datapipe
         """
@@ -177,15 +182,22 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         self.all_variables = list(
             set(self.input_variables).union(self.output_variables)
         )
-        # Channels jointly loaded/scaled from the store. Forecast/inference only
-        # reads ICs, so output-only diagnostics need not exist in the dataset;
-        # training still stages input ∪ output for supervised targets.
+        # Channels that must exist in the store. Forecast/inference only reads
+        # ICs, so output-only diagnostics need not be present; training still
+        # requires input ∪ output for supervised targets.
         self.staging_variables = (
             list(self.input_variables)
             if self.forecast_mode
             else self.all_variables
         )
-        self.all_scaling = None
+        # Output-only channels in output order (stable for soft-constraint indexing).
+        input_set = set(self.input_variables)
+        self.ic_diagnostic_variables = [
+            name for name in self.output_variables if name not in input_set
+        ]
+        self.return_ic_diagnostics = bool(return_ic_diagnostics) and (
+            not self.forecast_mode
+        )
 
         # Check if for fsspec if necessary and make sure path exist
         _check_availability(dataset_path)
@@ -199,48 +211,24 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                 "Either start and end date or forecast_init_times must be provided"
             )
 
-        # Validate channels that will actually be read from the store.
-        missing_channels = set(self.staging_variables) - set(self.ds["channel_in"][:])
-        if len(missing_channels) > 0:
+        # Validate requested fields exist in the store.
+        from .zarr_layout import available_field_names
+
+        available = available_field_names(self.ds)
+        missing_channels = set(self.staging_variables) - available
+        if missing_channels:
             raise KeyError(
-                f"Requested Input, coupled, or output variables not found in dataset: {missing_channels}"
+                f"Requested input or output variables not found in dataset: {missing_channels}"
             )
 
         self._get_time_da(self.dataset_path, start_date, end_date)
 
-        self.all_variable_indices = [
-            int(np.where(self.ds["channel_in"][:] == ch)[0][0])
-            for ch in self.staging_variables
-        ]
-
-        # Validate constants exist
         if constant_variables:
-            missing_constants = set(constant_variables) - set(self.ds["channel_c"][:])
-            if len(missing_constants) > 0:
+            missing_constants = set(constant_variables) - available
+            if missing_constants:
                 raise KeyError(
                     f"Requested constants not found in dataset: {missing_constants}"
                 )
-
-        self.constant_variable_indices = (
-            [
-                int(np.where(self.ds["channel_c"][:] == ch)[0][0])
-                for ch in self.constant_variables
-            ]
-            if self.constant_variables
-            else None
-        )
-        self.input_variable_indices = [
-            self.staging_variables.index(inp_ch) for inp_ch in self.input_variables
-        ]
-        # Output indices are only used when loading supervised targets.
-        self.output_variable_indices = (
-            None
-            if self.forecast_mode
-            else [
-                self.staging_variables.index(out_ch)
-                for out_ch in self.output_variables
-            ]
-        )
 
         # Length of the data window needed for one sample
         if self.forecast_mode:
@@ -273,6 +261,13 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             )
             for n in range(self.batch_size)
         ]
+        # Contiguous intp arrays for windowed loads / insolation gather.
+        self._input_indices_np = np.asarray(self._input_indices, dtype=np.intp)
+        self._output_indices_np = np.asarray(self._output_indices, dtype=np.intp)
+        self._sol_indices_np = np.asarray(
+            [inp + out for inp, out in zip(self._input_indices, self._output_indices)],
+            dtype=np.intp,
+        )
 
         self.spatial_dims = (
             self.ds["face"].shape[0],
@@ -287,11 +282,18 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         self.target_scaling = None
         self.constant_scaling = None
         self.constants = None
+        # Year-length insolation table (built below when add_insolation=True).
+        # Constructed in the parent before DataLoader fork so workers share the
+        # pages via COW instead of recomputing float transcendentals per batch.
+        self._insolation_lut = None
+        self._insolation_lut_step_h = None
 
         if self.scaling:
             self._get_scaling_da()
         if self.constant_variables:
             self.constants = self.get_constants()
+        if self.add_insolation:
+            self._build_insolation_lut()
 
         self.add_train_noise = add_train_noise
         self.train_noise_params = train_noise_params
@@ -456,13 +458,6 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                 f"Target channels {missing} not found in the scaling config dict data.scaling ({list(self.scaling.keys())})"
             )
 
-        # Align mean/std with the staged channel axis used in __getitem__.
-        self.all_scaling = build_channel_scaling(
-            self.staging_variables,
-            scaling,
-            mean_expand_axes=(0, 2, 3, 4),
-        )
-
         if self.constant_variables:
             missing_constants = [
                 var
@@ -508,7 +503,9 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         if self.constant_variables is None:
             return None
 
-        const = np.asarray(self.ds["constants"][self.constant_variable_indices])
+        from .zarr_layout import load_constant_fields
+
+        const = load_constant_fields(self.ds, self.constant_variables)
 
         if self.constant_scaling:
             const = (const - self.constant_scaling["mean"]) / self.constant_scaling[
@@ -568,6 +565,35 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             ) * self.data_time_step
             return self.time_da[time_index[0]].values + timedeltas
         return self.time_da[slice(*time_index)].values
+
+    def _build_insolation_lut(self) -> None:
+        """Precompute insolation for one leap-year of ``data_time_step`` slots."""
+        from physicsnemo.utils.insolation import insolation
+
+        step_h = int(round(self.data_time_step / pd.Timedelta("1h")))
+        if step_h <= 0:
+            raise ValueError(f"invalid data_time_step for insolation LUT: {self.data_time_step}")
+        # Leap-year span so day-of-year indices through Dec 31 of leap years are valid.
+        n_slots = (366 * 24) // step_h
+        hours = np.arange(n_slots, dtype=np.int64) * step_h
+        dates = np.datetime64("1996-01-01T00:00:00") + hours.astype("timedelta64[h]")
+        # ~550MB float32 for HPX64; shared across forked DataLoader workers.
+        self._insolation_lut = insolation(dates, self.lat, self.lon)
+        self._insolation_lut_step_h = step_h
+
+    def insolation_for_dates(self, dates) -> np.ndarray:
+        """Return insolation ``(T, F, H, W)`` for ``dates``, via LUT when available."""
+        from physicsnemo.utils.insolation import insolation
+
+        if self._insolation_lut is None:
+            return insolation(dates, self.lat, self.lon)
+
+        dates64 = np.asarray(dates, dtype="datetime64[ns]")
+        years = dates64.astype("datetime64[Y]")
+        hours = (dates64 - years) / np.timedelta64(1, "h")
+        slots = np.rint(hours / self._insolation_lut_step_h).astype(np.intp)
+        np.clip(slots, 0, self._insolation_lut.shape[0] - 1, out=slots)
+        return self._insolation_lut[slots]
 
     def __len__(self) -> int:
         """Get number of samples available in the dataset based on
