@@ -209,3 +209,123 @@ def test_resolve_mask_field_named_arrays_and_coupled_stem_loader(tmp_path):
         threshold=None,
     )
     np.testing.assert_allclose(soft.numpy(), ocean)
+
+
+def test_load_windowed_channel_data_ic_diagnostics(tmp_path):
+    """IC diagnostics are output-only channels gathered at input times."""
+    ds = _make_named_store(tmp_path / "named", t=8)
+    time_sl = slice(0, 6)
+    input_names = ["t2m"]
+    output_names = ["t2m", "u10m", "v10m"]
+    ic_diag_names = ["u10m", "v10m"]
+    input_time_idx = np.asarray([[0], [1]], dtype=np.intp)
+    output_time_idx = np.asarray([[2], [3]], dtype=np.intp)
+    output_scaling = {
+        "mean": np.zeros((1, 3, 1, 1, 1), dtype=np.float32),
+        "std": np.ones((1, 3, 1, 1, 1), dtype=np.float32),
+    }
+    inputs, targets, ic_diag = load_windowed_channel_data(
+        ds,
+        time_sl,
+        input_names=input_names,
+        input_time_idx=input_time_idx,
+        output_names=output_names,
+        output_time_idx=output_time_idx,
+        output_scaling=output_scaling,
+        ic_diagnostic_names=ic_diag_names,
+    )
+    assert ic_diag is not None
+    assert ic_diag.shape[2] == 2
+    staging = load_channel_data(ds, time_sl, ["t2m", "u10m", "v10m"], n_threads=1)
+    exp_ic = staging[input_time_idx[:, :, None], np.asarray([1, 2])[None, None, :]]
+    np.testing.assert_array_equal(ic_diag, exp_ic)
+    assert inputs.shape[2] == 1
+    assert targets.shape[2] == 3
+
+
+def test_TimeSeriesDataset_return_ic_diagnostics(tmp_path):
+    """Train mode can return output-only channels at input times for soft constraints."""
+    omegaconf = pytest.importorskip("omegaconf")
+    pd = pytest.importorskip("pandas")
+    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
+        TimeSeriesDatasetZarr,
+    )
+
+    input_variables = ["tcwv"]
+    output_variables = ["tcwv", "msl", "sp"]
+    dataset_path = tmp_path / "ic_diag.zarr"
+    n_time = 12
+    face, height, width = 1, 2, 2
+    times = pd.date_range("1979-01-01", periods=n_time, freq="6h")
+    n_chan = len(output_variables)
+    data = np.zeros((n_time, n_chan, face, height, width), dtype=np.float32)
+    for i in range(n_chan):
+        data[:, i] = float(i + 1)
+    ds = xr.Dataset(
+        data_vars={
+            "inputs": (
+                ("time", "channel_in", "face", "height", "width"),
+                data,
+            ),
+            "targets": (
+                ("time", "channel_out", "face", "height", "width"),
+                data.copy(),
+            ),
+            "lat": (("face", "height", "width"), np.zeros((face, height, width))),
+            "lon": (("face", "height", "width"), np.zeros((face, height, width))),
+        },
+        coords={
+            "time": times,
+            "channel_in": output_variables,
+            "channel_out": output_variables,
+        },
+    )
+    ds.to_zarr(dataset_path)
+
+    scaling = omegaconf.DictConfig(
+        {
+            "tcwv": {"mean": 0.0, "std": 1.0},
+            "msl": {"mean": 0.0, "std": 1.0},
+            "sp": {"mean": 0.0, "std": 1.0},
+        }
+    )
+    dataset = TimeSeriesDatasetZarr(
+        dataset_path=str(dataset_path),
+        data_time_step="6h",
+        time_step="6h",
+        gap="6h",
+        scaling=scaling,
+        input_variables=input_variables,
+        output_variables=output_variables,
+        start_date="1979-01-01",
+        end_date="1979-01-03",
+        batch_size=1,
+        input_time_dim=1,
+        output_time_dim=1,
+        return_ic_diagnostics=True,
+    )
+    assert dataset.ic_diagnostic_variables == ["msl", "sp"]
+    inputs, targets, ic_diag = dataset[0]
+    assert ic_diag is not None
+    assert ic_diag.shape[3] == 2
+    assert float(ic_diag[0, 0, -1, 0].mean()) == pytest.approx(2.0)
+    assert float(ic_diag[0, 0, -1, 1].mean()) == pytest.approx(3.0)
+    assert inputs[0].shape[3] == 1
+    assert float(inputs[0][0, 0, -1, 0].mean()) == pytest.approx(1.0)
+
+    batch = TimeSeriesDatasetZarr(
+        dataset_path=str(dataset_path),
+        data_time_step="6h",
+        time_step="6h",
+        gap="6h",
+        scaling=scaling,
+        input_variables=input_variables,
+        output_variables=output_variables,
+        start_date="1979-01-01",
+        end_date="1979-01-03",
+        batch_size=1,
+        input_time_dim=1,
+        output_time_dim=1,
+        return_ic_diagnostics=False,
+    )[0]
+    assert len(batch) == 2
