@@ -245,6 +245,111 @@ def test_hydrostasy_soft_constraint_matches_loss_with_hydrostasy(tmp_path):
     assert torch.allclose(soft_per, legacy_per[len(channels) :], rtol=1e-5, atol=1e-6)
 
 
+def test_dry_air_mass_soft_constraint_diagnostic_sp_ic_anchor():
+    """sp diagnostic-only: IC dry mass from input_diagnostics; pred from channels."""
+    pred_channels = ["tcwv", "msl", "sp"]
+    input_channels = ["tcwv"]
+    diag_channels = ["msl", "sp"]
+    scaling = _dry_air_scaling()
+    mod = DryAirMassSoftConstraint(
+        channels=pred_channels,
+        input_channels=input_channels,
+        diagnostic_channels=diag_channels,
+        scaling=scaling,
+        weight=1.0,
+        alpha=0.383431,
+    )
+    assert mod.needs_input_diagnostics is True
+    trainer = _DummyTrainer(device=torch.device("cpu"), output_variables=pred_channels)
+    mod.setup(trainer)
+
+    B, F, T, H, W = 2, 1, 3, 4, 4
+    g0 = 9.81
+    torch.manual_seed(0)
+    # Prognostic input: tcwv only
+    inp = torch.randn(B, F, 1, 1, H, W)
+    tcwv_phys = inp * scaling["tcwv"]["std"] + scaling["tcwv"]["mean"]
+    # IC diagnostics: msl unused, sp set so dry mass is known
+    ic_diag = torch.zeros(B, F, 1, 2, H, W)
+    sp_phys = 100000.0 + 100.0 * torch.randn(B, F, 1, 1, H, W)
+    ic_diag[:, :, :, 1:2] = (sp_phys - scaling["sp"]["mean"]) / scaling["sp"]["std"]
+    sp_dry = (sp_phys - g0 * tcwv_phys).mean(dim=(1, 4, 5), keepdim=True)
+
+    pred = torch.randn(B, F, T, 3, H, W)
+    tcwv_const = torch.full(
+        (B, F, T, 1, H, W),
+        (20.0 - scaling["tcwv"]["mean"]) / scaling["tcwv"]["std"],
+    )
+    pred[:, :, :, 0:1] = tcwv_const
+    tcwv_phys_pred = tcwv_const * scaling["tcwv"]["std"] + scaling["tcwv"]["mean"]
+    sp_phys_needed = sp_dry + g0 * tcwv_phys_pred.mean(dim=(1, 4, 5), keepdim=True)
+    sp_norm = (sp_phys_needed - scaling["sp"]["mean"]) / scaling["sp"]["std"]
+    pred[:, :, :, 2:3] = sp_norm.expand(B, F, T, 1, H, W)
+
+    loss = mod.constraint_loss(
+        pred, pred.clone(), input=inp, input_diagnostics=ic_diag
+    )
+    assert float(loss) == pytest.approx(0.0, abs=1e-5)
+
+    with pytest.raises(ValueError, match="requires input_diagnostics"):
+        mod.constraint_loss(pred, pred.clone(), input=inp)
+
+
+def test_dry_air_mass_soft_constraint_requires_diagnostics_flag():
+    with pytest.raises(ValueError, match="requires IC field 'sp'"):
+        DryAirMassSoftConstraint(
+            channels=["tcwv", "sp"],
+            input_channels=["tcwv"],
+            diagnostic_channels=["msl"],  # sp missing
+            scaling=_dry_air_scaling(),
+        )
+
+
+def test_loss_with_soft_constraints_composes_dry_air_diagnostics():
+    pred_channels = ["tcwv", "sp"]
+    input_channels = ["tcwv"]
+    diag_channels = ["sp"]
+    scaling = _dry_air_scaling()
+    data_loss = WeightedMSE(weights=[1.0, 1.0])
+    dry = DryAirMassSoftConstraint(
+        channels=pred_channels,
+        input_channels=input_channels,
+        diagnostic_channels=diag_channels,
+        scaling=scaling,
+        weight=1.0,
+    )
+    wrapper = LossWithSoftConstraints(data_loss=data_loss, constraints=[dry])
+    assert wrapper.needs_input is True
+    assert wrapper.needs_input_diagnostics is True
+    trainer = _DummyTrainer(device=torch.device("cpu"), output_variables=pred_channels)
+    wrapper.setup(trainer)
+
+    B, F, T, H, W = 1, 1, 2, 3, 3
+    g0 = 9.81
+    inp = torch.zeros(B, F, 1, 1, H, W)
+    ic_diag = torch.zeros(B, F, 1, 1, H, W)
+    # Conserved: sp_phys = g0 * tcwv_phys + const; tcwv=0 -> sp = mean
+    # With zeros in normalized space: sp_phys=mean, tcwv_phys=mean
+    # dry = mean_sp - g0*mean_tcwv; keep pred identical to IC dry mass
+    tcwv_phys = scaling["tcwv"]["mean"]
+    sp_dry = scaling["sp"]["mean"] - g0 * tcwv_phys
+    pred = torch.zeros(B, F, T, 2, H, W)
+    tcwv_phys_t = torch.full((B, F, T, 1, H, W), tcwv_phys)
+    sp_phys = sp_dry + g0 * tcwv_phys_t
+    pred[:, :, :, 0:1] = (tcwv_phys_t - scaling["tcwv"]["mean"]) / scaling["tcwv"][
+        "std"
+    ]
+    pred[:, :, :, 1:2] = (sp_phys - scaling["sp"]["mean"]) / scaling["sp"]["std"]
+    # IC matches first step
+    ic_diag[:, :, :, 0:1] = pred[:, :, :1, 1:2]
+
+    with pytest.raises(ValueError, match="requires input_diagnostics"):
+        wrapper(pred, pred.clone(), input=inp)
+    out = wrapper(pred, pred.clone(), input=inp, input_diagnostics=ic_diag)
+    assert out.shape == ()
+    assert torch.allclose(out, data_loss(pred, pred.clone()), rtol=1e-3, atol=1e-4)
+
+
 def test_loss_with_soft_constraints_composes_dry_air():
     channels = ["tcwv", "sp"]
     scaling = _dry_air_scaling()
@@ -252,6 +357,7 @@ def test_loss_with_soft_constraints_composes_dry_air():
     dry = DryAirMassSoftConstraint(channels=channels, scaling=scaling, weight=1.0)
     wrapper = LossWithSoftConstraints(data_loss=data_loss, constraints=[dry])
     assert wrapper.needs_input is True
+    assert wrapper.needs_input_diagnostics is False
     trainer = _DummyTrainer(device=torch.device("cpu"), output_variables=channels)
     wrapper.setup(trainer)
 

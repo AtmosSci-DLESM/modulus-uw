@@ -71,6 +71,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         add_train_noise: bool = False,
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
+        return_ic_diagnostics: bool = False,
         meta: DatapipeMetaData = MetaData(),
     ):
         """Initialize time series dataset.
@@ -98,6 +99,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             add_train_noise=add_train_noise,
             train_noise_params=train_noise_params,
             train_noise_seed=train_noise_seed,
+            return_ic_diagnostics=return_ic_diagnostics,
             meta=meta,
         )
 
@@ -120,9 +122,12 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
 
         Returns
         -------
-        Union[List[np.ndarray], Tuple[List[np.ndarray], np.ndarray]]
+        Union[List[np.ndarray], Tuple[List[np.ndarray], np.ndarray], Tuple[List[np.ndarray], np.ndarray, Optional[np.ndarray]]]
             In forecast mode: List of input arrays
-            In training mode: Tuple of (input arrays, target array)
+            In training mode: Tuple of (input arrays, target array), or with
+            ``return_ic_diagnostics=True`` a third element of diagnostic channels
+            at input times ``[B, F, T_in, C_diag, H, W]`` (``None`` if there are
+            no output-only channels).
 
             Input arrays are in order:
             - Model inputs [B, F, T, C, H, W]
@@ -183,6 +188,9 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_target")
             target_array = staging_ds[:, self.output_variable_indices]
             torch.cuda.nvtx.range_pop()
+        if self.return_ic_diagnostics and self.ic_diagnostic_variable_indices:
+            # Same scaled staging window; gather output-only channels at input times.
+            ic_diag_array = staging_ds[:, self.ic_diagnostic_variable_indices]
         torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:process_batch")
@@ -212,6 +220,16 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
                 + self.spatial_dims,
                 dtype="float32",
             )
+        if self.return_ic_diagnostics and self.ic_diagnostic_variable_indices:
+            ic_diagnostics = np.empty(
+                (
+                    this_batch,
+                    self.input_time_dim,
+                    len(self.ic_diagnostic_variables),
+                )
+                + self.spatial_dims,
+                dtype="float32",
+            )
 
         # Iterate over valid sample windows
         torch.cuda.nvtx.range_push(
@@ -221,6 +239,8 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             inputs[sample] = input_array[self._input_indices[sample]]
             if not self.forecast_mode:
                 targets[sample] = target_array[self._output_indices[sample]]
+            if self.return_ic_diagnostics and self.ic_diagnostic_variable_indices:
+                ic_diagnostics[sample] = ic_diag_array[self._input_indices[sample]]
             if self.add_insolation:
                 decoder_inputs[sample] = (
                     sol
@@ -268,4 +288,12 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         targets = np.transpose(targets, axes=(0, 3, 1, 2, 4, 5))
 
         torch.cuda.nvtx.range_pop()
+        if self.return_ic_diagnostics:
+            if self.ic_diagnostic_variable_indices:
+                ic_diagnostics = np.transpose(
+                    ic_diagnostics, axes=(0, 3, 1, 2, 4, 5)
+                )
+            else:
+                ic_diagnostics = None
+            return inputs_result, targets, ic_diagnostics
         return inputs_result, targets

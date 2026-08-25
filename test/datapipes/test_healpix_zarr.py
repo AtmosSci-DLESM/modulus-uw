@@ -231,6 +231,76 @@ def test_TimeSeriesDataset_forecast_skips_missing_diagnostic_channels(tmp_path):
     assert sample[0].shape[3] == len(input_variables)
 
 
+def test_TimeSeriesDataset_return_ic_diagnostics(tmp_path):
+    """Train mode can return output-only channels at input times for soft constraints."""
+    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
+        TimeSeriesDatasetZarr,
+    )
+
+    input_variables = ["tcwv"]
+    output_variables = ["tcwv", "msl", "sp"]
+    dataset_path = tmp_path / "ic_diag.zarr"
+    channel_in = output_variables
+    _make_minimal_healpix_zarr(dataset_path, channel_in=channel_in, n_time=12)
+    # Distinct values per channel so we can verify indexing.
+    store = zarr.open(str(dataset_path), mode="r+")
+    for i, _name in enumerate(channel_in):
+        store["inputs"][:, i] = float(i + 1)
+
+    scaling = omegaconf.DictConfig(
+        {
+            "tcwv": {"mean": 0.0, "std": 1.0},
+            "msl": {"mean": 0.0, "std": 1.0},
+            "sp": {"mean": 0.0, "std": 1.0},
+        }
+    )
+    ds = TimeSeriesDatasetZarr(
+        dataset_path=str(dataset_path),
+        data_time_step="6h",
+        time_step="6h",
+        gap="6h",
+        scaling=scaling,
+        input_variables=input_variables,
+        output_variables=output_variables,
+        start_date="1979-01-01",
+        end_date="1979-01-03",
+        batch_size=1,
+        input_time_dim=1,
+        output_time_dim=1,
+        return_ic_diagnostics=True,
+    )
+    assert ds.ic_diagnostic_variables == ["msl", "sp"]
+    inputs, targets, ic_diag = ds[0]
+    assert ic_diag is not None
+    # [B, F, T, C_diag, H, W]
+    assert ic_diag.shape[3] == 2
+    # Scaled: (value - 0) / 1 = channel index + 1
+    assert float(ic_diag[0, 0, -1, 0].mean()) == pytest.approx(2.0)
+    assert float(ic_diag[0, 0, -1, 1].mean()) == pytest.approx(3.0)
+    # Prognostic input is tcwv only (channel value 1)
+    assert inputs[0].shape[3] == 1
+    assert float(inputs[0][0, 0, -1, 0].mean()) == pytest.approx(1.0)
+
+    # Flag off: two-tuple return
+    ds2 = TimeSeriesDatasetZarr(
+        dataset_path=str(dataset_path),
+        data_time_step="6h",
+        time_step="6h",
+        gap="6h",
+        scaling=scaling,
+        input_variables=input_variables,
+        output_variables=output_variables,
+        start_date="1979-01-01",
+        end_date="1979-01-03",
+        batch_size=1,
+        input_time_dim=1,
+        output_time_dim=1,
+        return_ic_diagnostics=False,
+    )
+    batch = ds2[0]
+    assert len(batch) == 2
+
+
 @import_or_fail("omegaconf")
 @import_or_fail("netCDF4")
 @nfsdata_or_fail

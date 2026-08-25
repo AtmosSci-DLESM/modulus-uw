@@ -104,6 +104,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         add_train_noise: bool = False,
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
+        return_ic_diagnostics: bool = False,
         meta: DatapipeMetaData = None,
     ):
         """Initialize base time series dataset.
@@ -124,6 +125,10 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             Number of time steps in input sequence
         output_time_dim : int, default=1
             Number of time steps to predict
+        return_ic_diagnostics : bool, default=False
+            Train mode only: also return ground-truth output-only (diagnostic)
+            channels at input times for soft constraints that need IC anchors
+            (e.g. diagnostic ``sp``). Forecast mode ignores this flag.
         data_time_step : Union[int, str], default="3h"
             Either integer hours or a str interpretable by pandas
             Time resolution of raw data
@@ -185,6 +190,15 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             if self.forecast_mode
             else self.all_variables
         )
+        # Output-only channels in output order (stable for soft-constraint indexing).
+        input_set = set(self.input_variables)
+        self.ic_diagnostic_variables = [
+            name for name in self.output_variables if name not in input_set
+        ]
+        # Train-only; never load diagnostic ICs in forecast mode.
+        self.return_ic_diagnostics = bool(return_ic_diagnostics) and (
+            not self.forecast_mode
+        )
         self.all_scaling = None
 
         # Check if for fsspec if necessary and make sure path exist
@@ -240,6 +254,14 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                 self.staging_variables.index(out_ch)
                 for out_ch in self.output_variables
             ]
+        )
+        self.ic_diagnostic_variable_indices = (
+            [
+                self.staging_variables.index(ch)
+                for ch in self.ic_diagnostic_variables
+            ]
+            if self.return_ic_diagnostics and self.ic_diagnostic_variables
+            else None
         )
 
         # Length of the data window needed for one sample

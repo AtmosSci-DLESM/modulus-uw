@@ -69,6 +69,7 @@ class TimeSeriesDataModuleZarr:
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
+        return_ic_diagnostics: bool = False,
     ):
         """
         Parameters
@@ -137,6 +138,9 @@ class TimeSeriesDataModuleZarr:
         in_order: bool, optional
             Passed to torch.utils.data.DataLoader when set (requires PyTorch with ``in_order`` support).
             If None, DataLoader default applies.
+        return_ic_diagnostics: bool, optional
+            Train mode: return ground-truth output-only channels at input times as a
+            third batch element for soft constraints. default False
         """
         super().__init__()
         self.dataset_path = Path(dataset_path)
@@ -165,6 +169,11 @@ class TimeSeriesDataModuleZarr:
         self.train_noise_params = train_noise_params
         self.train_noise_seed = train_noise_seed
         self.in_order = in_order
+        self.return_ic_diagnostics = return_ic_diagnostics
+        input_set = set(self.input_variables)
+        self.ic_diagnostic_variables = [
+            name for name in self.output_variables if name not in input_set
+        ]
 
         self.train_dataset = None
         self.val_dataset = None
@@ -205,6 +214,7 @@ class TimeSeriesDataModuleZarr:
             "time_step": self.time_step,
             "gap": self.gap,
             "scaling": self.scaling,
+            "return_ic_diagnostics": self.return_ic_diagnostics,
         }
 
     def _validate_setup_requirements(self) -> None:
@@ -460,6 +470,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
+        return_ic_diagnostics: bool = False,
     ):
         """
         Parameters
@@ -530,6 +541,9 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             Seed for the random number generator for adding noise to the training data, default 42
         in_order: bool, optional
             Passed to torch.utils.data.DataLoader when set. If None, DataLoader default applies.
+        return_ic_diagnostics: bool, optional
+            Train mode: return ground-truth output-only channels at input times as a
+            third batch element for soft constraints. default False
         """
         self.couplings = couplings
 
@@ -560,6 +574,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             train_noise_params,
             train_noise_seed,
             in_order,
+            return_ic_diagnostics,
         )
 
     def _get_coupled_vars(self):

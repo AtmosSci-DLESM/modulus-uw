@@ -44,12 +44,15 @@ def _error_tolerant(error: torch.Tensor) -> torch.Tensor:
 class SoftConstraint(torch.nn.Module):
     """Base class for soft constraints composed by :class:`LossWithSoftConstraints`.
 
-    Subclasses set ``needs_input`` and must match that flag in ``constraint_loss``:
+    Subclasses set ``needs_input`` / ``needs_input_diagnostics`` and must match
+    those flags in ``constraint_loss``:
     if ``needs_input`` is False, do not accept an ``input`` argument; if True,
-    require ``input`` as a keyword-only argument.
+    require ``input`` as a keyword-only argument. Same for
+    ``needs_input_diagnostics`` / ``input_diagnostics``.
     """
 
     needs_input: bool = False
+    needs_input_diagnostics: bool = False
 
     def setup(self, trainer) -> None:
         """Move buffers to trainer device. Override as needed."""
@@ -74,6 +77,7 @@ class HydrostasySoftConstraint(SoftConstraint):
     """
 
     needs_input = False
+    needs_input_diagnostics = False
 
     def __init__(
         self,
@@ -265,11 +269,18 @@ class DryAirMassSoftConstraint(SoftConstraint):
     Soft dry-air-mass conservation constraint.
 
     Penalizes step-to-step changes in the global-mean dry surface pressure
-    ``sp_dry = sp - g0 * tcwv``. The prognostic input anchors the first
+    ``sp_dry = sp - g0 * tcwv``. The IC (last input time) anchors the first
     predicted timestep; later terms compare consecutive predicted timesteps.
+
+    ``channels`` indexes ``prediction`` (typically ``output_variables``).
+    ``input_channels`` indexes prognostic ``input`` (typically
+    ``input_variables``). Fields required at the IC that are absent from
+    ``input_channels`` are read from ``input_diagnostics`` (output-only
+    channels at input times from the datapipe).
     """
 
     needs_input = True
+    _REQUIRED_IC_FIELDS = ("sp", "tcwv")
 
     def __init__(
         self,
@@ -278,13 +289,54 @@ class DryAirMassSoftConstraint(SoftConstraint):
         weight: float = 0.001,
         alpha: float = 0.383431,
         g0: float = 9.81,
+        input_channels: Optional[Sequence[str]] = None,
+        diagnostic_channels: Optional[Sequence[str]] = None,
     ):
         super().__init__()
         self.channels = list(channels)
+        self.input_channels = (
+            list(input_channels) if input_channels is not None else list(channels)
+        )
         self.sp_channel_index = self.channels.index("sp")
         self.tcwv_channel_index = self.channels.index("tcwv")
         self.weight = float(weight)
         self.g0 = float(g0)
+
+        # IC field -> index in prognostic input, or None if diagnostic-only.
+        self._ic_input_index: Dict[str, Optional[int]] = {}
+        missing_from_input: list[str] = []
+        for name in self._REQUIRED_IC_FIELDS:
+            if name in self.input_channels:
+                self._ic_input_index[name] = self.input_channels.index(name)
+            else:
+                self._ic_input_index[name] = None
+                missing_from_input.append(name)
+
+        self.needs_input_diagnostics = len(missing_from_input) > 0
+        # diagnostic_channels: order of the IC-diagnostics tensor from the
+        # datapipe (output_variables \\ input_variables). Resolved in setup()
+        # from the trainer when not passed explicitly.
+        if diagnostic_channels is not None:
+            self.diagnostic_channels = list(diagnostic_channels)
+        elif self.needs_input_diagnostics:
+            # Fallback: output-only names that appear in the prediction list.
+            input_set = set(self.input_channels)
+            self.diagnostic_channels = [
+                c for c in self.channels if c not in input_set
+            ]
+        else:
+            self.diagnostic_channels = []
+
+        self._ic_diag_index: Dict[str, int] = {}
+        for name in missing_from_input:
+            if name not in self.diagnostic_channels:
+                raise ValueError(
+                    f"DryAirMassSoftConstraint requires IC field '{name}' in "
+                    f"input_channels or diagnostic_channels; got "
+                    f"input_channels={self.input_channels!r}, "
+                    f"diagnostic_channels={self.diagnostic_channels!r}."
+                )
+            self._ic_diag_index[name] = self.diagnostic_channels.index(name)
 
         self.register_buffer(
             "ps_mean",
@@ -319,31 +371,80 @@ class DryAirMassSoftConstraint(SoftConstraint):
         self.tcwv_mean = self.tcwv_mean.to(device=device)
         self.tcwv_std = self.tcwv_std.to(device=device)
         self.alpha = self.alpha.to(device=device)
+        # Prefer datamodule channel order when the trainer exposes it.
+        if self.needs_input_diagnostics:
+            diag_vars = getattr(trainer, "ic_diagnostic_variables", None)
+            if diag_vars is None:
+                dm = getattr(trainer, "data_module", None)
+                diag_vars = getattr(dm, "ic_diagnostic_variables", None) if dm else None
+            if diag_vars is not None:
+                self.diagnostic_channels = list(diag_vars)
+                for name in self._REQUIRED_IC_FIELDS:
+                    if self._ic_input_index[name] is None:
+                        if name not in self.diagnostic_channels:
+                            raise ValueError(
+                                f"IC diagnostic field '{name}' not in "
+                                f"trainer.ic_diagnostic_variables="
+                                f"{self.diagnostic_channels!r}."
+                            )
+                        self._ic_diag_index[name] = self.diagnostic_channels.index(
+                            name
+                        )
+
+    def _global_mean_sp_dry_from_channels(
+        self,
+        sp: torch.Tensor,
+        tcwv: torch.Tensor,
+    ) -> torch.Tensor:
+        """Global-mean dry surface pressure from normalized ``sp`` / ``tcwv`` slices."""
+        sp = sp * self.ps_std + self.ps_mean
+        tcwv = tcwv * self.tcwv_std + self.tcwv_mean
+        sp_dry = sp - self.g0 * tcwv
+        return sp_dry.mean(dim=(1, 4, 5), keepdim=True)
 
     def _global_mean_sp_dry(self, tensor: torch.Tensor) -> torch.Tensor:
         """
-        Global-mean dry surface pressure.
+        Global-mean dry surface pressure from a prediction-layout tensor.
 
         Parameters
         ----------
         tensor : torch.Tensor
-            Shape ``[B, F, T, C, H, W]`` (normalized).
-
-        Returns
-        -------
-        torch.Tensor
-            Shape ``[B, F, T, 1, 1, 1]`` in Pa.
+            Shape ``[B, F, T, C, H, W]`` (normalized), channel order ``channels``.
         """
         sp = tensor[
             :, :, :, self.sp_channel_index : self.sp_channel_index + 1, :, :
         ]
-        sp = sp * self.ps_std + self.ps_mean
         tcwv = tensor[
             :, :, :, self.tcwv_channel_index : self.tcwv_channel_index + 1, :, :
         ]
-        tcwv = tcwv * self.tcwv_std + self.tcwv_mean
-        sp_dry = sp - self.g0 * tcwv
-        return sp_dry.mean(dim=(1, 4, 5), keepdim=True)
+        return self._global_mean_sp_dry_from_channels(sp, tcwv)
+
+    def _ic_field(
+        self,
+        name: str,
+        input: torch.Tensor,
+        input_diagnostics: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Last-time slice of an IC field from prognostic input or diagnostics."""
+        in_idx = self._ic_input_index[name]
+        if in_idx is not None:
+            return input[:, :, -1:, in_idx : in_idx + 1, :, :]
+        if input_diagnostics is None:
+            raise ValueError(
+                f"DryAirMassSoftConstraint requires input_diagnostics for IC "
+                f"field '{name}' (not present in prognostic input)."
+            )
+        diag_idx = self._ic_diag_index[name]
+        return input_diagnostics[:, :, -1:, diag_idx : diag_idx + 1, :, :]
+
+    def _global_mean_sp_dry_ic(
+        self,
+        input: torch.Tensor,
+        input_diagnostics: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        sp = self._ic_field("sp", input, input_diagnostics)
+        tcwv = self._ic_field("tcwv", input, input_diagnostics)
+        return self._global_mean_sp_dry_from_channels(sp, tcwv)
 
     def constraint_loss(
         self,
@@ -351,6 +452,7 @@ class DryAirMassSoftConstraint(SoftConstraint):
         target: torch.Tensor,
         *,
         input: torch.Tensor,
+        input_diagnostics: Optional[torch.Tensor] = None,
         average_channels: bool = True,
     ) -> torch.Tensor:
         if input is None:
@@ -358,16 +460,25 @@ class DryAirMassSoftConstraint(SoftConstraint):
                 "DryAirMassSoftConstraint requires prognostic input "
                 "(pass input=inputs[0] from the trainer)."
             )
+        if self.needs_input_diagnostics and input_diagnostics is None:
+            raise ValueError(
+                "DryAirMassSoftConstraint requires input_diagnostics because "
+                "sp and/or tcwv are not in prognostic input_channels "
+                "(enable data.return_ic_diagnostics and pass the third batch "
+                "element from the trainer)."
+            )
         with torch.amp.autocast("cuda", enabled=False):
             prediction = prediction.float()
             input = input.float()
+            if input_diagnostics is not None:
+                input_diagnostics = input_diagnostics.float()
             if prediction.ndim != 6:
                 raise AssertionError("Expected predictions to have 6 dimensions")
 
             sp_dry_pred = self._global_mean_sp_dry(prediction)
-            sp_dry_input = self._global_mean_sp_dry(input[:, :, -1:])
+            sp_dry_input = self._global_mean_sp_dry_ic(input, input_diagnostics)
 
-            # [B, F, T, 1, 1, 1] transitions: t=0 vs input, then consecutive preds
+            # [B, F, T, 1, 1, 1] transitions: t=0 vs IC, then consecutive preds
             T = sp_dry_pred.shape[2]
             prev = sp_dry_input
             losses = []
@@ -392,9 +503,8 @@ class LossWithSoftConstraints(torch.nn.Module):
     Compatible with the DLWP trainer ``setup`` / ``average_channels`` conventions.
 
     ``needs_input`` is True iff any child soft constraint requires prognostic
-    input. When True, ``forward`` accepts required keyword ``input=``; when
-    False, ``forward`` does not accept ``input``. Trainers should gate passing
-    prognostic tensors solely on ``needs_input``.
+    input. ``needs_input_diagnostics`` is True iff any child needs IC diagnostic
+    channels. Trainers should gate passing tensors on those flags.
     """
 
     def __init__(
@@ -407,13 +517,15 @@ class LossWithSoftConstraints(torch.nn.Module):
         if constraints is None:
             constraints = []
         self.constraints = torch.nn.ModuleList(list(constraints))
-        # Instance attribute (not a property) so trainers can use getattr(..., False).
+        # Instance attributes (not properties) so trainers can use getattr(..., False).
         self.needs_input = any(
             getattr(c, "needs_input", False) for c in self.constraints
         )
-        # Bind a forward whose signature matches needs_input: include ``input``
-        # only when at least one soft constraint requires it.
-        if self.needs_input:
+        self.needs_input_diagnostics = any(
+            getattr(c, "needs_input_diagnostics", False) for c in self.constraints
+        )
+        # Bind a forward whose signature matches the needs_* flags.
+        if self.needs_input or self.needs_input_diagnostics:
             self.forward = self._forward_with_input
         else:
             self.forward = self._forward_without_input
@@ -430,26 +542,18 @@ class LossWithSoftConstraints(torch.nn.Module):
         target: torch.Tensor,
         average_channels: bool,
         input: Optional[torch.Tensor],
+        input_diagnostics: Optional[torch.Tensor],
     ) -> list[torch.Tensor]:
         parts = []
         for constraint in self.constraints:
+            kwargs = {"average_channels": average_channels}
             if constraint.needs_input:
-                parts.append(
-                    constraint.constraint_loss(
-                        prediction,
-                        target,
-                        input=input,
-                        average_channels=average_channels,
-                    )
-                )
-            else:
-                parts.append(
-                    constraint.constraint_loss(
-                        prediction,
-                        target,
-                        average_channels=average_channels,
-                    )
-                )
+                kwargs["input"] = input
+            if getattr(constraint, "needs_input_diagnostics", False):
+                kwargs["input_diagnostics"] = input_diagnostics
+            parts.append(
+                constraint.constraint_loss(prediction, target, **kwargs)
+            )
         return parts
 
     def _combine(
@@ -482,7 +586,11 @@ class LossWithSoftConstraints(torch.nn.Module):
             average_channels=average_channels,
         )
         parts = self._constraint_parts(
-            prediction, target, average_channels, input=None
+            prediction,
+            target,
+            average_channels,
+            input=None,
+            input_diagnostics=None,
         )
         return self._combine(data, parts, average_channels)
 
@@ -492,11 +600,18 @@ class LossWithSoftConstraints(torch.nn.Module):
         target: torch.Tensor,
         average_channels: bool = True,
         input: Optional[torch.Tensor] = None,
+        input_diagnostics: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if input is None:
+        if self.needs_input and input is None:
             raise ValueError(
                 "LossWithSoftConstraints requires prognostic input because a "
                 "soft constraint has needs_input=True (pass input=inputs[0])."
+            )
+        if self.needs_input_diagnostics and input_diagnostics is None:
+            raise ValueError(
+                "LossWithSoftConstraints requires input_diagnostics because a "
+                "soft constraint has needs_input_diagnostics=True (pass the "
+                "IC diagnostics tensor from the datapipe)."
             )
         data = self.data_loss(
             prediction,
@@ -504,6 +619,10 @@ class LossWithSoftConstraints(torch.nn.Module):
             average_channels=average_channels,
         )
         parts = self._constraint_parts(
-            prediction, target, average_channels, input=input
+            prediction,
+            target,
+            average_channels,
+            input=input,
+            input_diagnostics=input_diagnostics,
         )
         return self._combine(data, parts, average_channels)
