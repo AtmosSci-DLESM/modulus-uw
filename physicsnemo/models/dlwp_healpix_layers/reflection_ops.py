@@ -231,3 +231,27 @@ def reorder_channels_even_odd(x: th.Tensor, odd_idx: th.Tensor) -> Tuple[th.Tens
 
 def apply_channel_order(x: th.Tensor, order: th.Tensor) -> th.Tensor:
     return x.index_select(1, order.to(x.device))
+
+
+def is_nonzero_scalar_mean(mean) -> bool:
+    """True only for a numeric scalar mean that is not (approximately) zero.
+
+    Odd channels may use a spatial (path or array) climatology mean that
+    satisfies R(μ)=-μ; only a nonzero *scalar* mean breaks normalize∘ρ = ρ∘normalize.
+    """
+    if isinstance(mean, str):
+        try:
+            float(mean)
+        except (TypeError, ValueError):
+            return False
+    try:
+        import numpy as np
+
+        if isinstance(mean, np.ndarray):
+            return False
+    except ImportError:
+        pass
+    try:
+        return abs(float(mean)) > 1e-12
+    except (TypeError, ValueError):
+        return False

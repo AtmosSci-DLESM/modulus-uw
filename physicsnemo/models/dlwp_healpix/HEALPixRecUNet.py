@@ -37,6 +37,7 @@ from physicsnemo.models.dlwp_healpix_layers.reflection_ops import (
     compute_sin_lat_faces,
     expand_sin_lat_folded,
     hpx_reflect_typed,
+    is_nonzero_scalar_mean,
     reorder_channels_even_odd,
     resolve_reflection_equivariance_mode,
 )
@@ -400,13 +401,17 @@ class HEALPixRecUNet(Module):
         odd_in_var_idx_t = th.tensor(odd_in_var_idx, dtype=th.long) if odd_in_var_idx else None
         self.register_buffer("odd_in_var_idx", odd_in_var_idx_t, persistent=False)
 
-        # Zero-mean check for odd inputs and odd diagnostics (when present in scaling).
+        # Odd channels may use a spatial (path) clim mean that satisfies R(μ)=-μ;
+        # only nonzero *scalar* means break normalize∘ρ = ρ∘normalize.
         odd_mean_vars = list(odd_in_vars) + odd_diag
         if self.scaling is not None and odd_mean_vars:
             for var in odd_mean_vars:
-                if var in self.scaling and self.scaling[var]["mean"] != 0.0:
+                if var in self.scaling and is_nonzero_scalar_mean(
+                    self.scaling[var]["mean"]
+                ):
                     raise ValueError(
-                        f"Reflectional equivariance can only be enforced if all odd variables have zero mean. "
+                        f"Reflectional equivariance can only be enforced if all odd variables have zero "
+                        f"scalar mean (or a spatial clim mean with R(μ)=-μ). "
                         f"Odd variable {var} has mean {self.scaling[var]['mean']}"
                     )
 
