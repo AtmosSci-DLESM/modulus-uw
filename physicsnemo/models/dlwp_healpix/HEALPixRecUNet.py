@@ -70,7 +70,7 @@ class HEALPixRecUNet(Module):
         presteps: int = 1,
         enable_nhwc: bool = False,
         couplings: list = [],
-        residual_prediction: bool = True,
+        residual_prediction: bool | str = "same-index-add",
         couplings_time_first: bool = True,
         constraints: list[DictConfig] = None,
         hpx_padding_mode: str | None = None,
@@ -111,8 +111,20 @@ class HEALPixRecUNet(Module):
             Model with [N, H, W, C] instead of [N, C, H, W]
         couplings: list, optional
             sequence of dictionaries that describe coupling mechanisms
-        residual_prediction: bool, optional
-            If the model should predict the residual between the input and the output. Default: True
+        residual_prediction: bool | str, optional
+            If the model should predict the residual between the input and the output. Default: same-index-add.
+            Can be one of:
+            - "none": the model predicts the output state directly.
+            - "same-index-add": output_i = input_i + delta_i. Each delta is added to
+              the input at the same time index. Can cause oscillatory forecasts (first output
+              good, second bad) when input_time_dim > 1, since the base for each output is
+              misaligned with the intended temporal advance.
+            - "last-reference": output_i = last_input + delta_i. All deltas are
+              differences from the last input state. No loop; one broadcast + add.
+            - "chained": output_0 = last_input + delta_0, then output_i = output_{i-1}
+              + delta_i, so each output advances from the previous one.
+            Deprecated booleans map to "same-index-add" (True) and "none" (False), which
+            preserves the behavior of the original boolean flag.
         couplings_time_first: bool, optional
             Whether coupled data is in [T, B, C, F, H, W] rather than [B, F, T, C, H, W] format
         constraints: list[DictConfig], optional
@@ -173,6 +185,13 @@ class HEALPixRecUNet(Module):
         self.hpx_padding_mode = hpx_padding_mode
         self.compile_padding = compile_padding
         self.nside = nside
+
+        if isinstance(self.residual_prediction, bool):
+            legacy_residual_prediction = self.residual_prediction
+            self.residual_prediction = "same-index-add" if legacy_residual_prediction else "none"
+            logger.warning(f"Residual prediction type {legacy_residual_prediction} is deprecated. Using '{self.residual_prediction}' instead. Please update your configuration.")
+        if self.residual_prediction not in ["none", "same-index-add", "last-reference", "chained"]:
+            raise ValueError(f"Invalid residual prediction type: {self.residual_prediction}")
 
         if len(encoder["n_channels"]) != len(decoder["n_channels"]):
             raise ValueError(
@@ -549,12 +568,26 @@ class HEALPixRecUNet(Module):
             decodings = self.decoder(encodings, **kwargs)
             # th.cuda.nvtx.range_pop()
 
-            # Residual prediction
+            # Residual prediction applies only to prognostics; diagnostics are absolute.
             combined = self._reshape_outputs(decodings)
             prognostics = combined[:, :, :, :self.input_channels]
             orig_input = self._reshape_outputs(input_tensor[:, : self.input_channels * self.input_time_dim])
-            if self.residual_prediction:
-                prognostics += orig_input
+            if self.residual_prediction == "same-index-add":
+                # Same index add: output_i = input_i + delta_i. Each delta is added to
+                # the input at the same time index. Can cause oscillatory forecasts (first output
+                # good, second bad) when input_time_dim > 1, since the base for each output is
+                # misaligned with the intended temporal advance.
+                prognostics = orig_input + prognostics
+            elif self.residual_prediction == "last-reference":
+                # Last reference: output_i = last_input + delta_i. All deltas are
+                # differences from the last input state, broadcast over the time dim.
+                prognostics = orig_input[:, :, -1:, :, :, :] + prognostics
+            elif self.residual_prediction == "chained":
+                # Chained: output_0 = last_input + delta_0, then output_i = output_{i-1}
+                # + delta_i, i.e. the last input plus the running sum of the deltas.
+                prognostics = orig_input[:, :, -1:, :, :, :] + th.cumsum(
+                    prognostics, dim=2
+                )
             diagnostics = combined[:, :, :, self.input_channels:]
             out = th.cat([prognostics, diagnostics], dim=3)
 
