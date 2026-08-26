@@ -1,6 +1,21 @@
-import numpy as np
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import warnings
 import torch
-import xarray as xr
 
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.launch.logging import PythonLogger, RankZeroLoggingWrapper
@@ -11,7 +26,7 @@ if DistributedManager.is_initialized():
 else:
     logger0 = logger
 
-'''
+"""
 Constraints for the DLWP HEALPix model. All constraints should take two arguments:
 - prediction: the predicted tensor from the model
 - input: the input tensor to the model
@@ -19,7 +34,7 @@ The constraint should return the prediction tensor with the constraints applied.
 Both the prediction and input tensors are expected to be in the shape [B, F, T, C, H, W].
 The input tensor may not be used for some constraints but is always expected as
 an input argument for consistency.
-'''
+"""
 
 
 def replace_value_keep_gradient(
@@ -36,11 +51,14 @@ def replace_value_keep_gradient(
 
 
 class NonnegativeConstraint(torch.nn.Module):
+    """Clamp the selected channels so they stay nonnegative in physical units."""
+
     def __init__(
         self,
         variables: list[str],
         in_channels: list[str],
         out_channels: list[str] = None,
+        channels: list[str] = None,
         scaling: dict[str, dict[str, float]] = None,
         keep_grad_through_clamp: bool = False,
     ):
@@ -53,6 +71,9 @@ class NonnegativeConstraint(torch.nn.Module):
             List of all input channel names in the model.
         out_channels: list[str]
             List of all output channel names in the model.
+        channels: list[str]
+            List of all channel names in the model.
+            Deprecated; use in_channels and out_channels instead.
         scaling: dict[str, dict[str, float]]
             Dictionary containing the mean and std for each variable.
         keep_grad_through_clamp: bool, optional
@@ -67,15 +88,20 @@ class NonnegativeConstraint(torch.nn.Module):
             self.channels = out_channels
         else:
             self.channels = in_channels
-        if scaling is not None:
-            self.scaling = scaling
-        else:
-            self.scaling = {var: {'mean': 0.0, 'std': 1.0} for var in self.variables}
         self.keep_grad_through_clamp = keep_grad_through_clamp
 
         # Only apply constraint to variables that are used by model
         missing = [var for var in self.variables if var not in self.channels]
         self.variables = [var for var in self.variables if var in self.channels]
+
+        if scaling is not None:
+            scaling = scaling
+        else:
+            # TODO: Decide if we want to use zero mean and unit std or raise an error
+            logger0.warning(
+                "No scaling provided for NonnegativeConstraint. Using zero mean and unit std."
+            )
+            scaling = {var: {"mean": 0.0, "std": 1.0} for var in self.variables}
 
         if missing:
             logger0.warning(
@@ -96,28 +122,32 @@ class NonnegativeConstraint(torch.nn.Module):
         self.register_buffer("thresholds", thresholds, persistent=False)
 
     def forward(self, prediction, input):
-        '''
+        """
         Tensors are expected to be in the shape [B, F, T, C, H, W]
-        '''
+        """
         thresholds = self.thresholds.to(dtype=prediction.dtype)
         clamped = torch.maximum(prediction, thresholds)
         if self.keep_grad_through_clamp:
             return replace_value_keep_gradient(prediction, clamped)
         return clamped
 
+
 class BoundConstraint(torch.nn.Module):
+    """Clamp the selected channels to physical [min, max] limits."""
+
     def __init__(
         self,
-        bounds: dict[str, list[float]],
+        bounds: dict[str, list[float]] | None,
         in_channels: list[str],
         out_channels: list[str] = None,
+        channels: list[str] = None,
         scaling: dict[str, dict[str, float]] = None,
         keep_grad_through_clamp: bool = False,
     ):
         """
         Parameters
         ----------
-        bounds: dict[str, list[float]]
+        bounds: dict[str, list[float]] | None
             Dictionary mapping variable names to [min, max] limits in physical units.
             Use None for unbounded limits.
             Example: {'sic': [0.0, 1.0], 'sit': [0.0, None]}
@@ -125,6 +155,9 @@ class BoundConstraint(torch.nn.Module):
             List of all input channel names in the model.
         out_channels: list[str]
             List of all output channel names in the model.
+        channels: list[str]
+            List of all channel names in the model.
+            Deprecated; use in_channels and out_channels instead.
         scaling: dict[str, dict[str, float]]
             Dictionary containing the mean and std for each variable.
         keep_grad_through_clamp: bool, optional
@@ -134,20 +167,27 @@ class BoundConstraint(torch.nn.Module):
             learning signal. Default False.
         """
         super().__init__()
-        self.bounds = bounds
+        self.bounds = bounds if bounds is not None else {}
+        if channels is not None:
+            logger0.warning("channels argument is deprecated; use in_channels and out_channels instead.")
         if out_channels is not None:
-            self.channels = out_channels
+            channels = out_channels
         else:
-            self.channels = in_channels
-        if scaling is not None:
-            self.scaling = scaling
-        else:
-            self.scaling = {var: {'mean': 0.0, 'std': 1.0} for var in self.variables}
+            channels = in_channels
         self.keep_grad_through_clamp = keep_grad_through_clamp
 
         # Only apply constraint to variables that are used by model
-        missing = [var for var in self.bounds if var not in self.channels]
-        self.variables = [var for var in self.bounds if var in self.channels]
+        missing = [var for var in self.bounds if var not channels]
+        self.variables = [var for var in self.bounds if var in channels]
+
+        if scaling is not None:
+            scaling = scaling
+        else:
+            # TODO: Decide if we want to use zero mean and unit std or raise an error
+            logger0.warning(
+                "No scaling provided for BoundConstraint. Using zero mean and unit std."
+            )
+            scaling = {var: {"mean": 0.0, "std": 1.0} for var in self.variables}
 
         if missing:
             logger0.warning(
@@ -160,10 +200,15 @@ class BoundConstraint(torch.nn.Module):
         constrained_set = set(self.variables)
         min_per_channel = []
         max_per_channel = []
-        for name in self.channels:
+        for name in channels:
             phys_min, phys_max = (
                 self.bounds[name] if name in constrained_set else (None, None)
             )
+            if phys_min is not None and phys_max is not None and phys_min > phys_max:
+                raise ValueError(
+                    f"Physical min {phys_min} is greater than physical max {phys_max} for variable {name}."
+                )
+
             if phys_min is None:
                 min_per_channel.append(float("-inf"))
             else:
@@ -187,9 +232,9 @@ class BoundConstraint(torch.nn.Module):
         self.register_buffer("max_thresholds", max_thresholds, persistent=False)
 
     def forward(self, prediction, input):
-        '''
+        """
         Tensors are expected to be in the shape [B, F, T, C, H, W]
-        '''
+        """
         min_thresholds = self.min_thresholds.to(dtype=prediction.dtype)
         max_thresholds = self.max_thresholds.to(dtype=prediction.dtype)
         clamped = torch.minimum(
@@ -198,6 +243,7 @@ class BoundConstraint(torch.nn.Module):
         if self.keep_grad_through_clamp:
             return replace_value_keep_gradient(prediction, clamped)
         return clamped
+
 
 class DryAirMassConstraint(torch.nn.Module):
     def __init__(
@@ -221,19 +267,26 @@ class DryAirMassConstraint(torch.nn.Module):
             self.channels = out_channels
         else:
             self.channels = in_channels
-        self.scaling = scaling
+        if scaling is not None:
+            scaling = scaling
+        else:
+            # TODO: Decide if we want to use zero mean and unit std or raise an error
+            logger0.warning(
+                "No scaling provided for DryAirMassConstraint. Using zero mean and unit std."
+            )
+            scaling = {var: {"mean": 0.0, "std": 1.0} for var in self.channels}
 
         self.sp_channel_index = self.channels.index("sp")
         self.tcwv_channel_index = self.channels.index("tcwv")
 
-        ps_mean = torch.tensor(scaling['sp']['mean'])
-        ps_std = torch.tensor(scaling['sp']['std'])
-        tcwv_mean = torch.tensor(scaling['tcwv']['mean'])
-        tcwv_std = torch.tensor(scaling['tcwv']['std'])
-        self.register_buffer('ps_mean', ps_mean, persistent=False) 
-        self.register_buffer('ps_std', ps_std, persistent=False)
-        self.register_buffer('tcwv_mean', tcwv_mean, persistent=False)
-        self.register_buffer('tcwv_std', tcwv_std, persistent=False)
+        ps_mean = torch.tensor(scaling["sp"]["mean"])
+        ps_std = torch.tensor(scaling["sp"]["std"])
+        tcwv_mean = torch.tensor(scaling["tcwv"]["mean"])
+        tcwv_std = torch.tensor(scaling["tcwv"]["std"])
+        self.register_buffer("ps_mean", ps_mean, persistent=False)
+        self.register_buffer("ps_std", ps_std, persistent=False)
+        self.register_buffer("tcwv_mean", tcwv_mean, persistent=False)
+        self.register_buffer("tcwv_std", tcwv_std, persistent=False)
 
         sp_channel_mask = torch.zeros(len(self.channels), dtype=torch.float32)
         sp_channel_mask[self.sp_channel_index] = 1.0
@@ -246,39 +299,47 @@ class DryAirMassConstraint(torch.nn.Module):
         self.g0 = 9.81
 
     def forward(self, prediction, input):
-        '''
+        """
         Tensors are expected to be in the shape [B, F, T, C, H, W]
-        '''
-        
+        """
+
         # Need to scale to physical units and compute small differences of large
         # surface pressures (in Pa), so disable autocast and force float32 precision
-        with torch.amp.autocast('cuda', enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             prediction = prediction.float()
             input = input.float()
 
             # Slice on dim 3 with constant bounds (compile-friendly; avoids
             # index_select + buffer index in backward).
-            sp = prediction[:, :, :, self.sp_channel_index : self.sp_channel_index + 1, :, :]
+            sp = prediction[
+                :, :, :, self.sp_channel_index : self.sp_channel_index + 1, :, :
+            ]
             sp = sp * self.ps_std + self.ps_mean
-            tcwv = prediction[:, :, :, self.tcwv_channel_index : self.tcwv_channel_index + 1, :, :]
+            tcwv = prediction[
+                :, :, :, self.tcwv_channel_index : self.tcwv_channel_index + 1, :, :
+            ]
             tcwv = tcwv * self.tcwv_std + self.tcwv_mean
 
-            # Get sp and tcwv from last time step of input tensor. Used to 
+            # Get sp and tcwv from last time step of input tensor. Used to
             # compute initial dry air mass which is to be conserved.
-            sp_0 = input[:, :, -1:, self.sp_channel_index : self.sp_channel_index + 1, :, :]
+            sp_0 = input[
+                :, :, -1:, self.sp_channel_index : self.sp_channel_index + 1, :, :
+            ]
             sp_0 = sp_0 * self.ps_std + self.ps_mean
-            tcwv_0 = input[:, :, -1:, self.tcwv_channel_index : self.tcwv_channel_index + 1, :, :]
+            tcwv_0 = input[
+                :, :, -1:, self.tcwv_channel_index : self.tcwv_channel_index + 1, :, :
+            ]
             tcwv_0 = tcwv_0 * self.tcwv_std + self.tcwv_mean
 
             # Get predicted and initial dry sp
             sp_dry = sp - self.g0 * tcwv
             sp_0_dry = sp_0 - self.g0 * tcwv_0
             # Correction is spatial average of dry air mass difference
-            correction = (sp_dry - sp_0_dry).mean(dim=[1,4,5], keepdim=True)
+            correction = (sp_dry - sp_0_dry).mean(dim=[1, 4, 5], keepdim=True)
             sp_corrected = sp - correction
 
             # Ensure sp is non-negative and rescale back to normalized space
-            sp_corrected = torch.clamp(sp_corrected, min=0.)
+            sp_corrected = torch.clamp(sp_corrected, min=0.0)
             sp_corrected = (sp_corrected - self.ps_mean) / self.ps_std
 
             mask = self.sp_channel_mask.to(
