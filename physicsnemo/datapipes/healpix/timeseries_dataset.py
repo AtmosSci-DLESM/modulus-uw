@@ -235,9 +235,10 @@ class TimeSeriesDataset(Dataset, Datapipe):
 
     def _get_scaling_da(self):
         """Setup the scaling values for this dataset"""
-        scaling_df = pd.DataFrame.from_dict(self.scaling).T
-        scaling_df.loc["zeros"] = {"mean": 0.0, "std": 1.0}
-        scaling_da = scaling_df.to_xarray().astype("float32")
+        from .scaling_utils import build_channel_scaling
+
+        scaling = dict(self.scaling)
+        scaling.setdefault("zeros", {"mean": 0.0, "std": 1.0})
 
         # REMARK: we remove the xarray overhead from these
         try:
@@ -245,22 +246,15 @@ class TimeSeriesDataset(Dataset, Datapipe):
             # includes diagnostic variables like tp6 and msl.
             # using 'channel_out' is still necessary for ocean models.
             if len(self.ds.channel_out) != (len(self.ds.channel_in)-len(self.couplings[0].variables)):
-                self.input_scaling = scaling_da.sel(
-                    index=self.ds.channel_in.values
-                ).rename({"index": "channel_in"})
+                input_names = list(self.ds.channel_in.values)
             else:
-                self.input_scaling = scaling_da.sel(
-                    index=self.ds.channel_out.values
-                ).rename({"index": "channel_in"})
-            self.input_scaling = {
-                "mean": np.expand_dims(
-                    self.input_scaling["mean"].to_numpy(), (0, 2, 3, 4)
-                ),
-                "std": np.expand_dims(
-                    self.input_scaling["std"].to_numpy(), (0, 2, 3, 4)
-                ),
-            }
-        except (ValueError, KeyError):
+                input_names = list(self.ds.channel_out.values)
+            self.input_scaling = build_channel_scaling(
+                input_names,
+                scaling,
+                mean_expand_axes=(0, 2, 3, 4),
+            )
+        except KeyError:
             missing = [
                 m
                 for m in self.ds.channel_in.values
@@ -270,18 +264,12 @@ class TimeSeriesDataset(Dataset, Datapipe):
                 f"Input channels {missing} not found in the scaling config dict data.scaling ({list(self.scaling.keys())})"
             )
         try:
-            self.target_scaling = scaling_da.sel(
-                index=self.ds.channel_out.values
-            ).rename({"index": "channel_out"})
-            self.target_scaling = {
-                "mean": np.expand_dims(
-                    self.target_scaling["mean"].to_numpy(), (0, 2, 3, 4)
-                ),
-                "std": np.expand_dims(
-                    self.target_scaling["std"].to_numpy(), (0, 2, 3, 4)
-                ),
-            }
-        except (ValueError, KeyError):
+            self.target_scaling = build_channel_scaling(
+                list(self.ds.channel_out.values),
+                scaling,
+                mean_expand_axes=(0, 2, 3, 4),
+            )
+        except KeyError:
             missing = [
                 m
                 for m in self.ds.channel_out.values
@@ -294,18 +282,13 @@ class TimeSeriesDataset(Dataset, Datapipe):
         try:
             # not all datasets will have constants
             if "constants" in self.ds.data_vars:
-                self.constant_scaling = scaling_da.sel(
-                    index=self.ds.channel_c.values
-                ).rename({"index": "channel_out"})
-                self.constant_scaling = {
-                    "mean": np.expand_dims(
-                        self.constant_scaling["mean"].to_numpy(), (1, 2, 3)
-                    ),
-                    "std": np.expand_dims(
-                        self.constant_scaling["std"].to_numpy(), (1, 2, 3)
-                    ),
-                }
-        except (ValueError, KeyError):
+                self.constant_scaling = build_channel_scaling(
+                    list(self.ds.channel_c.values),
+                    scaling,
+                    mean_expand_axes=(1, 2, 3),
+                    allow_spatial_mean=False,
+                )
+        except KeyError:
             missing = [
                 m
                 for m in self.ds.channel_c.values

@@ -81,15 +81,15 @@ class NonnegativeConstraint(torch.nn.Module):
             )
 
         constrained_set = set(self.variables)
-        per_channel = [
-            (0.0 - scaling[name]["mean"]) / scaling[name]["std"]
-            if name in constrained_set
-            else float("-inf")
-            for name in self.channels
-        ]
-        thresholds = torch.tensor(per_channel, dtype=torch.float32).view(
-            1, 1, 1, -1, 1, 1
+        from physicsnemo.datapipes.healpix.scaling_utils import stack_normalized_bounds
+
+        thresholds_np = stack_normalized_bounds(
+            self.channels,
+            scaling,
+            {name: 0.0 for name in constrained_set},
+            unconstrained=float("-inf"),
         )
+        thresholds = torch.as_tensor(thresholds_np, dtype=torch.float32)
         self.register_buffer("thresholds", thresholds, persistent=False)
 
     def forward(self, prediction, input):
@@ -172,33 +172,30 @@ class BoundedConstraint(torch.nn.Module):
             name for name in requested if name in self.channels
         }
 
-        lower_per_channel = []
-        upper_per_channel = []
-        for name in self.channels:
-            if name not in self.constrained_variables:
-                lower_per_channel.append(float("-inf"))
-                upper_per_channel.append(float("inf"))
-                continue
-            scale = scaling[name]
-            if name in lower_bounds:
-                lower_per_channel.append(
-                    (lower_bounds[name] - scale["mean"]) / scale["std"]
-                )
-            else:
-                lower_per_channel.append(float("-inf"))
-            if name in upper_bounds:
-                upper_per_channel.append(
-                    (upper_bounds[name] - scale["mean"]) / scale["std"]
-                )
-            else:
-                upper_per_channel.append(float("inf"))
+        from physicsnemo.datapipes.healpix.scaling_utils import stack_normalized_bounds
 
-        lower_thresholds = torch.tensor(
-            lower_per_channel, dtype=torch.float32
-        ).view(1, 1, 1, -1, 1, 1)
-        upper_thresholds = torch.tensor(
-            upper_per_channel, dtype=torch.float32
-        ).view(1, 1, 1, -1, 1, 1)
+        lower_thresholds_np = stack_normalized_bounds(
+            self.channels,
+            scaling,
+            {
+                name: lower_bounds[name]
+                for name in self.constrained_variables
+                if name in lower_bounds
+            },
+            unconstrained=float("-inf"),
+        )
+        upper_thresholds_np = stack_normalized_bounds(
+            self.channels,
+            scaling,
+            {
+                name: upper_bounds[name]
+                for name in self.constrained_variables
+                if name in upper_bounds
+            },
+            unconstrained=float("inf"),
+        )
+        lower_thresholds = torch.as_tensor(lower_thresholds_np, dtype=torch.float32)
+        upper_thresholds = torch.as_tensor(upper_thresholds_np, dtype=torch.float32)
         self.register_buffer("lower_thresholds", lower_thresholds, persistent=False)
         self.register_buffer("upper_thresholds", upper_thresholds, persistent=False)
 
