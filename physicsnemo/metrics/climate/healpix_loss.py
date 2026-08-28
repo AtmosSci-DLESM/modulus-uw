@@ -1003,6 +1003,10 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
     with almost-fair ensemble weighting, optional land–sea masking, and
     channel-wise weights. Optionally weights patch-vector components by
     a Gaussian in distance from the patch center (weights sum to one).
+
+    With ``n_members=1`` the pairwise spread term is undefined and the loss
+    collapses to patched MAE: the (optionally spatially weighted) Euclidean
+    norm of each patch vector versus the target, analogous to CRPS→MAE.
     """
 
     def __init__(
@@ -1028,7 +1032,8 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             list of floats that determine weighting of variable loss, assumed to be
             in order consistent with order of model output channels
         n_members: int
-            number of ensemble members in the model output
+            number of ensemble members in the model output. ``1`` selects the
+            patched-MAE collapse (skill term only; no ensemble-spread term).
         lsm_file: str
             path to the lsm file. Default is None, no lsm is applied.
         open_dict: dict
@@ -1059,8 +1064,8 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             Set False to keep the incoming dtype for native AMP.
         """
         super().__init__()
-        if n_members < 2:
-            raise ValueError("n_members must be at least 2 for energy score to be defined")
+        if n_members < 1:
+            raise ValueError("n_members must be at least 1")
         self.n_members = n_members
         self.loss_weights = th.tensor(weights)
         self.device = None
@@ -1087,17 +1092,23 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         else:
             self.patch_weights = None
 
-        # Parameters for almost fair energy score
-        self.coeff_eps = 1 - ((1 - alpha) / n_members)
-        self.averaging_coeff = 1 / (2 * n_members * (n_members - 1))
+        # Almost-fair pairwise coeffs are unused for n=1 (patched MAE).
+        if n_members == 1:
+            self.coeff_eps = 1.0
+            self.averaging_coeff = 1.0
+            self.diag_mask = th.zeros(1, 1)
+        else:
+            self.coeff_eps = 1 - ((1 - alpha) / n_members)
+            self.averaging_coeff = 1 / (2 * n_members * (n_members - 1))
+            self.diag_mask = th.ones(self.n_members, self.n_members) - th.eye(
+                self.n_members
+            )
 
         if lsm_file is not None:
             self.lsm_ds = xr.open_dataset(lsm_file, **open_dict).constants.sel(selection_dict)
             self.lsm_tensor = 1 - th.tensor(np.expand_dims(self.lsm_ds.values, (0, 2, 3)))
         else:
             self.lsm_tensor = th.ones(1, 1, 1, 1, 1, 1)
-
-        self.diag_mask = th.ones(self.n_members, self.n_members) - th.eye(self.n_members)
         # HEALPix padding module (expects [..., F, H, W])
         if self.patch_radius > 0:
             self.hpx_pad = make_hpx_padding_layer(
@@ -1210,6 +1221,10 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             h,
             w,
         )  # [Cond,B,F,T,C,H,W]
+
+        # n=1: patched MAE — skill term only (no pairwise spread)
+        if n == 1:
+            return diff_to_target.squeeze(0)  # [B,F,T,C,H,W]
 
         if n == 2:
             diff_target = diff_to_target.sum(dim=0)  # [B,F,T,C,H,W]
