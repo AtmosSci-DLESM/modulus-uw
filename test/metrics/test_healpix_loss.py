@@ -544,6 +544,70 @@ def test_PatchedEnergyScoreLoss_two_member_fast_matches_pairwise(
     assert torch.isclose(fast, pairwise, rtol=1e-5, atol=1e-5)
 
 
+def test_PatchedEnergyScoreLoss_rejects_zero_members():
+    with pytest.raises(ValueError, match="n_members must be at least 1"):
+        PatchedEnergyScoreLoss(weights=[1.0], n_members=0)
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+@pytest.mark.parametrize("patch_size", [3])
+@pytest.mark.parametrize("hpx_padding_mode", ["karlbauer", "isolatitude"])
+@pytest.mark.parametrize("enable_nhwc", [False])
+@pytest.mark.parametrize("patch_weight_sigma", [None, 1.0])
+def test_PatchedEnergyScoreLoss_one_member_zero_and_matches_patch_mae(
+    device, patch_size, hpx_padding_mode, enable_nhwc, patch_weight_sigma
+):
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    b, f, t, c, h, w = 2, 12, 2, 2, 64, 64
+    n_members = 1
+    weights = [1.0] * c
+
+    loss_fn = PatchedEnergyScoreLoss(
+        weights=weights,
+        n_members=n_members,
+        patch_size=patch_size,
+        hpx_padding_mode=hpx_padding_mode,
+        enable_nhwc=enable_nhwc,
+        nside=h,
+        patch_weight_sigma=patch_weight_sigma,
+    )
+    trainer = trainer_helper(output_variables=[f"var{i}" for i in range(c)], device=device)
+    loss_fn.setup(trainer)
+
+    # Perfect forecast → 0
+    target = torch.randn(b, f, t, c, h, w, device=device)
+    prediction = target.clone()
+    loss_perfect = loss_fn(prediction, target, average_channels=True)
+    assert torch.isclose(loss_perfect, torch.tensor(0.0, device=device), atol=1e-6)
+
+    # Random pred: equals mean of weighted patch norms vs target (no spread term)
+    torch.manual_seed(1)
+    target = torch.randn(b, f, t, c, h, w, device=device)
+    pred = torch.randn(n_members, b, f, t, c, h, w, device=device)
+    prediction = pred.reshape(n_members * b, f, t, c, h, w)
+
+    loss = loss_fn(prediction, target, average_channels=True)
+
+    with torch.no_grad():
+        tar_unfold = loss_fn._unfold_target(target)
+    pred_unfold = loss_fn._unfold_prediction_members(pred)
+    expected = loss_fn._reshape_member_norms(
+        loss_fn._weighted_patch_norm(
+            pred_unfold - tar_unfold.unsqueeze(0), patch_dim=-2
+        ),
+        b,
+        f,
+        t,
+        c,
+        h,
+        w,
+    ).squeeze(0).mean()
+
+    assert torch.isclose(loss, expected, rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 @pytest.mark.parametrize("patch_size", [3, 5])
 @pytest.mark.parametrize("hpx_padding_mode", ["earth2grid", "karlbauer", "isolatitude"])
