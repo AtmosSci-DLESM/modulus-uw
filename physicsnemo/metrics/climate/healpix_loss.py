@@ -1007,6 +1007,10 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
     With ``n_members=1`` the pairwise spread term is undefined and the loss
     collapses to patched MAE: the (optionally spatially weighted) Euclidean
     norm of each patch vector versus the target, analogous to CRPS→MAE.
+    ``norm_eps=0`` (default) is that exact energy score / patched MAE.
+    ``norm_eps>0`` uses the smoothed floor ``sqrt(||v||_2^2 + norm_eps)``
+    (n=1 is then smoothed patched MAE; a perfect forecast scores
+    ``sqrt(norm_eps)`` rather than 0).
     """
 
     def __init__(
@@ -1024,6 +1028,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         patch_weight_sigma: float = None,
         channel_chunk_size: int | None = None,
         cast_to_fp32: bool = True,
+        norm_eps: float = 0.0,
     ):
         """
         Parameters
@@ -1062,10 +1067,17 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         cast_to_fp32: bool, optional
             If True (default), cast prediction/target to float32 before scoring.
             Set False to keep the incoming dtype for native AMP.
+        norm_eps: float, optional
+            Forward floor on patch Euclidean norms: ``sqrt(||v||_2^2 + norm_eps)``
+            when ``norm_eps > 0``. Default ``0.0`` keeps the unsmoothed
+            ``vector_norm`` / weighted-sqrt path (exact energy score). Must be
+            ``>= 0``.
         """
         super().__init__()
         if n_members < 1:
             raise ValueError("n_members must be at least 1")
+        if norm_eps < 0:
+            raise ValueError("norm_eps must be >= 0")
         self.n_members = n_members
         self.loss_weights = th.tensor(weights)
         self.device = None
@@ -1079,6 +1091,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         self.nside = nside
         self.channel_chunk_size = channel_chunk_size
         self.cast_to_fp32 = cast_to_fp32
+        self.norm_eps = float(norm_eps)
 
         # Gaussian weights for patch positions (row-major, center-weighted, sum=1)
         if patch_weight_sigma is not None and patch_weight_sigma > 0:
@@ -1141,13 +1154,21 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         """
         Weighted L2 norm over the patch dimension: sqrt(sum_k w_k * v_k^2).
         ``patch_dim=-1`` for [..., D]; ``patch_dim=-2`` for unfold layout [..., D, HW].
+        With ``norm_eps > 0`` this is ``sqrt(sumsq + norm_eps)``.
         """
         if self.patch_weights is None:
+            if self.norm_eps > 0:
+                return th.sqrt(
+                    (diff_vec ** 2).sum(dim=patch_dim).clamp(min=0.0) + self.norm_eps
+                )
             return th.linalg.vector_norm(diff_vec, dim=patch_dim)
         w = self.patch_weights
         if patch_dim == -2:
             w = w.unsqueeze(-1)
-        return th.sqrt((diff_vec ** 2 * w).sum(dim=patch_dim).clamp(min=0.0))
+        sq = (diff_vec ** 2 * w).sum(dim=patch_dim).clamp(min=0.0)
+        if self.norm_eps > 0:
+            return th.sqrt(sq + self.norm_eps)
+        return th.sqrt(sq)
 
     def _pad_and_unfold(self, x: th.Tensor) -> th.Tensor:
         """Pad HEALPix faces if needed, then unfold to [N*C, D, H*W]."""
