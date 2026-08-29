@@ -1080,14 +1080,16 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
     Patched multivariate energy score loss on HEALPix grids.
     Uses N×N local spatial neighborhoods as vectors for the energy score,
     with almost-fair ensemble weighting, optional land–sea masking, and
-    channel-wise weights. Optionally weights patch-vector components by
-    a Gaussian in distance from the patch center (weights sum to one).
+    channel-wise weights. Patch-vector norms always use weights that sum to
+    one: uniform ``1/D`` when ``patch_weight_sigma`` is omitted (so a flat
+    residual ``ε`` scores ``ε``, matching pixel MAE scale), or a Gaussian in
+    distance from the patch center when ``patch_weight_sigma`` is set.
 
     With ``n_members=1`` the pairwise spread term is undefined and the loss
-    collapses to patched MAE: the (optionally spatially weighted) Euclidean
-    norm of each patch vector versus the target, analogous to CRPS→MAE.
+    collapses to patched MAE: the spatially weighted Euclidean norm of each
+    patch vector versus the target, analogous to CRPS→MAE.
     ``norm_eps=0`` (default) is that exact energy score / patched MAE.
-    ``norm_eps>0`` uses the smoothed floor ``sqrt(||v||_2^2 + norm_eps)``
+    ``norm_eps>0`` uses the smoothed floor ``sqrt(sum_k w_k v_k^2 + norm_eps)``
     (n=1 is then smoothed patched MAE; a perfect forecast scores
     ``sqrt(norm_eps)`` rather than 0).
     """
@@ -1139,7 +1141,8 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             distance from the patch center (weights sum to 1, center gets highest weight).
             Patch_weight_sigma is the standard deviation of the Gaussian.
             Patch_weight_sigma = 1 for standard normal distribution.
-            If None, no spatial weighting within the patch (default).
+            If None (default), use uniform weights ``1/D`` (also sum to 1) so the
+            patch norm matches ordinary MAE scale for spatially flat residuals.
         channel_chunk_size: int or None, optional
             Pad/unfold this many channels at a time to reduce peak memory.
             Default ``None`` processes all channels in one pass.
@@ -1147,10 +1150,10 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             If True (default), cast prediction/target to float32 before scoring.
             Set False to keep the incoming dtype for native AMP.
         norm_eps: float, optional
-            Forward floor on patch Euclidean norms: ``sqrt(||v||_2^2 + norm_eps)``
-            when ``norm_eps > 0``. Default ``0.0`` keeps the unsmoothed
-            ``vector_norm`` / weighted-sqrt path (exact energy score). Must be
-            ``>= 0``.
+            Forward floor on patch Euclidean norms:
+            ``sqrt(sum_k w_k v_k^2 + norm_eps)`` when ``norm_eps > 0``.
+            Default ``0.0`` keeps the unsmoothed weighted-sqrt path (exact
+            energy score). Must be ``>= 0``.
         """
         super().__init__()
         if n_members < 1:
@@ -1172,9 +1175,9 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         self.cast_to_fp32 = cast_to_fp32
         self.norm_eps = float(norm_eps)
 
-        # Gaussian weights for patch positions (row-major, center-weighted, sum=1)
+        # Patch-position weights (row-major, sum=1): Gaussian if sigma set, else uniform 1/D.
+        D = patch_size ** 2
         if patch_weight_sigma is not None and patch_weight_sigma > 0:
-            D = patch_size ** 2
             c = float(self.patch_radius)
             ri = th.arange(patch_size, dtype=th.float32).unsqueeze(1).expand(-1, patch_size).reshape(-1)
             ci = th.arange(patch_size, dtype=th.float32).unsqueeze(0).expand(patch_size, -1).reshape(-1)
@@ -1182,7 +1185,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             w = th.exp(-d_sq / (2.0 * patch_weight_sigma ** 2))
             self.patch_weights = (w / w.sum()).reshape(1, -1)
         else:
-            self.patch_weights = None
+            self.patch_weights = th.full((1, D), 1.0 / float(D), dtype=th.float32)
 
         # Almost-fair pairwise coeffs are unused for n=1 (patched MAE).
         if n_members == 1:
@@ -1226,21 +1229,15 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         if self.hpx_pad is not None:
             self.hpx_pad = self.hpx_pad.to(device=trainer.device)
         self.unfold = self.unfold.to(device=trainer.device)
-        if self.patch_weights is not None:
-            self.patch_weights = self.patch_weights.to(device=trainer.device)
+        self.patch_weights = self.patch_weights.to(device=trainer.device)
 
     def _weighted_patch_norm(self, diff_vec: th.Tensor, patch_dim: int = -1) -> th.Tensor:
         """
         Weighted L2 norm over the patch dimension: sqrt(sum_k w_k * v_k^2).
-        ``patch_dim=-1`` for [..., D]; ``patch_dim=-2`` for unfold layout [..., D, HW].
+        Weights always sum to 1 (uniform 1/D or Gaussian). ``patch_dim=-1`` for
+        [..., D]; ``patch_dim=-2`` for unfold layout [..., D, HW].
         With ``norm_eps > 0`` this is ``sqrt(sumsq + norm_eps)``.
         """
-        if self.patch_weights is None:
-            if self.norm_eps > 0:
-                return th.sqrt(
-                    (diff_vec ** 2).sum(dim=patch_dim).clamp(min=0.0) + self.norm_eps
-                )
-            return th.linalg.vector_norm(diff_vec, dim=patch_dim)
         w = self.patch_weights
         if patch_dim == -2:
             w = w.unsqueeze(-1)
