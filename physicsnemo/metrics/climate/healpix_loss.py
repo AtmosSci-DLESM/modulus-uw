@@ -317,6 +317,9 @@ class WeightedCRPSLoss(th.nn.MSELoss):
 
     """
     Probabilistic loss function that allows for user defined weighting of variables when calculating CRPS.
+
+    With ``n_members=1`` the pairwise spread term is undefined and the loss
+    collapses to weighted MAE (absolute error), analogous to CRPS→MAE.
     """
 
     def __init__(
@@ -338,7 +341,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
             list of floats that determine weighting of variable loss, assumed to be
             in order consistent with order of model output channels
         n_members: int
-            number of ensemble members in the model output
+            number of ensemble members in the model output. ``1`` selects the
+            MAE collapse (skill term only; no ensemble-spread term).
         alpha: float
             hyperparamter for approximating fair CRPS loss. between 0 and 1, 1 corresponds to a fair CRPS loss.
         mean_penalty: float
@@ -357,10 +361,9 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         """
         super().__init__()
         self.loss_weights = th.tensor(weights)
-        if n_members < 2:
-            raise ValueError("n_members must be at least 2 for CRPS loss to be defined")
-        else:    
-            self.n_members = n_members
+        if n_members < 1:
+            raise ValueError("n_members must be at least 1")
+        self.n_members = n_members
         self.device = None
         self.mean_penalty = mean_penalty
         self.multiscale = multiscale
@@ -373,14 +376,22 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         else:
             self.lsm_tensor = th.ones(1, 1, 1, 1, 1, 1) # Spoof the tensor dimensions for broadcasting
 
-        # Parameters for "almost fair CRPS" loss. See https://arxiv.org/html/2412.15832v1
-        self.coeff_eps = 1 - ((1-alpha) / (n_members))
-        self.averaging_coeff = 1 / (2* n_members * (n_members - 1))
+        # Almost-fair pairwise coeffs are unused for n=1 (MAE).
+        # See https://arxiv.org/html/2412.15832v1 for n>=2.
+        if n_members == 1:
+            self.coeff_eps = 1.0
+            self.averaging_coeff = 1.0
+            self.diag_mask = th.zeros(1, 1)
+        else:
+            self.coeff_eps = 1 - ((1 - alpha) / n_members)
+            self.averaging_coeff = 1 / (2 * n_members * (n_members - 1))
+            self.diag_mask = th.ones(self.n_members, self.n_members) - th.eye(
+                self.n_members
+            )
 
         # For n>2, will use pairwise distance to copmute [NxN] distance matrix
         # Diagonal elements of (prediciton - target) matrix are zeroed out to avoid double counting
         self.pdist = th.nn.PairwiseDistance(p=1)
-        self.diag_mask = th.ones(self.n_members, self.n_members) - th.eye(self.n_members) # Mask to zero out diagonal elements
 
     def setup(self, trainer):
         """
@@ -396,6 +407,12 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         self.pdist = self.pdist.to(device=trainer.device)
         self.diag_mask = self.diag_mask.to(device=trainer.device)   
         self.lsm_tensor = self.lsm_tensor.to(device=trainer.device)
+
+    def _1member_mae(self, prediction, target, lsm_tensor):
+        """n=1 skill-only path: weighted absolute error [B, F, T, C, H, W]."""
+        mae = th.abs(prediction.squeeze(0) - target)
+        mae *= lsm_tensor
+        return mae
 
     def _2member_crps(self, prediction, target, lsm_tensor):
         diff_target = th.abs(prediction - target.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
@@ -478,6 +495,68 @@ class WeightedCRPSLoss(th.nn.MSELoss):
         # Apply channel weights across channel dims
         prediction *= self.loss_weights[None, None, None, None, :, None, None]
         target *= self.loss_weights[None, None, None, :, None, None]
+
+        if n == 1:
+            # Skill-only MAE collapse (no pairwise spread)
+            mae = self._1member_mae(prediction, target, self.lsm_tensor)
+
+            if average_channels:
+                loss = mae.mean()
+            else:
+                loss = mae.mean(dim=(0, 1, 2, 4, 5))
+
+            if self.mean_penalty > 0:
+                if self.masked_processing and self.lsm_tensor.numel() > 1:
+                    valid_pixels = self.lsm_tensor.numel()
+                else:
+                    valid_pixels = f * h * w
+
+                prediction_count = n * b * t * valid_pixels
+                target_count = b * t * valid_pixels
+                ens_global_means = (prediction * self.lsm_tensor).sum(
+                    dim=(0, 1, 2, 3, 5, 6)
+                ) / prediction_count
+                target_global_means = (target * self.lsm_tensor).sum(
+                    dim=(0, 1, 2, 4, 5)
+                ) / target_count
+
+                bias_penalty = self.mean_penalty * th.abs(
+                    ens_global_means - target_global_means
+                )
+                if average_channels:
+                    loss += bias_penalty.mean()
+                else:
+                    loss += bias_penalty
+
+            if self.multiscale > 0.0:
+                mae_scales = 0
+                for scale in self.scales:
+                    if self.masked_processing and self.lsm_tensor.numel() > 1:
+                        masked_pred, masked_lsm = self._masked_pool(
+                            prediction, scale, self.lsm_tensor
+                        )
+                        masked_tar, _ = self._masked_pool(
+                            target, scale, self.lsm_tensor
+                        )
+                        mae_scale = self._1member_mae(
+                            masked_pred, masked_tar, masked_lsm
+                        )
+                    else:
+                        pred = self._pool(prediction, scale)
+                        tar = self._pool(target, scale)
+                        lsm = self._pool(self.lsm_tensor, scale)
+                        mae_scale = self._1member_mae(pred, tar, lsm)
+
+                    if average_channels:
+                        mae_scale = mae_scale.mean()
+                    else:
+                        mae_scale = mae_scale.mean(dim=(0, 1, 2, 4, 5))
+                    mae_scales += mae_scale
+
+                mae_scales = mae_scales / len(self.scales)
+                loss += self.multiscale * mae_scales
+
+            return loss
 
         if n == 2:
             # Use faster explicit implementation

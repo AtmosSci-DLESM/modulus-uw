@@ -28,6 +28,7 @@ from physicsnemo.metrics.climate.healpix_loss import (
     OceanMSE,
     WeightedMSE,
     WeightedOceanMSE,
+    WeightedCRPSLoss,
     PatchedEnergyScoreLoss,
 )
 
@@ -447,6 +448,53 @@ def test_WeightedOceanMSE(
         rtol=rtol,
         atol=atol,
     )
+
+
+def test_WeightedCRPSLoss_rejects_zero_members():
+    with pytest.raises(ValueError, match="n_members must be at least 1"):
+        WeightedCRPSLoss(weights=[1.0], n_members=0)
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_WeightedCRPSLoss_one_member_zero_and_matches_mae(device):
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    b, f, t, c, h, w = 2, 12, 2, 3, 16, 16
+    n_members = 1
+    weights = [1.0, 2.0, 0.5]
+
+    loss_fn = WeightedCRPSLoss(weights=weights, n_members=n_members)
+    trainer = trainer_helper(
+        output_variables=[f"var{i}" for i in range(c)], device=device
+    )
+    loss_fn.setup(trainer)
+
+    # Perfect forecast → 0
+    target = torch.randn(b, f, t, c, h, w, device=device)
+    prediction = target.clone()
+    loss_perfect = loss_fn(prediction, target, average_channels=True)
+    assert torch.isclose(loss_perfect, torch.tensor(0.0, device=device), atol=1e-6)
+
+    # Random pred: mean |w * (pred - target)| with no spread term
+    torch.manual_seed(1)
+    target = torch.randn(b, f, t, c, h, w, device=device)
+    pred = torch.randn(n_members, b, f, t, c, h, w, device=device)
+    # Clone: WeightedCRPSLoss multiplies channel weights into tensors in-place
+    prediction = pred.reshape(n_members * b, f, t, c, h, w).clone()
+    target_in = target.clone()
+
+    loss = loss_fn(prediction, target_in, average_channels=True)
+
+    w = torch.tensor(weights, device=device, dtype=torch.float32)
+    expected = (
+        (pred.squeeze(0) * w[None, None, None, :, None, None]
+         - target * w[None, None, None, :, None, None])
+        .abs()
+        .mean()
+    )
+    assert torch.isclose(loss, expected, rtol=1e-5, atol=1e-5)
+
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 @pytest.mark.parametrize("patch_size", [3, 5])
