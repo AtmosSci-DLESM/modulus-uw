@@ -551,6 +551,51 @@ def test_PatchedEnergyScoreLoss_rejects_zero_members():
         PatchedEnergyScoreLoss(weights=[1.0], n_members=0)
 
 
+def test_PatchedEnergyScoreLoss_rejects_negative_norm_eps():
+    with pytest.raises(ValueError, match="norm_eps must be >= 0"):
+        PatchedEnergyScoreLoss(weights=[1.0], n_members=1, norm_eps=-1e-6)
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+@pytest.mark.parametrize("patch_weight_sigma", [None, 1.0])
+def test_PatchedEnergyScoreLoss_norm_eps_perfect_forecast_and_zero_grad(
+    device, patch_weight_sigma
+):
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    b, f, t, c, h, w = 2, 12, 1, 2, 16, 16
+    norm_eps = 1.0e-6
+    weights = [1.0] * c
+
+    loss_fn = PatchedEnergyScoreLoss(
+        weights=weights,
+        n_members=1,
+        patch_size=3,
+        hpx_padding_mode="karlbauer",
+        enable_nhwc=False,
+        nside=h,
+        patch_weight_sigma=patch_weight_sigma,
+        norm_eps=norm_eps,
+    )
+    trainer = trainer_helper(output_variables=[f"var{i}" for i in range(c)], device=device)
+    loss_fn.setup(trainer)
+
+    target = torch.randn(b, f, t, c, h, w, device=device)
+    prediction = target.clone()
+    loss = loss_fn(prediction, target, average_channels=True)
+    expected = torch.sqrt(torch.tensor(norm_eps, device=device, dtype=loss.dtype))
+    assert torch.isclose(loss, expected, rtol=1e-5, atol=1e-5)
+
+    # Zero patch residual: gradient of sqrt(||v||^2 + eps) is 0 (no NaN).
+    diff = torch.zeros(2, 9, 8, device=device, requires_grad=True)
+    norms = loss_fn._weighted_patch_norm(diff, patch_dim=-2)
+    norms.sum().backward()
+    assert diff.grad is not None
+    assert torch.all(torch.isfinite(diff.grad))
+    assert torch.allclose(diff.grad, torch.zeros_like(diff.grad), atol=1e-6)
+
+
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 @pytest.mark.parametrize("patch_size", [3])
 @pytest.mark.parametrize("hpx_padding_mode", ["karlbauer", "isolatitude"])
