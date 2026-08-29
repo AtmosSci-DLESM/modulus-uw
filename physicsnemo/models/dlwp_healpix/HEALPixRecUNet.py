@@ -482,16 +482,30 @@ class HEALPixRecUNet(Module):
         -------
         th.Tensor: Predicted outputs
         """
-        self.reset()
+        # Do not call self.reset() at the top of every forward. Finite reset_cycle
+        # still re-zeros via _initialize_hidden when hours % reset_cycle == 0
+        # (always true at step 0). With reset_cycle=inf, wiping here would discard
+        # GRU state between coupled-inference forward() calls (one per coupler window).
         outputs = []
         for step in range(self.integration_steps):
             # th.cuda.nvtx.range_push(f"Integration step: {step}")
             # (Re-)initialize recurrent hidden states
-            if (step * (self.delta_t * self.input_time_dim)) % self.reset_cycle == 0:
+            hours = step * (self.delta_t * self.input_time_dim)
+            if self.reset_cycle == float("inf"):
+                # 0 % inf == 0, so the finite-cycle modulo would re-prime every
+                # forward at step 0. Honor "never reset" after the first prime so
+                # hidden state carries across coupler windows when inference sets
+                # reset_cycle=inf (disable_*_recurrent_reset).
+                need_init = not getattr(self, "_recurrent_hidden_primed", False)
+            else:
+                need_init = (hours % self.reset_cycle) == 0
+            if need_init:
                 if conditions_cln is not None:
                     self._initialize_hidden(inputs=inputs, outputs=outputs, step=step, conditions_cln=conditions_cln[step])
                 else:
                     self._initialize_hidden(inputs=inputs, outputs=outputs, step=step)
+                if self.reset_cycle == float("inf"):
+                    self._recurrent_hidden_primed = True
 
             # Construct concatenated input: [prognostics|TISR|constants]
             if step == 0:
@@ -575,3 +589,5 @@ class HEALPixRecUNet(Module):
         """Resets the state of the network"""
         self.encoder.reset()
         self.decoder.reset()
+        # Allow a later forward to re-prime when reset_cycle is inf.
+        self._recurrent_hidden_primed = False
