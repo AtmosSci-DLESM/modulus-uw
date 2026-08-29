@@ -655,6 +655,52 @@ def test_PatchedEnergyScoreLoss_one_member_zero_and_matches_patch_mae(
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 @pytest.mark.parametrize("patch_size", [3, 5])
+def test_PatchedEnergyScoreLoss_default_uniform_weights_mae_scale(device, patch_size):
+    """Default (no sigma) uses uniform 1/D weights → flat residual scores |ε| like MAE."""
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    b, f, t, c, h, w = 1, 12, 1, 1, 16, 16
+    D = patch_size ** 2
+    loss_fn = PatchedEnergyScoreLoss(
+        weights=[1.0],
+        n_members=1,
+        patch_size=patch_size,
+        hpx_padding_mode="karlbauer",
+        enable_nhwc=False,
+        nside=h,
+        patch_weight_sigma=None,
+    )
+    trainer = trainer_helper(output_variables=["var0"], device=device)
+    loss_fn.setup(trainer)
+
+    assert loss_fn.patch_weights is not None
+    assert torch.allclose(
+        loss_fn.patch_weights.sum(), torch.tensor(1.0, device=device), atol=1e-6
+    )
+    assert torch.allclose(
+        loss_fn.patch_weights,
+        torch.full_like(loss_fn.patch_weights, 1.0 / D),
+        atol=1e-6,
+    )
+
+    eps = 0.5
+    target = torch.zeros(b, f, t, c, h, w, device=device)
+    prediction = torch.full_like(target, eps)
+    loss = loss_fn(prediction, target, average_channels=True)
+    # Uniform 1/D: sqrt(mean(r^2)) = |eps|; also equals ||r||_2 / sqrt(D)
+    assert torch.isclose(
+        loss, torch.tensor(eps, device=device, dtype=loss.dtype), rtol=1e-5, atol=1e-5
+    )
+
+    diff = torch.full((1, D, 4), eps, device=device)
+    weighted = loss_fn._weighted_patch_norm(diff, patch_dim=-2)
+    unnorm = torch.linalg.vector_norm(diff, dim=-2)
+    assert torch.allclose(weighted, unnorm / (D ** 0.5), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+@pytest.mark.parametrize("patch_size", [3, 5])
 @pytest.mark.parametrize("hpx_padding_mode", ["earth2grid", "karlbauer", "isolatitude"])
 @pytest.mark.parametrize("enable_nhwc", [True, False])
 @pytest.mark.parametrize("patch_weight_sigma", [None, 1.0])
