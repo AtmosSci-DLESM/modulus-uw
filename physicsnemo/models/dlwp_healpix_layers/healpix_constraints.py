@@ -35,6 +35,32 @@ def replace_value_keep_gradient(
     return x + (new_value - x).detach()
 
 
+class _ClampSTEInterior(torch.autograd.Function):
+    """Hard clamp in forward; STE backward only when ``∂L/∂y`` points into bounds.
+
+    Below the lower bound, pass ``grad_output`` only if it is negative (increase
+    toward the interior). Above the upper bound, pass it only if it is positive
+    (decrease toward the interior). Inside the bounds the clamp is identity.
+    """
+
+    @staticmethod
+    def forward(ctx, x, lower, upper):
+        ctx.save_for_backward(x, lower, upper)
+        return torch.minimum(torch.maximum(x, lower), upper)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, lower, upper = ctx.saved_tensors
+        below = x < lower
+        above = x > upper
+        inside = ~(below | above)
+        zeros = torch.zeros_like(grad_output)
+        grad = torch.where(inside, grad_output, zeros)
+        grad = torch.where(below & (grad_output < 0), grad_output, grad)
+        grad = torch.where(above & (grad_output > 0), grad_output, grad)
+        return grad, None, None
+
+
 class NonnegativeConstraint(torch.nn.Module):
     def __init__(
         self,
@@ -112,6 +138,7 @@ class BoundedConstraint(torch.nn.Module):
         out_channels: list[str] | None = None,
         scaling: dict[str, dict[str, float]] | None = None,
         keep_grad_through_clamp: bool = False,
+        ste_interior_only: bool = False,
     ):
         """
         Clamp model outputs to optional physical lower and/or upper bounds.
@@ -135,6 +162,10 @@ class BoundedConstraint(torch.nn.Module):
         keep_grad_through_clamp: bool, optional
             If True, apply clamps with a straight-through estimator so
             saturated cells still receive a learning signal. Default False.
+        ste_interior_only: bool, optional
+            If True, require ``keep_grad_through_clamp`` and pass saturated
+            gradients only when they point toward the feasible set (increase
+            below a lower bound, decrease above an upper bound). Default False.
         """
         super().__init__()
         lower_bounds = lower_bounds or {}
@@ -144,6 +175,11 @@ class BoundedConstraint(torch.nn.Module):
                 "BoundedConstraint requires at least one of lower_bounds or "
                 "upper_bounds."
             )
+        if ste_interior_only and not keep_grad_through_clamp:
+            raise ValueError(
+                "BoundedConstraint ste_interior_only=True requires "
+                "keep_grad_through_clamp=True."
+            )
 
         if out_channels is not None:
             self.channels = out_channels
@@ -151,6 +187,7 @@ class BoundedConstraint(torch.nn.Module):
             self.channels = in_channels
         self.scaling = scaling
         self.keep_grad_through_clamp = keep_grad_through_clamp
+        self.ste_interior_only = ste_interior_only
 
         requested = set(lower_bounds) | set(upper_bounds)
         for name in requested:
@@ -208,6 +245,8 @@ class BoundedConstraint(torch.nn.Module):
         '''
         lower = self.lower_thresholds.to(dtype=prediction.dtype)
         upper = self.upper_thresholds.to(dtype=prediction.dtype)
+        if self.keep_grad_through_clamp and self.ste_interior_only:
+            return _ClampSTEInterior.apply(prediction, lower, upper)
         clamped = torch.maximum(prediction, lower)
         clamped = torch.minimum(clamped, upper)
         if self.keep_grad_through_clamp:

@@ -627,6 +627,62 @@ def test_bounded_keep_grad_through_clamp_passes_gradient():
     torch.testing.assert_close(x_ste.grad, torch.ones_like(raw))
 
 
+def _bounded_interior_mod():
+    channels = ["x"]
+    scaling = {"x": {"mean": 0.0, "std": 1.0}}
+    return BoundedConstraint(
+        lower_bounds={"x": 0.0},
+        upper_bounds={"x": 2.0},
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+        keep_grad_through_clamp=True,
+        ste_interior_only=True,
+    )
+
+
+def test_bounded_ste_interior_only_requires_keep_grad():
+    with pytest.raises(ValueError, match="ste_interior_only"):
+        BoundedConstraint(
+            lower_bounds={"x": 0.0},
+            in_channels=["x"],
+            out_channels=["x"],
+            scaling={"x": {"mean": 0.0, "std": 1.0}},
+            keep_grad_through_clamp=False,
+            ste_interior_only=True,
+        )
+
+
+def test_bounded_ste_interior_only_forward_clamps():
+    mod = _bounded_interior_mod()
+    prediction = torch.tensor([[[[[[-1.0, 1.0, 3.0]]]]]])
+    torch.testing.assert_close(
+        mod(prediction, prediction),
+        torch.tensor([[[[[[0.0, 1.0, 2.0]]]]]]),
+    )
+
+
+def test_bounded_ste_interior_only_blocks_outward_grad():
+    mod = _bounded_interior_mod()
+    raw = torch.tensor([[[[[[-1.0, 1.0, 3.0]]]]]])
+    x = raw.clone().requires_grad_(True)
+    # grad_output = 1 everywhere: below-lower blocked, inside passed,
+    # above-upper passed (decrease is toward the interior).
+    mod(x, x).sum().backward()
+    torch.testing.assert_close(
+        x.grad, torch.tensor([[[[[[0.0, 1.0, 1.0]]]]]])
+    )
+
+
+def test_bounded_ste_interior_only_passes_inward_grad():
+    mod = _bounded_interior_mod()
+    raw = torch.tensor([[[[[[-1.0, 1.0, 3.0]]]]]])
+    x = raw.clone().requires_grad_(True)
+    weights = torch.tensor([[[[[[-1.0, 1.0, 1.0]]]]]])
+    (mod(x, x) * weights).sum().backward()
+    torch.testing.assert_close(x.grad, weights)
+
+
 def test_bounded_torch_compile_forward():
     channels = ["x", "y"]
     scaling = {
