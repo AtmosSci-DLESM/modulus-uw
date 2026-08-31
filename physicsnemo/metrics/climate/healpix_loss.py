@@ -1090,8 +1090,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
     patch vector versus the target, analogous to CRPS→MAE.
 
     Weighted norms are ``||v ⊙ √w||₂`` via ``torch.linalg.vector_norm`` so
-    zero / identical-member residuals keep a finite zero subgradient (no
-    ``norm_eps`` floor required).
+    zero / identical-member residuals keep a finite zero subgradient.
     """
 
     def __init__(
@@ -1109,7 +1108,6 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         patch_weight_sigma: float = None,
         channel_chunk_size: int | None = None,
         cast_to_fp32: bool = True,
-        norm_eps: float = 0.0,
     ):
         """
         Parameters
@@ -1149,9 +1147,6 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         cast_to_fp32: bool, optional
             If True (default), cast prediction/target to float32 before scoring.
             Set False to keep the incoming dtype for native AMP.
-        norm_eps: float, optional
-            Ignored. Retained for Hydra/config compatibility with older YAMLs.
-            Zero-residual gradients are already finite via ``vector_norm``.
         """
         super().__init__()
         if n_members < 1:
