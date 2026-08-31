@@ -520,25 +520,28 @@ def test_PatchedEnergyScoreLoss_two_member_fast_matches_pairwise(
 
     fast = loss_fn._energy_score_field(pred, target, n_members, b, f, t, c, h, w).mean()
 
+    # Pairwise reduction (same as the n>2 branch of _energy_score_field).
+    n = n_members
+    pred_nchw = pred.permute(0, 1, 3, 2, 4, 5, 6).reshape(n * b * t * f, c, h, w)
+    pred_pad = loss_fn._pad_faces(pred_nchw)
     with torch.no_grad():
-        tar_unfold = loss_fn._unfold_target(target)
-    pred_unfold = loss_fn._unfold_prediction_members(pred)
-    diff_to_target = loss_fn._reshape_member_norms(
-        loss_fn._weighted_patch_norm(pred_unfold - tar_unfold.unsqueeze(0), patch_dim=-2),
-        b, f, t, c, h, w,
-    )
-    diff_i = diff_to_target
-    pred_i = pred_unfold.unsqueeze(1)
-    pred_j = pred_unfold.unsqueeze(0)
-    dist_ensemble = loss_fn._weighted_patch_norm(pred_i - pred_j, patch_dim=-2)
-    dist_ensemble = dist_ensemble.view(n_members, n_members, b, t, f, c, h, w).permute(
-        0, 1, 2, 4, 3, 5, 6, 7
-    )
+        tar_nchw = target.permute(0, 2, 1, 3, 4, 5).reshape(b * t * f, c, h, w)
+        tar_pad = loss_fn._pad_faces(tar_nchw)
+    btf = b * t * f
+    hp, wp = pred_pad.shape[-2], pred_pad.shape[-1]
+    p = pred_pad.view(n, btf, c, hp, wp)
+    skill = loss_fn._patch_l2(
+        (p - tar_pad.unsqueeze(0)).reshape(n * btf, c, hp, wp)
+    ).view(n, b, t, f, c, h, w).permute(0, 1, 3, 2, 4, 5, 6)
+    dist = loss_fn._patch_l2(
+        (p.unsqueeze(1) - p.unsqueeze(0)).reshape(n * n * btf, c, hp, wp)
+    ).view(n, n, b, t, f, c, h, w).permute(0, 1, 2, 4, 3, 5, 6, 7)
     mask = loss_fn.diag_mask[:, :, None, None, None, None, None, None]
-    diff_terms = mask * (diff_i.unsqueeze(0) + diff_i.unsqueeze(1))
-    dist_terms = mask * dist_ensemble
     pairwise = (
-        loss_fn.averaging_coeff * (diff_terms - loss_fn.coeff_eps * dist_terms).sum(dim=(0, 1))
+        loss_fn.averaging_coeff
+        * (mask * (skill.unsqueeze(0) + skill.unsqueeze(1) - loss_fn.coeff_eps * dist)).sum(
+            dim=(0, 1)
+        )
     ).mean()
 
     assert torch.isclose(fast, pairwise, rtol=1e-5, atol=1e-5)
