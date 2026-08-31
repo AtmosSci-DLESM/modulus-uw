@@ -603,7 +603,7 @@ def test_PatchedEnergyScoreLoss_rejects_zero_members():
 def test_PatchedEnergyScoreLoss_zero_residual_finite_grad(
     device, patch_weight_sigma, n_members
 ):
-    """vector_norm(v⊙√w) keeps finite zero grads (no norm_eps floor)."""
+    """vector_norm(v⊙√w) keeps finite zero grads at identical-member residuals."""
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
