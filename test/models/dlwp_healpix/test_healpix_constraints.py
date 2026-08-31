@@ -336,11 +336,10 @@ def test_nonnegative_keep_grad_through_clamp_forward_unchanged():
     )
 
 
-def test_nonnegative_keep_grad_through_clamp_passes_gradient():
-    """Below-threshold cells get zero grad with plain clamp, identity with STE."""
+def test_nonnegative_keep_grad_through_clamp_blocks_outward_grad():
+    """Plain clamp zeros saturated grads; STE with grad_output=1 blocks below-lower."""
     channels = ["x"]
     scaling = {"x": {"mean": 0.0, "std": 1.0}}
-    # One saturated-negative cell and one interior cell
     raw = torch.tensor([[[[[[-2.0, 1.0]]]]]])
 
     plain = NonnegativeConstraint(
@@ -367,20 +366,26 @@ def test_nonnegative_keep_grad_through_clamp_passes_gradient():
     out = ste(x_ste, x_ste)
     torch.testing.assert_close(out, torch.tensor([[[[[[0.0, 1.0]]]]]]))
     out.sum().backward()
-    torch.testing.assert_close(x_ste.grad, torch.ones_like(raw))
-
-
-def test_replace_value_keep_gradient_identity_backward():
-    from physicsnemo.models.dlwp_healpix_layers.healpix_constraints import (
-        replace_value_keep_gradient,
+    torch.testing.assert_close(
+        x_ste.grad, torch.tensor([[[[[[0.0, 1.0]]]]]])
     )
 
-    x = torch.tensor([-1.0, 0.5, 2.0], requires_grad=True)
-    new_value = torch.clamp(x, min=0.0)
-    out = replace_value_keep_gradient(x, new_value)
-    torch.testing.assert_close(out, torch.tensor([0.0, 0.5, 2.0]))
-    out.sum().backward()
-    torch.testing.assert_close(x.grad, torch.ones_like(x))
+def test_nonnegative_keep_grad_through_clamp_passes_inward_grad():
+    """STE below the lower bound passes grad_output when it points into bounds."""
+    channels = ["x"]
+    scaling = {"x": {"mean": 0.0, "std": 1.0}}
+    raw = torch.tensor([[[[[[-2.0, 1.0]]]]]])
+    ste = NonnegativeConstraint(
+        variables=["x"],
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+        keep_grad_through_clamp=True,
+    )
+    x = raw.clone().requires_grad_(True)
+    weights = torch.tensor([[[[[[-1.0, 1.0]]]]]])
+    (ste(x, x) * weights).sum().backward()
+    torch.testing.assert_close(x.grad, weights)
 
 
 def _reference_bounded_forward(
@@ -593,7 +598,7 @@ def test_bounded_keep_grad_through_clamp_forward_unchanged():
     )
 
 
-def test_bounded_keep_grad_through_clamp_passes_gradient():
+def test_bounded_keep_grad_through_clamp_blocks_outward_grad():
     channels = ["x"]
     scaling = {"x": {"mean": 0.0, "std": 1.0}}
     raw = torch.tensor([[[[[[-1.0, 1.0, 3.0]]]]]])
@@ -623,63 +628,29 @@ def test_bounded_keep_grad_through_clamp_passes_gradient():
     x_ste = raw.clone().requires_grad_(True)
     out = ste(x_ste, x_ste)
     torch.testing.assert_close(out, torch.tensor([[[[[[0.0, 1.0, 2.0]]]]]]))
+    # grad_output = 1: below-lower blocked, inside passed, above-upper passed
+    # (decrease is toward the interior).
     out.sum().backward()
-    torch.testing.assert_close(x_ste.grad, torch.ones_like(raw))
+    torch.testing.assert_close(
+        x_ste.grad, torch.tensor([[[[[[0.0, 1.0, 1.0]]]]]])
+    )
 
 
-def _bounded_interior_mod():
+def test_bounded_keep_grad_through_clamp_passes_inward_grad():
     channels = ["x"]
     scaling = {"x": {"mean": 0.0, "std": 1.0}}
-    return BoundedConstraint(
+    raw = torch.tensor([[[[[[-1.0, 1.0, 3.0]]]]]])
+    ste = BoundedConstraint(
         lower_bounds={"x": 0.0},
         upper_bounds={"x": 2.0},
         in_channels=channels,
         out_channels=channels,
         scaling=scaling,
         keep_grad_through_clamp=True,
-        ste_interior_only=True,
     )
-
-
-def test_bounded_ste_interior_only_requires_keep_grad():
-    with pytest.raises(ValueError, match="ste_interior_only"):
-        BoundedConstraint(
-            lower_bounds={"x": 0.0},
-            in_channels=["x"],
-            out_channels=["x"],
-            scaling={"x": {"mean": 0.0, "std": 1.0}},
-            keep_grad_through_clamp=False,
-            ste_interior_only=True,
-        )
-
-
-def test_bounded_ste_interior_only_forward_clamps():
-    mod = _bounded_interior_mod()
-    prediction = torch.tensor([[[[[[-1.0, 1.0, 3.0]]]]]])
-    torch.testing.assert_close(
-        mod(prediction, prediction),
-        torch.tensor([[[[[[0.0, 1.0, 2.0]]]]]]),
-    )
-
-
-def test_bounded_ste_interior_only_blocks_outward_grad():
-    mod = _bounded_interior_mod()
-    raw = torch.tensor([[[[[[-1.0, 1.0, 3.0]]]]]])
-    x = raw.clone().requires_grad_(True)
-    # grad_output = 1 everywhere: below-lower blocked, inside passed,
-    # above-upper passed (decrease is toward the interior).
-    mod(x, x).sum().backward()
-    torch.testing.assert_close(
-        x.grad, torch.tensor([[[[[[0.0, 1.0, 1.0]]]]]])
-    )
-
-
-def test_bounded_ste_interior_only_passes_inward_grad():
-    mod = _bounded_interior_mod()
-    raw = torch.tensor([[[[[[-1.0, 1.0, 3.0]]]]]])
     x = raw.clone().requires_grad_(True)
     weights = torch.tensor([[[[[[-1.0, 1.0, 1.0]]]]]])
-    (mod(x, x) * weights).sum().backward()
+    (ste(x, x) * weights).sum().backward()
     torch.testing.assert_close(x.grad, weights)
 
 
