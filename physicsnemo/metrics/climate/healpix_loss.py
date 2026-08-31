@@ -1088,10 +1088,10 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
     With ``n_members=1`` the pairwise spread term is undefined and the loss
     collapses to patched MAE: the spatially weighted Euclidean norm of each
     patch vector versus the target, analogous to CRPS→MAE.
-    ``norm_eps=0`` (default) is that exact energy score / patched MAE.
-    ``norm_eps>0`` uses the smoothed floor ``sqrt(sum_k w_k v_k^2 + norm_eps)``
-    (n=1 is then smoothed patched MAE; a perfect forecast scores
-    ``sqrt(norm_eps)`` rather than 0).
+
+    Weighted norms are ``||v ⊙ √w||₂`` via ``torch.linalg.vector_norm`` so
+    zero / identical-member residuals keep a finite zero subgradient (no
+    ``norm_eps`` floor required).
     """
 
     def __init__(
@@ -1150,16 +1150,12 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             If True (default), cast prediction/target to float32 before scoring.
             Set False to keep the incoming dtype for native AMP.
         norm_eps: float, optional
-            Forward floor on patch Euclidean norms:
-            ``sqrt(sum_k w_k v_k^2 + norm_eps)`` when ``norm_eps > 0``.
-            Default ``0.0`` keeps the unsmoothed weighted-sqrt path (exact
-            energy score). Must be ``>= 0``.
+            Ignored. Retained for Hydra/config compatibility with older YAMLs.
+            Zero-residual gradients are already finite via ``vector_norm``.
         """
         super().__init__()
         if n_members < 1:
             raise ValueError("n_members must be at least 1")
-        if norm_eps < 0:
-            raise ValueError("norm_eps must be >= 0")
         self.n_members = n_members
         self.loss_weights = th.tensor(weights)
         self.device = None
@@ -1173,7 +1169,6 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         self.nside = nside
         self.channel_chunk_size = channel_chunk_size
         self.cast_to_fp32 = cast_to_fp32
-        self.norm_eps = float(norm_eps)
 
         # Patch-position weights (row-major, sum=1): Gaussian if sigma set, else uniform 1/D.
         D = patch_size ** 2
@@ -1233,18 +1228,16 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
 
     def _weighted_patch_norm(self, diff_vec: th.Tensor, patch_dim: int = -1) -> th.Tensor:
         """
-        Weighted L2 norm over the patch dimension: sqrt(sum_k w_k * v_k^2).
-        Weights always sum to 1 (uniform 1/D or Gaussian). ``patch_dim=-1`` for
-        [..., D]; ``patch_dim=-2`` for unfold layout [..., D, HW].
-        With ``norm_eps > 0`` this is ``sqrt(sumsq + norm_eps)``.
+        Weighted L2 norm over the patch dimension: ``||v ⊙ √w||₂``.
+        Uses ``torch.linalg.vector_norm`` so a zero residual has a finite zero
+        subgradient (unlike hand-rolled ``sqrt(sum w v^2)``). Weights always
+        sum to 1 (uniform 1/D or Gaussian). ``patch_dim=-1`` for [..., D];
+        ``patch_dim=-2`` for unfold layout [..., D, HW].
         """
         w = self.patch_weights
         if patch_dim == -2:
             w = w.unsqueeze(-1)
-        sq = (diff_vec ** 2 * w).sum(dim=patch_dim).clamp(min=0.0)
-        if self.norm_eps > 0:
-            return th.sqrt(sq + self.norm_eps)
-        return th.sqrt(sq)
+        return th.linalg.vector_norm(diff_vec * w.sqrt(), dim=patch_dim)
 
     def _pad_and_unfold(self, x: th.Tensor) -> th.Tensor:
         """Pad HEALPix faces if needed, then unfold to [N*C, D, H*W]."""
@@ -1411,10 +1404,10 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
                     w,
                 )
 
-        es *= self.lsm_tensor
+        es = es * self.lsm_tensor
 
         # Apply channel weights (per-variable scaling)
-        es *= self.loss_weights[None, None, None, :, None, None]
+        es = es * self.loss_weights[None, None, None, :, None, None]
 
         if average_channels:
             loss = es.mean()
