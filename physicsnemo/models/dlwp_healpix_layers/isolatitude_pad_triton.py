@@ -10,6 +10,9 @@ chain is a large fraction of CUDA-graph time. These Triton kernels gather (fwd)
 and scatter-add (bwd) using the same precomputed indices, writing the output
 directly in the requested memory format so the extra copies are unnecessary.
 
+Each program covers a ``[BLOCK_O, BLOCK_C]`` tile of output pixels × channels.
+One-pixel programs were launch-bound at nside=64 (~50k spatial programs).
+
 ``index1[o] < 0`` means a single source (``out = x[index0]``); otherwise
 ``out = 0.5 * (x[index0] + x[index1])``.
 """
@@ -19,6 +22,9 @@ from __future__ import annotations
 import torch as th
 
 _HPX_FACES = 12
+# Output pixels per program. H100 nside=64 C=256 NHWC bf16: 1→0.46ms fwd, 8→0.15ms;
+# 64+ slows down; 256 regresses past the one-pixel grid.
+_BLOCK_O = 8
 
 try:
     import triton
@@ -48,6 +54,7 @@ if _HAVE_TRITON:
         W,
         Hp,
         Wp,
+        nout,
         stride_xn,
         stride_xc,
         stride_xh,
@@ -56,24 +63,28 @@ if _HAVE_TRITON:
         stride_yc,
         stride_yh,
         stride_yw,
+        BLOCK_O: tl.constexpr,
         BLOCK_C: tl.constexpr,
         FACES: tl.constexpr,
     ):
         b = tl.program_id(0)
-        o = tl.program_id(1)
+        o0 = tl.program_id(1) * BLOCK_O
         c0 = tl.program_id(2) * BLOCK_C
+        offs_o = o0 + tl.arange(0, BLOCK_O)
         offs_c = c0 + tl.arange(0, BLOCK_C)
+        mask_o = offs_o < nout
         mask_c = offs_c < C
+        mask = mask_o[:, None] & mask_c[None, :]
 
         face_out = Hp * Wp
         in_area = H * W
-        f = o // face_out
-        rem = o - f * face_out
+        f = offs_o // face_out
+        rem = offs_o - f * face_out
         hp = rem // Wp
         wp = rem - hp * Wp
 
-        s0 = tl.load(index0_ptr + o)
-        s1 = tl.load(index1_ptr + o)
+        s0 = tl.load(index0_ptr + offs_o, mask=mask_o, other=0)
+        s1 = tl.load(index1_ptr + offs_o, mask=mask_o, other=-1)
 
         f0 = s0 // in_area
         hw0 = s0 - f0 * in_area
@@ -82,21 +93,39 @@ if _HAVE_TRITON:
         n0 = b * FACES + f0
         n_out = b * FACES + f
 
-        x0 = x_ptr + n0 * stride_xn + h0 * stride_xh + w0 * stride_xw + offs_c * stride_xc
-        v = tl.load(x0, mask=mask_c, other=0)
+        x0 = (
+            x_ptr
+            + n0[:, None] * stride_xn
+            + h0[:, None] * stride_xh
+            + w0[:, None] * stride_xw
+            + offs_c[None, :] * stride_xc
+        )
+        v = tl.load(x0, mask=mask, other=0)
 
-        blend = s1 >= 0
+        blend = (s1 >= 0)[:, None]
         f1 = s1 // in_area
         hw1 = s1 - f1 * in_area
         h1 = hw1 // W
         w1 = hw1 - h1 * W
         n1 = b * FACES + f1
-        x1 = x_ptr + n1 * stride_xn + h1 * stride_xh + w1 * stride_xw + offs_c * stride_xc
-        v1 = tl.load(x1, mask=mask_c & blend, other=0)
+        x1 = (
+            x_ptr
+            + n1[:, None] * stride_xn
+            + h1[:, None] * stride_xh
+            + w1[:, None] * stride_xw
+            + offs_c[None, :] * stride_xc
+        )
+        v1 = tl.load(x1, mask=mask & blend, other=0)
         v = tl.where(blend, (v + v1) * 0.5, v)
 
-        y = y_ptr + n_out * stride_yn + hp * stride_yh + wp * stride_yw + offs_c * stride_yc
-        tl.store(y, v, mask=mask_c)
+        y = (
+            y_ptr
+            + n_out[:, None] * stride_yn
+            + hp[:, None] * stride_yh
+            + wp[:, None] * stride_yw
+            + offs_c[None, :] * stride_yc
+        )
+        tl.store(y, v, mask=mask)
 
     @triton.jit
     def _isolatitude_pad_bwd_kernel(
@@ -110,6 +139,7 @@ if _HAVE_TRITON:
         W,
         Hp,
         Wp,
+        nout,
         stride_gxn,
         stride_gxc,
         stride_gxh,
@@ -118,29 +148,39 @@ if _HAVE_TRITON:
         stride_gyc,
         stride_gyh,
         stride_gyw,
+        BLOCK_O: tl.constexpr,
         BLOCK_C: tl.constexpr,
         FACES: tl.constexpr,
     ):
         b = tl.program_id(0)
-        o = tl.program_id(1)
+        o0 = tl.program_id(1) * BLOCK_O
         c0 = tl.program_id(2) * BLOCK_C
+        offs_o = o0 + tl.arange(0, BLOCK_O)
         offs_c = c0 + tl.arange(0, BLOCK_C)
+        mask_o = offs_o < nout
         mask_c = offs_c < C
+        mask = mask_o[:, None] & mask_c[None, :]
 
         face_out = Hp * Wp
         in_area = H * W
-        f = o // face_out
-        rem = o - f * face_out
+        f = offs_o // face_out
+        rem = offs_o - f * face_out
         hp = rem // Wp
         wp = rem - hp * Wp
         n_out = b * FACES + f
 
-        gy = gy_ptr + n_out * stride_gyn + hp * stride_gyh + wp * stride_gyw + offs_c * stride_gyc
-        g = tl.load(gy, mask=mask_c, other=0)
+        gy = (
+            gy_ptr
+            + n_out[:, None] * stride_gyn
+            + hp[:, None] * stride_gyh
+            + wp[:, None] * stride_gyw
+            + offs_c[None, :] * stride_gyc
+        )
+        g = tl.load(gy, mask=mask, other=0)
 
-        s0 = tl.load(index0_ptr + o)
-        s1 = tl.load(index1_ptr + o)
-        blend = s1 >= 0
+        s0 = tl.load(index0_ptr + offs_o, mask=mask_o, other=0)
+        s1 = tl.load(index1_ptr + offs_o, mask=mask_o, other=-1)
+        blend = (s1 >= 0)[:, None]
         g0 = tl.where(blend, g * 0.5, g)
 
         f0 = s0 // in_area
@@ -148,16 +188,28 @@ if _HAVE_TRITON:
         h0 = hw0 // W
         w0 = hw0 - h0 * W
         n0 = b * FACES + f0
-        gx0 = gx_ptr + n0 * stride_gxn + h0 * stride_gxh + w0 * stride_gxw + offs_c * stride_gxc
-        tl.atomic_add(gx0, g0, mask=mask_c)
+        gx0 = (
+            gx_ptr
+            + n0[:, None] * stride_gxn
+            + h0[:, None] * stride_gxh
+            + w0[:, None] * stride_gxw
+            + offs_c[None, :] * stride_gxc
+        )
+        tl.atomic_add(gx0, g0, mask=mask)
 
         f1 = s1 // in_area
         hw1 = s1 - f1 * in_area
         h1 = hw1 // W
         w1 = hw1 - h1 * W
         n1 = b * FACES + f1
-        gx1 = gx_ptr + n1 * stride_gxn + h1 * stride_gxh + w1 * stride_gxw + offs_c * stride_gxc
-        tl.atomic_add(gx1, g0, mask=mask_c & blend)
+        gx1 = (
+            gx_ptr
+            + n1[:, None] * stride_gxn
+            + h1[:, None] * stride_gxh
+            + w1[:, None] * stride_gxw
+            + offs_c[None, :] * stride_gxc
+        )
+        tl.atomic_add(gx1, g0, mask=mask & blend)
 
 
 def _block_c(channels: int) -> int:
@@ -176,7 +228,8 @@ def _launch_fwd(x: th.Tensor, y: th.Tensor, index0: th.Tensor, index1: th.Tensor
     B = BF // _HPX_FACES
     nout = _HPX_FACES * Hp * Wp
     block_c = _block_c(C)
-    grid = (B, nout, triton.cdiv(C, block_c))
+    block_o = int(_BLOCK_O)
+    grid = (B, triton.cdiv(nout, block_o), triton.cdiv(C, block_c))
     _isolatitude_pad_fwd_kernel[grid](
         x,
         y,
@@ -188,6 +241,7 @@ def _launch_fwd(x: th.Tensor, y: th.Tensor, index0: th.Tensor, index1: th.Tensor
         W,
         Hp,
         Wp,
+        nout,
         x.stride(0),
         x.stride(1),
         x.stride(2),
@@ -196,6 +250,7 @@ def _launch_fwd(x: th.Tensor, y: th.Tensor, index0: th.Tensor, index1: th.Tensor
         y.stride(1),
         y.stride(2),
         y.stride(3),
+        BLOCK_O=block_o,
         BLOCK_C=block_c,
         FACES=_HPX_FACES,
     )
@@ -207,7 +262,8 @@ def _launch_bwd(gy: th.Tensor, gx: th.Tensor, index0: th.Tensor, index1: th.Tens
     B = BF // _HPX_FACES
     nout = _HPX_FACES * Hp * Wp
     block_c = _block_c(C)
-    grid = (B, nout, triton.cdiv(C, block_c))
+    block_o = int(_BLOCK_O)
+    grid = (B, triton.cdiv(nout, block_o), triton.cdiv(C, block_c))
     _isolatitude_pad_bwd_kernel[grid](
         gy,
         gx,
@@ -219,6 +275,7 @@ def _launch_bwd(gy: th.Tensor, gx: th.Tensor, index0: th.Tensor, index1: th.Tens
         W,
         Hp,
         Wp,
+        nout,
         gx.stride(0),
         gx.stride(1),
         gx.stride(2),
@@ -227,6 +284,7 @@ def _launch_bwd(gy: th.Tensor, gx: th.Tensor, index0: th.Tensor, index1: th.Tens
         gy.stride(1),
         gy.stride(2),
         gy.stride(3),
+        BLOCK_O=block_o,
         BLOCK_C=block_c,
         FACES=_HPX_FACES,
     )
