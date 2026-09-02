@@ -37,6 +37,7 @@ Details on the HEALPix can be found at https://iopscience.iop.org/article/10.108
 from __future__ import annotations
 
 import logging
+import os
 
 import torch as th
 
@@ -50,6 +51,15 @@ try:
 except ImportError:
     logger.warning("Could not import pad from earth2grid.healpix.")
     have_earth2grid = False
+
+try:
+    from .isolatitude_pad_triton import (
+        isolatitude_pad_cuda_available,
+        isolatitude_pad_triton,
+    )
+except ImportError:
+    isolatitude_pad_cuda_available = lambda: False  # noqa: E731
+    isolatitude_pad_triton = None
 
 _ENABLE_HEALPIXPAD_DEPRECATION_MSG = (
     "enable_healpixpad is deprecated; use hpx_padding_mode instead "
@@ -678,8 +688,11 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
     """
     Isolatitude HEALPix padding via **precomputed gather** indices.
 
-    Indices are derived once from ``isolatitude_pad_folded``, then each forward is a small
-    number of ``gather`` and average steps.
+    Indices are derived once from ``isolatitude_pad_folded``. On CUDA a fused
+    Triton gather (forward) / scatter-add (backward) writes the padded tensor
+    in-place in NCHW or NHWC so the training path does not permute, clone, then
+    copy to channels-last. CPU (and ``PHYSICSNEMO_ISOLATITUDE_PAD=aten``) keep
+    the original ATen gather implementation.
     """
 
     def __init__(
@@ -713,6 +726,8 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             )
         idx, valid = build_isolatitude_gather_index(padding, nside)
         self.register_buffer("_index0", idx[0], persistent=False) # always 1
+        # Dense second source; -1 means "no blend" (used by the fused CUDA kernel).
+        self.register_buffer("_index1_or_neg1", idx[1].to(dtype=th.int32), persistent=False)
         self.register_buffer("_index1", idx[1].clamp_min(0), persistent=False)
 
         # Boolean mask for the second gather source
@@ -756,7 +771,28 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
                 f"(from init), but input has H={H}. Make sure that nside was set correctly "
                 f"in the model config."
             )
-        
+        if BF % F != 0:
+            raise ValueError(
+                f"Folded batch {BF} is not divisible by {F} HEALPix faces"
+            )
+
+        # Fused gather/scatter keeps NHWC (or NCHW) without permute+clone+copy.
+        # CPU, missing Triton, or PHYSICSNEMO_ISOLATITUDE_PAD=aten use ATen gather.
+        use_fused = (
+            data.is_cuda
+            and isolatitude_pad_triton is not None
+            and isolatitude_pad_cuda_available()
+            and os.environ.get("PHYSICSNEMO_ISOLATITUDE_PAD", "triton") != "aten"
+        )
+        if use_fused:
+            return isolatitude_pad_triton(
+                data,
+                self._index0,
+                self._index1_or_neg1,
+                self.p,
+                self.enable_nhwc,
+            )
+
         x = data.reshape(B, F, C, H, W)
         flat = x.permute(0, 2, 1, 3, 4).reshape(B, C, F * H * W)
 
