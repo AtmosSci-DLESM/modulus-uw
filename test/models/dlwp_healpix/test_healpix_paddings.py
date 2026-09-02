@@ -103,6 +103,55 @@ def test_healpix_padding_isolatitude_matches_folded_reference(
 
 
 @import_or_fail("hydra")
+@pytest.mark.parametrize("enable_nhwc", [False, True])
+@pytest.mark.parametrize("dtype", ["fp32", "bf16"])
+def test_isolatitude_pad_triton_matches_gather_fwd_bwd(enable_nhwc, dtype, pytestconfig):
+    """CUDA fused pad must match the ATen gather path in value and input grad."""
+    from physicsnemo.models.dlwp_healpix_layers.healpix_paddings import (
+        HEALPixPaddingIsolatitude,
+    )
+    from physicsnemo.models.dlwp_healpix_layers.isolatitude_pad_triton import (
+        isolatitude_pad_cuda_available,
+    )
+
+    if not isolatitude_pad_cuda_available():
+        pytest.skip("Triton CUDA pad kernel unavailable")
+
+    torch.manual_seed(0)
+    padding, hw, batch_size, c = 1, 16, 2, 8
+    dt = torch.bfloat16 if dtype == "bf16" else torch.float32
+    x_cpu = torch.randn(batch_size * 12, c, hw, hw, dtype=torch.float32)
+    if enable_nhwc:
+        x_cpu = x_cpu.to(memory_format=torch.channels_last)
+    x_cpu = x_cpu.detach().requires_grad_(True)
+
+    pad_cpu = HEALPixPaddingIsolatitude(
+        padding=padding, nside=hw, enable_nhwc=enable_nhwc
+    )
+    y_cpu = pad_cpu(x_cpu)
+    go = torch.randn_like(y_cpu)
+    (g_cpu,) = torch.autograd.grad(y_cpu, x_cpu, go)
+
+    x_gpu = x_cpu.detach().to(device="cuda", dtype=dt).requires_grad_(True)
+    if enable_nhwc:
+        x_gpu = x_gpu.to(memory_format=torch.channels_last)
+    pad_gpu = HEALPixPaddingIsolatitude(
+        padding=padding, nside=hw, enable_nhwc=enable_nhwc
+    ).to("cuda")
+    y_gpu = pad_gpu(x_gpu)
+    go_gpu = go.to(device="cuda", dtype=dt)
+    if enable_nhwc:
+        go_gpu = go_gpu.to(memory_format=torch.channels_last)
+        assert y_gpu.is_contiguous(memory_format=torch.channels_last)
+    (g_gpu,) = torch.autograd.grad(y_gpu, x_gpu, go_gpu)
+
+    rtol = 2.0e-2 if dtype == "bf16" else 1.0e-5
+    atol = 2.0e-2 if dtype == "bf16" else 1.0e-6
+    torch.testing.assert_close(y_gpu.float().cpu(), y_cpu, rtol=rtol, atol=atol)
+    torch.testing.assert_close(g_gpu.float().cpu(), g_cpu, rtol=rtol, atol=atol)
+
+
+@import_or_fail("hydra")
 @pytest.mark.parametrize("padding", [1, 2, 3, 4, 5])
 @pytest.mark.parametrize("hw", [16, 32, 64])
 @pytest.mark.parametrize("enable_nhwc", [False, True])
