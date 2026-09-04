@@ -50,7 +50,6 @@ import xarray as xr
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
-from physicsnemo.datapipes.healpix.zarr_layout import resolve_mask_field
 from .healpix_layers import HEALPixLayer
 from .healpix_paddings import HEALPixFoldFaces, HEALPixUnfoldFaces
 
@@ -115,7 +114,9 @@ def load_spatial_mask(
     """
     ds = _open_mask_dataset(dataset_path)
     try:
-        field = resolve_mask_field(ds, data_var, selection_dict)
+        field = ds[data_var]
+        if selection_dict:
+            field = field.sel(**dict(selection_dict))
         values = np.asarray(field.values, dtype=np.float32)
     finally:
         ds.close()
