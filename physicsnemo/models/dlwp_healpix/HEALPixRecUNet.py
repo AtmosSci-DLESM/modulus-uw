@@ -108,7 +108,9 @@ class HEALPixRecUNet(Module):
         presteps: int, optional
             number of model steps to initialize recurrent states.
         enable_nhwc: bool, optional
-            Model with [N, H, W, C] instead of [N, C, H, W]
+            If True, use channels-last (NHWC) memory format for folded face
+            tensors and HEALPix conv/padding layers. Logical shape stays
+            ``[N, C, H, W]``.
         couplings: list, optional
             sequence of dictionaries that describe coupling mechanisms
         residual_prediction: bool, optional
@@ -194,7 +196,7 @@ class HEALPixRecUNet(Module):
             )
 
         # Build the model layers
-        self.fold = HEALPixFoldFaces()
+        self.fold = HEALPixFoldFaces(enable_nhwc=self.enable_nhwc)
         self.unfold = HEALPixUnfoldFaces(num_faces=12)
         self.encoder = instantiate(
             config=encoder,
@@ -345,8 +347,6 @@ class HEALPixRecUNet(Module):
 
         # fold faces into batch dim (BF, C, H, W)
         res = self.fold(res)
-        if self.enable_nhwc:
-            res = res.to(memory_format=th.channels_last)
         return res
 
     def _reshape_outputs(self, outputs: th.Tensor) -> th.Tensor:
