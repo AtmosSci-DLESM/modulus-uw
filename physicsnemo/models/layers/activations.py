@@ -180,6 +180,25 @@ class CappedGELU(torch.nn.Module):
         self._cap_value = float(cap_value)
         self.compile_forward = compile_forward
 
+    @property
+    def cap_value(self) -> float:
+        """Maximum that values will be capped at."""
+        return self._cap_value
+
+    @cap_value.setter
+    def cap_value(self, value: float) -> None:
+        # Used to keep cap_value in sync with the buffer
+        self._cap_value = float(value)
+        with torch.no_grad():
+            self.cap.fill_(self._cap_value)
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        super()._load_from_state_dict(*args, **kwargs)
+        # `load_state_dict` copies into `cap` in place and so bypasses
+        # __setattr__; the scalar that forward reads has to be refreshed here or
+        # it would silently keep the value passed to __init__.
+        self._cap_value = float(self.cap)
+
     def forward(self, inputs):
         if self.compile_forward:
             return _capped_gelu_compiled(self.gelu, inputs, self._cap_value)
