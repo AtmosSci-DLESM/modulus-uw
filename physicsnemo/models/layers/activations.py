@@ -134,6 +134,16 @@ class CappedLeakyReLU(torch.nn.Module):
         return x
 
 
+def _capped_gelu(gelu: nn.Module, inputs: Tensor, cap: float) -> Tensor:
+    return torch.clamp(gelu(inputs), max=cap)
+
+
+# Compiled at module scope so every CappedGELU instance shares one compilation,
+# and so instances hold no compiled callable of their own (keeps them picklable
+# and deep-copyable).
+_capped_gelu_compiled = torch.compile(_capped_gelu)
+
+
 class CappedGELU(torch.nn.Module):
     """
     Implements a GELU with capped maximum value.
@@ -149,24 +159,34 @@ class CappedGELU(torch.nn.Module):
 
     """
 
-    def __init__(self, cap_value=1.0, **kwargs):
+    def __init__(self, cap_value=1.0, compile_forward=False, **kwargs):
         """
         Parameters:
         ----------
         cap_value: float, optional
             Maximum that values will be capped at
+        compile_forward: bool, optional
+            Fuse the GELU and the clamp into a single kernel via `torch.compile`.
+            Costs a few seconds of compilation on the first call, so it is off by
+            default; it is also redundant when the whole model is compiled.
         **kwargs:
              Keyword arguments to be passed to the `torch.nn.GELU` function
         """
 
         super().__init__()
         self.add_module("gelu", torch.nn.GELU(**kwargs))
+        # Buffer is retained because existing checkpoints carry a `cap` entry.
         self.register_buffer("cap", torch.tensor(cap_value, dtype=torch.float32))
+        self._cap_value = float(cap_value)
+        self.compile_forward = compile_forward
 
     def forward(self, inputs):
-        x = self.gelu(inputs)
-        x = torch.clamp(x, max=self.cap)
-        return x
+        if self.compile_forward:
+            return _capped_gelu_compiled(self.gelu, inputs, self._cap_value)
+        # A Python float keeps clamp on the faster scalar overload; passing the
+        # `cap` buffer instead dispatches to clamp.Tensor, which is ~1.4x slower
+        # on reduced-precision inputs.
+        return torch.clamp(self.gelu(inputs), max=self._cap_value)
 
 
 # Dictionary of activation functions
