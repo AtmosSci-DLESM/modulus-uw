@@ -16,6 +16,8 @@
 
 """Self-contained regression tests for HEALPix couplers."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -234,7 +236,8 @@ def test_zarr_variable_order_matches_requested_variables(tmp_path):
 
 
 def test_trailing_average_preserves_all_coupled_variables():
-    """TrailingAverageCoupler must keep every coupled variable through averaging."""
+    """TrailingAverageCoupler (opt-in mode) must keep every coupled variable
+    through averaging, and select the correct raw indices per period."""
     variables = ["c0", "c1", "c2"]
     input_times = ["6h", "12h"]
     batch_size = 2
@@ -247,14 +250,106 @@ def test_trailing_average_preserves_all_coupled_variables():
         input_times=input_times,
         input_time_dim=2,
         output_time_dim=2,
+        use_inclusive_trailing_average=True,
     )
-    coupler.coupled_channel_indices = list(range(len(variables)))
+    mock_coupled_module = SimpleNamespace(output_variables=variables, time_step="3h")
+    coupler.setup_coupling(mock_coupled_module)
+    assert coupler.coupled_channel_indices == [0, 1, 2]
+
+    channel_bases = [10.0, 100.0, 1000.0]
+    boundary_offsets = [-5.0, -50.0, -500.0]
+    boundary = torch.empty(
+        batch_size, coupler.spatial_dims[0], 1, len(variables),
+        coupler.spatial_dims[1], coupler.spatial_dims[2],
+    )
+    for i, (base, offset) in enumerate(zip(channel_bases, boundary_offsets)):
+        boundary[:, :, 0, i, :, :] = base + offset
+    coupler.seed_boundary_state(boundary)
+
+    coupled_fields = torch.empty(
+        batch_size,
+        coupler.spatial_dims[0],
+        4,
+        len(variables),
+        coupler.spatial_dims[1],
+        coupler.spatial_dims[2],
+    )
+    for i, base in enumerate(channel_bases):
+        for t in range(4):
+            coupled_fields[:, :, t, i, :, :] = base + t
+
+    coupler.set_coupled_fields(coupled_fields)
+    result = coupler.construct_integrated_couplings()
+    assert list(result.shape) == [
+        coupler.coupled_integration_dim,
+        batch_size,
+        coupler.timevar_dim,
+    ] + list(coupler.spatial_dims)
+
+    # dt=3h, averaging_window=6h -> window_steps=2; input_times=[6h,12h] -> r=[2,4].
+    # Post-prepend buffer is [boundary, v0, v1, v2, v3].
+    # period0 (r=2) selects post-prepend indices [0,1,2] = [boundary, v0, v1].
+    # period1 (r=4) selects post-prepend indices [2,3,4] = [v1, v2, v3].
+    for var_idx, (base, offset) in enumerate(zip(channel_bases, boundary_offsets)):
+        v = [base + t for t in range(4)]
+        expected_period0 = ((base + offset) + v[0] + v[1]) / 3
+        expected_period1 = (v[1] + v[2] + v[3]) / 3
+        for period, expected in enumerate([expected_period0, expected_period1]):
+            timevar_idx = period * len(variables) + var_idx
+            slice_result = result[:, :, timevar_idx, :, :, :]
+            assert torch.allclose(
+                slice_result, torch.full_like(slice_result, expected)
+            ), f"channel {var_idx} period {period}: expected {expected}"
+
+
+def test_trailing_average_unseeded_raises():
+    variables = ["c0", "c1"]
+    coupler = TrailingAverageCoupler(
+        dataset=_make_coupler_dataset(variables + ["x"], n_time=16),
+        batch_size=1,
+        variables=variables,
+        presteps=0,
+        averaging_window="6h",
+        input_times=["6h", "12h"],
+        input_time_dim=2,
+        output_time_dim=2,
+        use_inclusive_trailing_average=True,
+    )
+    mock_coupled_module = SimpleNamespace(output_variables=variables, time_step="3h")
+    coupler.setup_coupling(mock_coupled_module)
+
+    coupled_fields = torch.rand(
+        1, coupler.spatial_dims[0], 4, len(variables),
+        coupler.spatial_dims[1], coupler.spatial_dims[2],
+    )
+    with pytest.raises(RuntimeError, match="no boundary state has been"):
+        coupler.set_coupled_fields(coupled_fields)
+
+
+def test_trailing_average_legacy_default_and_opt_in_guards():
+    """Default (opt-in flag unset) uses the legacy disjoint-block formula, and
+    the opt-in-only APIs (seed_boundary_state, variable_strides) guard against
+    misuse on a legacy coupler."""
+    variables = ["c0", "c1"]
+    input_times = ["6h", "12h"]
+    batch_size = 2
+    coupler = TrailingAverageCoupler(
+        dataset=_make_coupler_dataset(variables + ["x"], n_time=16),
+        batch_size=batch_size,
+        variables=variables,
+        presteps=0,
+        averaging_window="6h",
+        input_times=input_times,
+        input_time_dim=2,
+        output_time_dim=2,
+    )
+    assert coupler.use_inclusive_trailing_average is False
 
     data_time_step = "3h"
-    averaging_window_max_indices = [
-        pd.Timedelta(t) // pd.Timedelta(data_time_step) for t in input_times
-    ]
+    dt = pd.Timedelta(data_time_step)
+    averaging_window_max_indices = [pd.Timedelta(t) // dt for t in input_times]
     di = averaging_window_max_indices[0]
+    # Original/legacy disjoint-block formula (no boundary prepend).
     averaging_slices = []
     for j in range(coupler.coupled_integration_dim):
         averaging_slices.append([])
@@ -266,9 +361,9 @@ def test_trailing_average_preserves_all_coupled_variables():
                 )
             )
     coupler.averaging_slices = averaging_slices
+    coupler.coupled_channel_indices = list(range(len(variables)))
 
-    channel_values = [100.0, 200.0, 300.0]
-    coupled_fields = torch.empty(
+    coupled_fields = torch.rand(
         batch_size,
         coupler.spatial_dims[0],
         4,
@@ -276,19 +371,83 @@ def test_trailing_average_preserves_all_coupled_variables():
         coupler.spatial_dims[1],
         coupler.spatial_dims[2],
     )
-    for i, value in enumerate(channel_values):
-        coupled_fields[:, :, :, i, :, :] = value
+    coupler.set_coupled_fields(coupled_fields)
+    assert coupler.coupled_mode
+
+    with pytest.raises(RuntimeError, match="use_inclusive_trailing_average=True"):
+        coupler.seed_boundary_state(coupled_fields)
+
+    with pytest.raises(ValueError, match="use_inclusive_trailing_average=True"):
+        TrailingAverageCoupler(
+            dataset=_make_coupler_dataset(variables + ["x"], n_time=16),
+            batch_size=batch_size,
+            variables=variables,
+            presteps=0,
+            averaging_window="6h",
+            input_times=input_times,
+            input_time_dim=2,
+            output_time_dim=2,
+            variable_strides={"c0": "24h"},
+        )
+
+
+def test_trailing_average_variable_strides_subsample_independently():
+    """Per-variable `variable_strides` must select each channel's own raw
+    indices within a shared `averaging_window`, matching
+    `compute_trailing_mean.py`'s per-variable `coupled_dt` semantics."""
+    variables = ["z1000", "ttr"]
+    coupler = TrailingAverageCoupler(
+        dataset=_make_coupler_dataset(variables + ["x"], n_time=32),
+        batch_size=1,
+        variables=variables,
+        presteps=0,
+        averaging_window="96h",
+        input_times=["96h"],
+        input_time_dim=2,
+        output_time_dim=2,
+        use_inclusive_trailing_average=True,
+        variable_strides={"z1000": "24h"},  # ttr defaults to coupled_module.time_step (6h)
+    )
+    mock_coupled_module = SimpleNamespace(output_variables=variables, time_step="6h")
+    coupler.setup_coupling(mock_coupled_module)
+    assert coupler.coupled_channel_indices == [0, 1]
+
+    n_raw = 16  # 96h / 6h
+    z1000_boundary, ttr_boundary = 500.0, 2500.0
+    boundary = torch.empty(
+        1, coupler.spatial_dims[0], 1, len(variables),
+        coupler.spatial_dims[1], coupler.spatial_dims[2],
+    )
+    boundary[:, :, 0, 0, :, :] = z1000_boundary
+    boundary[:, :, 0, 1, :, :] = ttr_boundary
+    coupler.seed_boundary_state(boundary)
+
+    coupled_fields = torch.empty(
+        1,
+        coupler.spatial_dims[0],
+        n_raw,
+        len(variables),
+        coupler.spatial_dims[1],
+        coupler.spatial_dims[2],
+    )
+    z1000_raw = [1000.0 + 10.0 * t for t in range(n_raw)]
+    ttr_raw = [5000.0 + 7.0 * t for t in range(n_raw)]
+    for t in range(n_raw):
+        coupled_fields[:, :, t, 0, :, :] = z1000_raw[t]
+        coupled_fields[:, :, t, 1, :, :] = ttr_raw[t]
 
     coupler.set_coupled_fields(coupled_fields)
     result = coupler.construct_integrated_couplings()
-    assert list(result.shape) == [
-        coupler.coupled_integration_dim,
-        batch_size,
-        coupler.timevar_dim,
-    ] + list(coupler.spatial_dims)
 
-    for period in range(len(input_times)):
-        for var_idx, value in enumerate(channel_values):
-            timevar_idx = period * len(variables) + var_idx
-            slice_result = result[:, :, timevar_idx, :, :, :]
-            assert torch.allclose(slice_result, torch.full_like(slice_result, value))
+    # window_steps = 96h/6h = 16. z1000 stride ratio = 24h/6h = 4 -> indices
+    # [0, 4, 8, 12, 16] into the boundary-prepended buffer ([boundary] + raw[0:16]).
+    # ttr stride ratio = 1 -> every index [0..16].
+    z1000_selected = [z1000_boundary, z1000_raw[3], z1000_raw[7], z1000_raw[11], z1000_raw[15]]
+    expected_z1000 = sum(z1000_selected) / len(z1000_selected)
+    ttr_selected = [ttr_boundary] + ttr_raw
+    expected_ttr = sum(ttr_selected) / len(ttr_selected)
+
+    got_z1000 = result[0, :, 0, :, :, :]
+    got_ttr = result[0, :, 1, :, :, :]
+    assert torch.allclose(got_z1000, torch.full_like(got_z1000, expected_z1000), atol=1e-3)
+    assert torch.allclose(got_ttr, torch.full_like(got_ttr, expected_ttr), atol=1e-3)

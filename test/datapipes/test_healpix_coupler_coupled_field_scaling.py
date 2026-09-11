@@ -133,6 +133,7 @@ def _make_trailing_coupler(
         input_times=input_times,
         input_time_dim=1,
         output_time_dim=1,
+        use_inclusive_trailing_average=True,
     )
     # Simulate setup_coupling without a full coupled module.
     coupler.coupled_channel_indices = list(range(len(incoming_variables)))
@@ -349,8 +350,8 @@ def test_trailing_average_without_scaling_unchanged():
     out_bare = bare.construct_integrated_couplings()
 
     # Sanity: matches reference average in z-space (old path).
-    slices = bare.averaging_slices
-    ref = _reference_trailing_average(znorm.to(torch.float64), slices, dtype=torch.float32)
+    indices = bare.averaging_indices
+    ref = _reference_trailing_average(znorm.to(torch.float64), indices, dtype=torch.float32)
     assert _max_abs_err(out_bare, ref) < 1e-5
     assert bare.incoming_coupled_scaling is None
 
@@ -392,14 +393,14 @@ def test_rescaling_recovers_physical_trailing_mean():
     coupler = _make_trailing_coupler(
         incoming=_yaml_scaling(),
     )
-    slices = coupler.averaging_slices
+    indices = coupler.averaging_indices
     coupler.set_coupled_fields(znorm_instant)
     znorm_out = coupler.construct_integrated_couplings()
 
     # Coupler output is in outgoing z-space; denorm to compare with physical mean.
     recovered = _denorm_timevar_with(znorm_out, outgoing_keys)
     physical_mean = _reference_trailing_average(
-        physical, slices, dtype=torch.float64
+        physical, indices, dtype=torch.float64
     )
     err_with_api = _max_abs_err(recovered, physical_mean)
 
@@ -498,12 +499,12 @@ def test_stability_denorm_mean_renorm_vs_float64_reference():
     coupler = _make_trailing_coupler(
         incoming=_yaml_scaling(),
     )
-    slices = coupler.averaging_slices
+    indices = coupler.averaging_indices
     coupler.set_coupled_fields(znorm)
     got = coupler.construct_integrated_couplings().to(torch.float64)
 
     phys_avg_f64 = _reference_trailing_average(
-        physical, slices, dtype=torch.float64
+        physical, indices, dtype=torch.float64
     )
     ref = _renorm_timevar_physical(phys_avg_f64, outgoing_keys, dtype=torch.float64)
 

@@ -146,12 +146,13 @@ def _run_trailing_average(physical_or_znorm, input_times=("48h", "96h")):
         input_times=list(input_times),
         input_time_dim=1,
         output_time_dim=1,
+        use_inclusive_trailing_average=True,
     )
-    slices = _configure_trailing_average(
+    indices = _configure_trailing_average(
         coupler, list(input_times), data_time_step="3h"
     )
     coupler.set_coupled_fields(physical_or_znorm.to(torch.float32))
-    return coupler.construct_integrated_couplings(), slices
+    return coupler.construct_integrated_couplings(), indices
 
 
 def test_mismatched_instant_norm_trailing_denorm_vs_physical_mean():

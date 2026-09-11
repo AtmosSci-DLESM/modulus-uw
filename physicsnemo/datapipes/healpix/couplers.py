@@ -24,7 +24,19 @@ prepares them as forcing for another (e.g. ocean). Two strategies are provided:
 * ``ConstantCoupler`` — broadcast the first available time step across the
   coupled integration window.
 * ``TrailingAverageCoupler`` — average over trailing windows whose right edges
-  are given by ``input_times`` (e.g. 48 h and 96 h).
+  are given by ``input_times`` (e.g. 48 h and 96 h) and whose length is
+  ``averaging_window``. By default (``use_inclusive_trailing_average=False``)
+  each period is averaged over a disjoint block of raw steps -- this is the
+  original/legacy behavior and does **not** reproduce the full
+  ``averaging_window`` for multi-period ``input_times``. Passing
+  ``use_inclusive_trailing_average=True`` opts into a corrected mode where
+  each period is averaged over the full inclusive time interval
+  ``[input_times[i] - averaging_window, input_times[i]]`` (both endpoints
+  included) at the source component's ``time_step`` spacing (optionally
+  subsampled per variable via ``variable_strides``) -- matching
+  ``data_preprocessing/compute_trailing_mean.py`` exactly. That mode needs the
+  source component's t=0 (call-start) raw step to complete the left edge of
+  the first period's window; see ``TrailingAverageCoupler.seed_boundary_state``.
 
 Tensor layouts
 --------------
@@ -598,6 +610,8 @@ class TrailingAverageCoupler(BaseCoupler):
         averaging_window: str = "24h",
         input_times: Sequence = [pd.Timedelta("24h"), pd.Timedelta("48h")],
         prepared_coupled_data=True,
+        use_inclusive_trailing_average: bool = False,
+        variable_strides: dict = None,
         **kwargs,
     ):
         """
@@ -628,6 +642,35 @@ class TrailingAverageCoupler(BaseCoupler):
             averages have already been calculated so that each time step denotes
             the right side of a averaging_window window.
             This is highly recommended for training, default True
+        use_inclusive_trailing_average: bool, optional
+            Opt-in fix for inference-time trailing-average semantics, default False.
+            When False (default), preserving legacy behavior for existing
+            configs/checkpoints, each period's average is a disjoint block of raw
+            steps between the previous period's boundary and its own -- this does
+            **not** reproduce the full ``averaging_window`` for multi-period
+            ``input_times`` (e.g. for periods ``[48h, 96h]`` the "96h" period only
+            averages the second half of that window, not the full 96h span), and can
+            diverge from how ``data_preprocessing/compute_trailing_mean.py`` builds
+            the training data.
+            When True, each period's average is taken over the full inclusive time
+            interval ``[input_times[i] - averaging_window, input_times[i]]`` (both
+            endpoints included), matching ``compute_trailing_mean.py`` exactly. This
+            mode also needs a boundary raw step to complete the left edge of the
+            window -- seed it once per forecast with ``seed_boundary_state``;
+            ``set_coupled_fields`` raises if called before that.
+        variable_strides: dict, optional
+            Only used when ``use_inclusive_trailing_average=True``; raises
+            ``ValueError`` otherwise. Maps a coupled variable name (an entry of
+            ``variables``) to a pandas-Timedelta-parseable stride string indicating
+            how densely to subsample ``coupled_module``'s raw output within the
+            trailing window for that variable, mirroring
+            ``compute_trailing_mean.py``'s per-variable ``coupled_dt``. Variables not
+            present in this dict default to ``coupled_module.time_step`` (i.e. every
+            raw step, no subsampling). Example:
+            ``{"z1000-96H": "24h", "ttr-96H": "6h"}`` averages z1000 every 24h and ttr
+            every 6h within their respective 96h trailing windows. Each stride must
+            evenly divide ``averaging_window`` so both endpoints of the window are
+            included, matching ``compute_trailing_mean.py``'s slicing.
         """
         super().__init__(
             dataset=dataset,
@@ -643,6 +686,18 @@ class TrailingAverageCoupler(BaseCoupler):
 
         # TrailingAverageCoupler-specific attributes
         self.averaging_window = pd.Timedelta(averaging_window)
+        self.use_inclusive_trailing_average = use_inclusive_trailing_average
+        self.variable_strides = dict(variable_strides) if variable_strides else {}
+        if not use_inclusive_trailing_average and self.variable_strides:
+            raise ValueError(
+                "variable_strides requires use_inclusive_trailing_average=True; "
+                "the legacy averaging path does not support per-variable subsampling."
+            )
+        # Cached last raw step of the previous call's coupled_fields, used to complete
+        # the left edge of the first period's trailing-average window. Only used when
+        # use_inclusive_trailing_average=True. See `seed_boundary_state` and
+        # `set_coupled_fields`.
+        self._boundary_state = None
 
         if self.use_zarr:
             cf_dates = cftime.num2pydate(
@@ -699,22 +754,99 @@ class TrailingAverageCoupler(BaseCoupler):
 
         # TrailingAverageCoupler-specific setup
         # find averaging periods from component output
-        averaging_window_max_indices = [
-            i // pd.Timedelta(coupled_module.time_step) for i in self.input_times
-        ]
+        dt = pd.Timedelta(coupled_module.time_step)
+        averaging_window_max_indices = [i // dt for i in self.input_times]
         di = averaging_window_max_indices[0]
         # TODO: Now support output_time_dim =/= input_time_dim, but presteps need to be 0, will add support for presteps>0
-        averaging_slices = []
-        for j in range(self.coupled_integration_dim):
-            averaging_slices.append([])
-            for i, r in enumerate(averaging_window_max_indices):
-                averaging_slices[j].append(
-                    slice(
-                        self.input_time_dim * j * di + i * di,
-                        self.input_time_dim * j * di + r,
+
+        if not self.use_inclusive_trailing_average:
+            # Legacy behavior (default): each period's average is a disjoint block of
+            # raw steps, NOT the full inclusive averaging_window for multi-period
+            # input_times -- see `use_inclusive_trailing_average` docstring. Preserved
+            # as-is for backward compatibility with existing configs/checkpoints.
+            averaging_slices = []
+            for j in range(self.coupled_integration_dim):
+                averaging_slices.append([])
+                for i, r in enumerate(averaging_window_max_indices):
+                    averaging_slices[j].append(
+                        slice(
+                            self.input_time_dim * j * di + i * di,
+                            self.input_time_dim * j * di + r,
+                        )
                     )
+            self.averaging_slices = averaging_slices
+            self.averaging_indices = None
+            self.window_steps = None
+            return
+
+        # Opt-in corrected mode: each period i of block j reproduces
+        # compute_trailing_mean.py's semantics -- a trailing mean over
+        # `averaging_window` (length `window_steps` raw steps), inclusive of both
+        # endpoints, ending at that period's `input_times[i]`, optionally subsampled
+        # per variable via `variable_strides`. `set_coupled_fields` prepends one
+        # boundary raw step (the source component's state at this call's t=0) ahead
+        # of the freshly produced raw buffer, so index 0 corresponds to t=0 and index
+        # k>=1 corresponds to t=k*dt. Under that indexing the inclusive window for
+        # period i of block j is [base + r - window_steps, base + r] where
+        # base = input_time_dim * j * di and r = averaging_window_max_indices[i].
+        if self.averaging_window.total_seconds() % dt.total_seconds() != 0:
+            raise ValueError(
+                f"averaging_window {self.averaging_window} is not divisible by "
+                f"coupled_module.time_step {dt}"
+            )
+        window_steps = int(self.averaging_window // dt)
+
+        variable_ratios = []
+        for v in self.variables:
+            stride = pd.Timedelta(self.variable_strides.get(v, dt))
+            if stride.total_seconds() % dt.total_seconds() != 0:
+                raise ValueError(
+                    f"variable_strides[{v!r}]={stride} is not divisible by "
+                    f"coupled_module.time_step {dt}"
                 )
-        self.averaging_slices = averaging_slices
+            ratio = int(stride // dt)
+            if window_steps % ratio != 0:
+                raise ValueError(
+                    f"variable_strides[{v!r}]={stride} does not evenly divide "
+                    f"averaging_window {self.averaging_window}; both endpoints of "
+                    "the trailing window would not be included, unlike "
+                    "compute_trailing_mean.py's slicing."
+                )
+            variable_ratios.append(ratio)
+
+        averaging_indices = []
+        for j in range(self.coupled_integration_dim):
+            averaging_indices.append([])
+            base = self.input_time_dim * j * di
+            for i, r in enumerate(averaging_window_max_indices):
+                start = base + r - window_steps
+                stop = base + r
+                averaging_indices[j].append(
+                    [list(range(start, stop + 1, ratio)) for ratio in variable_ratios]
+                )
+        self.averaging_indices = averaging_indices
+        self.averaging_slices = None
+        self.window_steps = window_steps
+
+    def seed_boundary_state(self, state: th.Tensor):
+        """
+        Seed the boundary raw step used to complete the left edge of the first
+        period's trailing-average window (see `setup_coupling`). Only meaningful
+        when `use_inclusive_trailing_average=True`.
+
+        Call once, before the first `set_coupled_fields` of a forecast, with the
+        source component's true state at that first call's start time (t=0) --
+        e.g. the initial condition already used to seed the source model --
+        in the same [B, F, T>=1, C, H, W] layout that will later be passed to
+        `set_coupled_fields` (its last time step is used). `set_coupled_fields`
+        raises if called before this.
+        """
+        if not self.use_inclusive_trailing_average:
+            raise RuntimeError(
+                "seed_boundary_state has no effect unless "
+                "use_inclusive_trailing_average=True."
+            )
+        self._boundary_state = state[:, :, -1:].clone()
 
     def set_coupled_fields(self, coupled_fields: th.tensor):
         """
@@ -731,17 +863,54 @@ class TrailingAverageCoupler(BaseCoupler):
             The data to use when the dataloader requests coupled fields. Expected
             format is [B, F, T, C, H, W]
         """
+        if not self.use_inclusive_trailing_average:
+
+            def _trailing_average(fields: th.Tensor) -> th.Tensor:
+                # TODO: Now support output_time_dim =/= input_time_dim, but presteps
+                # need to be 0, will add support for presteps>0
+                coupled_averaging_periods = []
+                for j in range(self.coupled_integration_dim):
+                    averaging_periods = [
+                        fields[:, :, s, :, :, :].mean(dim=2, keepdim=True)
+                        for s in self.averaging_slices[j]
+                    ]
+                    coupled_averaging_periods.append(
+                        th.concat(averaging_periods, dim=3)
+                    )
+                return th.concat(coupled_averaging_periods, dim=2)
+
+            self._store_preset_coupled_fields(coupled_fields, _trailing_average)
+            return
+
+        if self._boundary_state is None:
+            raise RuntimeError(
+                "TrailingAverageCoupler.set_coupled_fields called with "
+                "use_inclusive_trailing_average=True but no boundary state has "
+                "been seeded. Call seed_boundary_state() once before the first "
+                "set_coupled_fields() of a forecast (reset_coupler() clears the "
+                "cached boundary and requires re-seeding)."
+            )
+        boundary = self._boundary_state.to(
+            device=coupled_fields.device, dtype=coupled_fields.dtype
+        )
+        fields_with_boundary = th.cat([boundary, coupled_fields], dim=2)
+        self._boundary_state = coupled_fields[:, :, -1:].clone()
 
         def _trailing_average(fields: th.Tensor) -> th.Tensor:
-            # TODO: Now support output_time_dim =/= input_time_dim, but presteps
-            # need to be 0, will add support for presteps>0
             coupled_averaging_periods = []
             for j in range(self.coupled_integration_dim):
-                averaging_periods = [
-                    fields[:, :, s, :, :, :].mean(dim=2, keepdim=True)
-                    for s in self.averaging_slices[j]
-                ]
+                averaging_periods = []
+                for period_indices in self.averaging_indices[j]:
+                    channel_means = [
+                        fields[:, :, idx, c : c + 1, :, :].mean(dim=2, keepdim=True)
+                        for c, idx in enumerate(period_indices)
+                    ]
+                    averaging_periods.append(th.concat(channel_means, dim=3))
                 coupled_averaging_periods.append(th.concat(averaging_periods, dim=3))
             return th.concat(coupled_averaging_periods, dim=2)
 
-        self._store_preset_coupled_fields(coupled_fields, _trailing_average)
+        self._store_preset_coupled_fields(fields_with_boundary, _trailing_average)
+
+    def reset_coupler(self):
+        super().reset_coupler()
+        self._boundary_state = None

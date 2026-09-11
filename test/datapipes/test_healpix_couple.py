@@ -314,6 +314,7 @@ def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconf
         input_times=input_times,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
+        use_inclusive_trailing_average=True,
     )
     assert isinstance(coupler, TrailingAverageCoupler)
 
@@ -325,21 +326,23 @@ def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconf
     with pytest.raises(ValueError, match=("Missing variables in coupled module")):
         coupler.setup_coupling(mock_coupled_module)
 
-    # veryify averaging slices computed correctly
+    # veryify averaging indices computed correctly
     mock_coupled_module = coupler_helper(
         output_variables=["not_coupled", "z500", "z1000"],
         time_step="3h",
     )
     coupler.setup_coupling(mock_coupled_module)
-    averaging_window_max_indices = [
-        i // pd.Timedelta(mock_coupled_module.time_step) for i in input_times
-    ]
-    dt = averaging_window_max_indices[0]
-    # assumes only 1 integration step, otherwise would be wrong
-    expected_slices = [[]]
-    for i, window_end in enumerate(averaging_window_max_indices):
-        expected_slices[0].append(slice(i * dt, window_end))
-    assert expected_slices == coupler.averaging_slices
+    dt_td = pd.Timedelta(mock_coupled_module.time_step)
+    averaging_window_max_indices = [i // dt_td for i in input_times]
+    window_steps = pd.Timedelta(averaging_window) // dt_td
+    # assumes only 1 integration step, otherwise would be wrong; no
+    # variable_strides configured, so both channels share the same index list
+    # per period.
+    expected_indices = [[]]
+    for r in averaging_window_max_indices:
+        period_indices = list(range(r - window_steps, r + 1))
+        expected_indices[0].append([period_indices, period_indices])
+    assert expected_indices == coupler.averaging_indices
 
     interval = 2
     data_time_step = "3h"
@@ -371,21 +374,9 @@ def test_TrailingAverageCoupler(data_dir, dataset_name, scaling_dict, pytestconf
     expected = np.expand_dims(coupled_scaling["std"].to_numpy(), (0, 2, 3, 4))
     assert np.array_equal(expected, coupler.coupled_scaling["std"])
 
-    averaging_window_max_indices = [
-        i // pd.Timedelta(data_time_step) for i in coupler.input_times
-    ]
-    di = averaging_window_max_indices[0]
-    averaging_slices = []
-    for j in range(coupler.coupled_integration_dim):
-        averaging_slices.append([])
-        for i, r in enumerate(averaging_window_max_indices):
-            averaging_slices[j].append(
-                slice(
-                    coupler.input_time_dim * j * di + i * di,
-                    coupler.input_time_dim * j * di + r,
-                )
-            )
-    coupler.averaging_slices = averaging_slices
+    # coupler.averaging_indices was already computed correctly by setup_coupling()
+    # above; only the channel selection is simplified for the shape-only checks
+    # that follow.
     coupler.coupled_channel_indices = [0, 1]
 
     coupled_fields_batch_size = batch_size * 2
@@ -454,25 +445,25 @@ def test_TrailingAverageCoupler_multiple_variables(data_dir, dataset_name, pytes
         input_times=input_times,
         input_time_dim=input_time_dim,
         output_time_dim=output_time_dim,
+        use_inclusive_trailing_average=True,
     )
     coupler.coupled_channel_indices = list(range(len(variables)))
 
     data_time_step = "3h"
+    dt_td = pd.Timedelta(data_time_step)
     averaging_window_max_indices = [
-        i // pd.Timedelta(data_time_step) for i in input_times
+        i // dt_td for i in input_times
     ]
     di = averaging_window_max_indices[0]
-    averaging_slices = []
+    window_steps = coupler.averaging_window // dt_td
+    averaging_indices = []
     for j in range(coupler.coupled_integration_dim):
-        averaging_slices.append([])
+        averaging_indices.append([])
+        base = coupler.input_time_dim * j * di
         for i, r in enumerate(averaging_window_max_indices):
-            averaging_slices[j].append(
-                slice(
-                    coupler.input_time_dim * j * di + i * di,
-                    coupler.input_time_dim * j * di + r,
-                )
-            )
-    coupler.averaging_slices = averaging_slices
+            period_indices = list(range(base + r - window_steps, base + r + 1))
+            averaging_indices[j].append([period_indices] * len(variables))
+    coupler.averaging_indices = averaging_indices
 
     channel_values = [100.0, 200.0, 300.0]
     coupled_fields = th.empty(

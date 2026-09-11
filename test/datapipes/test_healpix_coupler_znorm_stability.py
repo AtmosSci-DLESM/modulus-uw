@@ -148,36 +148,55 @@ def _make_dataset(variables, n_time=32):
 
 
 def _configure_trailing_average(coupler, input_times, data_time_step="3h"):
-    averaging_window_max_indices = [
-        pd.Timedelta(t) // pd.Timedelta(data_time_step) for t in input_times
-    ]
+    """Mirror TrailingAverageCoupler.setup_coupling's averaging_indices.
+
+    Requires the coupler to have been constructed with
+    ``use_inclusive_trailing_average=True``. Each period ``i`` is an inclusive
+    time-interval window of length ``averaging_window`` ending at
+    ``input_times[i]``, matching ``compute_trailing_mean.py``'s trailing-mean
+    semantics. Index 0 of the buffer this indexes into is the boundary (t=0)
+    raw step that ``set_coupled_fields`` prepends -- see
+    ``_reference_trailing_average``. None of these tests use per-variable
+    strides, so every channel shares the same index list per period.
+    """
+    dt = pd.Timedelta(data_time_step)
+    averaging_window_max_indices = [pd.Timedelta(t) // dt for t in input_times]
     di = averaging_window_max_indices[0]
-    averaging_slices = []
+    window_steps = coupler.averaging_window // dt
+    n_channels = len(coupler.variables)
+    averaging_indices = []
     for j in range(coupler.coupled_integration_dim):
-        averaging_slices.append([])
+        averaging_indices.append([])
+        base = coupler.input_time_dim * j * di
         for i, r in enumerate(averaging_window_max_indices):
-            averaging_slices[j].append(
-                slice(
-                    coupler.input_time_dim * j * di + i * di,
-                    coupler.input_time_dim * j * di + r,
-                )
-            )
-    coupler.averaging_slices = averaging_slices
+            idx = list(range(base + r - window_steps, base + r + 1))
+            averaging_indices[j].append([idx] * n_channels)
+    coupler.averaging_indices = averaging_indices
     coupler.coupled_channel_indices = list(range(len(coupler.variables)))
-    return averaging_slices
+    return averaging_indices
 
 
-def _reference_trailing_average(physical, averaging_slices, dtype):
-    """Mirror TrailingAverageCoupler.set_coupled_fields averaging in ``dtype``."""
+def _reference_trailing_average(physical, averaging_indices, dtype):
+    """Mirror TrailingAverageCoupler.set_coupled_fields averaging in ``dtype``.
+
+    ``set_coupled_fields`` prepends one boundary raw step (this call's t=0)
+    before slicing; with no ``seed_boundary_state`` call (none of these tests
+    seed one) it falls back to replicating the tensor's own first raw step.
+    """
     fields = physical.to(dtype)
-    periods = []
-    for slices in averaging_slices:
-        averaged = [
-            fields[:, :, s, :, :, :].mean(dim=2, keepdim=True) for s in slices
-        ]
-        periods.append(torch.concat(averaged, dim=3))
+    fields = torch.cat([fields[:, :, :1], fields], dim=2)
+    periods_all = []
+    for block in averaging_indices:
+        period_means = []
+        for period_indices in block:
+            channel_means = [
+                fields[:, :, idx, c : c + 1, :, :].mean(dim=2, keepdim=True)
+                for c, idx in enumerate(period_indices)
+            ]
+            period_means.append(torch.concat(channel_means, dim=3))
+        periods_all.append(torch.concat(period_means, dim=3))
     # [B, F, integration, timevar, H, W] -> [integration, B, timevar, F, H, W]
-    return torch.concat(periods, dim=2).permute(2, 0, 3, 1, 4, 5)
+    return torch.concat(periods_all, dim=2).permute(2, 0, 3, 1, 4, 5)
 
 
 def _max_abs_err(a, b):
@@ -222,8 +241,9 @@ def test_trailing_average_znorm_matches_physical_float64_reference(variables):
         input_times=input_times,
         input_time_dim=2,
         output_time_dim=2,
+        use_inclusive_trailing_average=True,
     )
-    averaging_slices = _configure_trailing_average(coupler, input_times)
+    averaging_indices = _configure_trailing_average(coupler, input_times)
 
     znorm_f32 = _normalize(physical, variables, dtype=torch.float32)
     coupler.set_coupled_fields(znorm_f32)
@@ -231,7 +251,7 @@ def test_trailing_average_znorm_matches_physical_float64_reference(variables):
 
     # Reference: average in physical float64, then normalize.
     phys_avg_f64 = _reference_trailing_average(
-        physical, averaging_slices, dtype=torch.float64
+        physical, averaging_indices, dtype=torch.float64
     )
     ref = _normalize_timevar(
         phys_avg_f64, variables, n_input_times=len(input_times), dtype=torch.float32
@@ -280,8 +300,9 @@ def test_trailing_average_znorm_vs_physical_float32_error(variables):
         input_times=input_times,
         input_time_dim=2,
         output_time_dim=2,
+        use_inclusive_trailing_average=True,
     )
-    averaging_slices = _configure_trailing_average(coupler, input_times)
+    averaging_indices = _configure_trailing_average(coupler, input_times)
     n_times = len(input_times)
     timevar_names = variables * n_times
 
@@ -291,7 +312,7 @@ def test_trailing_average_znorm_vs_physical_float32_error(variables):
 
     # Physical float32 path: cast -> average -> normalize
     phys_avg_f32 = _reference_trailing_average(
-        physical, averaging_slices, dtype=torch.float32
+        physical, averaging_indices, dtype=torch.float32
     ).to(torch.float64)
     physical_f32_path = _normalize_timevar(
         phys_avg_f32, variables, n_input_times=n_times, dtype=torch.float64
@@ -299,7 +320,7 @@ def test_trailing_average_znorm_vs_physical_float32_error(variables):
 
     # Reference
     phys_avg_f64 = _reference_trailing_average(
-        physical, averaging_slices, dtype=torch.float64
+        physical, averaging_indices, dtype=torch.float64
     )
     reference = _normalize_timevar(
         phys_avg_f64, variables, n_input_times=n_times, dtype=torch.float64
@@ -339,8 +360,9 @@ def test_trailing_average_ocean_forcing_config_znorm_roundtrip():
         input_times=input_times,
         input_time_dim=1,
         output_time_dim=1,
+        use_inclusive_trailing_average=True,
     )
-    averaging_slices = _configure_trailing_average(
+    averaging_indices = _configure_trailing_average(
         coupler, input_times, data_time_step=data_time_step
     )
 
@@ -351,7 +373,7 @@ def test_trailing_average_ocean_forcing_config_znorm_roundtrip():
     )
 
     phys_avg = _reference_trailing_average(
-        physical, averaging_slices, dtype=torch.float64
+        physical, averaging_indices, dtype=torch.float64
     )
     # Coupler returns time_first [I, B, timevar, F, H, W]; reference matches that layout.
     max_err = _max_abs_err(denormed, phys_avg)
@@ -444,14 +466,15 @@ def test_mixed_scale_channels_remain_independent_in_znorm_average():
         input_times=input_times,
         input_time_dim=2,
         output_time_dim=2,
+        use_inclusive_trailing_average=True,
     )
-    averaging_slices = _configure_trailing_average(coupler, input_times)
+    averaging_indices = _configure_trailing_average(coupler, input_times)
 
     coupler.set_coupled_fields(_normalize(physical, variables, dtype=torch.float32))
     got = coupler.construct_integrated_couplings().to(torch.float64)
 
     phys_avg = _reference_trailing_average(
-        physical, averaging_slices, dtype=torch.float64
+        physical, averaging_indices, dtype=torch.float64
     )
     ref = _normalize_timevar(
         phys_avg, variables, n_input_times=len(input_times), dtype=torch.float64
