@@ -18,10 +18,11 @@ from typing import Sequence
 
 import torch as th
 from hydra.utils import instantiate
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.checkpoint import checkpoint
 
 from .healpix_paddings import warn_deprecated_enable_healpixpad
+from .reflection_ops import bank_sizes, strip_nested_odd_fraction
 
 
 class UNetEncoder(th.nn.Module):
@@ -43,6 +44,8 @@ class UNetEncoder(th.nn.Module):
         per_level_cln: Sequence[bool] = None,
         per_level_checkpointing: Sequence[bool] = None,
         enable_healpixpad: bool | None = None,
+        structural_input_even: int | None = None,
+        odd_fraction: float = 0.25,
     ):
         """
         Parameters
@@ -81,9 +84,13 @@ class UNetEncoder(th.nn.Module):
             If None, the checkpointing will not be applied
         enable_healpixpad: bool, optional
             Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
+        odd_fraction: float, optional
+            Global even|odd bank split for ReflectionSteerable blocks. Set on
+            ``HEALPixRecUNet`` and propagated here; do not set per conv block.
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        self.odd_fraction = float(odd_fraction)
         if len(nside) != len(n_channels):
             raise ValueError(
                 f"nside must have the same length as n_channels ({len(n_channels)}), "
@@ -127,10 +134,23 @@ class UNetEncoder(th.nn.Module):
                 )
 
             # apply conditional layer norm if enabled for this level
-            block_config = conv_block.copy()
+            block_config = strip_nested_odd_fraction(
+                conv_block, self.odd_fraction, label="encoder.conv_block"
+            )
             if "conditional_layer_norm" in block_config and block_config.conditional_layer_norm is not None:
                 if not per_level_cln[n]:
                     block_config.conditional_layer_norm = None
+
+            target = str(OmegaConf.select(block_config, "_target_", default=""))
+            is_reflection_steerable = "ReflectionSteerable" in target
+            conv_extra = {}
+            if is_reflection_steerable:
+                conv_extra["odd_fraction"] = self.odd_fraction
+                if n == 0 and structural_input_even is not None:
+                    conv_extra["in_even"] = structural_input_even
+                elif n > 0:
+                    conv_extra["in_even"] = bank_sizes(old_channels, self.odd_fraction)[0]
+                conv_extra["out_even"] = bank_sizes(curr_channel, self.odd_fraction)[0]
 
             modules.append(
                 instantiate(
@@ -144,6 +164,7 @@ class UNetEncoder(th.nn.Module):
                     hpx_padding_mode=hpx_padding_mode,
                     compile_padding=compile_padding,
                     nside=nside[n],
+                    **conv_extra,
                 )
             )
             old_channels = curr_channel
@@ -153,7 +174,7 @@ class UNetEncoder(th.nn.Module):
         self.encoder = th.nn.ModuleList(self.encoder)
 
 
-    def _forward_layer_pass(self, layer_group: th.nn.Module, inp: th.Tensor, conditions_cln: th.Tensor=None) -> th.Tensor:
+    def _forward_layer_pass(self, layer_group: th.nn.Module, inp: th.Tensor, conditions_cln: th.Tensor=None, sin_lat_gate: th.Tensor=None) -> th.Tensor:
         """
         Forward pass of single layer of the encoder
         Handled seperately to allow for checkpointing of the layer
@@ -164,6 +185,9 @@ class UNetEncoder(th.nn.Module):
             The inputs to encode
         conditions_cln: th.Tensor: optional
             The conditional inputs for the normalization layers.
+        sin_lat_gate: th.Tensor, optional
+            Odd geometric field (``sin(lat)``) for optional cross-parity 1×1
+            paths in ReflectionSteerable blocks.
 
         Returns
         -------
@@ -175,14 +199,21 @@ class UNetEncoder(th.nn.Module):
             if getattr(layer, 'cln_enabled', False):
                 if conditions_cln is None:
                     raise ValueError("Conditional inputs are required for layers with cln_enabled=True")
-                interim_output = layer(interim_output, conditions_cln=conditions_cln)
+                if getattr(layer, "reflection_steerable", False):
+                    interim_output = layer(
+                        interim_output, conditions_cln=conditions_cln, sin_lat_gate=sin_lat_gate
+                    )
+                else:
+                    interim_output = layer(interim_output, conditions_cln=conditions_cln)
+            elif getattr(layer, "reflection_steerable", False):
+                interim_output = layer(interim_output, sin_lat_gate=sin_lat_gate)
             else:
                 interim_output = layer(interim_output)
             
         # Return the outputs of the last layer
         return interim_output
 
-    def forward(self, inputs: Sequence, conditions_cln: th.Tensor=None) -> Sequence:
+    def forward(self, inputs: Sequence, conditions_cln: th.Tensor=None, sin_lat_gate: th.Tensor=None) -> Sequence:
         """
         Forward pass of the HEALPix Unet encoder
 
@@ -192,6 +223,9 @@ class UNetEncoder(th.nn.Module):
             The inputs to encode
         conditions_cln: th.Tensor: optional
             The conditional inputs for the normalization layers.
+        sin_lat_gate: th.Tensor, optional
+            Odd geometric field (``sin(lat)``) at the current encoder resolution.
+            If a sequence is provided, ``sin_lat_gate[n]`` is used at level ``n``.
 
         Returns
         -------
@@ -200,10 +234,22 @@ class UNetEncoder(th.nn.Module):
         outputs = []
         for n, layer_group in enumerate(self.encoder):
             interim_output = inputs
+            gate_n = None
+            if sin_lat_gate is not None:
+                gate_n = sin_lat_gate[n] if isinstance(sin_lat_gate, (list, tuple)) else sin_lat_gate
             if self.per_level_checkpointing[n]:
-                interim_output = checkpoint(self._forward_layer_pass, layer_group, interim_output, conditions_cln, use_reentrant=False)
+                interim_output = checkpoint(
+                    self._forward_layer_pass,
+                    layer_group,
+                    interim_output,
+                    conditions_cln,
+                    gate_n,
+                    use_reentrant=False,
+                )
             else:
-                interim_output = self._forward_layer_pass(layer_group, interim_output, conditions_cln)
+                interim_output = self._forward_layer_pass(
+                    layer_group, interim_output, conditions_cln, gate_n
+                )
             outputs.append(interim_output)
             inputs = outputs[-1]
         # Return the outputs of the last layer
