@@ -211,8 +211,13 @@ class UNetEncoder(th.nn.Module):
         -------
         Sequence: The encoded values
         """
+        emit_nvtx = not th.compiler.is_compiling()
+        if emit_nvtx:
+            th.cuda.nvtx.range_push("dlesym_encoder")
         outputs = []
         for n, layer_group in enumerate(self.encoder):
+            if emit_nvtx:
+                th.cuda.nvtx.range_push("dlesym_encoder:layer")
             interim_output = inputs
             if self.per_level_checkpointing[n]:
                 # Disable reentrancy and rng preservation conditionally to allow for cuda graph capture with checkpointing
@@ -228,7 +233,11 @@ class UNetEncoder(th.nn.Module):
                 interim_output = self._forward_layer_pass(layer_group, interim_output, conditions_cln)
             outputs.append(interim_output)
             inputs = outputs[-1]
+            if emit_nvtx:
+                th.cuda.nvtx.range_pop() # dlesym_encoder:layer
         # Return the outputs of the last layer
+        if emit_nvtx:
+            th.cuda.nvtx.range_pop()
         return outputs
 
     def reset(self):

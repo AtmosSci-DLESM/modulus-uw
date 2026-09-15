@@ -240,6 +240,9 @@ class UNetDecoder(th.nn.Module):
         torch.Tensor: The decoded values
         """
         x = inputs[-1]
+        emit_nvtx = not th.compiler.is_compiling()
+        if emit_nvtx:
+            th.cuda.nvtx.range_push("dlesym:decoder")
         for n, layer in enumerate(self.decoder):
             skip_connection = inputs[-1 - n] if layer["upsamp"] is not None else None
             if self.per_level_checkpointing[n]:
@@ -261,7 +264,8 @@ class UNetDecoder(th.nn.Module):
             # the recurrent block changing during reinitialization
             if layer["recurrent"] is not None:
                 x = layer["recurrent"](x)
-
+        if emit_nvtx:
+            th.cuda.nvtx.range_pop()
         return self.output_layer(x)
 
     def reset(self):

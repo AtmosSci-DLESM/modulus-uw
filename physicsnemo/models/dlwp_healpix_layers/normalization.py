@@ -26,7 +26,7 @@ except ImportError:
     _APEX_AVAILABLE = False
 
 
-@th.compile
+#@th.compile
 def _cln_affine(x_norm, gamma_raw, beta, scale_center, n_faces):
     """Fused affine transform: expand gamma/beta across faces and apply to normalized input."""
     C = gamma_raw.shape[-1]
@@ -207,7 +207,9 @@ class ConditionalLayerNorm(th.nn.Module):
         th.Tensor
             Normalized and conditioned tensor of shape: (B, C, H, W)
         """
-
+        emit_nvtx = not th.compiler.is_compiling()
+        if emit_nvtx:
+            th.cuda.nvtx.range_push("layer_norm:forward")
         is_channels_last = x.is_contiguous(memory_format=th.channels_last)
 
         # LayerNorm on last dim: permute to (B, H, W, C)
@@ -221,9 +223,15 @@ class ConditionalLayerNorm(th.nn.Module):
         gamma_raw, beta = gamma_beta.chunk(2, dim=-1)  # each (B*n_cond, C)
 
         # Fused affine: expand across faces + scale_center + multiply + add
+        if emit_nvtx:
+            th.cuda.nvtx.range_push("layer_norm:forward:cln_affine")
         result = _cln_affine(x_norm, gamma_raw, beta, self.scale_center, self.n_faces)
+        if emit_nvtx:
+            th.cuda.nvtx.range_pop() #layer_norm:forward:cln_affine
 
         # Return to NCHW logical layout, preserving channels_last memory format if input was
+        if emit_nvtx:
+            th.cuda.nvtx.range_pop()
         if is_channels_last:
             return result.permute(0, 3, 1, 2).contiguous(memory_format=th.channels_last)
         else:
