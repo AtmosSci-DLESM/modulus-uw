@@ -165,13 +165,9 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         self.curr_item = None  # keeps track of current initialization
 
     def _get_scaling_da(self):
-        scaling_df = pd.DataFrame.from_dict(self.scaling).T
-        scaling_df.loc["zeros"] = {"mean": 0.0, "std": 1.0}
-        scaling_da = scaling_df.to_xarray().astype("float32")
-
         # only thing we do different here is get the scaling for the coupled values
         for c in self.couplings:
-            c.set_scaling(scaling_da)
+            c.set_scaling(self.scaling)
         super()._get_scaling_da()
 
     def __getitem__(self, item):
