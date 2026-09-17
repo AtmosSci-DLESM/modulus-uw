@@ -417,26 +417,28 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         - All variables combined
         - Constant fields
 
-        Each ``data.scaling[var].mean`` may be a scalar or a path to a
-        ``(face, height, width)`` climatology map; ``std`` is always scalar.
-
         Raises
         ------
         KeyError
             If scaling parameters are missing for any variables
         """
-        from .scaling_utils import build_channel_scaling
-
-        scaling = dict(self.scaling)
-        scaling.setdefault("zeros", {"mean": 0.0, "std": 1.0})
+        scaling_df = pd.DataFrame.from_dict(self.scaling).T
+        scaling_df.loc["zeros"] = {"mean": 0.0, "std": 1.0}
+        scaling_da = scaling_df.to_xarray().astype("float32")
 
         try:
-            self.input_scaling = build_channel_scaling(
-                self.input_variables,
-                scaling,
-                mean_expand_axes=(0, 2, 3, 4),
+            self.input_scaling = scaling_da.sel(index=self.input_variables).rename(
+                {"index": "channel_in"}
             )
-        except KeyError:
+            self.input_scaling = {
+                "mean": np.expand_dims(
+                    self.input_scaling["mean"].values.copy(), (0, 2, 3, 4)
+                ),
+                "std": np.expand_dims(
+                    self.input_scaling["std"].values.copy(), (0, 2, 3, 4)
+                ),
+            }
+        except (ValueError, KeyError):
             missing = [
                 m for m in self.input_variables if m not in list(self.scaling.keys())
             ]
@@ -445,12 +447,18 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             )
 
         try:
-            self.target_scaling = build_channel_scaling(
-                self.output_variables,
-                scaling,
-                mean_expand_axes=(0, 2, 3, 4),
+            self.target_scaling = scaling_da.sel(index=self.output_variables).rename(
+                {"index": "channel_out"}
             )
-        except KeyError:
+            self.target_scaling = {
+                "mean": np.expand_dims(
+                    self.target_scaling["mean"].values.copy(), (0, 2, 3, 4)
+                ),
+                "std": np.expand_dims(
+                    self.target_scaling["std"].values.copy(), (0, 2, 3, 4)
+                ),
+            }
+        except (ValueError, KeyError):
             missing = [
                 m for m in self.output_variables if m not in list(self.scaling.keys())
             ]
@@ -459,6 +467,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             )
 
         if self.constant_variables:
+            # Check that all constant variables are present in scaling data
             missing_constants = [
                 var
                 for var in self.constant_variables
@@ -470,15 +479,19 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                 )
 
             try:
-                # Constants stay scalar-mean only: a time-mean clim of a static
-                # field is the field itself and would zero the channel.
-                self.constant_scaling = build_channel_scaling(
-                    self.constant_variables,
-                    scaling,
-                    mean_expand_axes=(1, 2, 3),
-                    allow_spatial_mean=False,
-                )
-            except KeyError:
+
+                self.constant_scaling = scaling_da.sel(
+                    index=self.constant_variables
+                ).rename({"index": "channel_out"})
+                self.constant_scaling = {
+                    "mean": np.expand_dims(
+                        self.constant_scaling["mean"].values.copy(), (1, 2, 3)
+                    ),
+                    "std": np.expand_dims(
+                        self.constant_scaling["std"].values.copy(), (1, 2, 3)
+                    ),
+                }
+            except (ValueError, KeyError):
                 missing = [
                     m
                     for m in self.constant_variables

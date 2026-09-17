@@ -159,29 +159,30 @@ class BaseCoupler(ABC):
         """
         pass
 
-    def set_scaling(self, scaling):
+    def set_scaling(self, scaling_da):
         """
-        Build coupled-channel mean/std arrays from Hydra ``data.scaling``.
+        Called by CoupledDataset to compute static indices for training samples
 
         Parameters
         ----------
-        scaling: mapping
-            Per-variable ``{mean, std}`` entries (``mean`` may be a scalar or a
-            path to a ``(F, H, W)`` climatology map).
+        scaling_da: xarray.DataArray
+            values used to scale input data, uses mean and std
         """
-        from .scaling_utils import build_channel_scaling
-
-        missing_channels = set(self.variables) - set(scaling.keys())
+        # verify all the channels are there for scaling, this avoids an opaque
+        # "not all values found in index 'index'"" error that looks like its from hydra
+        missing_channels = set(self.variables) - set(scaling_da.index.values)
         if len(missing_channels) > 0:
             raise KeyError(
                 f"Coupled variable(s) not found in scaling values: {missing_channels}"
             )
 
-        self.coupled_scaling = build_channel_scaling(
-            self.variables,
-            scaling,
-            mean_expand_axes=(0, 2, 3, 4),
+        coupled_scaling = scaling_da.sel(index=self.variables).rename(
+            {"index": "channel_in"}
         )
+        self.coupled_scaling = {
+            "mean": np.expand_dims(coupled_scaling["mean"].to_numpy(), (0, 2, 3, 4)),
+            "std": np.expand_dims(coupled_scaling["std"].to_numpy(), (0, 2, 3, 4)),
+        }
 
     def setup_coupling(self, coupled_module):
         """
