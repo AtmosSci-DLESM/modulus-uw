@@ -22,17 +22,38 @@ an input argument for consistency.
 '''
 
 
-def replace_value_keep_gradient(
-    x: torch.Tensor, new_value: torch.Tensor
-) -> torch.Tensor:
-    """
-    Use ``new_value`` in the forward pass but keep ``x``'s gradient in the backward pass.
+class ClampInteriorSTE(torch.autograd.Function):
+    """Hard clamp in forward. Backward is identity inside the interval.
 
-    Straight-through estimator for hard corrections (e.g. nonnegative clamps): the
-    forward value is the projected ``new_value``, while backward treats the op as
-    identity so saturated cells still receive a learning signal.
+    Outside, pass ``grad_output`` only when it points into the feasible set:
+    increase when below the lower bound, decrease when above the upper bound.
+    Outward gradients are dropped so the pre-clamp latent does not drift
+    further out of bounds while the forward value stays at the bound.
     """
-    return x + (new_value - x).detach()
+
+    @staticmethod
+    def forward(ctx, x, lower, upper):
+        ctx.save_for_backward(x, lower, upper)
+        return torch.minimum(torch.maximum(x, lower), upper)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, lower, upper = ctx.saved_tensors
+        below = x < lower
+        above = x > upper
+        inside = ~(below | above)
+        zeros = torch.zeros_like(grad_output)
+        grad = torch.where(inside, grad_output, zeros)
+        grad = torch.where(below & (grad_output < 0), grad_output, grad)
+        grad = torch.where(above & (grad_output > 0), grad_output, grad)
+        return grad, None, None
+
+
+def clamp_keep_interior_grad(
+    x: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor
+) -> torch.Tensor:
+    """Hard clamp ``x`` to ``[lower, upper]`` with interior-only STE backward."""
+    return ClampInteriorSTE.apply(x, lower, upper)
 
 
 class NonnegativeConstraint(torch.nn.Module):
@@ -56,10 +77,11 @@ class NonnegativeConstraint(torch.nn.Module):
         scaling: dict[str, dict[str, float]]
             Dictionary containing the mean and std for each variable.
         keep_grad_through_clamp: bool, optional
-            If True, apply the nonnegative clamp with a straight-through
-            estimator: forward values are still clamped to physical zero, but
-            gradients flow as if the clamp were identity so below-threshold
-            predictions still get a learning signal. Default False.
+            If True, forward is still the hard clamp to physical zero, but
+            backward passes ``∂L/∂y`` on saturated cells only when it points
+            into the feasible set (increase when below the lower bound).
+            Default False uses the true clamp Jacobian (zeros on
+            saturated cells).
         """
         super().__init__()
         self.variables = variables
@@ -91,16 +113,138 @@ class NonnegativeConstraint(torch.nn.Module):
             1, 1, 1, -1, 1, 1
         )
         self.register_buffer("thresholds", thresholds, persistent=False)
+        self.register_buffer(
+            "unconstrained_upper",
+            torch.tensor(float("inf")),
+            persistent=False,
+        )
 
     def forward(self, prediction, input):
         '''
         Tensors are expected to be in the shape [B, F, T, C, H, W]
         '''
         thresholds = self.thresholds.to(dtype=prediction.dtype)
-        clamped = torch.maximum(prediction, thresholds)
         if self.keep_grad_through_clamp:
-            return replace_value_keep_gradient(prediction, clamped)
-        return clamped
+            return clamp_keep_interior_grad(
+                prediction,
+                thresholds,
+                self.unconstrained_upper.to(dtype=prediction.dtype),
+            )
+        return torch.maximum(prediction, thresholds)
+
+
+class BoundedConstraint(torch.nn.Module):
+    def __init__(
+        self,
+        lower_bounds: dict[str, float] | None = None,
+        upper_bounds: dict[str, float] | None = None,
+        in_channels: list[str] | None = None,
+        out_channels: list[str] | None = None,
+        scaling: dict[str, dict[str, float]] | None = None,
+        keep_grad_through_clamp: bool = False,
+    ):
+        """
+        Clamp model outputs to optional physical lower and/or upper bounds.
+
+        Bounds are specified in physical units and converted to normalized
+        thresholds using ``scaling``. Channels without a bound on a given side
+        are left unconstrained on that side.
+
+        Parameters
+        ----------
+        lower_bounds: dict[str, float], optional
+            Per-variable physical lower bounds (inclusive).
+        upper_bounds: dict[str, float], optional
+            Per-variable physical upper bounds (inclusive).
+        in_channels: list[str]
+            List of all input channel names in the model.
+        out_channels: list[str]
+            List of all output channel names in the model.
+        scaling: dict[str, dict[str, float]]
+            Dictionary containing the mean and std for each variable.
+        keep_grad_through_clamp: bool, optional
+            If True, forward is still the hard clamp, but backward passes
+            ``∂L/∂y`` on saturated cells only when it points into the feasible
+            set (increase below a lower bound, decrease above an upper bound).
+            Default False uses the true clamp Jacobian (zeros on saturated
+            cells).
+        """
+        super().__init__()
+        lower_bounds = lower_bounds or {}
+        upper_bounds = upper_bounds or {}
+        if not lower_bounds and not upper_bounds:
+            raise ValueError(
+                "BoundedConstraint requires at least one of lower_bounds or "
+                "upper_bounds."
+            )
+
+        if out_channels is not None:
+            self.channels = out_channels
+        else:
+            self.channels = in_channels
+        self.scaling = scaling
+        self.keep_grad_through_clamp = keep_grad_through_clamp
+
+        requested = set(lower_bounds) | set(upper_bounds)
+        for name in requested:
+            if name in lower_bounds and name in upper_bounds:
+                if lower_bounds[name] > upper_bounds[name]:
+                    raise ValueError(
+                        f"BoundedConstraint for {name!r}: lower bound "
+                        f"{lower_bounds[name]} exceeds upper bound "
+                        f"{upper_bounds[name]}."
+                    )
+
+        missing = [var for var in requested if var not in self.channels]
+        if missing:
+            logger0.warning(
+                f"Requested bounded variables {missing} not found in model "
+                "channels and will be ignored."
+            )
+        self.constrained_variables = {
+            name for name in requested if name in self.channels
+        }
+
+        lower_per_channel = []
+        upper_per_channel = []
+        for name in self.channels:
+            if name not in self.constrained_variables:
+                lower_per_channel.append(float("-inf"))
+                upper_per_channel.append(float("inf"))
+                continue
+            scale = scaling[name]
+            if name in lower_bounds:
+                lower_per_channel.append(
+                    (lower_bounds[name] - scale["mean"]) / scale["std"]
+                )
+            else:
+                lower_per_channel.append(float("-inf"))
+            if name in upper_bounds:
+                upper_per_channel.append(
+                    (upper_bounds[name] - scale["mean"]) / scale["std"]
+                )
+            else:
+                upper_per_channel.append(float("inf"))
+
+        lower_thresholds = torch.tensor(
+            lower_per_channel, dtype=torch.float32
+        ).view(1, 1, 1, -1, 1, 1)
+        upper_thresholds = torch.tensor(
+            upper_per_channel, dtype=torch.float32
+        ).view(1, 1, 1, -1, 1, 1)
+        self.register_buffer("lower_thresholds", lower_thresholds, persistent=False)
+        self.register_buffer("upper_thresholds", upper_thresholds, persistent=False)
+
+    def forward(self, prediction, input):
+        '''
+        Tensors are expected to be in the shape [B, F, T, C, H, W]
+        '''
+        lower = self.lower_thresholds.to(dtype=prediction.dtype)
+        upper = self.upper_thresholds.to(dtype=prediction.dtype)
+        if self.keep_grad_through_clamp:
+            return clamp_keep_interior_grad(prediction, lower, upper)
+        clamped = torch.maximum(prediction, lower)
+        return torch.minimum(clamped, upper)
 
 class DryAirMassConstraint(torch.nn.Module):
     def __init__(
