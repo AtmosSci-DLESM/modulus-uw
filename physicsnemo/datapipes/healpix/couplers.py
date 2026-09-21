@@ -59,6 +59,15 @@ import torch as th
 import xarray as xr
 import zarr as zr
 
+from physicsnemo.datapipes.healpix.coupling_ops import (
+    CONSTANT,
+    TRAILING_AVERAGE,
+    CouplingOp,
+    denormalize,
+    renormalize,
+    rescale_through_physical,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,6 +77,10 @@ class BaseCoupler(ABC):
 
     This class contains common functionality shared by different coupler implementations.
     """
+
+    #: Coupling strategy this class implements, one of the mode names in
+    #: :mod:`physicsnemo.datapipes.healpix.coupling_ops`. Set by subclasses.
+    coupling_method: str = None
 
     def __init__(
         self,
@@ -131,6 +144,9 @@ class BaseCoupler(ABC):
         self.integrated_couplings = None
         self.ds_variable_indices = []
         self.time_first = time_first
+        # Ops built by coupling_op(), keyed by rescale_in_physical_space. Built
+        # lazily and dropped whenever the configuration they captured changes.
+        self._coupling_ops = {}
         self.incoming_coupled_scaling = None
         self.outgoing_coupled_scaling = None
         # Set by setup_coupling: source-module channel names for denorm lookups,
@@ -211,6 +227,34 @@ class BaseCoupler(ABC):
             "std": np.expand_dims(coupled_scaling["std"].to_numpy(), (0, 2, 3, 4)),
         }
 
+    def _invalidate_coupling_ops(self):
+        """Drop cached ops so the next :meth:`coupling_op` rebuilds them.
+
+        Called whenever state that :meth:`CouplingOp.from_coupler` captures
+        changes, so a cached op can never outlive the configuration it read.
+        """
+        self._coupling_ops.clear()
+
+    @property
+    def incoming_coupled_scaling(self):
+        """Statistics that normalized the source component's fields, or None."""
+        return self._incoming_coupled_scaling
+
+    @incoming_coupled_scaling.setter
+    def incoming_coupled_scaling(self, scaling):
+        self._incoming_coupled_scaling = scaling
+        self._invalidate_coupling_ops()
+
+    @property
+    def outgoing_coupled_scaling(self):
+        """Statistics used to renormalize the coupled result, or None."""
+        return self._outgoing_coupled_scaling
+
+    @outgoing_coupled_scaling.setter
+    def outgoing_coupled_scaling(self, scaling):
+        self._outgoing_coupled_scaling = scaling
+        self._invalidate_coupling_ops()
+
     def set_coupled_scaling(self, incoming_coupled_scaling):
         """Set incoming denorm stats; outgoing renorm uses ``coupled_scaling`` tiled.
 
@@ -272,25 +316,14 @@ class BaseCoupler(ABC):
             "std": th.as_tensor(std).view(1, 1, 1, -1, 1, 1),
         }
 
-    @staticmethod
-    def _denormalize(x: th.Tensor, scaling: dict) -> th.Tensor:
-        mean = scaling["mean"].to(device=x.device, dtype=x.dtype)
-        std = scaling["std"].to(device=x.device, dtype=x.dtype)
-        return x * std + mean
-
-    @staticmethod
-    def _renormalize(x: th.Tensor, scaling: dict) -> th.Tensor:
-        mean = scaling["mean"].to(device=x.device, dtype=x.dtype)
-        std = scaling["std"].to(device=x.device, dtype=x.dtype)
-        return (x - mean) / std
+    _denormalize = staticmethod(denormalize)
+    _renormalize = staticmethod(renormalize)
 
     def rescale_coupled_fields_through_physical(
         self, coupled_fields: th.Tensor, physical_op
     ) -> th.Tensor:
         """
         Rescale coupled fields through physical space.
-        Fields may overflow when denormalized, so we run in float32 mid-flight.
-        float32 → Denorm → ``physical_op`` → renorm → restore input dtype.
 
         Parameters
         ----------
@@ -299,28 +332,54 @@ class BaseCoupler(ABC):
         physical_op: callable
             The physical operation to apply to the coupled fields.
         """
-        orig_dtype = coupled_fields.dtype
-        physical_fields = self._denormalize(
-            coupled_fields.float(), self.incoming_coupled_scaling
+        return rescale_through_physical(
+            coupled_fields,
+            physical_op,
+            self.incoming_coupled_scaling,
+            self.outgoing_coupled_scaling,
         )
-        transformed_fields = physical_op(physical_fields)
-        normalized_fields = self._renormalize(
-            transformed_fields, self.outgoing_coupled_scaling
-        )
-        return normalized_fields.to(dtype=orig_dtype)
 
-    def _store_preset_coupled_fields(self, coupled_fields: th.Tensor, physical_op):
-        """Index channels, optionally rescale through physical space, then store."""
-        coupled_fields = coupled_fields[:, :, :, self.coupled_channel_indices, :, :]
-        if self.incoming_coupled_scaling is not None:
-            preset = self.rescale_coupled_fields_through_physical(
-                coupled_fields, physical_op
+    def coupling_op(self, rescale_in_physical_space: bool = True) -> CouplingOp:
+        """Return this coupler's coupling as a standalone differentiable module.
+
+        The returned :class:`~physicsnemo.datapipes.healpix.coupling_ops.CouplingOp`
+        carries the coupler's channel indices, time reduction, and scaling
+        statistics, so callers that need to couple fields inside an autograd
+        graph (distributed inference, coupled training) can run exactly what the
+        dataloader runs instead of reimplementing it.
+
+        The op is built once per ``rescale_in_physical_space`` value and cached,
+        because ``set_coupled_fields`` runs this on every dataloader step and
+        constructing an :class:`~torch.nn.Module` per step is pure overhead.
+        Reconfiguring the coupler drops the cache, so the op cannot go stale. As
+        a consequence the instance is shared between callers: moving it with
+        ``.to()`` sticks, and mutating it is visible to everyone.
+
+        Parameters
+        ----------
+        rescale_in_physical_space: bool, optional
+            Whether the op should act on this coupler's scaling statistics.
+            Pass False to reduce in normalized space with the statistics still
+            attached, which reproduces the numbers a caller produced before
+            physical-space rescaling was available. Default True.
+
+        Returns
+        -------
+        CouplingOp
+            Reflecting the coupler's configuration as of the last
+            ``setup_coupling`` or ``set_coupled_scaling`` call.
+        """
+        op = self._coupling_ops.get(rescale_in_physical_space)
+        if op is None:
+            op = CouplingOp.from_coupler(
+                self, rescale_in_physical_space=rescale_in_physical_space
             )
-        else:
-            preset = physical_op(coupled_fields)
-        if self.time_first:
-            preset = preset.permute(2, 0, 3, 1, 4, 5)
-        self.preset_coupled_fields = preset
+            self._coupling_ops[rescale_in_physical_space] = op
+        return op
+
+    def _store_preset_coupled_fields(self, coupled_fields: th.Tensor):
+        """Apply the coupling operation and buffer the result for the dataloader."""
+        self.preset_coupled_fields = self.coupling_op()(coupled_fields)
         self.coupled_mode = True
 
     def setup_coupling(self, coupled_module):
@@ -359,6 +418,7 @@ class BaseCoupler(ABC):
         self.coupled_channel_indices = channel_indices
         self.incoming_variables = incoming_variables
         self.outgoing_variable_order = outgoing_variable_order
+        self._invalidate_coupling_ops()
 
     def reset_coupler(self):
         self.coupled_mode = False
@@ -476,6 +536,8 @@ class ConstantCoupler(BaseCoupler):
     force the model with this field consistently
     """
 
+    coupling_method = CONSTANT
+
     def __init__(
         self,
         dataset: xr.Dataset,
@@ -563,16 +625,7 @@ class ConstantCoupler(BaseCoupler):
             The data to use when the dataloader requests coupled fields. Expected
             format is [B, F, T, C, H, W]
         """
-
-        def _broadcast_first_time(fields: th.Tensor) -> th.Tensor:
-            # Clone so later mutations of coupled_fields cannot alter presets.
-            return (
-                fields[:, :, :1]
-                .expand(-1, -1, self.coupled_integration_dim, -1, -1, -1)
-                .clone()
-            )
-
-        self._store_preset_coupled_fields(coupled_fields, _broadcast_first_time)
+        self._store_preset_coupled_fields(coupled_fields)
 
 
 class TrailingAverageCoupler(BaseCoupler):
@@ -582,6 +635,8 @@ class TrailingAverageCoupler(BaseCoupler):
     Trailing average coupler uses coupled input times as the right side of
     an average that is taken over an "averaging_window" window size.
     """
+
+    coupling_method = TRAILING_AVERAGE
 
     def __init__(
         self,
@@ -711,6 +766,9 @@ class TrailingAverageCoupler(BaseCoupler):
                     )
                 )
         self.averaging_slices = averaging_slices
+        # super().setup_coupling already invalidated, but averaging_slices is
+        # assigned after that call, so the windows need their own invalidation.
+        self._invalidate_coupling_ops()
 
     def set_coupled_fields(self, coupled_fields: th.tensor):
         """
@@ -727,17 +785,4 @@ class TrailingAverageCoupler(BaseCoupler):
             The data to use when the dataloader requests coupled fields. Expected
             format is [B, F, T, C, H, W]
         """
-
-        def _trailing_average(fields: th.Tensor) -> th.Tensor:
-            # TODO: Now support output_time_dim =/= input_time_dim, but presteps
-            # need to be 0, will add support for presteps>0
-            coupled_averaging_periods = []
-            for j in range(self.coupled_integration_dim):
-                averaging_periods = [
-                    fields[:, :, s, :, :, :].mean(dim=2, keepdim=True)
-                    for s in self.averaging_slices[j]
-                ]
-                coupled_averaging_periods.append(th.concat(averaging_periods, dim=3))
-            return th.concat(coupled_averaging_periods, dim=2)
-
-        self._store_preset_coupled_fields(coupled_fields, _trailing_average)
+        self._store_preset_coupled_fields(coupled_fields)
