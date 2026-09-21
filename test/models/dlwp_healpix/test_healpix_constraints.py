@@ -24,7 +24,7 @@ sys.path.append(os.path.join(os.path.dirname(script_path), ".."))
 import pytest
 import torch
 
-from physicsnemo.models.dlwp_healpix_layers.healpix_constraints import ( 
+from physicsnemo.models.dlwp_healpix_layers.healpix_constraints import (
     BoundConstraint,
     DryAirMassConstraint,
     NonnegativeConstraint,
@@ -637,24 +637,16 @@ def test_bound_default_scaling_with_missing_variable(caplog):
     assert mod.max_thresholds.view(-1).tolist() == [4.0]
 
 
-def test_bound_inverted_bounds_warns_and_disables_clamping(caplog):
+def test_bound_inverted_bounds_raises():
     channels = ["a", "b"]
     scaling = {name: {"mean": 0.0, "std": 1.0} for name in channels}
-    with caplog.at_level(logging.WARNING):
-        mod = BoundConstraint(
+    with pytest.raises(ValueError, match="is greater than physical max"):
+        BoundConstraint(
             bounds={"a": [1.0, -1.0], "b": [-1.0, 1.0]},
             in_channels=channels,
             out_channels=channels,
             scaling=scaling,
         )
-    assert "is greater than physical max" in caplog.text
-
-    # The inverted channel is left unclamped, the well-ordered one still clamps.
-    assert torch.isneginf(mod.min_thresholds.view(-1)[0])
-    assert torch.isposinf(mod.max_thresholds.view(-1)[0])
-    prediction = torch.tensor([[[[[[5.0]], [[5.0]]]]]])
-    out = mod(prediction, prediction)
-    torch.testing.assert_close(out, torch.tensor([[[[[[5.0]], [[1.0]]]]]]))
 
 
 def test_bound_open_ended_limits_do_not_trigger_inverted_warning(caplog):

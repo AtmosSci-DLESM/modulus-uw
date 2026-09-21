@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
 import torch
 
 from physicsnemo.distributed import DistributedManager
@@ -84,6 +83,11 @@ class NonnegativeConstraint(torch.nn.Module):
         """
         super().__init__()
         self.variables = variables
+        if channels is not None:
+            logger0.warning(
+                "channels argument is deprecated; use in_channels and out_channels instead."
+            )
+            in_channels = channels
         if out_channels is not None:
             self.channels = out_channels
         else:
@@ -169,16 +173,19 @@ class BoundConstraint(torch.nn.Module):
         super().__init__()
         self.bounds = bounds if bounds is not None else {}
         if channels is not None:
-            logger0.warning("channels argument is deprecated; use in_channels and out_channels instead.")
+            logger0.warning(
+                "channels argument is deprecated; use in_channels and out_channels instead."
+            )
+            in_channels = channels
         if out_channels is not None:
-            channels = out_channels
+            self.channels = out_channels
         else:
-            channels = in_channels
+            self.channels = in_channels
         self.keep_grad_through_clamp = keep_grad_through_clamp
 
         # Only apply constraint to variables that are used by model
-        missing = [var for var in self.bounds if var not channels]
-        self.variables = [var for var in self.bounds if var in channels]
+        missing = [var for var in self.bounds if var not in self.channels]
+        self.variables = [var for var in self.bounds if var in self.channels]
 
         if scaling is not None:
             scaling = scaling
@@ -200,7 +207,7 @@ class BoundConstraint(torch.nn.Module):
         constrained_set = set(self.variables)
         min_per_channel = []
         max_per_channel = []
-        for name in channels:
+        for name in self.channels:
             phys_min, phys_max = (
                 self.bounds[name] if name in constrained_set else (None, None)
             )
