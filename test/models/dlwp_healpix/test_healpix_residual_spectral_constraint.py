@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from physicsnemo.models.dlwp_healpix_layers.healpix_residual_spectral_constraint import (
+    InputSkipSpectralLowPassConstraint,
     ResidualSpectralLowPassConstraint,
 )
 
@@ -137,3 +138,54 @@ def test_backward_through_filter():
     assert pred.grad[:, :, :, 0].abs().sum() > 0
     # Unlisted channels are identity; grad must pass through.
     assert pred.grad[:, :, :, 1].abs().sum() > 0
+
+
+def _split_ell(mod, faces, cutoff):
+    alm = mod._to_alm(faces)
+    ell = torch.arange(mod.lmax, device=faces.device).view(1, 1, 1, mod.lmax, 1)
+    dtype = alm.real.dtype
+    high = mod._from_alm(alm * (ell >= cutoff).to(dtype))
+    low = mod._from_alm(alm * (ell < cutoff).to(dtype))
+    return high, low
+
+
+@pytest.mark.skipif(not _cuda_sht_available(), reason=CUDA_REASON)
+def test_input_skip_drops_high_ell_of_state_keeps_residual():
+    device = "cuda"
+    mod = InputSkipSpectralLowPassConstraint(
+        cutoffs={"PRESsfc": CUTOFF},
+        in_channels=["PRESsfc", "TMP2m"],
+        out_channels=["PRESsfc", "TMP2m", "PRATEsfc"],
+        nside=NSIDE,
+        lmax=LMAX,
+    ).to(device)
+    torch.manual_seed(3)
+    b, t, h = 1, 1, NSIDE
+    state = torch.randn(b, 12, t, 1, h, h, device=device)
+    state_high, state_low = _split_ell(mod, state, CUTOFF)
+    # Zero residual: output high-ℓ of PRESsfc is removed; low-ℓ of x is kept.
+    orig = torch.zeros(b, 12, t, 2, h, h, device=device)
+    orig[:, :, :, :1] = state_high + state_low
+    pred = orig.new_zeros(b, 12, t, 3, h, h)
+    pred[:, :, :, :2] = orig
+    pred[:, :, :, 1] = torch.randn_like(orig[:, :, :, 1])
+    pred[:, :, :, 2] = torch.randn(b, 12, t, h, h, device=device)
+    out = mod(pred, orig)
+    p_out = _ell_power(mod, out[:, :, :, :1])
+    p_state = _ell_power(mod, state_high + state_low)
+    assert p_out[CUTOFF:].sum() < 1e-4 * p_state[CUTOFF:].sum().clamp(min=1e-12)
+    assert torch.allclose(p_out[:CUTOFF], p_state[:CUTOFF], rtol=1e-3, atol=1e-5)
+    assert torch.allclose(out[:, :, :, 1], pred[:, :, :, 1])
+    assert torch.allclose(out[:, :, :, 2], pred[:, :, :, 2])
+
+    # Zero input: high-ℓ of the residual is kept.
+    residual = torch.randn(b, 12, t, 1, h, h, device=device)
+    res_high, res_low = _split_ell(mod, residual, CUTOFF)
+    orig.zero_()
+    pred.zero_()
+    pred[:, :, :, :1] = res_high + res_low
+    out = mod(pred, orig)
+    p_res = _ell_power(mod, res_high + res_low)
+    p_kept = _ell_power(mod, out[:, :, :, :1])
+    assert torch.allclose(p_kept[CUTOFF:], p_res[CUTOFF:], rtol=1e-3, atol=1e-5)
+    assert torch.allclose(p_kept[:CUTOFF], p_res[:CUTOFF], rtol=1e-3, atol=1e-5)
