@@ -14,13 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Hard RecUNet constraint: spherical low-pass of selected prognostic residuals.
+"""Hard RecUNet spherical low-pass constraints on selected prognostics.
 
-Applied after residual add as ``y := x + LP_{ℓ < ℓ_cut}(y − x)``. Filtering the
-increment (not the full field) keeps the initial high-ℓ state (orography in
-surface pressure) while stopping a random walk of unresolved Δy. Per-variable
-cutoffs are compile-friendly buffers; SHT matches the FACE→RING path in
-``healpix_loss``.
+``ResidualSpectralLowPassConstraint`` is applied after residual add as
+``y := x + LP_{ℓ < ℓ_cut}(y − x)``. Filtering the increment (not the full field)
+keeps the initial high-ℓ state (orography in surface pressure) while stopping a
+random walk of unresolved Δy.
+
+``InputSkipSpectralLowPassConstraint`` is the other split:
+``y := LP_{ℓ < ℓ_cut}(x) + (y − x)``. The decoder still sees the unfiltered
+state. High-ℓ of the carried state is dropped each step, so unpredictable
+small-scale noise does not accumulate; high-ℓ in the output comes only from
+this step's residual.
+
+Per-variable cutoffs are compile-friendly buffers; SHT matches the FACE→RING
+path in ``healpix_loss``.
 """
 
 from __future__ import annotations
@@ -164,6 +172,10 @@ class ResidualSpectralLowPassConstraint(torch.nn.Module):
             )
         return out
 
+    def _combine(self, orig_sel: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        """``y = x + LP(y − x)``. High-ℓ of the carried state is unchanged."""
+        return orig_sel + self._lowpass_residual(residual)
+
     def forward(self, prediction: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
         """
         Parameters
@@ -178,9 +190,20 @@ class ResidualSpectralLowPassConstraint(torch.nn.Module):
             orig = input.float()
             if orig.shape[2] != prediction.shape[2]:
                 orig = orig[:, :, -1:]
-            residual = self._select(prediction, self._pred_idx) - self._select(
-                orig, self._orig_idx
-            )
-            filtered = self._select(orig, self._orig_idx) + self._lowpass_residual(residual)
+            orig_sel = self._select(orig, self._orig_idx)
+            residual = self._select(prediction, self._pred_idx) - orig_sel
+            filtered = self._combine(orig_sel, residual)
             out = self._replace(prediction, self._pred_idx, filtered)
         return out.to(dtype=orig_dtype)
+
+
+class InputSkipSpectralLowPassConstraint(ResidualSpectralLowPassConstraint):
+    """Low-pass the residual-add skip, not the increment.
+
+    RecUNet has already run on the unfiltered state. This rewrites selected
+    channels as ``y := LP(x) + (y − x)``, which is the same as filtering ``x``
+    immediately before the residual is added.
+    """
+
+    def _combine(self, orig_sel: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        return self._lowpass_residual(orig_sel) + residual
