@@ -41,6 +41,23 @@ def _error_tolerant(error: torch.Tensor) -> torch.Tensor:
     return error / (1.0 + torch.exp(1.0 - error))
 
 
+def reduce_per_term_loss(
+    terms: torch.Tensor, n_data_variables: int
+) -> torch.Tensor:
+    """Training scalar: ``sum(per-term losses) / n_data_variables``.
+
+    Dividing by the data-channel count ``C`` (not the full term count) keeps the
+    data contribution equal to a uniform-weight mean while each constraint term
+    contributes ``1/C`` of its value. This replaces the older sum-of-block-means
+    reduction (``mean(data) + mean(hydro) + dry_air + …``).
+    """
+    if n_data_variables < 1:
+        raise ValueError(
+            f"n_data_variables must be >= 1, got {n_data_variables}"
+        )
+    return terms.sum() / float(n_data_variables)
+
+
 class SoftConstraint(torch.nn.Module):
     """Base class for soft constraints composed by :class:`LossWithSoftConstraints`.
 
@@ -49,6 +66,9 @@ class SoftConstraint(torch.nn.Module):
     if ``needs_input`` is False, do not accept an ``input`` argument; if True,
     require ``input`` as a keyword-only argument. Same for
     ``needs_input_diagnostics`` / ``input_diagnostics``.
+
+    ``physical_rmse`` returns the physical residual RMSE used by validation
+    metrics (no alpha, no tolerant map, no loss weight).
     """
 
     needs_input: bool = False
@@ -66,6 +86,17 @@ class SoftConstraint(torch.nn.Module):
         average_channels: bool = True,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+    def physical_rmse(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Physical residual RMSE (no alpha / tolerant map / loss weight)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement physical_rmse"
+        )
 
 
 class HydrostasySoftConstraint(SoftConstraint):
@@ -262,6 +293,42 @@ class HydrostasySoftConstraint(SoftConstraint):
             if average_channels:
                 return torch.mean(Tv_loss)
             return Tv_loss
+
+    def physical_rmse(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Per-layer RMSE of virtual-temperature imbalance in K.
+
+        Underground columns are masked when ``topography_masking`` is True.
+        No alpha, tolerant map, or loss weight is applied.
+        """
+        del target, kwargs
+        with torch.amp.autocast("cuda", enabled=False):
+            prediction = prediction.float()
+            if prediction.ndim != 6:
+                raise AssertionError("Expected predictions to have 6 dimensions")
+            x = self.scale(prediction)
+            Tv_avg, Tv_model_avg = self.constraint(x)
+            Tv_error = Tv_avg - Tv_model_avg
+            n_layers = Tv_error.shape[2]
+            if self.topography_masking:
+                valid = x[:, :, 1 : self.num_z_levels, :, :] >= self.topography
+            else:
+                valid = torch.ones_like(Tv_error, dtype=torch.bool)
+            rmse = []
+            for layer in range(n_layers):
+                err = Tv_error[:, :, layer, :, :]
+                mask = valid[:, :, layer, :, :]
+                if mask.any():
+                    rmse.append(torch.sqrt((err[mask] ** 2).mean()))
+                else:
+                    rmse.append(
+                        torch.zeros((), device=prediction.device, dtype=prediction.dtype)
+                    )
+            return torch.stack(rmse)
 
 
 class DryAirMassSoftConstraint(SoftConstraint):
@@ -495,12 +562,60 @@ class DryAirMassSoftConstraint(SoftConstraint):
                 return loss
             return loss.reshape(())
 
+    def physical_rmse(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor = None,
+        *,
+        input: torch.Tensor,
+        input_diagnostics: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """RMSE of global-mean dry-surface-pressure change in Pa.
+
+        Same IC / consecutive-prediction transitions as ``constraint_loss``,
+        without alpha, tolerant map, or loss weight.
+        """
+        del target, kwargs
+        if input is None:
+            raise ValueError(
+                "DryAirMassSoftConstraint.physical_rmse requires prognostic input."
+            )
+        if self.needs_input_diagnostics and input_diagnostics is None:
+            raise ValueError(
+                "DryAirMassSoftConstraint.physical_rmse requires input_diagnostics."
+            )
+        with torch.amp.autocast("cuda", enabled=False):
+            prediction = prediction.float()
+            input = input.float()
+            if input_diagnostics is not None:
+                input_diagnostics = input_diagnostics.float()
+            if prediction.ndim != 6:
+                raise AssertionError("Expected predictions to have 6 dimensions")
+
+            sp_dry_pred = self._global_mean_sp_dry(prediction)
+            sp_dry_input = self._global_mean_sp_dry_ic(input, input_diagnostics)
+            T = sp_dry_pred.shape[2]
+            prev = sp_dry_input
+            residuals = []
+            for t in range(T):
+                curr = sp_dry_pred[:, :, t : t + 1]
+                residuals.append(curr - prev)
+                prev = curr
+            stacked = torch.cat(residuals, dim=2)
+            return torch.sqrt((stacked ** 2).mean())
+
 
 class LossWithSoftConstraints(torch.nn.Module):
     """
     Loss-agnostic wrapper that adds zero or more soft constraints to a data loss.
 
     Compatible with the DLWP trainer ``setup`` / ``average_channels`` conventions.
+
+    When ``average_channels=True``, the training scalar is
+    ``sum(per-term losses) / n_data_variables`` (see :func:`reduce_per_term_loss`),
+    not the older sum of block means. ``average_channels=False`` returns the
+    concatenated per-term vector ``[data channels | constraint terms…]``.
 
     ``needs_input`` is True iff any child soft constraint requires prognostic
     input. ``needs_input_diagnostics`` is True iff any child needs IC diagnostic
@@ -562,17 +677,19 @@ class LossWithSoftConstraints(torch.nn.Module):
         parts: list[torch.Tensor],
         average_channels: bool,
     ) -> torch.Tensor:
-        if not parts:
-            return data
-        if average_channels:
-            total = data
-            for p in parts:
-                total = total + p
-            return total
-        pieces = [data]
+        """Concatenate per-term losses; optionally reduce with ``sum / C``.
+
+        ``data`` must be the per-channel data-loss vector (``average_channels``
+        already False at the call site). ``C = data.shape[0]``.
+        """
+        pieces = [data if data.dim() > 0 else data.unsqueeze(0)]
         for p in parts:
             pieces.append(p if p.dim() > 0 else p.unsqueeze(0))
-        return torch.cat(pieces)
+        terms = torch.cat(pieces) if parts else pieces[0]
+        if not average_channels:
+            return terms
+        n_data = int(pieces[0].shape[0])
+        return reduce_per_term_loss(terms, n_data)
 
     def _forward_without_input(
         self,
@@ -580,15 +697,16 @@ class LossWithSoftConstraints(torch.nn.Module):
         target: torch.Tensor,
         average_channels: bool = True,
     ) -> torch.Tensor:
+        # Always collect the per-term vector so the scalar path can use sum/C.
         data = self.data_loss(
             prediction,
             target,
-            average_channels=average_channels,
+            average_channels=False,
         )
         parts = self._constraint_parts(
             prediction,
             target,
-            average_channels,
+            average_channels=False,
             input=None,
             input_diagnostics=None,
         )
@@ -616,12 +734,12 @@ class LossWithSoftConstraints(torch.nn.Module):
         data = self.data_loss(
             prediction,
             target,
-            average_channels=average_channels,
+            average_channels=False,
         )
         parts = self._constraint_parts(
             prediction,
             target,
-            average_channels,
+            average_channels=False,
             input=input,
             input_diagnostics=input_diagnostics,
         )
