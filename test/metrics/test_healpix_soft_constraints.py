@@ -159,6 +159,136 @@ def test_loss_with_soft_constraints_no_constraints():
         wrapper(pred, target, input=pred)
 
 
+def test_loss_with_soft_constraints_sum_over_c_reduction():
+    """Scalar is sum(per-term) / C, not sum of block means."""
+    from physicsnemo.metrics.climate.healpix_soft_constraints import (
+        reduce_per_term_loss,
+    )
+
+    channels = ["tcwv", "sp"]
+    scaling = _dry_air_scaling()
+    data_loss = WeightedMSE(weights=[1.0, 1.0])
+    dry = DryAirMassSoftConstraint(
+        channels=channels, scaling=scaling, weight=1.0, alpha=0.383431
+    )
+    wrapper = LossWithSoftConstraints(data_loss=data_loss, constraints=[dry])
+    trainer = _DummyTrainer(device=torch.device("cpu"), output_variables=channels)
+    wrapper.setup(trainer)
+
+    B, F, T, H, W = 1, 1, 2, 2, 2
+    C = len(channels)
+    inp = torch.zeros(B, F, 1, C, H, W)
+    pred = torch.zeros(B, F, T, C, H, W)
+    # Non-zero dry-air residual: predicted sp drifts from IC
+    pred[:, :, :, channels.index("sp")] = 1.0
+    target = pred.clone()
+
+    per = wrapper(pred, target, average_channels=False, input=inp)
+    assert per.shape == (3,)
+    scalar = wrapper(pred, target, average_channels=True, input=inp)
+    expected = reduce_per_term_loss(per, n_data_variables=C)
+    assert torch.allclose(scalar, expected)
+
+    data_mean = data_loss(pred, target, average_channels=True)
+    dry_scalar = dry.constraint_loss(pred, target, input=inp, average_channels=True)
+    # Old sum-of-block-means would be data_mean + dry_scalar; new reduction differs
+    # whenever the dry-air term is nonzero.
+    old_block_sum = data_mean + dry_scalar
+    assert not torch.allclose(scalar, old_block_sum)
+    assert torch.allclose(scalar, (per[:C].sum() + per[C]) / C)
+
+
+def test_hydrostasy_soft_constraint_physical_rmse(tmp_path):
+    hPa_levels = [500.0, 700.0, 850.0]
+    channels = [
+        "z500",
+        "z700",
+        "z850",
+        "t500",
+        "t700",
+        "t850",
+        "q500",
+        "q700",
+        "q850",
+    ]
+    scaling = {
+        f"z{int(p)}": {"mean": 5000.0 * i, "std": 100.0}
+        for i, p in enumerate(hPa_levels)
+    }
+    scaling.update({f"t{int(p)}": {"mean": 250.0, "std": 10.0} for p in hPa_levels})
+    scaling.update({f"q{int(p)}": {"mean": 0.001, "std": 0.0005} for p in hPa_levels})
+    faces, hh, ww = 12, 4, 4
+    topo = np.zeros((faces, hh, ww), dtype=np.float32)
+    ds = xr.Dataset(
+        {
+            "constants": (
+                ("face", "channel_c", "height", "width"),
+                topo[:, None, :, :],
+            )
+        },
+        coords={"channel_c": ["z"]},
+    )
+    zarr_path = tmp_path / "topo.zarr"
+    ds.to_zarr(zarr_path)
+
+    soft = HydrostasySoftConstraint(
+        hPa_levels=hPa_levels,
+        channels=channels,
+        weights=[0.001, 0.002],
+        alpha=[0.2, 0.3],
+        scaling=scaling,
+        dataset_path=str(zarr_path),
+        surface_geopotential_name="z",
+        surface_geopotential_mean=0.0,
+        surface_geopotential_std=1.0,
+        convert_topography_to_meters=True,
+        topography_masking=False,
+    )
+    trainer = _DummyTrainer(device=torch.device("cpu"), output_variables=channels)
+    soft.setup(trainer)
+    torch.manual_seed(1)
+    pred = torch.randn(1, faces, 1, len(channels), hh, ww)
+    rmse = soft.physical_rmse(pred, pred.clone())
+    assert rmse.shape == (len(hPa_levels) - 1,)
+    assert torch.isfinite(rmse).all()
+    assert (rmse >= 0).all()
+
+
+def test_dry_air_mass_soft_constraint_physical_rmse():
+    channels = ["tcwv", "sp"]
+    scaling = _dry_air_scaling()
+    mod = DryAirMassSoftConstraint(
+        channels=channels, scaling=scaling, weight=1.0, alpha=0.383431
+    )
+    trainer = _DummyTrainer(device=torch.device("cpu"), output_variables=channels)
+    mod.setup(trainer)
+
+    B, F, T, H, W = 1, 1, 2, 3, 3
+    g0 = 9.81
+    # Exact conservation in physical units (zeros in normalized space).
+    inp = torch.zeros(B, F, 1, 2, H, W)
+    tcwv_phys = scaling["tcwv"]["mean"]
+    sp_dry = scaling["sp"]["mean"] - g0 * tcwv_phys
+    pred = torch.zeros(B, F, T, 2, H, W)
+    tcwv_phys_t = torch.full((B, F, T, 1, H, W), tcwv_phys)
+    sp_phys = sp_dry + g0 * tcwv_phys_t
+    pred[:, :, :, 0:1] = (tcwv_phys_t - scaling["tcwv"]["mean"]) / scaling["tcwv"][
+        "std"
+    ]
+    pred[:, :, :, 1:2] = (sp_phys - scaling["sp"]["mean"]) / scaling["sp"]["std"]
+
+    rmse0 = mod.physical_rmse(pred, pred.clone(), input=inp)
+    assert rmse0.shape == ()
+    assert float(rmse0) == pytest.approx(0.0, abs=1e-4)
+
+    pred2 = pred.clone()
+    pred2[:, :, :, channels.index("sp")] += 0.5
+    rmse1 = mod.physical_rmse(pred2, pred2.clone(), input=inp)
+    assert float(rmse1) > 0.0
+    # Physical RMSE is in Pa and must exceed the alpha-normalized loss scale.
+    assert float(rmse1) > 1.0
+
+
 def test_hydrostasy_soft_constraint_matches_loss_with_hydrostasy(tmp_path):
     """Tv soft-constraint term matches LossWithHydrostasy Tv contribution."""
     hPa_levels = [500.0, 700.0, 850.0]
