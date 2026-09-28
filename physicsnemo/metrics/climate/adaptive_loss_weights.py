@@ -61,7 +61,10 @@ class AdaptiveLossWeights(torch.nn.Module):
         (e.g. ``WeightedMSE`` or ``LossWithSoftConstraints``).
     n_data_variables:
         Number of leading terms that are data variables (``C``). Constraint
-        terms follow in ``constraint_groups`` order.
+        terms follow in ``constraint_groups`` order. Omit this and ``setup``
+        sets it from ``len(trainer.output_variables)`` so the count stays
+        aligned with the data layout. A value that disagrees with
+        ``output_variables`` raises in ``setup``.
     constraint_groups:
         Ordered groups so Hydra can list relative scales. Each entry is a
         mapping ``{"name": str, "scales": Sequence[float]}``. Example::
@@ -106,7 +109,7 @@ class AdaptiveLossWeights(torch.nn.Module):
     def __init__(
         self,
         inner: torch.nn.Module,
-        n_data_variables: int,
+        n_data_variables: Optional[int] = None,
         constraint_groups: Optional[
             Sequence[Union[Mapping[str, Any], Dict[str, Any]]]
         ] = None,
@@ -117,7 +120,7 @@ class AdaptiveLossWeights(torch.nn.Module):
         eps: float = 1e-12,
     ):
         super().__init__()
-        if n_data_variables < 1:
+        if n_data_variables is not None and int(n_data_variables) < 1:
             raise ValueError(
                 f"n_data_variables must be >= 1, got {n_data_variables}"
             )
@@ -129,20 +132,56 @@ class AdaptiveLossWeights(torch.nn.Module):
             )
 
         self.inner = inner
-        self.n_data_variables = int(n_data_variables)
+        self._n_data_arg = (
+            None if n_data_variables is None else int(n_data_variables)
+        )
+        self._constraint_groups_arg = (
+            list(constraint_groups) if constraint_groups is not None else []
+        )
+        self._variable_names_arg = (
+            None if variable_names is None else list(variable_names)
+        )
         self.warmup_epochs = int(warmup_epochs)
         self.ema_window_epochs = float(ema_window_epochs)
         self.eps = float(eps)
         self.steps_per_epoch = (
             int(steps_per_epoch) if steps_per_epoch is not None else None
         )
+        self._built = False
+        # Placeholders until ``_build`` so attribute access before setup fails
+        # clearly rather than with a missing-buffer error mid-forward.
+        self.n_data_variables = 0
+        self.n_terms = 0
+        self.variable_names = []
+        self.term_names = []
+        self.constraint_group_names = []
+        self._group_slices = []
 
-        groups = list(constraint_groups) if constraint_groups is not None else []
-        self.constraint_group_names: List[str] = []
+        # Propagate soft-constraint input flags for trainer gating.
+        self.needs_input = bool(getattr(inner, "needs_input", False))
+        self.needs_input_diagnostics = bool(
+            getattr(inner, "needs_input_diagnostics", False)
+        )
+
+        # Filled each forward for TensorBoard / NV logging (not in state_dict).
+        self.log_buffers: Dict[str, torch.Tensor] = {}
+        self._pending_unweighted: Optional[torch.Tensor] = None
+
+        if self._n_data_arg is not None:
+            self._build(self._n_data_arg)
+
+    def _build(self, n_data_variables: int) -> None:
+        """Allocate EMA/weight buffers for ``C = n_data_variables`` data terms."""
+        if n_data_variables < 1:
+            raise ValueError(
+                f"n_data_variables must be >= 1, got {n_data_variables}"
+            )
+        self.n_data_variables = int(n_data_variables)
+        self.constraint_group_names = []
         scale_list: List[float] = [1.0] * self.n_data_variables
-        self._group_slices: List[tuple[str, slice]] = []
+        self._group_slices = []
         cursor = self.n_data_variables
-        for group in groups:
+        for group in self._constraint_groups_arg:
             name = str(group["name"])
             scales = _as_float_list(group["scales"])
             if not scales:
@@ -153,24 +192,18 @@ class AdaptiveLossWeights(torch.nn.Module):
             cursor += len(scales)
 
         self.n_terms = len(scale_list)
-        if variable_names is None:
+        names = self._variable_names_arg
+        if names is None:
             self.variable_names = [f"var_{i}" for i in range(self.n_data_variables)]
         else:
-            if len(variable_names) != self.n_data_variables:
+            if len(names) != self.n_data_variables:
                 raise ValueError(
-                    f"variable_names length {len(variable_names)} != "
+                    f"variable_names length {len(names)} != "
                     f"n_data_variables {self.n_data_variables}"
                 )
-            self.variable_names = list(variable_names)
+            self.variable_names = list(names)
 
-        self.term_names: List[str] = list(self.variable_names)
-        for name, sl in self._group_slices:
-            n = sl.stop - sl.start
-            if n == 1:
-                self.term_names.append(name)
-            else:
-                self.term_names.extend(f"{name}/{i}" for i in range(n))
-
+        self._rebuild_term_names()
         self.register_buffer(
             "relative_scales",
             torch.tensor(scale_list, dtype=torch.float32),
@@ -191,16 +224,16 @@ class AdaptiveLossWeights(torch.nn.Module):
             torch.tensor(0, dtype=torch.int32),
             persistent=True,
         )
+        self._built = True
 
-        # Propagate soft-constraint input flags for trainer gating.
-        self.needs_input = bool(getattr(inner, "needs_input", False))
-        self.needs_input_diagnostics = bool(
-            getattr(inner, "needs_input_diagnostics", False)
-        )
-
-        # Filled each forward for TensorBoard / NV logging (not in state_dict).
-        self.log_buffers: Dict[str, torch.Tensor] = {}
-        self._pending_unweighted: Optional[torch.Tensor] = None
+    def _rebuild_term_names(self) -> None:
+        self.term_names = list(self.variable_names)
+        for name, sl in self._group_slices:
+            n = sl.stop - sl.start
+            if n == 1:
+                self.term_names.append(name)
+            else:
+                self.term_names.extend(f"{name}/{i}" for i in range(n))
 
     def setup(self, trainer) -> None:
         if hasattr(self.inner, "setup"):
@@ -213,19 +246,31 @@ class AdaptiveLossWeights(torch.nn.Module):
                     "trainer.dataloader_train in setup()."
                 )
             self.steps_per_epoch = max(int(len(loader)), 1)
-        out_vars = getattr(trainer, "output_variables", None)
-        if out_vars is not None and len(out_vars) == self.n_data_variables:
+        out_vars = list(getattr(trainer, "output_variables", None) or [])
+        if not self._built:
+            if out_vars:
+                n_data = len(out_vars)
+            elif self._variable_names_arg:
+                n_data = len(self._variable_names_arg)
+            else:
+                raise ValueError(
+                    "AdaptiveLossWeights could not infer n_data_variables. "
+                    "Set trainer.output_variables before setup(), or pass "
+                    "n_data_variables."
+                )
+            self._build(n_data)
+        elif out_vars and len(out_vars) != self.n_data_variables:
+            raise ValueError(
+                f"n_data_variables={self.n_data_variables} does not match "
+                f"len(output_variables)={len(out_vars)}. Omit n_data_variables "
+                "so it is inferred from the trainer outputs."
+            )
+        if out_vars and len(out_vars) == self.n_data_variables:
             # Prefer trainer channel names for logging when the user did not
             # pass variable_names explicitly (still named var_*).
             if all(n.startswith("var_") for n in self.variable_names):
                 self.variable_names = list(out_vars)
-                self.term_names = list(self.variable_names)
-                for name, sl in self._group_slices:
-                    n = sl.stop - sl.start
-                    if n == 1:
-                        self.term_names.append(name)
-                    else:
-                        self.term_names.extend(f"{name}/{i}" for i in range(n))
+                self._rebuild_term_names()
         device = trainer.device
         self.relative_scales = self.relative_scales.to(device=device)
         self.ema = self.ema.to(device=device)
@@ -301,6 +346,11 @@ class AdaptiveLossWeights(torch.nn.Module):
         input: Optional[torch.Tensor] = None,
         input_diagnostics: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if not self._built:
+            raise RuntimeError(
+                "AdaptiveLossWeights.setup(trainer) must run before forward "
+                "when n_data_variables is inferred."
+            )
         if self.needs_input and input is None:
             raise ValueError(
                 "AdaptiveLossWeights requires prognostic input because the "
