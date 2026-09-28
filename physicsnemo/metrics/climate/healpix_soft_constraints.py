@@ -745,14 +745,21 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         self.pressure_levels = sorted(float(p) for p in hPa_levels)
         if len(self.pressure_levels) < 2:
             raise ValueError("Axial AAM requires at least two pressure levels")
-        self.u_channel_indices = []
+        # LongTensor buffer so advanced indexing is CUDA-graph safe (no host
+        # torch.tensor(..., device=) during capture/replay).
+        u_idxs = []
         for pl in self.pressure_levels:
             name = f"u{int(pl)}"
             if name not in self.channels:
                 raise ValueError(
                     f"Axial AAM requires channel {name!r} in channels={self.channels!r}"
                 )
-            self.u_channel_indices.append(self.channels.index(name))
+            u_idxs.append(self.channels.index(name))
+        self.register_buffer(
+            "u_channel_indices",
+            torch.tensor(u_idxs, dtype=torch.long),
+            persistent=False,
+        )
         for stress in self._STRESS_NAMES:
             if stress not in self.channels:
                 raise ValueError(
@@ -917,6 +924,7 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
     def setup(self, trainer) -> None:
         device = trainer.device
         self.p_levels_hpa = self.p_levels_hpa.to(device=device)
+        self.u_channel_indices = self.u_channel_indices.to(device=device)
         self.u_mean = self.u_mean.to(device=device)
         self.u_std = self.u_std.to(device=device)
         self.ps_mean = self.ps_mean.to(device=device)
@@ -1043,8 +1051,7 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         return m_r + m_omega
 
     def _aam_from_prediction(self, tensor: torch.Tensor) -> torch.Tensor:
-        u_idx = torch.tensor(self.u_channel_indices, device=tensor.device)
-        u_norm = tensor[:, :, :, u_idx, :, :]
+        u_norm = tensor[:, :, :, self.u_channel_indices, :, :]
         u = self._denorm_u(u_norm)
         sp = self._denorm_sp(
             tensor[:, :, :, self.sp_channel_index : self.sp_channel_index + 1, :, :]
