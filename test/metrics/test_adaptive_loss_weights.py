@@ -241,3 +241,42 @@ def test_wraps_weighted_mse_like_base_config():
     assert torch.allclose(scalar, per_mse.mean())
     assert "loss" in wrap.log_buffers
     assert "loss_data" in wrap.log_buffers
+
+
+def test_n_data_variables_inferred_from_output_variables():
+    inner = _FixedTerms(torch.tensor([2.0, 4.0, 6.0, 1.0]))
+    wrap = AdaptiveLossWeights(
+        inner=inner,
+        constraint_groups=[{"name": "dry_air", "scales": [0.001]}],
+        warmup_epochs=1,
+        steps_per_epoch=4,
+    )
+    assert wrap._built is False
+    trainer = _DummyTrainer(
+        device=torch.device("cpu"),
+        output_variables=["a", "b", "c"],
+        dataloader_train=[0] * 4,
+    )
+    wrap.setup(trainer)
+    assert wrap.n_data_variables == 3
+    assert wrap.n_terms == 4
+    assert wrap.variable_names == ["a", "b", "c"]
+    assert wrap.term_names[-1] == "dry_air"
+    pred = torch.zeros(1, 1, 1, 1, 1, 1)
+    scalar = wrap(pred, pred)
+    assert scalar.ndim == 0
+
+
+def test_explicit_n_data_variables_must_match_outputs():
+    wrap = AdaptiveLossWeights(
+        inner=_FixedTerms(torch.tensor([1.0, 2.0])),
+        n_data_variables=2,
+        steps_per_epoch=1,
+    )
+    trainer = _DummyTrainer(
+        device=torch.device("cpu"),
+        output_variables=["only_one"],
+        dataloader_train=[0],
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        wrap.setup(trainer)
