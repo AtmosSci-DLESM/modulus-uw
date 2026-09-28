@@ -1,4 +1,15 @@
-"""Helpers for healpix Zarr layouts (monolithic inputs vs per-variable arrays)."""
+"""Helpers for healpix Zarr layouts (stacked vs per-variable).
+
+Vocabulary used in docs and PRs maps to the identifiers below. Do not rename
+existing functions or the on-disk layout attribute for a wording change alone.
+
+- **stacked** — prognostic fields packed on a channel axis in ``inputs`` /
+  ``constants``. Detection: ``is_monolithic_layout``.
+- **per-variable** — one Zarr array per field. Detection:
+  ``is_per_variable_layout`` (and ``is_named_arrays_layout`` when the store
+  sets ``layout=named_arrays_healpix``). That on-disk attribute name is
+  stable; leave it unchanged.
+"""
 
 from __future__ import annotations
 

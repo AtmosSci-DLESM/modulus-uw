@@ -174,6 +174,55 @@ def test_load_windowed_channel_data_named_store(tmp_path):
     assert got_ic is None
 
 
+def test_load_windowed_channel_data_stacked_matches_per_variable(tmp_path):
+    """Stacked ``inputs`` and per-variable stores yield the same windowed tensors."""
+    t, f, h, w = 8, 12, 4, 4
+    channels = ["t2m", "u10m", "v10m"]
+    stacked_ds = _make_monolithic_store(tmp_path / "stacked", t=t, c=3, f=f, h=h, w=w)
+    # Same channel planes as the stacked store, one array per field.
+    data_vars = {
+        name: (
+            ("time", "face", "height", "width"),
+            np.asarray(stacked_ds["inputs"][:, i]),
+        )
+        for i, name in enumerate(channels)
+    }
+    per_var_xr = xr.Dataset(
+        data_vars,
+        coords={"time": np.arange(t), **_spatial_coords(f=f, h=h, w=w)},
+        attrs={"layout": "named_arrays_healpix"},
+    )
+    per_var_path = tmp_path / "per_variable"
+    per_var_xr.to_zarr(per_var_path, mode="w")
+    per_var_ds = zarr.open_group(str(per_var_path), mode="r")
+
+    assert is_monolithic_layout(stacked_ds) is True
+    assert is_named_arrays_layout(per_var_ds) is True
+
+    time_sl = slice(0, 6)
+    input_names = ["t2m", "v10m"]
+    output_names = ["u10m", "t2m"]
+    input_time_idx = np.asarray([[0, 2], [1, 3]], dtype=np.intp)
+    output_time_idx = np.asarray([[2, 4], [3, 5]], dtype=np.intp)
+    kwargs = dict(
+        time_sl=time_sl,
+        input_names=input_names,
+        input_time_idx=input_time_idx,
+        output_names=output_names,
+        output_time_idx=output_time_idx,
+        n_threads=1,
+    )
+    stacked_in, stacked_out, stacked_ic = load_windowed_channel_data(
+        stacked_ds, **kwargs
+    )
+    per_var_in, per_var_out, per_var_ic = load_windowed_channel_data(
+        per_var_ds, **kwargs
+    )
+    np.testing.assert_allclose(stacked_in, per_var_in)
+    np.testing.assert_allclose(stacked_out, per_var_out)
+    assert stacked_ic is None and per_var_ic is None
+
+
 def test_enable_zarrs_pipeline_when_installed():
     assert enable_zarrs_pipeline() is True
 
