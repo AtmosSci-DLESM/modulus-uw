@@ -170,7 +170,7 @@ def test_load_windowed_channel_data_per_variable_store(tmp_path):
     exp_in = staging[input_time_idx[:, :, None], np.asarray([0, 1])[None, None, :]]
     exp_out = staging[output_time_idx[:, :, None], np.asarray([2, 0])[None, None, :]]
 
-    got_in, got_out, got_ic = load_windowed_channel_data(
+    got_in, got_out = load_windowed_channel_data(
         ds,
         time_sl,
         input_names=input_names,
@@ -180,7 +180,6 @@ def test_load_windowed_channel_data_per_variable_store(tmp_path):
     )
     np.testing.assert_array_equal(got_in, exp_in)
     np.testing.assert_array_equal(got_out, exp_out)
-    assert got_ic is None
 
 
 def test_load_windowed_channel_data_stacked_matches_per_variable(tmp_path):
@@ -220,11 +219,10 @@ def test_load_windowed_channel_data_stacked_matches_per_variable(tmp_path):
         output_names=output_names,
         output_time_idx=output_time_idx,
     )
-    stacked_in, stacked_out, stacked_ic = load_windowed_channel_data(stacked_ds, **kwargs)
-    per_var_in, per_var_out, per_var_ic = load_windowed_channel_data(per_var_ds, **kwargs)
+    stacked_in, stacked_out = load_windowed_channel_data(stacked_ds, **kwargs)
+    per_var_in, per_var_out = load_windowed_channel_data(per_var_ds, **kwargs)
     np.testing.assert_allclose(stacked_in, per_var_in)
     np.testing.assert_allclose(stacked_out, per_var_out)
-    assert stacked_ic is None and per_var_ic is None
 
 
 def test_enable_zarrs_pipeline_when_installed():
@@ -415,7 +413,7 @@ def test_sharded_window_matches_arrays(tmp_path):
         assert np.array_equal(loaded[:, c], stored[name][sl], equal_nan=True)
     idx_in = np.array([[0, 1], [2, 3]])
     idx_out = np.array([[4, 6], [5, 7]])
-    inputs, targets, _ic = load_windowed_channel_data(
+    inputs, targets = load_windowed_channel_data(
         group, sl, ["t2m", "u10m"], idx_in, ["u10m", "t2m"], idx_out
     )
     for c, name in enumerate(("t2m", "u10m")):
