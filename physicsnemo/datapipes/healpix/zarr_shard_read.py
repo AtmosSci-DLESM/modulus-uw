@@ -1,9 +1,8 @@
 """One ``pread`` per time shard for per-variable healpix fields.
 
-Used when a field is time-sharded (inner chunks packed in time order) and,
-optionally, when ``_shard_index/<field>`` holds the offset/length pairs.
-Stores without that table, or a layout this reader does not handle, fall
-back to the zarr codec path. Stacked ``inputs`` reads never come here.
+Used when a field is time-sharded and inner chunks are packed in time order.
+The offset table at the end of each shard is read once and cached. Other
+layouts fall back to the zarr codec path. Stacked ``inputs`` reads never come here.
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ import threading
 
 import numpy as np
 
-SHARD_INDEX_GROUP = "_shard_index"
 _DIRECT_ALIGN = 4096
 _MAX_U64 = np.uint64(2**64 - 1)
 _COORD_KEYS = frozenset({"time", "face", "height", "width", "lat", "lon"})
@@ -24,7 +22,7 @@ _field_tables: dict[str, dict[str, "_FieldLayout"]] = {}
 
 
 def clear_shard_cache() -> None:
-    """Drop cached shard geometry. Tests use this after writing an index table."""
+    """Drop cached shard geometry. Tests use this between stores."""
     _layout_cache.clear()
     _field_tables.clear()
 
@@ -193,8 +191,6 @@ class _FieldLayout:
         self.ndim = len(inner)
         self.index_nbytes = chunks_per_shard_t * 16 + 4
         self.n_shards = (n_time + shard_t - 1) // shard_t
-        # (n_shards, chunks_per_shard, 2) when ``_shard_index/<name>`` is present.
-        self.index: np.ndarray | None = None
         self._lazy: dict[int, np.ndarray] = {}
         self._lazy_lock = threading.Lock()
 
@@ -205,8 +201,6 @@ class _FieldLayout:
         return os.path.join(self.root, tail)
 
     def offsets_for(self, shard_i: int) -> np.ndarray:
-        if self.index is not None:
-            return self.index[shard_i]
         with self._lazy_lock:
             cached = self._lazy.get(shard_i)
         if cached is not None:
@@ -330,19 +324,6 @@ def read_sharded_time_slice(array, time_sl: slice) -> np.ndarray | None:
     return _read_layout_window(layout, *bounds)
 
 
-def _attach_stored_indexes(group, table: dict[str, _FieldLayout]) -> None:
-    if SHARD_INDEX_GROUP not in group or not table:
-        return
-    index_group = group[SHARD_INDEX_GROUP]
-    for name in table:
-        if name not in index_group:
-            continue
-        arr = np.asarray(index_group[name][:], dtype=np.uint64)
-        layout = table[name]
-        if arr.shape == (layout.n_shards, layout.chunks_per_shard_t, 2):
-            layout.index = arr
-
-
 def _field_table(group) -> dict[str, _FieldLayout]:
     """Sharded fields in this store. Metadata is read once per process."""
     root = _store_root(group)
@@ -361,7 +342,6 @@ def _field_table(group) -> dict[str, _FieldLayout]:
         layout = _layout_from_array(array)
         if layout is not None:
             table[str(name)] = layout
-    _attach_stored_indexes(group, table)
     _field_tables[root] = table
     return table
 
