@@ -189,7 +189,7 @@ def test_post_backward_updates_ema_only_when_called():
     wrap.post_backward_update(epoch=0)
     assert int(wrap.ema_initialized.item()) == 1
     assert torch.allclose(wrap.ema, torch.tensor([1.0, 3.0]))
-    # Still in warmup: weights remain relative scales (ones).
+    # Still in warmup: weights remain relative loss scales (ones).
     assert torch.allclose(wrap.weights, torch.ones(C))
 
     # Second step with different inner terms via mutating buffer.
@@ -214,7 +214,7 @@ def test_state_dict_contains_ema_and_weights():
     assert "ema" in keys
     assert "weights" in keys
     assert "ema_initialized" in keys
-    assert "relative_scales" in keys
+    assert "relative_loss_scale" in keys
 
 
 def test_wraps_weighted_mse_like_base_config():
@@ -328,7 +328,7 @@ def test_log_and_pending_buffers_keep_identity_across_forwards():
     wrap.post_backward_update(1)
     assert wrap._pending_unweighted.data_ptr() == pending_ptr
     assert float(wrap.log_buffers["loss_unweighted/a"]) == pytest.approx(4.0)
-    # Equal unweighted terms → adaptive weights stay at the relative scales.
+    # Equal unweighted terms → adaptive weights stay at the relative loss scales.
     assert torch.allclose(wrap.weights, torch.ones(2), atol=1e-5)
 
     inner.terms.copy_(torch.tensor([1.0, 3.0]))
@@ -367,7 +367,7 @@ def test_scales_follow_constraint_spec_order():
         variable_names=["a", "b"],
     )
     assert torch.allclose(
-        wrap.relative_scales,
+        wrap.relative_loss_scale,
         torch.tensor([1.0, 1.0, 0.001, 0.01, 0.5, 0.25]),
     )
     assert wrap.term_names[-4:] == [
@@ -400,7 +400,7 @@ def test_constraint_scales_reject_mismatches():
             n_data_variables=1,
             steps_per_epoch=1,
         )
-    with pytest.raises(ValueError, match="relative_scales"):
+    with pytest.raises(ValueError, match="relative_loss_scale"):
         AdaptiveLossWeights(
             inner=_SpecTerms(torch.ones(2), [("dry_air", ["dry_air"], None)]),
             n_data_variables=1,

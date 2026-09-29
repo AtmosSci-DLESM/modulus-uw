@@ -82,13 +82,13 @@ class AdaptiveLossWeights(torch.nn.Module):
         aligned with the data layout. A value that disagrees with
         ``output_variables`` raises in ``setup``.
     constraint_groups:
-        Positional relative scales, only when ``inner`` has no
+        Positional relative loss scales, only when ``inner`` has no
         ``constraint_specs()``. Each entry is
         ``{"name": str, "scales": Sequence[float]}``, appended in YAML order.
 
         When ``inner`` exposes ``constraint_specs()`` (as
         ``LossWithSoftConstraints`` does), this argument must be omitted.
-        Each spec is ``(name, term_names, relative_scales)`` and the scale
+        Each spec is ``(name, term_names, relative_loss_scale)`` and the scale
         lives on that constraint. Scales are applied in constraint-module
         order. A multi-term constraint requires a mapping keyed by that
         constraint's term names (hydrostasy uses interface labels such as
@@ -96,7 +96,7 @@ class AdaptiveLossWeights(torch.nn.Module):
         scale, or a mapping whose keys do not match the term names, raises.
         Passing ``constraint_groups`` together with specs also raises.
 
-        Variable terms have implicit relative scale 1. During warmup, applied
+        Variable terms have implicit relative loss scale 1. During warmup, applied
         weights are 1 on variables and ``s_k`` on constraints. After warmup,
         ``w_i = T / m_i`` and ``w_k = s_k * T / m_k`` with ``T = mean(m)`` over
         the data-variable EMA.
@@ -229,7 +229,7 @@ class AdaptiveLossWeights(torch.nn.Module):
 
         self._rebuild_term_names()
         self.register_buffer(
-            "relative_scales",
+            "relative_loss_scale",
             torch.tensor(scale_list, dtype=torch.float32),
             persistent=True,
         )
@@ -240,7 +240,7 @@ class AdaptiveLossWeights(torch.nn.Module):
         )
         self.register_buffer(
             "weights",
-            self.relative_scales.detach().clone(),
+            self.relative_loss_scale.detach().clone(),
             persistent=True,
         )
         self.register_buffer(
@@ -268,7 +268,7 @@ class AdaptiveLossWeights(torch.nn.Module):
     ) -> Optional[List[tuple]]:
         """Specs from the inner criterion, or None when binding stays positional.
 
-        Each entry is ``(name, term_names, relative_scales)``.
+        Each entry is ``(name, term_names, relative_loss_scale)``.
         """
         provider = getattr(self.inner, "constraint_specs", None)
         if provider is None:
@@ -279,7 +279,7 @@ class AdaptiveLossWeights(torch.nn.Module):
             if len(spec) != 3:
                 raise ValueError(
                     "constraint_specs entries must be "
-                    "(name, term_names, relative_scales); "
+                    "(name, term_names, relative_loss_scale); "
                     f"got {spec!r}"
                 )
             name, terms, scales = spec
@@ -314,7 +314,7 @@ class AdaptiveLossWeights(torch.nn.Module):
         if self._constraint_groups_arg:
             raise ValueError(
                 "constraint_groups cannot be set when the inner criterion "
-                "exposes constraint_specs(); set relative_scales on each "
+                "exposes constraint_specs(); set relative_loss_scale on each "
                 "soft constraint instead"
             )
         resolved: List[tuple] = []
@@ -332,8 +332,8 @@ class AdaptiveLossWeights(torch.nn.Module):
                 )
             if scales is None:
                 raise ValueError(
-                    f"soft constraint {name!r} has no relative_scales; "
-                    f"set relative_scales for terms {list(terms)}"
+                    f"soft constraint {name!r} has no relative_loss_scale; "
+                    f"set relative_loss_scale for terms {list(terms)}"
                 )
             resolved.append(
                 (name, self._scales_for_terms(name, scales, terms), list(terms))
@@ -447,7 +447,7 @@ class AdaptiveLossWeights(torch.nn.Module):
                 self.variable_names = list(out_vars)
                 self._rebuild_term_names()
         device = trainer.device
-        self.relative_scales = self.relative_scales.to(device=device)
+        self.relative_loss_scale = self.relative_loss_scale.to(device=device)
         self.ema = self.ema.to(device=device)
         self.weights = self.weights.to(device=device)
         self.ema_initialized = self.ema_initialized.to(device=device)
@@ -457,7 +457,7 @@ class AdaptiveLossWeights(torch.nn.Module):
         # dict views the storage forward will ``copy_`` into.
         self._bind_log_buffers()
         # Warmup weights: 1 on variables, s_k on constraints.
-        self.weights.copy_(self.relative_scales)
+        self.weights.copy_(self.relative_loss_scale)
 
     def _ema_beta(self) -> float:
         if self.steps_per_epoch is None or self.steps_per_epoch < 1:
@@ -571,7 +571,7 @@ class AdaptiveLossWeights(torch.nn.Module):
     def _compute_adaptive_weights(self) -> torch.Tensor:
         m = self.ema.clamp_min(self.eps)
         T = m[: self.n_data_variables].mean()
-        return self.relative_scales * (T / m)
+        return self.relative_loss_scale * (T / m)
 
     def post_backward_update(self, epoch: int) -> None:
         """All-reduce unweighted terms, update EMA, ``copy_`` weights.
@@ -597,4 +597,4 @@ class AdaptiveLossWeights(torch.nn.Module):
         if int(epoch) >= self.warmup_epochs:
             self.weights.copy_(self._compute_adaptive_weights())
         else:
-            self.weights.copy_(self.relative_scales)
+            self.weights.copy_(self.relative_loss_scale)
