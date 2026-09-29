@@ -346,27 +346,22 @@ class _SpecTerms(_FixedTerms):
         return self._specs
 
 
-def test_named_scales_follow_constraint_order_not_yaml_order():
+def test_scales_follow_constraint_spec_order():
     inner = _SpecTerms(
         torch.ones(6),
         [
-            ("hydro", ["50-100", "850-1000"]),
-            ("dry_air", ["dry_air"]),
-            ("aam", ["aam"]),
+            (
+                "hydro",
+                ["50-100", "850-1000"],
+                {"850-1000": 0.01, "50-100": 0.001},
+            ),
+            ("dry_air", ["dry_air"], 0.5),
+            ("aam", ["aam"], 0.25),
         ],
     )
-    # YAML lists the groups in a different order than the constraint modules.
     wrap = AdaptiveLossWeights(
         inner=inner,
         n_data_variables=2,
-        constraint_groups=[
-            {"name": "aam", "scales": 0.25},
-            {"name": "dry_air", "scales": [0.5]},
-            {
-                "name": "hydro",
-                "scales": {"850-1000": 0.01, "50-100": 0.001},
-            },
-        ],
         warmup_epochs=1,
         steps_per_epoch=2,
         variable_names=["a", "b"],
@@ -385,33 +380,37 @@ def test_named_scales_follow_constraint_order_not_yaml_order():
     assert "loss_constraint/hydro/0" not in wrap.log_buffers
 
 
-def test_named_scales_reject_mismatches():
+def test_constraint_scales_reject_mismatches():
     hydro = _SpecTerms(
         torch.ones(3),
-        [("hydro", ["50-100", "100-150"])],
+        [("hydro", ["50-100", "100-150"], [0.001, 0.001])],
     )
     with pytest.raises(ValueError, match="mapping"):
         AdaptiveLossWeights(
             inner=hydro,
             n_data_variables=1,
-            constraint_groups=[{"name": "hydro", "scales": [0.001, 0.001]}],
             steps_per_epoch=1,
         )
     with pytest.raises(ValueError, match="missing"):
         AdaptiveLossWeights(
-            inner=hydro,
+            inner=_SpecTerms(
+                torch.ones(3),
+                [("hydro", ["50-100", "100-150"], {"50-100": 0.001})],
+            ),
             n_data_variables=1,
-            constraint_groups=[{"name": "hydro", "scales": {"50-100": 0.001}}],
             steps_per_epoch=1,
         )
-    with pytest.raises(ValueError, match="extra"):
+    with pytest.raises(ValueError, match="relative_scales"):
         AdaptiveLossWeights(
-            inner=_SpecTerms(torch.ones(2), [("dry_air", ["dry_air"])]),
+            inner=_SpecTerms(torch.ones(2), [("dry_air", ["dry_air"], None)]),
             n_data_variables=1,
-            constraint_groups=[
-                {"name": "dry_air", "scales": 0.001},
-                {"name": "aam", "scales": 0.001},
-            ],
+            steps_per_epoch=1,
+        )
+    with pytest.raises(ValueError, match="constraint_groups"):
+        AdaptiveLossWeights(
+            inner=_SpecTerms(torch.ones(2), [("dry_air", ["dry_air"], 0.001)]),
+            n_data_variables=1,
+            constraint_groups=[{"name": "dry_air", "scales": [0.001]}],
             steps_per_epoch=1,
         )
 

@@ -76,32 +76,28 @@ class AdaptiveLossWeights(torch.nn.Module):
         (e.g. ``WeightedMSE`` or ``LossWithSoftConstraints``).
     n_data_variables:
         Number of leading terms that are data variables (``C``). Constraint
-        terms follow in ``constraint_groups`` order. Omit this and ``setup``
+        terms follow the inner constraint order, or ``constraint_groups`` order
+        when the inner criterion has no specs. Omit this and ``setup``
         sets it from ``len(trainer.output_variables)`` so the count stays
         aligned with the data layout. A value that disagrees with
         ``output_variables`` raises in ``setup``.
     constraint_groups:
-        Relative scales for constraint terms. Each entry is
-        ``{"name": str, "scales": float | Sequence[float] | Mapping[str, float]}``.
+        Positional relative scales, only when ``inner`` has no
+        ``constraint_specs()``. Each entry is
+        ``{"name": str, "scales": Sequence[float]}``, appended in YAML order.
 
         When ``inner`` exposes ``constraint_specs()`` (as
-        ``LossWithSoftConstraints`` does), names are matched to those specs.
-        Scales are written in **constraint-module order**, not YAML order.
-        A multi-term constraint requires a mapping keyed by that constraint's
-        term names (hydrostasy uses interface labels such as ``"50-100"``).
-        A single-term constraint accepts a float. Missing, extra, or duplicate
-        names raise. Example::
+        ``LossWithSoftConstraints`` does), this argument must be omitted.
+        Each spec is ``(name, term_names, relative_scales)`` and the scale
+        lives on that constraint. Scales are applied in constraint-module
+        order. A multi-term constraint requires a mapping keyed by that
+        constraint's term names (hydrostasy uses interface labels such as
+        ``"50-100"``). A single-term constraint accepts a float. A missing
+        scale, or a mapping whose keys do not match the term names, raises.
+        Passing ``constraint_groups`` together with specs also raises.
 
-            [
-              {"name": "hydro", "scales": {"50-100": 0.001, "850-1000": 0.01}},
-              {"name": "aam", "scales": 0.001},
-              {"name": "dry_air", "scales": 0.001},
-            ]
-
-        When the inner criterion has no ``constraint_specs``, groups stay
-        positional: ``scales`` is a list appended in YAML order. Variable terms
-        have implicit relative scale 1. During warmup, applied weights are 1
-        on variables and ``s_k`` on constraints. After warmup,
+        Variable terms have implicit relative scale 1. During warmup, applied
+        weights are 1 on variables and ``s_k`` on constraints. After warmup,
         ``w_i = T / m_i`` and ``w_k = s_k * T / m_k`` with ``T = mean(m)`` over
         the data-variable EMA.
     variable_names:
@@ -270,12 +266,25 @@ class AdaptiveLossWeights(torch.nn.Module):
     def _inner_constraint_specs(
         self,
     ) -> Optional[List[tuple]]:
-        """Specs from the inner criterion, or None when binding stays positional."""
+        """Specs from the inner criterion, or None when binding stays positional.
+
+        Each entry is ``(name, term_names, relative_scales)``.
+        """
         provider = getattr(self.inner, "constraint_specs", None)
         if provider is None:
             return None
         specs = provider() if callable(provider) else provider
-        return [(str(name), [str(term) for term in terms]) for name, terms in specs]
+        parsed: List[tuple] = []
+        for spec in specs:
+            if len(spec) != 3:
+                raise ValueError(
+                    "constraint_specs entries must be "
+                    "(name, term_names, relative_scales); "
+                    f"got {spec!r}"
+                )
+            name, terms, scales = spec
+            parsed.append((str(name), [str(term) for term in terms], scales))
+        return parsed
 
     def _resolved_constraint_groups(
         self,
@@ -302,40 +311,34 @@ class AdaptiveLossWeights(torch.nn.Module):
         return resolved
 
     def _named_groups(self, specs: Sequence[tuple]) -> List[tuple]:
-        ordered: List[tuple] = []
-        by_name: Dict[str, List[str]] = {}
-        for name, terms in specs:
+        if self._constraint_groups_arg:
+            raise ValueError(
+                "constraint_groups cannot be set when the inner criterion "
+                "exposes constraint_specs(); set relative_scales on each "
+                "soft constraint instead"
+            )
+        resolved: List[tuple] = []
+        seen = set()
+        for name, terms, scales in specs:
             name = _group_name(name)
-            if name in by_name:
+            if name in seen:
                 raise ValueError(f"duplicate constraint name {name!r}")
+            seen.add(name)
             if not terms:
                 raise ValueError(f"constraint {name!r} exposes no terms")
             if any("/" in term for term in terms):
                 raise ValueError(
                     f"constraint {name!r} term names must not contain '/': {terms}"
                 )
-            by_name[name] = list(terms)
-            ordered.append((name, list(terms)))
-
-        groups: Dict[str, Any] = {}
-        for group in self._constraint_groups_arg:
-            name = _group_name(group["name"])
-            if name in groups:
-                raise ValueError(f"duplicate constraint group {name!r}")
-            groups[name] = group["scales"]
-
-        missing = [name for name, _terms in ordered if name not in groups]
-        extra = [name for name in groups if name not in by_name]
-        if missing or extra:
-            raise ValueError(
-                "constraint_groups names do not match the inner soft constraints. "
-                f"inner={[name for name, _terms in ordered]} "
-                f"config={list(groups)} missing={missing} extra={extra}"
+            if scales is None:
+                raise ValueError(
+                    f"soft constraint {name!r} has no relative_scales; "
+                    f"set relative_scales for terms {list(terms)}"
+                )
+            resolved.append(
+                (name, self._scales_for_terms(name, scales, terms), list(terms))
             )
-        return [
-            (name, self._scales_for_terms(name, groups[name], terms), terms)
-            for name, terms in ordered
-        ]
+        return resolved
 
     def _scales_for_terms(
         self,
