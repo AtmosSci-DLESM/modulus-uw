@@ -807,11 +807,11 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         input_channels: Optional[Sequence[str]] = None,
         diagnostic_channels: Optional[Sequence[str]] = None,
         name: str = "aam",
-        relative_scales=None,
+        relative_loss_scale=None,
     ):
         super().__init__()
         self.name = _constraint_name(name)
-        self.relative_scales = relative_scales
+        self.relative_loss_scale = relative_loss_scale
         self.channels = list(channels)
         self.input_channels = (
             list(input_channels) if input_channels is not None else list(channels)
