@@ -32,9 +32,6 @@ from physicsnemo.models.dlwp_healpix_layers import (
 from physicsnemo.models.dlwp_healpix_layers.coupled_partial_conv import (
     build_coupled_partial_conv_stem,
 )
-from physicsnemo.models.dlwp_healpix_layers.healpix_constraints import (
-    constraint_configs,
-)
 from physicsnemo.models.dlwp_healpix_layers.reflection_ops import (
     apply_channel_order,
     bank_sizes,
@@ -665,6 +662,13 @@ class HEALPixRecUNet(Module):
             Hydra configs for constraints, as a list in application order or a
             name-keyed mapping. Mapping keys are unused labels.
         """
+        # Imported here so this edit stays inside set_constraints. A new
+        # top-level import collides with other branches that add imports
+        # at the same point in the module.
+        from physicsnemo.models.dlwp_healpix_layers.healpix_constraints import (
+            constraint_configs,
+        )
+
         specs = constraint_configs(constraints)
         if specs is not None:
             self.constraints = [instantiate(spec) for spec in specs]
