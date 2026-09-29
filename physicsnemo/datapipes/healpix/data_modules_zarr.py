@@ -70,12 +70,19 @@ class ZarrDataloaderWorkerInit:
         if self.mp_sharing_strategy is not None:
             _configure_torch_mp_sharing_strategy(self.mp_sharing_strategy)
         if self.n_threads > 1:
+            import atexit
             import gc
 
-            from .zarr_layout import enable_zarrs_pipeline, init_worker_pool
+            from .zarr_layout import (
+                enable_zarrs_pipeline,
+                init_worker_pool,
+                shutdown_worker_pool,
+            )
 
             enable_zarrs_pipeline()
             init_worker_pool(self.n_threads)
+            # Register after zarrs import so this runs first at worker exit.
+            atexit.register(shutdown_worker_pool, True)
             # Rely on refcounting for large numpy buffers. Periodic gc.collect() on
             # the getitem path caused multi-hundred-ms jitter under training.
             gc.disable()

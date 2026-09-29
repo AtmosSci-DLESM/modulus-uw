@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 np = pytest.importorskip("numpy")
@@ -25,13 +27,17 @@ xr = pytest.importorskip("xarray")
 zarr = pytest.importorskip("zarr")
 
 from physicsnemo.datapipes.healpix.zarr_layout import (
+    _decode_shard_index,
+    _read_index_tail,
     available_field_names,
+    build_shard_index_table,
     enable_zarrs_pipeline,
     is_monolithic_layout,
     is_named_arrays_layout,
     load_channel_data,
     load_constant_fields,
     load_windowed_channel_data,
+    read_sharded_time_slice,
     resolve_mask_field,
 )
 
@@ -381,3 +387,153 @@ def test_TimeSeriesDataset_return_ic_diagnostics(tmp_path):
         return_ic_diagnostics=False,
     )[0]
     assert len(batch) == 2
+
+
+def _make_sharded_field(path, *, t: int = 20, shard_time: int = 8, f: int = 2, h: int = 2, w: int = 2):
+    """Per-variable array with inner time chunk 1 and a time shard, zstd level 0."""
+    from zarr.codecs import ZstdCodec
+
+    data = np.arange(t * f * h * w, dtype=np.float32).reshape(t, f, h, w)
+    # A NaN chunk forces an empty slot so a window can straddle a gap.
+    data[3] = np.nan
+    zarr.create_array(
+        store=str(path),
+        name="t2m",
+        shape=data.shape,
+        chunks=(1, f, h, w),
+        shards=(shard_time, f, h, w),
+        dtype="float32",
+        zarr_format=3,
+        compressors=[ZstdCodec(level=0)],
+        fill_value=np.nan,
+        dimension_names=["time", "face", "height", "width"],
+    )
+    array = zarr.open_array(f"{path}/t2m", mode="a")
+    array[:] = data
+    return data
+
+
+def test_read_sharded_time_slice_matches_array(tmp_path):
+    data = _make_sharded_field(tmp_path / "shard")
+    array = zarr.open_array(f"{tmp_path / 'shard'}/t2m", mode="r")
+    # Crosses the shard boundary at t=8 and includes the NaN sample at t=3.
+    sl = slice(2, 12)
+    got = read_sharded_time_slice(array, sl)
+    assert got is not None
+    ref = np.asarray(array[sl])
+    assert got.shape == ref.shape
+    assert np.array_equal(got, ref, equal_nan=True)
+    loaded = load_channel_data(zarr.open_group(str(tmp_path / "shard"), mode="r"), sl, ["t2m"])
+    assert np.array_equal(loaded[:, 0], ref, equal_nan=True)
+
+
+def test_sharded_gather_window_matches_arrays(tmp_path, monkeypatch):
+    """Every field of a sharded window is loaded together and matches array slices."""
+    import physicsnemo.datapipes.healpix.zarr_layout as zarr_layout
+
+    def _forbid_thread_pool(*_args, **_kwargs):
+        raise AssertionError("sharded fields must use the direct reader, not the small thread pool")
+
+    monkeypatch.setattr(zarr_layout, "_run_loaders_parallel", _forbid_thread_pool)
+    from zarr.codecs import ZstdCodec
+
+    path = tmp_path / "multi"
+    t, f, h, w, shard_time = 20, 2, 2, 2, 8
+    stored = {}
+    for i, name in enumerate(("t2m", "u10m")):
+        data = (np.arange(t * f * h * w, dtype=np.float32) + i * 1000).reshape(t, f, h, w)
+        data[3] = np.nan
+        stored[name] = data
+        zarr.create_array(
+            store=str(path),
+            name=name,
+            shape=data.shape,
+            chunks=(1, f, h, w),
+            shards=(shard_time, f, h, w),
+            dtype="float32",
+            zarr_format=3,
+            compressors=[ZstdCodec(level=0)],
+            fill_value=np.nan,
+            dimension_names=["time", "face", "height", "width"],
+        )
+        zarr.open_array(f"{path}/{name}", mode="a")[:] = data
+    group = zarr.open_group(str(path), mode="r")
+    sl = slice(2, 12)
+    loaded = load_channel_data(group, sl, ["t2m", "u10m"])
+    for c, name in enumerate(("t2m", "u10m")):
+        assert np.array_equal(loaded[:, c], stored[name][sl], equal_nan=True)
+    idx_in = np.array([[0, 1], [2, 3]])
+    idx_out = np.array([[4, 6], [5, 7]])
+    inputs, targets, _ic = load_windowed_channel_data(
+        group, sl, ["t2m", "u10m"], idx_in, ["u10m", "t2m"], idx_out
+    )
+    for c, name in enumerate(("t2m", "u10m")):
+        assert np.array_equal(inputs[:, :, c], stored[name][sl][idx_in], equal_nan=True)
+    for c, name in enumerate(("u10m", "t2m")):
+        assert np.array_equal(targets[:, :, c], stored[name][sl][idx_out], equal_nan=True)
+
+
+def _shard_index_nbytes(array) -> int:
+    shard_t = int(tuple(array.shards)[0])
+    inner_t = int(tuple(array.chunks)[0])
+    return (shard_t // inner_t) * 16 + 4
+
+
+def test_shard_index_table_matches_decoded_indexes(tmp_path):
+    path = tmp_path / "multi"
+    _make_sharded_field(path, t=20, shard_time=8)
+    from zarr.codecs import ZstdCodec
+
+    data = (np.arange(20 * 2 * 2 * 2, dtype=np.float32) + 1000).reshape(20, 2, 2, 2)
+    data[3] = np.nan
+    zarr.create_array(
+        store=str(path),
+        name="u10m",
+        shape=data.shape,
+        chunks=(1, 2, 2, 2),
+        shards=(8, 2, 2, 2),
+        dtype="float32",
+        zarr_format=3,
+        compressors=[ZstdCodec(level=0)],
+        fill_value=np.nan,
+        dimension_names=["time", "face", "height", "width"],
+    )
+    zarr.open_array(f"{path}/u10m", mode="a")[:] = data
+    group = zarr.open_group(str(path), mode="a")
+    written = build_shard_index_table(group, workers=2)
+    assert set(written) == {"t2m", "u10m"}
+    # Second pass: the store is now consolidated, which is how a real catalog is opened.
+    written_again = build_shard_index_table(zarr.open_group(str(path), mode="a"), workers=2)
+    assert set(written_again) == {"t2m", "u10m"}
+    assert "_shard_index" not in available_field_names(group)
+    group = zarr.open_group(str(path), mode="r")
+    for name in ("t2m", "u10m"):
+        array = group[name]
+        table = np.asarray(group["_shard_index"][name][:])
+        n_shards = int(np.ceil(array.shape[0] / array.shards[0]))
+        cps = int(array.shards[0] // array.chunks[0])
+        assert table.shape == (n_shards, cps, 2)
+        nbytes = _shard_index_nbytes(array)
+        root = str(array.store.root)
+        for shard_i in range(n_shards):
+            shard_path = os.path.join(root, name, "c", str(shard_i), "0", "0", "0")
+            decoded = _decode_shard_index(_read_index_tail(shard_path, nbytes), cps)
+            assert np.array_equal(table[shard_i], decoded)
+    sl = slice(2, 12)
+    loaded = load_channel_data(group, sl, ["t2m", "u10m"])
+    for c, name in enumerate(("t2m", "u10m")):
+        assert np.array_equal(loaded[:, c], np.asarray(group[name][sl]), equal_nan=True)
+
+
+def test_direct_read_falls_back_when_o_direct_fails(tmp_path, monkeypatch):
+    import physicsnemo.datapipes.healpix.zarr_layout as zarr_layout
+
+    def _no_direct(*_args, **_kwargs):
+        raise OSError("O_DIRECT refused")
+
+    monkeypatch.setattr(zarr_layout, "_pread_direct", _no_direct)
+    data = _make_sharded_field(tmp_path / "shard")
+    group = zarr.open_group(str(tmp_path / "shard"), mode="r")
+    sl = slice(2, 12)
+    loaded = load_channel_data(group, sl, ["t2m"])
+    assert np.array_equal(loaded[:, 0], data[sl], equal_nan=True)
