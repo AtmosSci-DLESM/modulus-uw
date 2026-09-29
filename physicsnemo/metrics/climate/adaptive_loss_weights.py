@@ -163,9 +163,13 @@ class AdaptiveLossWeights(torch.nn.Module):
             getattr(inner, "needs_input_diagnostics", False)
         )
 
-        # Filled each forward for TensorBoard / NV logging (not in state_dict).
+        # Views into ``_log_values``, bound in ``_build`` / ``setup``. Forward
+        # only ``copy_``s into that storage. CUDA-graph replay does not re-run
+        # Python assignments, so a fresh dict or tensor each forward would be
+        # orphaned by the later eval-graph capture and the trainer would log
+        # the capture-time values for the rest of the run.
         self.log_buffers: Dict[str, torch.Tensor] = {}
-        self._pending_unweighted: Optional[torch.Tensor] = None
+        self._log_tags: List[str] = []
 
         if self._n_data_arg is not None:
             self._build(self._n_data_arg)
@@ -224,7 +228,48 @@ class AdaptiveLossWeights(torch.nn.Module):
             torch.tensor(0, dtype=torch.int32),
             persistent=True,
         )
+        # Not checkpointed: replay writes these every forward.
+        self.register_buffer(
+            "_pending_unweighted",
+            torch.zeros(self.n_terms, dtype=torch.float32),
+            persistent=False,
+        )
+        n_logs = len(self._log_tag_list())
+        self.register_buffer(
+            "_log_values",
+            torch.zeros(n_logs, dtype=torch.float32),
+            persistent=False,
+        )
+        self._bind_log_buffers()
         self._built = True
+
+    def _log_tag_list(self) -> List[str]:
+        """TB tag order. Must match ``_fill_log_buffers`` exactly."""
+        tags = ["loss", "loss_data"]
+        for name, sl in self._group_slices:
+            tags.append(f"loss_constraint/{name}")
+            width = sl.stop - sl.start
+            if width > 1:
+                tags.extend(f"loss_constraint/{name}/{i}" for i in range(width))
+        for term_name in self.term_names:
+            tags.append(f"loss_weight/{term_name}")
+            tags.append(f"loss_weighted/{term_name}")
+            tags.append(f"loss_unweighted/{term_name}")
+        return tags
+
+    def _bind_log_buffers(self) -> None:
+        tags = self._log_tag_list()
+        if self._log_values.numel() != len(tags):
+            raise RuntimeError(
+                f"AdaptiveLossWeights log buffer has {self._log_values.numel()} "
+                f"slots but {len(tags)} tags."
+            )
+        self._log_tags = tags
+        # Views of the registered buffer, so a later ``copy_`` is what replay
+        # updates and what the trainer reads.
+        self.log_buffers = {
+            tag: self._log_values[i] for i, tag in enumerate(tags)
+        }
 
     def _rebuild_term_names(self) -> None:
         self.term_names = list(self.variable_names)
@@ -276,6 +321,11 @@ class AdaptiveLossWeights(torch.nn.Module):
         self.ema = self.ema.to(device=device)
         self.weights = self.weights.to(device=device)
         self.ema_initialized = self.ema_initialized.to(device=device)
+        self._pending_unweighted = self._pending_unweighted.to(device=device)
+        self._log_values = self._log_values.to(device=device)
+        # Rebind after the device move and any variable-name rewrite so the
+        # dict views the storage forward will ``copy_`` into.
+        self._bind_log_buffers()
         # Warmup weights: 1 on variables, s_k on constraints.
         self.weights.copy_(self.relative_scales)
 
@@ -316,27 +366,32 @@ class AdaptiveLossWeights(torch.nn.Module):
         weighted: torch.Tensor,
         scalar: torch.Tensor,
     ) -> None:
-        C = float(self.n_data_variables)
-        loss_data = weighted[: self.n_data_variables].sum() / C
-        logs: Dict[str, torch.Tensor] = {
-            "loss": scalar.detach(),
-            "loss_data": loss_data.detach(),
-        }
-        for name, sl in self._group_slices:
-            logs[f"loss_constraint/{name}"] = (
-                weighted[sl].sum() / C
-            ).detach()
-            # Per-term hydro (and multi-scale) contributions.
-            if sl.stop - sl.start > 1:
-                for i, idx in enumerate(range(sl.start, sl.stop)):
-                    logs[f"loss_constraint/{name}/{i}"] = (
-                        weighted[idx] / C
-                    ).detach()
-        for i, term_name in enumerate(self.term_names):
-            logs[f"loss_weight/{term_name}"] = self.weights[i].detach()
-            logs[f"loss_weighted/{term_name}"] = weighted[i].detach()
-            logs[f"loss_unweighted/{term_name}"] = unweighted[i].detach()
-        self.log_buffers = logs
+        # ``copy_`` into the buffers bound at setup. Assigning a new dict here
+        # is not replayed, so the eval-graph capture would leave the trainer
+        # reading capture-time tensors for every later training step.
+        C = self.n_data_variables
+        c_float = float(C)
+        values: List[torch.Tensor] = [
+            scalar.detach(),
+            (weighted[:C].sum() / c_float).detach(),
+        ]
+        for _name, sl in self._group_slices:
+            values.append((weighted[sl].sum() / c_float).detach())
+            width = sl.stop - sl.start
+            if width > 1:
+                for i in range(width):
+                    values.append((weighted[sl.start + i] / c_float).detach())
+        for i in range(self.n_terms):
+            values.append(self.weights[i].detach())
+            values.append(weighted[i].detach())
+            values.append(unweighted[i].detach())
+        if len(values) != self._log_values.numel():
+            raise RuntimeError(
+                f"AdaptiveLossWeights produced {len(values)} log values "
+                f"for {self._log_values.numel()} slots."
+            )
+        for i, val in enumerate(values):
+            self._log_values[i].copy_(val)
 
     def forward(
         self,
@@ -366,7 +421,10 @@ class AdaptiveLossWeights(torch.nn.Module):
             prediction, target, input, input_diagnostics
         )
         # Detach for the post-backward EMA path; keep a graph on weighted terms.
-        self._pending_unweighted = unweighted.detach()
+        # ``copy_`` so train and eval graph replays write the same buffer the
+        # trainer reads. Do not replace this tensor and do not clear it after
+        # the update: replay would not restore the Python reference.
+        self._pending_unweighted.copy_(unweighted.detach())
         weighted = unweighted * self.weights
         if not average_channels:
             self._fill_log_buffers(
@@ -411,4 +469,3 @@ class AdaptiveLossWeights(torch.nn.Module):
             self.weights.copy_(self._compute_adaptive_weights())
         else:
             self.weights.copy_(self.relative_scales)
-        self._pending_unweighted = None
