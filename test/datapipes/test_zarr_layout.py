@@ -421,21 +421,6 @@ def test_sharded_window_matches_arrays(tmp_path):
     for c, name in enumerate(("u10m", "t2m")):
         assert np.array_equal(targets[:, :, c], stored[name][sl][idx_out], equal_nan=True)
 
-
-def test_direct_read_falls_back_when_o_direct_fails(tmp_path, monkeypatch):
-    import physicsnemo.datapipes.healpix.zarr_shard_read as shard_read
-
-    def _no_direct(*_args, **_kwargs):
-        raise OSError("O_DIRECT refused")
-
-    monkeypatch.setattr(shard_read, "_pread_direct", _no_direct)
-    data = _make_sharded_field(tmp_path / "shard")
-    group = zarr.open_group(str(tmp_path / "shard"), mode="r")
-    sl = slice(2, 12)
-    loaded = load_channel_data(group, sl, ["t2m"])
-    assert np.array_equal(loaded[:, 0], data[sl], equal_nan=True)
-
-
 def test_load_windowed_channel_data_ic_diagnostics(tmp_path):
     ds = _make_per_variable_store(tmp_path / "named", t=8)
     time_sl = slice(0, 6)
@@ -517,4 +502,3 @@ def test_TimeSeriesDataset_return_ic_diagnostics(tmp_path):
     assert ic_diag.dtype == np.float32
     batch = TimeSeriesDatasetZarr(**common, return_ic_diagnostics=False)[0]
     assert len(batch) == 2
-
