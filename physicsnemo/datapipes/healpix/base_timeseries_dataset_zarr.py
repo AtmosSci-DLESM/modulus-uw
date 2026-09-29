@@ -154,9 +154,8 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         train_noise_seed : int, default=42
             Seed for train noise
         return_ic_diagnostics : bool, default=False
-            Train mode only: also return ground-truth output-only (diagnostic)
-            channels at input times for soft constraints that need IC anchors
-            (e.g. diagnostic ``sp``). Forecast mode ignores this flag.
+            Train mode only: also return ground-truth output-only channels at
+            input times. Forecast mode ignores this flag.
         meta : DatapipeMetaData, optional
             Metadata for the datapipe
         """
@@ -190,7 +189,6 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             if self.forecast_mode
             else self.all_variables
         )
-        # Output-only channels in output order (stable for soft-constraint indexing).
         input_set = set(self.input_variables)
         self.ic_diagnostic_variables = [
             name for name in self.output_variables if name not in input_set
@@ -261,7 +259,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             )
             for n in range(self.batch_size)
         ]
-        # Contiguous intp arrays for windowed loads / insolation gather.
+        # Contiguous intp arrays for windowed loads and insolation gather.
         self._input_indices_np = np.asarray(self._input_indices, dtype=np.intp)
         self._output_indices_np = np.asarray(self._output_indices, dtype=np.intp)
         self._sol_indices_np = np.asarray(
@@ -282,18 +280,11 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         self.target_scaling = None
         self.constant_scaling = None
         self.constants = None
-        # Year-length insolation table (built below when add_insolation=True).
-        # Constructed in the parent before DataLoader fork so workers share the
-        # pages via COW instead of recomputing float transcendentals per batch.
-        self._insolation_lut = None
-        self._insolation_lut_step_h = None
 
         if self.scaling:
             self._get_scaling_da()
         if self.constant_variables:
             self.constants = self.get_constants()
-        if self.add_insolation:
-            self._build_insolation_lut()
 
         self.add_train_noise = add_train_noise
         self.train_noise_params = train_noise_params
@@ -578,35 +569,6 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             ) * self.data_time_step
             return self.time_da[time_index[0]].values + timedeltas
         return self.time_da[slice(*time_index)].values
-
-    def _build_insolation_lut(self) -> None:
-        """Precompute insolation for one leap-year of ``data_time_step`` slots."""
-        from physicsnemo.utils.insolation import insolation
-
-        step_h = int(round(self.data_time_step / pd.Timedelta("1h")))
-        if step_h <= 0:
-            raise ValueError(f"invalid data_time_step for insolation LUT: {self.data_time_step}")
-        # Leap-year span so day-of-year indices through Dec 31 of leap years are valid.
-        n_slots = (366 * 24) // step_h
-        hours = np.arange(n_slots, dtype=np.int64) * step_h
-        dates = np.datetime64("1996-01-01T00:00:00") + hours.astype("timedelta64[h]")
-        # ~550MB float32 for HPX64; shared across forked DataLoader workers.
-        self._insolation_lut = insolation(dates, self.lat, self.lon)
-        self._insolation_lut_step_h = step_h
-
-    def insolation_for_dates(self, dates) -> np.ndarray:
-        """Return insolation ``(T, F, H, W)`` for ``dates``, via LUT when available."""
-        from physicsnemo.utils.insolation import insolation
-
-        if self._insolation_lut is None:
-            return insolation(dates, self.lat, self.lon)
-
-        dates64 = np.asarray(dates, dtype="datetime64[ns]")
-        years = dates64.astype("datetime64[Y]")
-        hours = (dates64 - years) / np.timedelta64(1, "h")
-        slots = np.rint(hours / self._insolation_lut_step_h).astype(np.intp)
-        np.clip(slots, 0, self._insolation_lut.shape[0] - 1, out=slots)
-        return self._insolation_lut[slots]
 
     def __len__(self) -> int:
         """Get number of samples available in the dataset based on

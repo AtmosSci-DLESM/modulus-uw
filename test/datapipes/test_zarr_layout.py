@@ -18,8 +18,6 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 np = pytest.importorskip("numpy")
@@ -27,10 +25,7 @@ xr = pytest.importorskip("xarray")
 zarr = pytest.importorskip("zarr")
 
 from physicsnemo.datapipes.healpix.zarr_layout import (
-    _decode_shard_index,
-    _read_index_tail,
     available_field_names,
-    build_shard_index_table,
     constants_are_stacked,
     enable_zarrs_pipeline,
     is_per_variable_layout,
@@ -38,7 +33,6 @@ from physicsnemo.datapipes.healpix.zarr_layout import (
     load_channel_data,
     load_constant_fields,
     load_windowed_channel_data,
-    read_sharded_time_slice,
     resolve_mask_field,
 )
 
@@ -117,7 +111,7 @@ def test_load_channel_data_stacked_by_name(tmp_path):
     ds = _make_stacked_store(tmp_path / "mono")
     time_sl = slice(0, 2)
     expected = np.asarray(ds["inputs"][time_sl, [0, 2]])
-    loaded = load_channel_data(ds, time_sl, ["t2m", "v10m"], n_threads=1)
+    loaded = load_channel_data(ds, time_sl, ["t2m", "v10m"])
     np.testing.assert_array_equal(loaded, expected)
 
 
@@ -127,13 +121,13 @@ def test_load_channel_data_per_variable_store(tmp_path):
     expected = np.stack(
         [np.asarray(ds["v10m"][time_sl]), np.asarray(ds["t2m"][time_sl])], axis=1
     )
-    loaded = load_channel_data(ds, time_sl, ["v10m", "t2m"], n_threads=1)
+    loaded = load_channel_data(ds, time_sl, ["v10m", "t2m"])
     np.testing.assert_array_equal(loaded, expected)
 
 
 def test_load_constant_fields_per_variable_store(tmp_path):
     ds = _make_per_variable_store(tmp_path / "named")
-    loaded = load_constant_fields(ds, ["lsm", "z"], n_threads=1)
+    loaded = load_constant_fields(ds, ["lsm", "z"])
     expected = np.stack([np.asarray(ds["lsm"]), np.asarray(ds["z"])], axis=0)
     np.testing.assert_array_equal(loaded, expected)
 
@@ -141,19 +135,19 @@ def test_load_constant_fields_per_variable_store(tmp_path):
 def test_load_channel_data_empty_raises_on_per_variable(tmp_path):
     ds = _make_per_variable_store(tmp_path / "named")
     with pytest.raises(ValueError, match="empty field name list"):
-        load_channel_data(ds, slice(0, 1), [], n_threads=1)
+        load_channel_data(ds, slice(0, 1), [])
 
 
 def test_load_channel_data_per_variable_store_with_scaling(tmp_path):
     ds = _make_per_variable_store(tmp_path / "named")
     time_sl = slice(0, 2)
-    raw = load_channel_data(ds, time_sl, ["v10m", "t2m"], n_threads=1)
+    raw = load_channel_data(ds, time_sl, ["v10m", "t2m"])
     scaling = {
         "mean": np.expand_dims(np.array([1.0, 2.0], dtype=np.float32), (0, 2, 3, 4)),
         "std": np.expand_dims(np.array([2.0, 4.0], dtype=np.float32), (0, 2, 3, 4)),
     }
     scaled = load_channel_data(
-        ds, time_sl, ["v10m", "t2m"], n_threads=1, scaling=scaling
+        ds, time_sl, ["v10m", "t2m"], scaling=scaling
     )
     expected = raw.copy()
     expected -= scaling["mean"]
@@ -171,24 +165,21 @@ def test_load_windowed_channel_data_per_variable_store(tmp_path):
     output_time_idx = np.asarray([[2, 4], [3, 5]], dtype=np.intp)
 
     staging = load_channel_data(
-        ds, time_sl, ["t2m", "v10m", "u10m"], n_threads=1
-    )
+        ds, time_sl, ["t2m", "v10m", "u10m"]    )
     # staging channel order: t2m=0, v10m=1, u10m=2
     exp_in = staging[input_time_idx[:, :, None], np.asarray([0, 1])[None, None, :]]
     exp_out = staging[output_time_idx[:, :, None], np.asarray([2, 0])[None, None, :]]
 
-    got_in, got_out, got_ic = load_windowed_channel_data(
+    got_in, got_out = load_windowed_channel_data(
         ds,
         time_sl,
         input_names=input_names,
         input_time_idx=input_time_idx,
         output_names=output_names,
         output_time_idx=output_time_idx,
-        n_threads=2,
     )
     np.testing.assert_array_equal(got_in, exp_in)
     np.testing.assert_array_equal(got_out, exp_out)
-    assert got_ic is None
 
 
 def test_load_windowed_channel_data_stacked_matches_per_variable(tmp_path):
@@ -227,17 +218,11 @@ def test_load_windowed_channel_data_stacked_matches_per_variable(tmp_path):
         input_time_idx=input_time_idx,
         output_names=output_names,
         output_time_idx=output_time_idx,
-        n_threads=1,
     )
-    stacked_in, stacked_out, stacked_ic = load_windowed_channel_data(
-        stacked_ds, **kwargs
-    )
-    per_var_in, per_var_out, per_var_ic = load_windowed_channel_data(
-        per_var_ds, **kwargs
-    )
+    stacked_in, stacked_out = load_windowed_channel_data(stacked_ds, **kwargs)
+    per_var_in, per_var_out = load_windowed_channel_data(per_var_ds, **kwargs)
     np.testing.assert_allclose(stacked_in, per_var_in)
     np.testing.assert_allclose(stacked_out, per_var_out)
-    assert stacked_ic is None and per_var_ic is None
 
 
 def test_enable_zarrs_pipeline_when_installed():
@@ -267,127 +252,92 @@ def test_resolve_mask_field_per_variable_legacy_layout_attr(tmp_path):
     opened.close()
 
 
-def test_load_windowed_channel_data_ic_diagnostics(tmp_path):
-    """IC diagnostics are output-only channels gathered at input times."""
-    ds = _make_per_variable_store(tmp_path / "named", t=8)
-    time_sl = slice(0, 6)
-    input_names = ["t2m"]
-    output_names = ["t2m", "u10m", "v10m"]
-    ic_diag_names = ["u10m", "v10m"]
-    input_time_idx = np.asarray([[0], [1]], dtype=np.intp)
-    output_time_idx = np.asarray([[2], [3]], dtype=np.intp)
-    output_scaling = {
-        "mean": np.zeros((1, 3, 1, 1, 1), dtype=np.float32),
-        "std": np.ones((1, 3, 1, 1, 1), dtype=np.float32),
-    }
-    inputs, targets, ic_diag = load_windowed_channel_data(
-        ds,
-        time_sl,
-        input_names=input_names,
-        input_time_idx=input_time_idx,
-        output_names=output_names,
-        output_time_idx=output_time_idx,
-        output_scaling=output_scaling,
-        ic_diagnostic_names=ic_diag_names,
-    )
-    assert ic_diag is not None
-    assert ic_diag.shape[2] == 2
-    staging = load_channel_data(ds, time_sl, ["t2m", "u10m", "v10m"], n_threads=1)
-    exp_ic = staging[input_time_idx[:, :, None], np.asarray([1, 2])[None, None, :]]
-    np.testing.assert_array_equal(ic_diag, exp_ic)
-    assert inputs.shape[2] == 1
-    assert targets.shape[2] == 3
+def test_missing_layout_attr_is_not_per_variable(tmp_path):
+    bare = _make_per_variable_store(tmp_path / "bare", layout="")
+    assert is_stacked_layout(bare) is False
+    assert is_per_variable_layout(bare) is False
+    with pytest.raises(ValueError, match="Unrecognized healpix Zarr layout"):
+        load_channel_data(bare, slice(0, 1), ["t2m"])
 
 
-def test_TimeSeriesDataset_return_ic_diagnostics(tmp_path):
-    """Train mode can return output-only channels at input times for soft constraints."""
+def test_stacked_getitem_matches_joint_inputs_scale(tmp_path):
+    """Stacked batches match a joint ``inputs`` read, in-place scale, and float32."""
     omegaconf = pytest.importorskip("omegaconf")
     pd = pytest.importorskip("pandas")
     from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
         TimeSeriesDatasetZarr,
     )
 
-    input_variables = ["tcwv"]
-    output_variables = ["tcwv", "msl", "sp"]
-    dataset_path = tmp_path / "ic_diag.zarr"
-    n_time = 12
-    face, height, width = 1, 2, 2
-    times = pd.date_range("1979-01-01", periods=n_time, freq="6h")
-    n_chan = len(output_variables)
-    data = np.zeros((n_time, n_chan, face, height, width), dtype=np.float32)
-    for i in range(n_chan):
-        data[:, i] = float(i + 1)
-    ds = xr.Dataset(
+    channels = ["t2m", "u10m", "v10m"]
+    input_variables = ["v10m", "t2m"]
+    output_variables = ["u10m", "t2m"]
+    n_time, face, height, width = 16, 1, 2, 2
+    times = pd.date_range("2021-03-01", periods=n_time, freq="6h")
+    data = np.arange(
+        n_time * len(channels) * face * height * width, dtype=np.float64
+    ).reshape(n_time, len(channels), face, height, width)
+    path = tmp_path / "stacked.zarr"
+    xr.Dataset(
         data_vars={
-            "inputs": (
-                ("time", "channel_in", "face", "height", "width"),
-                data,
-            ),
-            "targets": (
-                ("time", "channel_out", "face", "height", "width"),
-                data.copy(),
-            ),
+            "inputs": (("time", "channel_in", "face", "height", "width"), data),
             "lat": (("face", "height", "width"), np.zeros((face, height, width))),
             "lon": (("face", "height", "width"), np.zeros((face, height, width))),
-            "face": ("face", np.arange(face)),
-            "height": ("height", np.arange(height)),
-            "width": ("width", np.arange(width)),
         },
         coords={
             "time": times,
-            "channel_in": output_variables,
-            "channel_out": output_variables,
+            "channel_in": channels,
+            "face": np.arange(face),
+            "height": np.arange(height),
+            "width": np.arange(width),
         },
-    )
-    ds.to_zarr(dataset_path)
+    ).to_zarr(path)
 
-    scaling = omegaconf.DictConfig(
-        {
-            "tcwv": {"mean": 0.0, "std": 1.0},
-            "msl": {"mean": 0.0, "std": 1.0},
-            "sp": {"mean": 0.0, "std": 1.0},
-        }
-    )
+    means = {"t2m": 1.5, "u10m": -2.0, "v10m": 0.25}
+    stds = {"t2m": 2.0, "u10m": 4.0, "v10m": 0.5}
     dataset = TimeSeriesDatasetZarr(
-        dataset_path=str(dataset_path),
+        dataset_path=str(path),
         data_time_step="6h",
         time_step="6h",
         gap="6h",
-        scaling=scaling,
+        scaling=omegaconf.DictConfig(
+            {name: {"mean": means[name], "std": stds[name]} for name in channels}
+        ),
         input_variables=input_variables,
         output_variables=output_variables,
-        start_date="1979-01-01",
-        end_date="1979-01-03",
-        batch_size=1,
-        input_time_dim=1,
+        start_date="2021-03-01",
+        end_date="2021-03-04",
+        batch_size=2,
+        input_time_dim=2,
         output_time_dim=1,
-        return_ic_diagnostics=True,
     )
-    assert dataset.ic_diagnostic_variables == ["msl", "sp"]
-    inputs, targets, ic_diag = dataset[0]
-    assert ic_diag is not None
-    assert ic_diag.shape[3] == 2
-    assert float(ic_diag[0, 0, -1, 0].mean()) == pytest.approx(2.0)
-    assert float(ic_diag[0, 0, -1, 1].mean()) == pytest.approx(3.0)
-    assert inputs[0].shape[3] == 1
-    assert float(inputs[0][0, 0, -1, 0].mean()) == pytest.approx(1.0)
 
-    batch = TimeSeriesDatasetZarr(
-        dataset_path=str(dataset_path),
-        data_time_step="6h",
-        time_step="6h",
-        gap="6h",
-        scaling=scaling,
-        input_variables=input_variables,
-        output_variables=output_variables,
-        start_date="1979-01-01",
-        end_date="1979-01-03",
-        batch_size=1,
-        input_time_dim=1,
-        output_time_dim=1,
-        return_ic_diagnostics=False,
-    )[0]
-    assert len(batch) == 2
+    raw = np.asarray(zarr.open_group(str(path), mode="r")["inputs"][:])
+    name_to_i = {name: i for i, name in enumerate(channels)}
+    time_index, this_batch = dataset._get_time_index(0)
+    staging = np.array(raw[slice(*time_index)])
+    for i, name in enumerate(channels):
+        staging[:, i] -= np.asarray(means[name], dtype=staging.dtype)
+        staging[:, i] /= np.asarray(stds[name], dtype=staging.dtype)
+
+    def _windows(names, index_lists):
+        selected = staging[:, [name_to_i[name] for name in names]]
+        out = np.empty(
+            (this_batch, len(index_lists[0]), len(names), face, height, width),
+            dtype=np.float32,
+        )
+        for sample in range(this_batch):
+            out[sample] = selected[index_lists[sample]]
+        return np.transpose(out, (0, 3, 1, 2, 4, 5))
+
+    inputs, targets = dataset[0]
+    np.testing.assert_array_equal(
+        inputs[0], _windows(input_variables, dataset._input_indices)
+    )
+    np.testing.assert_array_equal(
+        targets, _windows(output_variables, dataset._output_indices)
+    )
+    assert inputs[0].dtype == np.float32
+    assert targets.dtype == np.float32
 
 
 def _make_sharded_field(path, *, t: int = 20, shard_time: int = 8, f: int = 2, h: int = 2, w: int = 2):
@@ -395,7 +345,6 @@ def _make_sharded_field(path, *, t: int = 20, shard_time: int = 8, f: int = 2, h
     from zarr.codecs import ZstdCodec
 
     data = np.arange(t * f * h * w, dtype=np.float32).reshape(t, f, h, w)
-    # A NaN chunk forces an empty slot so a window can straddle a gap.
     data[3] = np.nan
     zarr.create_array(
         store=str(path),
@@ -411,13 +360,16 @@ def _make_sharded_field(path, *, t: int = 20, shard_time: int = 8, f: int = 2, h
     )
     array = zarr.open_array(f"{path}/t2m", mode="a")
     array[:] = data
+    group = zarr.open_group(str(path), mode="a")
+    group.attrs["layout"] = "per_variable"
     return data
 
 
 def test_read_sharded_time_slice_matches_array(tmp_path):
+    from physicsnemo.datapipes.healpix.zarr_shard_read import read_sharded_time_slice
+
     data = _make_sharded_field(tmp_path / "shard")
     array = zarr.open_array(f"{tmp_path / 'shard'}/t2m", mode="r")
-    # Crosses the shard boundary at t=8 and includes the NaN sample at t=3.
     sl = slice(2, 12)
     got = read_sharded_time_slice(array, sl)
     assert got is not None
@@ -426,16 +378,10 @@ def test_read_sharded_time_slice_matches_array(tmp_path):
     assert np.array_equal(got, ref, equal_nan=True)
     loaded = load_channel_data(zarr.open_group(str(tmp_path / "shard"), mode="r"), sl, ["t2m"])
     assert np.array_equal(loaded[:, 0], ref, equal_nan=True)
+    assert np.array_equal(loaded[:, 0], data[sl], equal_nan=True)
 
 
-def test_sharded_gather_window_matches_arrays(tmp_path, monkeypatch):
-    """Every field of a sharded window is loaded together and matches array slices."""
-    import physicsnemo.datapipes.healpix.zarr_layout as zarr_layout
-
-    def _forbid_thread_pool(*_args, **_kwargs):
-        raise AssertionError("sharded fields must use the direct reader, not the small thread pool")
-
-    monkeypatch.setattr(zarr_layout, "_run_loaders_parallel", _forbid_thread_pool)
+def test_sharded_window_matches_arrays(tmp_path):
     from zarr.codecs import ZstdCodec
 
     path = tmp_path / "multi"
@@ -458,6 +404,8 @@ def test_sharded_gather_window_matches_arrays(tmp_path, monkeypatch):
             dimension_names=["time", "face", "height", "width"],
         )
         zarr.open_array(f"{path}/{name}", mode="a")[:] = data
+    group = zarr.open_group(str(path), mode="a")
+    group.attrs["layout"] = "per_variable"
     group = zarr.open_group(str(path), mode="r")
     sl = slice(2, 12)
     loaded = load_channel_data(group, sl, ["t2m", "u10m"])
@@ -465,7 +413,7 @@ def test_sharded_gather_window_matches_arrays(tmp_path, monkeypatch):
         assert np.array_equal(loaded[:, c], stored[name][sl], equal_nan=True)
     idx_in = np.array([[0, 1], [2, 3]])
     idx_out = np.array([[4, 6], [5, 7]])
-    inputs, targets, _ic = load_windowed_channel_data(
+    inputs, targets = load_windowed_channel_data(
         group, sl, ["t2m", "u10m"], idx_in, ["u10m", "t2m"], idx_out
     )
     for c, name in enumerate(("t2m", "u10m")):
@@ -474,67 +422,133 @@ def test_sharded_gather_window_matches_arrays(tmp_path, monkeypatch):
         assert np.array_equal(targets[:, :, c], stored[name][sl][idx_out], equal_nan=True)
 
 
-def _shard_index_nbytes(array) -> int:
-    shard_t = int(tuple(array.shards)[0])
-    inner_t = int(tuple(array.chunks)[0])
-    return (shard_t // inner_t) * 16 + 4
+def test_stored_shard_index_skips_tail_read(tmp_path, monkeypatch):
+    """A ``_shard_index/<field>`` table is (n_shards, chunks_per_shard, 2) uint64."""
+    import physicsnemo.datapipes.healpix.zarr_shard_read as shard_read
 
-
-def test_shard_index_table_matches_decoded_indexes(tmp_path):
-    path = tmp_path / "multi"
-    _make_sharded_field(path, t=20, shard_time=8)
-    from zarr.codecs import ZstdCodec
-
-    data = (np.arange(20 * 2 * 2 * 2, dtype=np.float32) + 1000).reshape(20, 2, 2, 2)
-    data[3] = np.nan
-    zarr.create_array(
-        store=str(path),
-        name="u10m",
-        shape=data.shape,
-        chunks=(1, 2, 2, 2),
-        shards=(8, 2, 2, 2),
-        dtype="float32",
-        zarr_format=3,
-        compressors=[ZstdCodec(level=0)],
-        fill_value=np.nan,
-        dimension_names=["time", "face", "height", "width"],
-    )
-    zarr.open_array(f"{path}/u10m", mode="a")[:] = data
+    path = tmp_path / "indexed"
+    _make_sharded_field(path)
     group = zarr.open_group(str(path), mode="a")
-    written = build_shard_index_table(group, workers=2)
-    assert set(written) == {"t2m", "u10m"}
-    # Second pass: the store is now consolidated, which is how a real catalog is opened.
-    written_again = build_shard_index_table(zarr.open_group(str(path), mode="a"), workers=2)
-    assert set(written_again) == {"t2m", "u10m"}
-    assert "_shard_index" not in available_field_names(group)
+    layout = shard_read._field_table(group)["t2m"]
+    rows = np.stack([layout.offsets_for(i) for i in range(layout.n_shards)]).astype("<u8")
+    assert rows.shape == (layout.n_shards, layout.chunks_per_shard_t, 2)
+    index_arr = zarr.create_array(
+        store=group.store,
+        name="_shard_index/t2m",
+        shape=rows.shape,
+        chunks=rows.shape,
+        dtype="<u8",
+        zarr_format=3,
+        overwrite=True,
+        compressors=[],
+    )
+    index_arr[:] = rows
+    shard_read.clear_shard_cache()
+
+    def _no_tail(*_args, **_kwargs):
+        raise AssertionError("stored shard index should replace the per-shard tail read")
+
+    monkeypatch.setattr(shard_read, "_read_index_tail", _no_tail)
     group = zarr.open_group(str(path), mode="r")
-    for name in ("t2m", "u10m"):
-        array = group[name]
-        table = np.asarray(group["_shard_index"][name][:])
-        n_shards = int(np.ceil(array.shape[0] / array.shards[0]))
-        cps = int(array.shards[0] // array.chunks[0])
-        assert table.shape == (n_shards, cps, 2)
-        nbytes = _shard_index_nbytes(array)
-        root = str(array.store.root)
-        for shard_i in range(n_shards):
-            shard_path = os.path.join(root, name, "c", str(shard_i), "0", "0", "0")
-            decoded = _decode_shard_index(_read_index_tail(shard_path, nbytes), cps)
-            assert np.array_equal(table[shard_i], decoded)
     sl = slice(2, 12)
-    loaded = load_channel_data(group, sl, ["t2m", "u10m"])
-    for c, name in enumerate(("t2m", "u10m")):
-        assert np.array_equal(loaded[:, c], np.asarray(group[name][sl]), equal_nan=True)
+    loaded = load_channel_data(group, sl, ["t2m"])
+    assert np.array_equal(loaded[:, 0], np.asarray(group["t2m"][sl]), equal_nan=True)
+    assert "_shard_index" not in available_field_names(group)
 
 
 def test_direct_read_falls_back_when_o_direct_fails(tmp_path, monkeypatch):
-    import physicsnemo.datapipes.healpix.zarr_layout as zarr_layout
+    import physicsnemo.datapipes.healpix.zarr_shard_read as shard_read
 
     def _no_direct(*_args, **_kwargs):
         raise OSError("O_DIRECT refused")
 
-    monkeypatch.setattr(zarr_layout, "_pread_direct", _no_direct)
+    monkeypatch.setattr(shard_read, "_pread_direct", _no_direct)
     data = _make_sharded_field(tmp_path / "shard")
     group = zarr.open_group(str(tmp_path / "shard"), mode="r")
     sl = slice(2, 12)
     loaded = load_channel_data(group, sl, ["t2m"])
     assert np.array_equal(loaded[:, 0], data[sl], equal_nan=True)
+
+
+def test_load_windowed_channel_data_ic_diagnostics(tmp_path):
+    ds = _make_per_variable_store(tmp_path / "named", t=8)
+    time_sl = slice(0, 6)
+    input_time_idx = np.asarray([[0], [1]], dtype=np.intp)
+    output_time_idx = np.asarray([[2], [3]], dtype=np.intp)
+    output_scaling = {
+        "mean": np.zeros((1, 3, 1, 1, 1), dtype=np.float32),
+        "std": np.ones((1, 3, 1, 1, 1), dtype=np.float32),
+    }
+    inputs, targets, ic_diag = load_windowed_channel_data(
+        ds,
+        time_sl,
+        input_names=["t2m"],
+        input_time_idx=input_time_idx,
+        output_names=["t2m", "u10m", "v10m"],
+        output_time_idx=output_time_idx,
+        output_scaling=output_scaling,
+        ic_diagnostic_names=["u10m", "v10m"],
+    )
+    assert ic_diag.shape[2] == 2
+    staging = load_channel_data(ds, time_sl, ["t2m", "u10m", "v10m"])
+    exp_ic = staging[input_time_idx[:, :, None], np.asarray([1, 2])[None, None, :]]
+    np.testing.assert_array_equal(ic_diag, exp_ic)
+    assert inputs.shape[2] == 1
+    assert targets.shape[2] == 3
+
+
+def test_TimeSeriesDataset_return_ic_diagnostics(tmp_path):
+    omegaconf = pytest.importorskip("omegaconf")
+    pd = pytest.importorskip("pandas")
+    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
+        TimeSeriesDatasetZarr,
+    )
+
+    output_variables = ["tcwv", "msl", "sp"]
+    dataset_path = tmp_path / "ic_diag.zarr"
+    n_time, face, height, width = 12, 1, 2, 2
+    data = np.zeros((n_time, 3, face, height, width), dtype=np.float32)
+    for i in range(3):
+        data[:, i] = float(i + 1)
+    xr.Dataset(
+        data_vars={
+            "inputs": (("time", "channel_in", "face", "height", "width"), data),
+            "lat": (("face", "height", "width"), np.zeros((face, height, width))),
+            "lon": (("face", "height", "width"), np.zeros((face, height, width))),
+        },
+        coords={
+            "time": pd.date_range("1979-01-01", periods=n_time, freq="6h"),
+            "channel_in": output_variables,
+            "face": np.arange(face),
+            "height": np.arange(height),
+            "width": np.arange(width),
+        },
+    ).to_zarr(dataset_path)
+    scaling = omegaconf.DictConfig(
+        {name: {"mean": 0.0, "std": 1.0} for name in output_variables}
+    )
+    common = dict(
+        dataset_path=str(dataset_path),
+        data_time_step="6h",
+        time_step="6h",
+        gap="6h",
+        scaling=scaling,
+        input_variables=["tcwv"],
+        output_variables=output_variables,
+        start_date="1979-01-01",
+        end_date="1979-01-03",
+        batch_size=1,
+        input_time_dim=1,
+        output_time_dim=1,
+    )
+    dataset = TimeSeriesDatasetZarr(**common, return_ic_diagnostics=True)
+    assert dataset.ic_diagnostic_variables == ["msl", "sp"]
+    inputs, targets, ic_diag = dataset[0]
+    assert ic_diag.shape[3] == 2
+    assert float(ic_diag[0, 0, -1, 0].mean()) == pytest.approx(2.0)
+    assert float(ic_diag[0, 0, -1, 1].mean()) == pytest.approx(3.0)
+    assert inputs[0].dtype == np.float32
+    assert ic_diag.dtype == np.float32
+    batch = TimeSeriesDatasetZarr(**common, return_ic_diagnostics=False)[0]
+    assert len(batch) == 2
+

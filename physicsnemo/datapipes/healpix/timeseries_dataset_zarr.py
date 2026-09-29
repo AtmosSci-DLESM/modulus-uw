@@ -23,9 +23,10 @@ import torch
 from omegaconf import DictConfig
 
 from physicsnemo.datapipes.meta import DatapipeMetaData
+from physicsnemo.utils.insolation import insolation
 
 from .base_timeseries_dataset_zarr import BaseTimeSeriesDatasetZarr
-from .zarr_layout import load_windowed_channel_data, maybe_collect_worker_gc
+from .zarr_layout import load_windowed_channel_data
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +172,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             if self.return_ic_diagnostics and self.ic_diagnostic_variables
             else None
         )
-        inputs, targets, ic_diagnostics = load_windowed_channel_data(
+        window = load_windowed_channel_data(
             self.ds,
             time_sl,
             input_names=self.input_variables,
@@ -182,6 +183,12 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             output_scaling=self.target_scaling,
             ic_diagnostic_names=ic_diag_names,
         )
+        if ic_diag_names:
+            inputs, targets, ic_diagnostics = window
+        else:
+            inputs, targets = window
+            ic_diagnostics = None
+        inputs = np.asarray(inputs, dtype=np.float32)
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()
 
@@ -190,19 +197,20 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             "TimeSeriesDataset:__getitem__:copy_inputs_targets_insolation"
         )
         if self.add_insolation:
-            sol = self.insolation_for_dates(self._get_forecast_sol_times(item))[
-                :, None
-            ]
+            sol = insolation(
+                self._get_forecast_sol_times(item), self.lat, self.lon
+            )[:, None]
             if self.forecast_mode:
-                # sol is already the (T_in+T_out, ...) sequence for the IC.
                 decoder_inputs = np.empty(
                     (this_batch, self.input_time_dim + self.output_time_dim, 1)
                     + self.spatial_dims,
-                    dtype="float32",
+                    dtype=np.float32,
                 )
                 decoder_inputs[:] = sol
             else:
-                decoder_inputs = sol[self._sol_indices_np[:this_batch]]
+                decoder_inputs = np.asarray(
+                    sol[self._sol_indices_np[:this_batch]], dtype=np.float32
+                )
         torch.cuda.nvtx.range_pop()
 
         if not self.forecast_mode and self.add_train_noise:
@@ -237,19 +245,17 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         torch.cuda.nvtx.range_pop()
 
         if self.forecast_mode:
-            maybe_collect_worker_gc()
             torch.cuda.nvtx.range_pop()
             return inputs_result
 
         # Transpose targets to match input format
-        targets = np.transpose(targets, axes=(0, 3, 1, 2, 4, 5))
-
-        maybe_collect_worker_gc()
+        targets = np.transpose(np.asarray(targets, dtype=np.float32), axes=(0, 3, 1, 2, 4, 5))
         torch.cuda.nvtx.range_pop()
         if self.return_ic_diagnostics:
             if ic_diagnostics is not None:
                 ic_diagnostics = np.transpose(
-                    ic_diagnostics, axes=(0, 3, 1, 2, 4, 5)
+                    np.asarray(ic_diagnostics, dtype=np.float32),
+                    axes=(0, 3, 1, 2, 4, 5),
                 )
             return inputs_result, targets, ic_diagnostics
         return inputs_result, targets

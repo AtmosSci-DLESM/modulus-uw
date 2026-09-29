@@ -113,7 +113,7 @@ def _load_topography(
             + surface_geopotential_mean
         )
     else:
-        const = load_constant_fields(ds, [surface_geopotential_name], n_threads=1)
+        const = load_constant_fields(ds, [surface_geopotential_name])
         topography = (
             surface_geopotential_std * const[0] + surface_geopotential_mean
         )
