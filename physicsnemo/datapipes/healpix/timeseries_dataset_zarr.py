@@ -165,7 +165,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
 
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_windows")
         # Decode each field once and scatter directly into sample windows
-        # (per-variable: threaded fills; monolithic: joint read + gather).
+        # (per-variable: threaded fills; stacked: joint read + gather).
         ic_diag_names = (
             self.ic_diagnostic_variables
             if self.return_ic_diagnostics and self.ic_diagnostic_variables

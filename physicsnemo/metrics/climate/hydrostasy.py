@@ -101,15 +101,12 @@ def _load_topography(
 ) -> torch.Tensor:
     """Load denormalized topography [1, F, 1, H, W] from a constants zarr store."""
     from physicsnemo.datapipes.healpix.zarr_layout import (
-        is_monolithic_layout,
-        is_named_arrays_layout,
+        constants_are_stacked,
         load_constant_fields,
     )
 
     ds = xr.open_zarr(dataset_path)
-    if is_monolithic_layout(ds) or (
-        not is_named_arrays_layout(ds) and "constants" in ds
-    ):
+    if constants_are_stacked(ds):
         topography = (
             surface_geopotential_std
             * ds["constants"].sel(channel_c=surface_geopotential_name).values

@@ -1,14 +1,13 @@
 """Helpers for healpix Zarr layouts (stacked vs per-variable).
 
-Vocabulary used in docs and PRs maps to the identifiers below. Do not rename
-existing functions or the on-disk layout attribute for a wording change alone.
-
 - **stacked** — prognostic fields packed on a channel axis in ``inputs`` /
-  ``constants``. Detection: ``is_monolithic_layout``.
+  ``constants``, with names in ``channel_in`` / ``channel_c``.
+  Detection: ``is_stacked_layout``.
 - **per-variable** — one Zarr array per field. Detection:
-  ``is_per_variable_layout`` (and ``is_named_arrays_layout`` when the store
-  sets ``layout=named_arrays_healpix``). That on-disk attribute name is
-  stable; leave it unchanged.
+  ``is_per_variable_layout``.
+
+New catalogs set the root attribute ``layout`` to ``per_variable``.
+Catalogs already written with ``layout=named_arrays_healpix`` still load.
 """
 
 from __future__ import annotations
@@ -27,6 +26,11 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 COORD_KEYS = frozenset({"time", "face", "height", "width", "lat", "lon"})
+
+# Root attribute written by current converters.
+PER_VARIABLE_LAYOUT_ATTR = "per_variable"
+# Written by earlier converters and the b24 builder.
+_LEGACY_PER_VARIABLE_LAYOUT_ATTR = "named_arrays_healpix"
 
 # Process-local pool for DataLoader workers (set via init_worker_pool in worker_init_fn).
 _worker_pool: ThreadPoolExecutor | None = None
@@ -124,29 +128,45 @@ def _atexit_shutdown() -> None:
 atexit.register(_atexit_shutdown)
 
 
-def is_monolithic_layout(ds) -> bool:
-    """True when store uses a single ``inputs`` array."""
+def _layout_attr(ds) -> str:
+    attrs = getattr(ds, "attrs", None) or {}
+    if not hasattr(attrs, "get"):
+        return ""
+    return str(attrs.get("layout", "") or "")
+
+
+def _has_per_variable_layout_attr(ds) -> bool:
+    layout = _layout_attr(ds)
+    return (
+        layout == PER_VARIABLE_LAYOUT_ATTR
+        or layout == _LEGACY_PER_VARIABLE_LAYOUT_ATTR
+        or layout.startswith("per_variable")
+    )
+
+
+def is_stacked_layout(ds) -> bool:
+    """True when prognostic fields are packed on a channel axis in ``inputs``."""
     return "inputs" in ds
 
 
-def is_named_arrays_layout(ds) -> bool:
-    """True for name-only per-field stores (no channel_* metadata arrays)."""
-    attrs = getattr(ds, "attrs", None) or {}
-    layout = attrs.get("layout", "") if hasattr(attrs, "get") else ""
-    return layout == "named_arrays_healpix"
-
-
 def is_per_variable_layout(ds) -> bool:
-    """True when prognostic fields are stored as separate arrays (not monolithic)."""
-    if is_monolithic_layout(ds):
+    """True when each field is stored as its own array."""
+    return not is_stacked_layout(ds)
+
+
+def constants_are_stacked(ds) -> bool:
+    """True when constants are a ``constants`` array indexed by ``channel_c``.
+
+    Per-variable catalogs (``layout=per_variable`` or the older
+    ``named_arrays_healpix``) store each constant as a top-level array.
+    A store that still has a ``constants`` array and does not declare a
+    per-variable layout keeps the stacked read.
+    """
+    if is_stacked_layout(ds):
+        return True
+    if _has_per_variable_layout_attr(ds):
         return False
-    if is_named_arrays_layout(ds):
-        return True
-    attrs = getattr(ds, "attrs", None) or {}
-    layout = attrs.get("layout", "") if hasattr(attrs, "get") else ""
-    if layout == "per_variable_healpix" or str(layout).startswith("per_variable"):
-        return True
-    return True
+    return "constants" in ds
 
 
 def resolve_mask_field(
@@ -154,10 +174,10 @@ def resolve_mask_field(
     data_var: str,
     selection_dict: Mapping[str, Any] | None = None,
 ):
-    """Resolve a spatial mask field from monolithic or named_arrays_healpix stores.
+    """Resolve a spatial mask field from stacked or per-variable stores.
 
-    Monolithic stores use ``data_var`` (e.g. ``constants``) with optional
-    ``selection_dict`` (e.g. ``channel_c``). Named-array stores expose each
+    Stacked stores use ``data_var`` (e.g. ``constants``) with optional
+    ``selection_dict`` (e.g. ``channel_c``). Per-variable stores expose each
     constant as a top-level array; configs still use ``data_var: constants`` and
     ``selection_dict.channel_c`` to pick the field name.
     """
@@ -168,12 +188,12 @@ def resolve_mask_field(
             field = field.sel(**sel)
         return field
 
-    if is_named_arrays_layout(ds) and data_var == "constants" and "channel_c" in sel:
+    if is_per_variable_layout(ds) and data_var == "constants" and "channel_c" in sel:
         field_name = str(sel.pop("channel_c"))
         if field_name not in ds.data_vars:
             raise KeyError(
                 f"Mask field {field_name!r} not found in dataset; "
-                "named_arrays_healpix stores expose constants as top-level arrays."
+                "per-variable stores expose constants as top-level arrays."
             )
         field = ds[field_name]
         if sel:
@@ -188,7 +208,7 @@ def resolve_mask_field(
 
 def available_field_names(ds) -> set[str]:
     """Field names loadable from this store (prognostic + constant)."""
-    if is_monolithic_layout(ds):
+    if is_stacked_layout(ds):
         names = {str(x) for x in np.asarray(ds["channel_in"][:])}
         if "channel_out" in ds:
             names.update(str(x) for x in np.asarray(ds["channel_out"][:]))
@@ -203,7 +223,7 @@ def available_field_names(ds) -> set[str]:
     }
 
 
-def _monolithic_channel_indices(ds, field_names: Sequence[str]) -> list[int]:
+def _stacked_channel_indices(ds, field_names: Sequence[str]) -> list[int]:
     cin = [str(x) for x in np.asarray(ds["channel_in"][:])]
     return [cin.index(n) for n in field_names]
 
@@ -253,13 +273,15 @@ def _coalesced_shard_codec(array):
     try:
         from zarr.codecs.bytes import BytesCodec
         from zarr.codecs.crc32c_ import Crc32cCodec
-        from zarr.codecs.sharding import ShardingCodec, ShardingCodecIndexLocation
+        from zarr.codecs.sharding import ShardingCodec
         from zarr.codecs.zstd import ZstdCodec
     except ImportError:
         return None
     if not isinstance(codec, ShardingCodec):
         return None
-    if codec.index_location != ShardingCodecIndexLocation.end:
+    # ``ShardingCodecIndexLocation.end`` is deprecated; compare the string value.
+    location = getattr(codec.index_location, "value", codec.index_location)
+    if location != "end":
         return None
     index_codecs = tuple(codec.index_codecs)
     if len(index_codecs) != 2 or not isinstance(index_codecs[0], BytesCodec):
@@ -634,14 +656,14 @@ def _scatter_time(block: np.ndarray, time_idx: np.ndarray, dest: np.ndarray) -> 
 
 
 def _window_timer_on() -> bool:
-    return os.environ.get("PERVAR_WINDOW_TIMER") == "1"
+    return os.environ.get("PER_VARIABLE_WINDOW_TIMER") == "1"
 
 
 def _log_window(t0: float | None, n_fields: int) -> None:
     if t0 is None:
         return
     print(
-        f"pervar_window pid={os.getpid()} fields={n_fields} "
+        f"per_variable_window pid={os.getpid()} fields={n_fields} "
         f"{time.perf_counter() - t0:.3f}s",
         flush=True,
     )
@@ -735,8 +757,8 @@ def load_channel_data(
             raise ValueError("empty field name list")
         return np.asarray(ds["inputs"][time_sl])[:, []]
 
-    if is_monolithic_layout(ds):
-        indices = _monolithic_channel_indices(ds, names)
+    if is_stacked_layout(ds):
+        indices = _stacked_channel_indices(ds, names)
         out = np.asarray(ds["inputs"][time_sl, indices])
         if scaling is not None:
             out -= scaling["mean"]
@@ -795,10 +817,10 @@ def load_windowed_channel_data(
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Load and scale fields directly into (B, T, C, F, H, W) sample windows.
 
-    For per-variable / named-array stores, each unique field is decoded and
-    scaled once on a worker thread, then scattered into channel-first scratch
-    buffers. For monolithic ``inputs`` stores, channels are read jointly and
-    gathered into the same window layout.
+    For per-variable stores, each unique field is decoded and scaled once on
+    a worker thread, then scattered into channel-first scratch buffers. For
+    stacked ``inputs`` stores, channels are read jointly and gathered into
+    the same window layout.
 
     Parameters
     ----------
@@ -836,8 +858,8 @@ def load_windowed_channel_data(
         )
     ic_diag_names = list(ic_diagnostic_names or [])
 
-    if is_monolithic_layout(ds):
-        # Monolithic stores are already a joint array; stage once then gather.
+    if is_stacked_layout(ds):
+        # Stacked stores are already a joint array; stage once then gather.
         names = list(dict.fromkeys(list(input_names) + list(output_names or [])))
         staging = load_channel_data(
             ds, time_sl, names, n_threads=n_threads, scaling=None
@@ -1009,9 +1031,7 @@ def load_constant_fields(
     if len(names) == 0:
         raise ValueError("empty constant field name list")
 
-    if is_monolithic_layout(ds) or (
-        not is_named_arrays_layout(ds) and "constants" in ds
-    ):
+    if constants_are_stacked(ds):
         cc = [str(x) for x in np.asarray(ds["channel_c"][:])]
         indices = [cc.index(n) for n in names]
         return np.asarray(ds["constants"][indices])
