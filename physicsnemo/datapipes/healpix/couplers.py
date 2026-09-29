@@ -113,7 +113,7 @@ class BaseCoupler(ABC):
             self.use_zarr = False
         elif type(self.ds) == zr.Group:
             self.use_zarr = True
-            from .zarr_layout import available_field_names, is_monolithic_layout
+            from .zarr_layout import available_field_names, is_stacked_layout
 
             available = available_field_names(self.ds)
             missing_variables = set(self.variables) - available
@@ -121,7 +121,7 @@ class BaseCoupler(ABC):
                 raise ValueError(
                     f"Missing variables in dataset for coupling: {missing_variables}"
                 )
-            if is_monolithic_layout(self.ds):
+            if is_stacked_layout(self.ds):
                 # Iterate over self.variables in the outer loop so selected indices
                 # follow the order of self.variables (matching the xarray path's
                 # `.sel(channel_in=self.variables)`), not the dataset's native
@@ -503,8 +503,8 @@ class TrailingAverageCoupler(BaseCoupler):
         self.averaging_window = pd.Timedelta(averaging_window)
 
         if self.use_zarr:
-            # Named-array / modern catalogs store datetime64 directly; older
-            # monolithic stores encode hours since start via CF units/calendar.
+            # Per-variable catalogs store datetime64 directly; stacked stores
+            # encode hours since start via CF units/calendar.
             time_arr = np.asarray(self.ds["time"][:])
             if np.issubdtype(time_arr.dtype, np.datetime64):
                 self.time_da = time_arr.astype("datetime64[ns]")

@@ -31,9 +31,10 @@ from physicsnemo.datapipes.healpix.zarr_layout import (
     _read_index_tail,
     available_field_names,
     build_shard_index_table,
+    constants_are_stacked,
     enable_zarrs_pipeline,
-    is_monolithic_layout,
-    is_named_arrays_layout,
+    is_per_variable_layout,
+    is_stacked_layout,
     load_channel_data,
     load_constant_fields,
     load_windowed_channel_data,
@@ -50,7 +51,7 @@ def _spatial_coords(*, f: int = 12, h: int = 4, w: int = 4) -> dict:
     }
 
 
-def _make_monolithic_store(path, *, t: int = 4, c: int = 3, f: int = 12, h: int = 4, w: int = 4):
+def _make_stacked_store(path, *, t: int = 4, c: int = 3, f: int = 12, h: int = 4, w: int = 4):
     channels = ["t2m", "u10m", "v10m"][:c]
     data = np.arange(t * c * f * h * w, dtype=np.float32).reshape(t, c, f, h, w)
     ds = xr.Dataset(
@@ -66,7 +67,9 @@ def _make_monolithic_store(path, *, t: int = 4, c: int = 3, f: int = 12, h: int 
     return zarr.open_group(str(path), mode="r")
 
 
-def _make_named_store(path, *, t: int = 4, f: int = 12, h: int = 4, w: int = 4):
+def _make_per_variable_store(
+    path, *, t: int = 4, f: int = 12, h: int = 4, w: int = 4, layout: str = "per_variable"
+):
     dynamic = ["t2m", "u10m", "v10m"]
     constants = ["lsm", "z"]
     data_vars = {}
@@ -83,35 +86,43 @@ def _make_named_store(path, *, t: int = 4, f: int = 12, h: int = 4, w: int = 4):
     ds = xr.Dataset(
         data_vars,
         coords={"time": np.arange(t), **_spatial_coords(f=f, h=h, w=w)},
-        attrs={"layout": "named_arrays_healpix"},
+        attrs={"layout": layout},
     )
     ds.to_zarr(path, mode="w")
     return zarr.open_group(str(path), mode="r")
 
 
 def test_layout_detection(tmp_path):
-    mono = _make_monolithic_store(tmp_path / "mono")
-    named = _make_named_store(tmp_path / "named")
-    assert is_monolithic_layout(mono) is True
-    assert is_named_arrays_layout(named) is True
-    assert is_monolithic_layout(named) is False
+    stacked = _make_stacked_store(tmp_path / "stacked")
+    per_var = _make_per_variable_store(tmp_path / "per_var")
+    legacy = _make_per_variable_store(
+        tmp_path / "legacy", layout="named_arrays_healpix"
+    )
+    assert is_stacked_layout(stacked) is True
+    assert is_per_variable_layout(stacked) is False
+    assert constants_are_stacked(stacked) is True
+    assert is_per_variable_layout(per_var) is True
+    assert is_stacked_layout(per_var) is False
+    assert constants_are_stacked(per_var) is False
+    assert is_per_variable_layout(legacy) is True
+    assert constants_are_stacked(legacy) is False
 
 
-def test_available_field_names_named_store(tmp_path):
-    named = _make_named_store(tmp_path / "named")
+def test_available_field_names_per_variable_store(tmp_path):
+    named = _make_per_variable_store(tmp_path / "per_var")
     assert available_field_names(named) == {"t2m", "u10m", "v10m", "lsm", "z"}
 
 
-def test_load_channel_data_monolithic_by_name(tmp_path):
-    ds = _make_monolithic_store(tmp_path / "mono")
+def test_load_channel_data_stacked_by_name(tmp_path):
+    ds = _make_stacked_store(tmp_path / "mono")
     time_sl = slice(0, 2)
     expected = np.asarray(ds["inputs"][time_sl, [0, 2]])
     loaded = load_channel_data(ds, time_sl, ["t2m", "v10m"], n_threads=1)
     np.testing.assert_array_equal(loaded, expected)
 
 
-def test_load_channel_data_named_store(tmp_path):
-    ds = _make_named_store(tmp_path / "named")
+def test_load_channel_data_per_variable_store(tmp_path):
+    ds = _make_per_variable_store(tmp_path / "named")
     time_sl = slice(0, 2)
     expected = np.stack(
         [np.asarray(ds["v10m"][time_sl]), np.asarray(ds["t2m"][time_sl])], axis=1
@@ -120,21 +131,21 @@ def test_load_channel_data_named_store(tmp_path):
     np.testing.assert_array_equal(loaded, expected)
 
 
-def test_load_constant_fields_named_store(tmp_path):
-    ds = _make_named_store(tmp_path / "named")
+def test_load_constant_fields_per_variable_store(tmp_path):
+    ds = _make_per_variable_store(tmp_path / "named")
     loaded = load_constant_fields(ds, ["lsm", "z"], n_threads=1)
     expected = np.stack([np.asarray(ds["lsm"]), np.asarray(ds["z"])], axis=0)
     np.testing.assert_array_equal(loaded, expected)
 
 
-def test_load_channel_data_empty_raises_on_named(tmp_path):
-    ds = _make_named_store(tmp_path / "named")
+def test_load_channel_data_empty_raises_on_per_variable(tmp_path):
+    ds = _make_per_variable_store(tmp_path / "named")
     with pytest.raises(ValueError, match="empty field name list"):
         load_channel_data(ds, slice(0, 1), [], n_threads=1)
 
 
-def test_load_channel_data_named_store_with_scaling(tmp_path):
-    ds = _make_named_store(tmp_path / "named")
+def test_load_channel_data_per_variable_store_with_scaling(tmp_path):
+    ds = _make_per_variable_store(tmp_path / "named")
     time_sl = slice(0, 2)
     raw = load_channel_data(ds, time_sl, ["v10m", "t2m"], n_threads=1)
     scaling = {
@@ -150,9 +161,9 @@ def test_load_channel_data_named_store_with_scaling(tmp_path):
     np.testing.assert_array_equal(scaled, expected)
 
 
-def test_load_windowed_channel_data_named_store(tmp_path):
+def test_load_windowed_channel_data_per_variable_store(tmp_path):
     """Option A: direct window fill matches staging[:, c][time_idx] gather."""
-    ds = _make_named_store(tmp_path / "named", t=8)
+    ds = _make_per_variable_store(tmp_path / "named", t=8)
     time_sl = slice(0, 6)
     input_names = ["t2m", "v10m"]
     output_names = ["u10m", "t2m"]  # t2m shared with inputs
@@ -184,7 +195,7 @@ def test_load_windowed_channel_data_stacked_matches_per_variable(tmp_path):
     """Stacked ``inputs`` and per-variable stores yield the same windowed tensors."""
     t, f, h, w = 8, 12, 4, 4
     channels = ["t2m", "u10m", "v10m"]
-    stacked_ds = _make_monolithic_store(tmp_path / "stacked", t=t, c=3, f=f, h=h, w=w)
+    stacked_ds = _make_stacked_store(tmp_path / "stacked", t=t, c=3, f=f, h=h, w=w)
     # Same channel planes as the stacked store, one array per field.
     data_vars = {
         name: (
@@ -196,14 +207,14 @@ def test_load_windowed_channel_data_stacked_matches_per_variable(tmp_path):
     per_var_xr = xr.Dataset(
         data_vars,
         coords={"time": np.arange(t), **_spatial_coords(f=f, h=h, w=w)},
-        attrs={"layout": "named_arrays_healpix"},
+        attrs={"layout": "per_variable"},
     )
     per_var_path = tmp_path / "per_variable"
     per_var_xr.to_zarr(per_var_path, mode="w")
     per_var_ds = zarr.open_group(str(per_var_path), mode="r")
 
-    assert is_monolithic_layout(stacked_ds) is True
-    assert is_named_arrays_layout(per_var_ds) is True
+    assert is_stacked_layout(stacked_ds) is True
+    assert is_per_variable_layout(per_var_ds) is True
 
     time_sl = slice(0, 6)
     input_names = ["t2m", "v10m"]
@@ -233,22 +244,21 @@ def test_enable_zarrs_pipeline_when_installed():
     assert enable_zarrs_pipeline() is True
 
 
-def test_resolve_mask_field_named_arrays_and_coupled_stem_loader(tmp_path):
-    """named_arrays_healpix LSM feeds coupled_partial_conv.load_spatial_mask."""
-    from physicsnemo.models.dlwp_healpix_layers.coupled_partial_conv import (
-        load_spatial_mask,
-    )
+def test_resolve_mask_field_per_variable_legacy_layout_attr(tmp_path):
+    """``channel_c`` selects a top-level array on a per-variable store.
 
+    The legacy ``named_arrays_healpix`` attribute is what catalogs already
+    on disk declare. The coupled stem calls this helper when it is installed.
+    """
     f, h, w = 12, 4, 4
-    ocean = np.zeros((f, h, w), dtype=np.float32)
-    ocean[0::2] = 1.0
-    land = 1.0 - ocean
+    land = np.zeros((f, h, w), dtype=np.float32)
+    land[0::2] = 1.0
     ds = xr.Dataset(
         {"lsm": (("face", "height", "width"), land)},
         coords=_spatial_coords(f=f, h=h, w=w),
         attrs={"layout": "named_arrays_healpix"},
     )
-    path = tmp_path / "mask_named.zarr"
+    path = tmp_path / "mask_per_variable.zarr"
     ds.to_zarr(path, mode="w")
 
     opened = xr.open_zarr(path)
@@ -256,19 +266,10 @@ def test_resolve_mask_field_named_arrays_and_coupled_stem_loader(tmp_path):
     np.testing.assert_allclose(field.values, land)
     opened.close()
 
-    soft = load_spatial_mask(
-        str(path),
-        data_var="constants",
-        selection_dict={"channel_c": "lsm"},
-        invert=True,
-        threshold=None,
-    )
-    np.testing.assert_allclose(soft.numpy(), ocean)
-
 
 def test_load_windowed_channel_data_ic_diagnostics(tmp_path):
     """IC diagnostics are output-only channels gathered at input times."""
-    ds = _make_named_store(tmp_path / "named", t=8)
+    ds = _make_per_variable_store(tmp_path / "named", t=8)
     time_sl = slice(0, 6)
     input_names = ["t2m"]
     output_names = ["t2m", "u10m", "v10m"]
