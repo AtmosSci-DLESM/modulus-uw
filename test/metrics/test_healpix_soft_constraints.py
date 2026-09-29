@@ -551,13 +551,20 @@ def test_hydrostatic_interface_names_follow_sorted_levels():
     hydro.name = "hydro"
     hydro.pressure_levels = [1000.0, 50.0, 850.0]
     assert hydro.term_names() == ["50-850", "850-1000"]
-    assert hydro.constraint_spec() == ("hydro", ["50-850", "850-1000"])
+    assert hydro.constraint_spec() == ("hydro", ["50-850", "850-1000"], None)
+    hydro.relative_scales = {"50-850": 0.001, "850-1000": 0.01}
+    assert hydro.constraint_spec() == (
+        "hydro",
+        ["50-850", "850-1000"],
+        {"50-850": 0.001, "850-1000": 0.01},
+    )
 
 
 def test_dry_air_constraint_spec_is_its_name():
     dry = DryAirMassSoftConstraint.__new__(DryAirMassSoftConstraint)
     dry.name = "dry_air"
-    assert dry.constraint_spec() == ("dry_air", ["dry_air"])
+    dry.relative_scales = 0.001
+    assert dry.constraint_spec() == ("dry_air", ["dry_air"], 0.001)
 
 
 def test_loss_constraint_specs_follow_module_order():
@@ -582,8 +589,8 @@ def test_loss_constraint_specs_follow_module_order():
         ],
     )
     assert loss.constraint_specs() == [
-        ("hydro", ["50-100", "850-1000"]),
-        ("dry_air", ["dry_air"]),
+        ("hydro", ["50-100", "850-1000"], None),
+        ("dry_air", ["dry_air"], None),
     ]
     with pytest.raises(ValueError, match="duplicate"):
         LossWithSoftConstraints(
