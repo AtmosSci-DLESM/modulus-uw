@@ -154,7 +154,7 @@ def available_field_names(ds) -> set[str]:
         return names
     if not is_per_variable_layout(ds):
         return set()
-    # ``_shard_index`` is loader metadata, not a prognostic field.
+    # A leading underscore marks loader metadata, not a prognostic field.
     return {
         str(k)
         for k in ds.keys()

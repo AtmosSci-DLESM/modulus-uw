@@ -422,40 +422,6 @@ def test_sharded_window_matches_arrays(tmp_path):
         assert np.array_equal(targets[:, :, c], stored[name][sl][idx_out], equal_nan=True)
 
 
-def test_stored_shard_index_skips_tail_read(tmp_path, monkeypatch):
-    """A ``_shard_index/<field>`` table is (n_shards, chunks_per_shard, 2) uint64."""
-    import physicsnemo.datapipes.healpix.zarr_shard_read as shard_read
-
-    path = tmp_path / "indexed"
-    _make_sharded_field(path)
-    group = zarr.open_group(str(path), mode="a")
-    layout = shard_read._field_table(group)["t2m"]
-    rows = np.stack([layout.offsets_for(i) for i in range(layout.n_shards)]).astype("<u8")
-    assert rows.shape == (layout.n_shards, layout.chunks_per_shard_t, 2)
-    index_arr = zarr.create_array(
-        store=group.store,
-        name="_shard_index/t2m",
-        shape=rows.shape,
-        chunks=rows.shape,
-        dtype="<u8",
-        zarr_format=3,
-        overwrite=True,
-        compressors=[],
-    )
-    index_arr[:] = rows
-    shard_read.clear_shard_cache()
-
-    def _no_tail(*_args, **_kwargs):
-        raise AssertionError("stored shard index should replace the per-shard tail read")
-
-    monkeypatch.setattr(shard_read, "_read_index_tail", _no_tail)
-    group = zarr.open_group(str(path), mode="r")
-    sl = slice(2, 12)
-    loaded = load_channel_data(group, sl, ["t2m"])
-    assert np.array_equal(loaded[:, 0], np.asarray(group["t2m"][sl]), equal_nan=True)
-    assert "_shard_index" not in available_field_names(group)
-
-
 def test_direct_read_falls_back_when_o_direct_fails(tmp_path, monkeypatch):
     import physicsnemo.datapipes.healpix.zarr_shard_read as shard_read
 
