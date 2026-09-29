@@ -280,3 +280,85 @@ def test_explicit_n_data_variables_must_match_outputs():
     )
     with pytest.raises(ValueError, match="does not match"):
         wrap.setup(trainer)
+
+
+def _two_term_wrapper(device: torch.device) -> tuple[AdaptiveLossWeights, _FixedTerms]:
+    inner = _FixedTerms(torch.tensor([2.0, 8.0], device=device))
+    wrap = AdaptiveLossWeights(
+        inner=inner,
+        n_data_variables=2,
+        warmup_epochs=1,
+        ema_window_epochs=1,
+        steps_per_epoch=1,
+        variable_names=["a", "b"],
+    )
+    wrap.setup(
+        _DummyTrainer(
+            device=device,
+            output_variables=["a", "b"],
+            dataloader_train=[0],
+        )
+    )
+    return wrap, inner
+
+
+def test_log_and_pending_buffers_keep_identity_across_forwards():
+    """A second forward must update the same storage the trainer holds.
+
+    Replacing those tensors (or clearing pending after the update) is not
+    replayed by a CUDA graph, so the eval capture would freeze the logs.
+    """
+    wrap, inner = _two_term_wrapper(torch.device("cpu"))
+    pred = torch.zeros(1, 1, 1, 1, 1, 1)
+    pending_ptr = wrap._pending_unweighted.data_ptr()
+    log_ptr = wrap._log_values.data_ptr()
+    loss_view = wrap.log_buffers["loss_unweighted/a"]
+
+    wrap(pred, pred)
+    assert wrap._pending_unweighted.data_ptr() == pending_ptr
+    assert wrap._log_values.data_ptr() == log_ptr
+    assert wrap.log_buffers["loss_unweighted/a"].data_ptr() == loss_view.data_ptr()
+    assert float(wrap.log_buffers["loss_unweighted/a"]) == pytest.approx(2.0)
+    wrap.post_backward_update(0)
+    assert wrap._pending_unweighted.data_ptr() == pending_ptr
+    assert torch.allclose(wrap.weights, torch.ones(2))
+
+    inner.terms.copy_(torch.tensor([4.0, 4.0]))
+    wrap(pred, pred)
+    wrap.post_backward_update(1)
+    assert wrap._pending_unweighted.data_ptr() == pending_ptr
+    assert float(wrap.log_buffers["loss_unweighted/a"]) == pytest.approx(4.0)
+    # Equal unweighted terms → adaptive weights stay at the relative scales.
+    assert torch.allclose(wrap.weights, torch.ones(2), atol=1e-5)
+
+    inner.terms.copy_(torch.tensor([1.0, 3.0]))
+    wrap(pred, pred)
+    wrap.post_backward_update(1)
+    assert float(wrap.weights[0]) > float(wrap.weights[1])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph")
+def test_eval_graph_capture_does_not_orphan_train_log_buffers():
+    device = torch.device("cuda")
+    wrap, inner = _two_term_wrapper(device)
+    static_pred = torch.zeros(1, 1, 1, 1, 1, 1, device=device)
+    static_tar = torch.zeros_like(static_pred)
+    # Warmup so the graph captures the copy_ into the stable buffers.
+    wrap(static_pred, static_tar)
+    train_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(train_graph):
+        train_loss = wrap(static_pred, static_tar)
+    # A later eval capture must not rebind the buffers the trainer reads.
+    eval_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(eval_graph):
+        eval_loss = wrap(static_pred, static_tar)
+
+    inner.terms.copy_(torch.tensor([5.0, 1.0], device=device))
+    train_graph.replay()
+    assert float(wrap.log_buffers["loss_unweighted/a"]) == pytest.approx(5.0)
+    assert float(wrap._pending_unweighted[0]) == pytest.approx(5.0)
+    assert torch.isfinite(train_loss)
+    wrap.post_backward_update(1)
+    assert float(wrap.weights[0]) != pytest.approx(1.0)
+    # Eval replay must not be required for the training logs to move.
+    assert eval_loss is not None
