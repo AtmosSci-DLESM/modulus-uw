@@ -27,6 +27,8 @@ from physicsnemo.metrics.climate.healpix_soft_constraints import (
     DryAirMassSoftConstraint,
     HydrostasySoftConstraint,
     LossWithSoftConstraints,
+    SoftConstraint,
+    hydrostatic_interface_names,
 )
 from physicsnemo.metrics.climate.hydrostasy import LossWithHydrostasy
 
@@ -540,3 +542,51 @@ def test_loss_with_soft_constraints_hydra(tmp_path):
     out_g = loss(pred_g, pred.clone(), input=inp)
     out_g.backward()
     assert pred_g.grad is not None
+
+
+def test_hydrostatic_interface_names_follow_sorted_levels():
+    # YAML order is not term order; Tv_loss walks sorted pressure.
+    assert hydrostatic_interface_names([300, 50, 100]) == ["50-100", "100-300"]
+    hydro = HydrostasySoftConstraint.__new__(HydrostasySoftConstraint)
+    hydro.name = "hydro"
+    hydro.pressure_levels = [1000.0, 50.0, 850.0]
+    assert hydro.term_names() == ["50-850", "850-1000"]
+    assert hydro.constraint_spec() == ("hydro", ["50-850", "850-1000"])
+
+
+def test_dry_air_constraint_spec_is_its_name():
+    dry = DryAirMassSoftConstraint.__new__(DryAirMassSoftConstraint)
+    dry.name = "dry_air"
+    assert dry.constraint_spec() == ("dry_air", ["dry_air"])
+
+
+def test_loss_constraint_specs_follow_module_order():
+    class _Named(SoftConstraint):
+        def __init__(self, name, terms):
+            super().__init__()
+            self.name = name
+            self._terms = list(terms)
+
+        def term_names(self):
+            return list(self._terms)
+
+        def constraint_loss(self, prediction, target, average_channels=True):
+            del prediction, target, average_channels
+            return torch.zeros(len(self._terms))
+
+    loss = LossWithSoftConstraints(
+        data_loss=WeightedMSE(weights=[1.0]),
+        constraints=[
+            _Named("hydro", ["50-100", "850-1000"]),
+            _Named("dry_air", ["dry_air"]),
+        ],
+    )
+    assert loss.constraint_specs() == [
+        ("hydro", ["50-100", "850-1000"]),
+        ("dry_air", ["dry_air"]),
+    ]
+    with pytest.raises(ValueError, match="duplicate"):
+        LossWithSoftConstraints(
+            data_loss=WeightedMSE(weights=[1.0]),
+            constraints=[_Named("hydro", ["50-100"]), _Named("hydro", ["100-150"])],
+        ).constraint_specs()
