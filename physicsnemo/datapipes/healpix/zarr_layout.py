@@ -229,14 +229,15 @@ def load_channel_data(
                 _apply_channel_scaling(out[:, i], scaling, i)
         return out
 
-    enable_zarrs_pipeline()
+    from .zarr_shard_read import read_field_time
+
     ref = ds[names[0]]
     tlen = _slice_length(ref.shape[0], time_sl)
     spatial = ref.shape[1:]
     out = np.empty((tlen, len(names)) + spatial, dtype=ref.dtype)
 
     def _fill(i: int, n: str) -> None:
-        block = np.asarray(ds[n][time_sl])
+        block = read_field_time(ds, n, time_sl)
         if scaling is not None:
             block = _apply_channel_scaling(block, scaling, i)
         out[:, i] = block
@@ -349,7 +350,8 @@ def load_windowed_channel_data(
             ]
         return inputs, targets
 
-    enable_zarrs_pipeline()
+    from .zarr_shard_read import read_field_time
+
     batch_size, t_in = input_time_idx.shape
     ref = ds[input_names[0]]
     spatial = ref.shape[1:]
@@ -394,7 +396,7 @@ def load_windowed_channel_data(
             targets_cf[out_c] = block[output_time_idx]
 
     def _fill(name: str, in_c: int | None, out_c: int | None) -> None:
-        block = np.asarray(ds[name][time_sl])
+        block = read_field_time(ds, name, time_sl)
         _place(block, in_c, out_c)
 
     _run_parallel(
