@@ -1181,7 +1181,13 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
             if input_diagnostics is not None:
                 input_diagnostics = input_diagnostics.float()
             residual = self._budget_residuals(prediction, input, input_diagnostics)
-            return torch.sqrt((residual ** 2).mean())
+            # A realistic budget residual is ~1e19 N·m. Squaring that in fp32
+            # overflows to inf (3e19**2 > 3.4e38), so the RMSE is accumulated
+            # in fp64 and only the result is cast back.
+            residual64 = residual.double()
+            return torch.sqrt((residual64 * residual64).mean()).to(
+                dtype=torch.float32
+            )
 
 
 class LossWithSoftConstraints(torch.nn.Module):
