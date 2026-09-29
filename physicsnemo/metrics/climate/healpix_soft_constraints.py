@@ -142,14 +142,23 @@ class SoftConstraint(torch.nn.Module):
             "loss scales can bind to its terms"
         )
 
-    def constraint_spec(self) -> tuple[str, list[str]]:
-        """``(name, term_names)`` for scale binding. Term order matches the loss."""
+    def constraint_spec(self) -> tuple[str, list[str], object]:
+        """``(name, term_names, relative_scales)``. Term order matches the loss.
+
+        ``relative_scales`` is the value passed at construction (a float, a
+        term-name mapping, or None). Adaptive loss weights read it from here.
+        ``name`` is only the log tag.
+        """
         if not hasattr(self, "name"):
             raise AttributeError(
                 f"{type(self).__name__} has no name; pass name= when "
                 "constructing it"
             )
-        return (_constraint_name(self.name), [str(term) for term in self.term_names()])
+        return (
+            _constraint_name(self.name),
+            [str(term) for term in self.term_names()],
+            getattr(self, "relative_scales", None),
+        )
 
 
 class HydrostasySoftConstraint(SoftConstraint):
@@ -179,9 +188,11 @@ class HydrostasySoftConstraint(SoftConstraint):
         g0: float = 9.81,
         topography_masking: bool = True,
         name: str = "hydro",
+        relative_scales=None,
     ):
         super().__init__()
         self.name = _constraint_name(name)
+        self.relative_scales = relative_scales
         self.g0 = g0
         self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
@@ -417,9 +428,11 @@ class DryAirMassSoftConstraint(SoftConstraint):
         input_channels: Optional[Sequence[str]] = None,
         diagnostic_channels: Optional[Sequence[str]] = None,
         name: str = "dry_air",
+        relative_scales=None,
     ):
         super().__init__()
         self.name = _constraint_name(name)
+        self.relative_scales = relative_scales
         self.channels = list(channels)
         self.input_channels = (
             list(input_channels) if input_channels is not None else list(channels)
@@ -714,13 +727,14 @@ class LossWithSoftConstraints(torch.nn.Module):
         for constraint in self.constraints:
             constraint.setup(trainer)
 
-    def constraint_specs(self) -> list[tuple[str, list[str]]]:
-        """``(name, term_names)`` for each constraint, in concatenation order.
+    def constraint_specs(self) -> list[tuple[str, list[str], object]]:
+        """``(name, term_names, relative_scales)`` in concatenation order.
 
-        Adaptive loss weights bind relative scales to these names. Term order
-        inside a constraint matches the vector that constraint appends.
+        Term order inside a constraint matches the vector that constraint
+        appends. ``relative_scales`` is whatever that constraint was constructed
+        with; adaptive loss weights apply it, and ``name`` is only the log tag.
         """
-        specs: list[tuple[str, list[str]]] = []
+        specs: list[tuple[str, list[str], object]] = []
         seen: set[str] = set()
         for constraint in self.constraints:
             spec_fn = getattr(constraint, "constraint_spec", None)
@@ -728,7 +742,7 @@ class LossWithSoftConstraints(torch.nn.Module):
                 raise TypeError(
                     f"{type(constraint).__name__} does not expose constraint_spec()"
                 )
-            name, term_names = spec_fn()
+            name, term_names, relative_scales = spec_fn()
             name = str(name)
             terms = [str(term) for term in term_names]
             if name in seen:
@@ -744,7 +758,7 @@ class LossWithSoftConstraints(torch.nn.Module):
                     f"{terms}"
                 )
             seen.add(name)
-            specs.append((name, terms))
+            specs.append((name, terms, relative_scales))
         return specs
 
     def _constraint_parts(
