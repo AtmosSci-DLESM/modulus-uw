@@ -155,6 +155,51 @@ def test_aam_soft_constraint_physical_rmse_smoke(tmp_path):
     assert float(rmse) >= 0.0
 
 
+def test_aam_physical_rmse_stays_finite_at_q50_scale(tmp_path):
+    """fp32 squaring of a ~1e19 N·m residual overflows; the RMSE must not."""
+    levels = [500.0, 700.0, 850.0]
+    nside = 2
+    channels = (
+        [f"u{int(p)}" for p in levels]
+        + ["sp", "avg_iews-6h", "avg_iegwss-6h"]
+    )
+    topo = np.zeros((12, nside, nside), dtype=np.float32)
+    ds = xr.Dataset(
+        {
+            "constants": (
+                ("face", "channel_c", "height", "width"),
+                topo[:, None, :, :],
+            )
+        },
+        coords={"channel_c": ["z"]},
+    )
+    zarr_path = tmp_path / "topo.zarr"
+    ds.to_zarr(zarr_path)
+    mod = AxialAngularMomentumSoftConstraint(
+        hPa_levels=levels,
+        channels=channels,
+        scaling=_aam_scaling(levels),
+        dataset_path=str(zarr_path),
+        surface_geopotential_name="z",
+        surface_geopotential_mean=0.0,
+        surface_geopotential_std=1.0,
+        convert_topography_to_meters=True,
+        weight=1.0,
+        alpha=2.93e19,
+    )
+    mod.setup(_DummyTrainer(device=torch.device("cpu"), output_variables=channels))
+    residual = torch.tensor([[2.93e19, -1.0e19]], dtype=torch.float32)
+    # The naive fp32 reduction is the bug this guards.
+    assert not torch.isfinite(torch.sqrt((residual ** 2).mean()))
+    mod._budget_residuals = lambda *args, **kwargs: residual
+    B, F, T, H, W = 1, 12, 2, nside, nside
+    zeros = torch.zeros(B, F, T, len(channels), H, W)
+    rmse = mod.physical_rmse(zeros, zeros, input=zeros[:, :, :1])
+    expected = torch.sqrt((residual.double() ** 2).mean()).float()
+    assert torch.isfinite(rmse)
+    assert torch.allclose(rmse, expected)
+
+
 def test_earth_aam_positive_for_positive_sp():
     nside = 2
     F, H, W = 12, nside, nside
