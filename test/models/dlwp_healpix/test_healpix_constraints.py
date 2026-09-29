@@ -370,7 +370,6 @@ def test_nonnegative_keep_grad_through_clamp_blocks_outward_grad():
         x_ste.grad, torch.tensor([[[[[[0.0, 1.0]]]]]])
     )
 
-
 def test_constraint_configs_list_matches_mapping_order():
     from hydra.utils import instantiate
     from omegaconf import OmegaConf
