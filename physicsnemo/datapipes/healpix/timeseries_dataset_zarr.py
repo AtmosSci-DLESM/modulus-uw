@@ -172,7 +172,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             if self.return_ic_diagnostics and self.ic_diagnostic_variables
             else None
         )
-        inputs, targets, ic_diagnostics = load_windowed_channel_data(
+        window = load_windowed_channel_data(
             self.ds,
             time_sl,
             input_names=self.input_variables,
@@ -183,6 +183,11 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             output_scaling=self.target_scaling,
             ic_diagnostic_names=ic_diag_names,
         )
+        if ic_diag_names:
+            inputs, targets, ic_diagnostics = window
+        else:
+            inputs, targets = window
+            ic_diagnostics = None
         inputs = np.asarray(inputs, dtype=np.float32)
         torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()

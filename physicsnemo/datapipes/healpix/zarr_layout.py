@@ -281,7 +281,10 @@ def load_windowed_channel_data(
     input_scaling: Mapping | None = None,
     output_scaling: Mapping | None = None,
     ic_diagnostic_names: Sequence[str] | None = None,
-) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+) -> (
+    tuple[np.ndarray, np.ndarray | None]
+    | tuple[np.ndarray, np.ndarray | None, np.ndarray]
+):
     """Load and scale fields directly into (B, T, C, F, H, W) sample windows.
 
     For per-variable stores, each unique field is decoded and scaled once on
@@ -310,10 +313,11 @@ def load_windowed_channel_data(
 
     Returns
     -------
-    inputs, targets, ic_diagnostics
+    inputs, targets
         ``inputs`` has shape ``(B, T_in, C_in, ...)``. ``targets`` is ``None``
-        when ``output_names`` is omitted. ``ic_diagnostics`` is ``None`` when
-        ``ic_diagnostic_names`` is empty; otherwise ``(B, T_in, C_diag, ...)``.
+        when ``output_names`` is omitted. When ``ic_diagnostic_names`` is
+        non-empty the return is ``(inputs, targets, ic_diagnostics)`` with
+        ``ic_diagnostics`` shaped ``(B, T_in, C_diag, ...)``.
     """
     input_names = list(input_names)
     ic_diag_names = list(ic_diagnostic_names or [])
@@ -356,12 +360,12 @@ def load_windowed_channel_data(
             targets = staging[
                 output_time_idx[:, :, np.newaxis], out_c[np.newaxis, np.newaxis, :]
             ]
-        ic_diagnostics = None
-        if ic_diag_names:
-            ic_c = np.asarray([name_to_i[n] for n in ic_diag_names], dtype=np.intp)
-            ic_diagnostics = staging[
-                input_time_idx[:, :, np.newaxis], ic_c[np.newaxis, np.newaxis, :]
-            ]
+        if not ic_diag_names:
+            return inputs, targets
+        ic_c = np.asarray([name_to_i[n] for n in ic_diag_names], dtype=np.intp)
+        ic_diagnostics = staging[
+            input_time_idx[:, :, np.newaxis], ic_c[np.newaxis, np.newaxis, :]
+        ]
         return inputs, targets, ic_diagnostics
 
     from .zarr_shard_read import read_field_time
@@ -433,9 +437,9 @@ def load_windowed_channel_data(
     # (C, B, T, ...) -> (B, T, C, ...); view, no copy.
     inputs = np.transpose(inputs_cf, (1, 2, 0, 3, 4, 5))
     targets = None if targets_cf is None else np.transpose(targets_cf, (1, 2, 0, 3, 4, 5))
-    ic_diagnostics = (
-        None if ic_diag_cf is None else np.transpose(ic_diag_cf, (1, 2, 0, 3, 4, 5))
-    )
+    if not ic_diag_names:
+        return inputs, targets
+    ic_diagnostics = np.transpose(ic_diag_cf, (1, 2, 0, 3, 4, 5))
     return inputs, targets, ic_diagnostics
 
 
