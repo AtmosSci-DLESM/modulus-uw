@@ -551,4 +551,3 @@ def test_TimeSeriesDataset_return_ic_diagnostics(tmp_path):
     assert ic_diag.dtype == np.float32
     batch = TimeSeriesDatasetZarr(**common, return_ic_diagnostics=False)[0]
     assert len(batch) == 2
-
