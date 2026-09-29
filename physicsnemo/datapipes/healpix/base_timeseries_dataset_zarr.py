@@ -570,6 +570,16 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             return self.time_da[time_index[0]].values + timedeltas
         return self.time_da[slice(*time_index)].values
 
+    def insolation_for_dates(self, dates) -> np.ndarray:
+        """Insolation ``(T, F, H, W)`` for arbitrary timestamps.
+
+        Rollout validation builds decoder insolation outside ``__getitem__``.
+        This uses the same ``insolation`` call as the training loader.
+        """
+        from physicsnemo.utils.insolation import insolation
+
+        return insolation(dates, self.lat, self.lon)
+
     def __len__(self) -> int:
         """Get number of samples available in the dataset based on
         timedeltas, gaps, start and end dates.
