@@ -208,3 +208,10 @@ def test_earth_aam_positive_for_positive_sp():
     cos_phi = torch.full((1, F, 1, 1, H, W), 0.5)
     m = earth_angular_momentum(sp, cos_phi, d_omega)
     assert float(m[0, 0]) > 0.0
+
+
+def test_aam_constraint_spec_is_its_name():
+    aam = AxialAngularMomentumSoftConstraint.__new__(AxialAngularMomentumSoftConstraint)
+    aam.name = "aam"
+    aam.relative_scales = 0.001
+    assert aam.constraint_spec() == ("aam", ["aam"], 0.001)

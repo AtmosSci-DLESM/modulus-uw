@@ -42,7 +42,22 @@ def reduce_per_term_loss(
 
 
 def _as_float_list(scales: Sequence[float]) -> List[float]:
+    if isinstance(scales, (str, bytes, Mapping)):
+        raise TypeError(
+            "positional constraint scales must be a sequence of floats; "
+            f"got {type(scales).__name__}"
+        )
     return [float(s) for s in scales]
+
+
+def _group_name(name: str) -> str:
+    text = str(name).strip()
+    if not text or "/" in text:
+        raise ValueError(
+            "constraint group name must be a non-empty string without '/'; "
+            f"got {name!r}"
+        )
+    return text
 
 
 class AdaptiveLossWeights(torch.nn.Module):
@@ -61,19 +76,25 @@ class AdaptiveLossWeights(torch.nn.Module):
         (e.g. ``WeightedMSE`` or ``LossWithSoftConstraints``).
     n_data_variables:
         Number of leading terms that are data variables (``C``). Constraint
-        terms follow in ``constraint_groups`` order. Omit this and ``setup``
+        terms follow the inner constraint order, or ``constraint_groups`` order
+        when the inner criterion has no specs. Omit this and ``setup``
         sets it from ``len(trainer.output_variables)`` so the count stays
         aligned with the data layout. A value that disagrees with
         ``output_variables`` raises in ``setup``.
     constraint_groups:
-        Ordered groups so Hydra can list relative scales. Each entry is a
-        mapping ``{"name": str, "scales": Sequence[float]}``. Example::
+        Positional relative scales, only when ``inner`` has no
+        ``constraint_specs()``. Each entry is
+        ``{"name": str, "scales": Sequence[float]}``, appended in YAML order.
 
-            [
-              {"name": "hydro", "scales": [0.001]*5 + [0.01]*4},
-              {"name": "dry_air", "scales": [0.001]},
-              {"name": "aam", "scales": [0.001]},
-            ]
+        When ``inner`` exposes ``constraint_specs()`` (as
+        ``LossWithSoftConstraints`` does), this argument must be omitted.
+        Each spec is ``(name, term_names, relative_scales)`` and the scale
+        lives on that constraint. Scales are applied in constraint-module
+        order. A multi-term constraint requires a mapping keyed by that
+        constraint's term names (hydrostasy uses interface labels such as
+        ``"50-100"``). A single-term constraint accepts a float. A missing
+        scale, or a mapping whose keys do not match the term names, raises.
+        Passing ``constraint_groups`` together with specs also raises.
 
         Variable terms have implicit relative scale 1. During warmup, applied
         weights are 1 on variables and ``s_k`` on constraints. After warmup,
@@ -183,15 +204,14 @@ class AdaptiveLossWeights(torch.nn.Module):
         self.n_data_variables = int(n_data_variables)
         self.constraint_group_names = []
         scale_list: List[float] = [1.0] * self.n_data_variables
+        # (name, slice into the full term vector, term names in loss order)
         self._group_slices = []
         cursor = self.n_data_variables
-        for group in self._constraint_groups_arg:
-            name = str(group["name"])
-            scales = _as_float_list(group["scales"])
-            if not scales:
-                raise ValueError(f"constraint group {name!r} has empty scales")
+        for name, scales, term_names in self._resolved_constraint_groups():
             self.constraint_group_names.append(name)
-            self._group_slices.append((name, slice(cursor, cursor + len(scales))))
+            self._group_slices.append(
+                (name, slice(cursor, cursor + len(scales)), list(term_names))
+            )
             scale_list.extend(scales)
             cursor += len(scales)
 
@@ -243,14 +263,125 @@ class AdaptiveLossWeights(torch.nn.Module):
         self._bind_log_buffers()
         self._built = True
 
+    def _inner_constraint_specs(
+        self,
+    ) -> Optional[List[tuple]]:
+        """Specs from the inner criterion, or None when binding stays positional.
+
+        Each entry is ``(name, term_names, relative_scales)``.
+        """
+        provider = getattr(self.inner, "constraint_specs", None)
+        if provider is None:
+            return None
+        specs = provider() if callable(provider) else provider
+        parsed: List[tuple] = []
+        for spec in specs:
+            if len(spec) != 3:
+                raise ValueError(
+                    "constraint_specs entries must be "
+                    "(name, term_names, relative_scales); "
+                    f"got {spec!r}"
+                )
+            name, terms, scales = spec
+            parsed.append((str(name), [str(term) for term in terms], scales))
+        return parsed
+
+    def _resolved_constraint_groups(
+        self,
+    ) -> List[tuple]:
+        """``(name, scales, term_names)`` in the order terms are concatenated."""
+        specs = self._inner_constraint_specs()
+        if specs is None:
+            return self._positional_groups()
+        return self._named_groups(specs)
+
+    def _positional_groups(self) -> List[tuple]:
+        resolved: List[tuple] = []
+        seen = set()
+        for group in self._constraint_groups_arg:
+            name = _group_name(group["name"])
+            if name in seen:
+                raise ValueError(f"duplicate constraint group {name!r}")
+            seen.add(name)
+            scales = _as_float_list(group["scales"])
+            if not scales:
+                raise ValueError(f"constraint group {name!r} has empty scales")
+            terms = [name] if len(scales) == 1 else [str(i) for i in range(len(scales))]
+            resolved.append((name, scales, terms))
+        return resolved
+
+    def _named_groups(self, specs: Sequence[tuple]) -> List[tuple]:
+        if self._constraint_groups_arg:
+            raise ValueError(
+                "constraint_groups cannot be set when the inner criterion "
+                "exposes constraint_specs(); set relative_scales on each "
+                "soft constraint instead"
+            )
+        resolved: List[tuple] = []
+        seen = set()
+        for name, terms, scales in specs:
+            name = _group_name(name)
+            if name in seen:
+                raise ValueError(f"duplicate constraint name {name!r}")
+            seen.add(name)
+            if not terms:
+                raise ValueError(f"constraint {name!r} exposes no terms")
+            if any("/" in term for term in terms):
+                raise ValueError(
+                    f"constraint {name!r} term names must not contain '/': {terms}"
+                )
+            if scales is None:
+                raise ValueError(
+                    f"soft constraint {name!r} has no relative_scales; "
+                    f"set relative_scales for terms {list(terms)}"
+                )
+            resolved.append(
+                (name, self._scales_for_terms(name, scales, terms), list(terms))
+            )
+        return resolved
+
+    def _scales_for_terms(
+        self,
+        name: str,
+        scales: Any,
+        term_names: Sequence[str],
+    ) -> List[float]:
+        if isinstance(scales, Mapping):
+            missing = [term for term in term_names if term not in scales]
+            extra = [str(key) for key in scales.keys() if str(key) not in term_names]
+            if missing or extra:
+                raise ValueError(
+                    f"constraint group {name!r} scale keys do not match terms "
+                    f"{list(term_names)}. missing={missing} extra={extra}"
+                )
+            return [float(scales[term]) for term in term_names]
+        if isinstance(scales, bool) or isinstance(scales, (int, float)):
+            if len(term_names) != 1:
+                raise ValueError(
+                    f"constraint group {name!r} has terms {list(term_names)}; "
+                    "pass a mapping of term name to scale"
+                )
+            return [float(scales)]
+        if isinstance(scales, (str, bytes)):
+            raise TypeError(
+                f"constraint group {name!r} scales must be a float or a mapping "
+                f"of term name to scale, got {type(scales).__name__}"
+            )
+        values = [float(scale) for scale in scales]
+        if len(term_names) == 1 and len(values) == 1:
+            return values
+        raise ValueError(
+            f"constraint group {name!r} has terms {list(term_names)}; "
+            "pass a mapping of term name to scale, not a positional list"
+        )
+
     def _log_tag_list(self) -> List[str]:
         """TB tag order. Must match ``_fill_log_buffers`` exactly."""
         tags = ["loss", "loss_data"]
-        for name, sl in self._group_slices:
+        for name, _sl, term_names in self._group_slices:
             tags.append(f"loss_constraint/{name}")
-            width = sl.stop - sl.start
-            if width > 1:
-                tags.extend(f"loss_constraint/{name}/{i}" for i in range(width))
+            if len(term_names) > 1:
+                tags.extend(f"loss_constraint/{name}/{term}" for term in term_names)
         for term_name in self.term_names:
             tags.append(f"loss_weight/{term_name}")
             tags.append(f"loss_weighted/{term_name}")
@@ -273,12 +404,11 @@ class AdaptiveLossWeights(torch.nn.Module):
 
     def _rebuild_term_names(self) -> None:
         self.term_names = list(self.variable_names)
-        for name, sl in self._group_slices:
-            n = sl.stop - sl.start
-            if n == 1:
+        for name, _sl, term_names in self._group_slices:
+            if len(term_names) == 1:
                 self.term_names.append(name)
             else:
-                self.term_names.extend(f"{name}/{i}" for i in range(n))
+                self.term_names.extend(f"{name}/{term}" for term in term_names)
 
     def setup(self, trainer) -> None:
         if hasattr(self.inner, "setup"):
@@ -375,11 +505,10 @@ class AdaptiveLossWeights(torch.nn.Module):
             scalar.detach(),
             (weighted[:C].sum() / c_float).detach(),
         ]
-        for _name, sl in self._group_slices:
+        for _name, sl, term_names in self._group_slices:
             values.append((weighted[sl].sum() / c_float).detach())
-            width = sl.stop - sl.start
-            if width > 1:
-                for i in range(width):
+            if len(term_names) > 1:
+                for i in range(len(term_names)):
                     values.append((weighted[sl.start + i] / c_float).detach())
         for i in range(self.n_terms):
             values.append(self.weights[i].detach())
