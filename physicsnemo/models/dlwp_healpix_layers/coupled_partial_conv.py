@@ -114,9 +114,17 @@ def load_spatial_mask(
     """
     ds = _open_mask_dataset(dataset_path)
     try:
-        field = ds[data_var]
-        if selection_dict:
-            field = field.sel(**dict(selection_dict))
+        # Named-array stores keep each constant as its own variable. That resolver
+        # ships with the per-variable loader; monolithic constants/channel_c masks
+        # still load when the resolver is not installed yet.
+        try:
+            from physicsnemo.datapipes.healpix.zarr_layout import resolve_mask_field
+        except ImportError:
+            field = ds[data_var]
+            if selection_dict:
+                field = field.sel(**dict(selection_dict))
+        else:
+            field = resolve_mask_field(ds, data_var, selection_dict)
         values = np.asarray(field.values, dtype=np.float32)
     finally:
         ds.close()
