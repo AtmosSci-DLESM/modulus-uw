@@ -25,6 +25,7 @@ import zarr
 from omegaconf import DictConfig, OmegaConf
 
 from physicsnemo.datapipes.meta import DatapipeMetaData
+from physicsnemo.utils.insolation import insolation
 
 from . import couplers
 from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
@@ -216,14 +217,11 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
 
         if self.forecast_mode:
             inputs_result = super().__getitem__(item)
-            ic_diagnostics = None
+        elif self.return_ic_diagnostics:
+            inputs_result, targets, ic_diagnostics = super().__getitem__(item)
         else:
-            batch = super().__getitem__(item)
-            if self.return_ic_diagnostics:
-                inputs_result, targets, ic_diagnostics = batch
-            else:
-                inputs_result, targets = batch
-                ic_diagnostics = None
+            inputs_result, targets = super().__getitem__(item)
+            ic_diagnostics = None
 
         # used by the couplers to determine what time index to load
         # see method "next_integration()" for details
@@ -272,7 +270,6 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         torch.cuda.nvtx.range_pop()  # CoupledTimeSeriesDataset:__getitem__
         if self.forecast_mode:
             return inputs_result
-
         if self.return_ic_diagnostics:
             return inputs_result, targets, ic_diagnostics
         return inputs_result, targets
@@ -291,8 +288,10 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
             Insolation tensor
         """
         sol = torch.tensor(
-            self.insolation_for_dates(
-                self._get_forecast_sol_times(self.curr_item) + time_offset
+            insolation(
+                self._get_forecast_sol_times(self.curr_item) + time_offset,
+                self.lat,
+                self.lon,
             )[:, None]
         )
         decoder_inputs = np.empty(

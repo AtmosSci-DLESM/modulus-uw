@@ -51,42 +51,14 @@ def _configure_torch_mp_sharing_strategy(strategy: str) -> None:
     torch.multiprocessing.set_sharing_strategy(strategy)
 
 
-class ZarrDataloaderWorkerInit:
-    """Picklable DataLoader worker_init_fn (required for spawn / forkserver workers).
+class _MpSharingWorkerInit:
+    """Picklable worker_init_fn. Spawn workers cannot use a lambda or closure."""
 
-    CUDA training must not fork DataLoader workers from a parent that already
-    initialized CUDA; spawn workers run this in a clean interpreter.
-    """
-
-    def __init__(
-        self,
-        n_threads: int,
-        mp_sharing_strategy: Optional[str] = None,
-    ) -> None:
-        self.n_threads = n_threads
+    def __init__(self, mp_sharing_strategy: str) -> None:
         self.mp_sharing_strategy = mp_sharing_strategy
 
     def __call__(self, worker_id: int) -> None:
-        if self.mp_sharing_strategy is not None:
-            _configure_torch_mp_sharing_strategy(self.mp_sharing_strategy)
-        if self.n_threads > 1:
-            import gc
-
-            from .zarr_layout import enable_zarrs_pipeline, init_worker_pool
-
-            enable_zarrs_pipeline()
-            init_worker_pool(self.n_threads)
-            # Rely on refcounting for large numpy buffers. Periodic gc.collect() on
-            # the getitem path caused multi-hundred-ms jitter under training.
-            gc.disable()
-
-
-def _zarr_dataloader_worker_init(
-    n_threads: int,
-    mp_sharing_strategy: Optional[str] = None,
-) -> ZarrDataloaderWorkerInit:
-    """Factory kept for scratch hooks that wrap worker_init_fn."""
-    return ZarrDataloaderWorkerInit(n_threads, mp_sharing_strategy)
+        _configure_torch_mp_sharing_strategy(self.mp_sharing_strategy)
 
 
 def _default_dataloader_multiprocessing_context() -> Optional[str]:
@@ -129,10 +101,9 @@ class TimeSeriesDataModuleZarr:
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
-        dataloader_io_threads: int = 8,
+        return_ic_diagnostics: bool = False,
         mp_sharing_strategy: Optional[str] = None,
         dataloader_multiprocessing_context: Optional[str] = None,
-        return_ic_diagnostics: bool = False,
     ):
         """
         Parameters
@@ -201,13 +172,6 @@ class TimeSeriesDataModuleZarr:
         in_order: bool, optional
             Passed to torch.utils.data.DataLoader when set (requires PyTorch with ``in_order`` support).
             If None, DataLoader default applies.
-        dataloader_io_threads: int, optional
-            Threads per DataLoader worker for per-variable Zarr reads. When >1 and
-            num_workers > 0, workers reuse a persistent thread pool instead of
-            creating a new pool on every batch.
-        return_ic_diagnostics: bool, optional
-            Train mode: return ground-truth output-only channels at input times as a
-            third batch element for soft constraints. default False
         """
         super().__init__()
         self.dataset_path = Path(dataset_path)
@@ -236,7 +200,7 @@ class TimeSeriesDataModuleZarr:
         self.train_noise_params = train_noise_params
         self.train_noise_seed = train_noise_seed
         self.in_order = in_order
-        self.dataloader_io_threads = dataloader_io_threads
+        self.return_ic_diagnostics = return_ic_diagnostics
         self.mp_sharing_strategy = mp_sharing_strategy
         if dataloader_multiprocessing_context is None:
             dataloader_multiprocessing_context = (
@@ -245,11 +209,6 @@ class TimeSeriesDataModuleZarr:
                 else None
             )
         self.dataloader_multiprocessing_context = dataloader_multiprocessing_context
-        self.return_ic_diagnostics = return_ic_diagnostics
-        input_set = set(self.input_variables)
-        self.ic_diagnostic_variables = [
-            name for name in self.output_variables if name not in input_set
-        ]
 
         self.train_dataset = None
         self.val_dataset = None
@@ -437,15 +396,14 @@ class TimeSeriesDataModuleZarr:
             dataloader_kwargs["prefetch_factor"] = self.prefetch_factor
         if self.in_order is not None:
             dataloader_kwargs["in_order"] = self.in_order
-        if self.num_workers > 0:
-            dataloader_kwargs["worker_init_fn"] = ZarrDataloaderWorkerInit(
-                self.dataloader_io_threads,
-                self.mp_sharing_strategy,
+        if self.num_workers > 0 and self.mp_sharing_strategy is not None:
+            dataloader_kwargs["worker_init_fn"] = _MpSharingWorkerInit(
+                self.mp_sharing_strategy
             )
-            if self.dataloader_multiprocessing_context is not None:
-                dataloader_kwargs["multiprocessing_context"] = (
-                    self.dataloader_multiprocessing_context
-                )
+        if self.num_workers > 0 and self.dataloader_multiprocessing_context is not None:
+            dataloader_kwargs["multiprocessing_context"] = (
+                self.dataloader_multiprocessing_context
+            )
         loader = DataLoader(**dataloader_kwargs)
 
         return loader, sampler
@@ -555,10 +513,9 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
-        dataloader_io_threads: int = 8,
+        return_ic_diagnostics: bool = False,
         mp_sharing_strategy: Optional[str] = None,
         dataloader_multiprocessing_context: Optional[str] = None,
-        return_ic_diagnostics: bool = False,
     ):
         """
         Parameters
@@ -629,9 +586,6 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             Seed for the random number generator for adding noise to the training data, default 42
         in_order: bool, optional
             Passed to torch.utils.data.DataLoader when set. If None, DataLoader default applies.
-        return_ic_diagnostics: bool, optional
-            Train mode: return ground-truth output-only channels at input times as a
-            third batch element for soft constraints. default False
         """
         self.couplings = couplings
 
@@ -662,10 +616,9 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             train_noise_params,
             train_noise_seed,
             in_order,
-            dataloader_io_threads,
+            return_ic_diagnostics,
             mp_sharing_strategy,
             dataloader_multiprocessing_context,
-            return_ic_diagnostics,
         )
 
     def _get_coupled_vars(self):

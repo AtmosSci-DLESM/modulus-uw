@@ -1,10 +1,17 @@
-"""Helpers for healpix Zarr layouts (monolithic inputs vs per-variable arrays)."""
+"""Helpers for healpix Zarr layouts (stacked vs per-variable).
+
+- **stacked** — prognostic fields packed on a channel axis in ``inputs`` /
+  ``constants``, with names in ``channel_in`` / ``channel_c``.
+  Detection: ``is_stacked_layout``.
+- **per-variable** — one Zarr array per field, root attribute
+  ``layout=per_variable``. Detection: ``is_per_variable_layout``.
+
+Catalogs already written with ``layout=named_arrays_healpix`` still load.
+"""
 
 from __future__ import annotations
 
-import atexit
 import logging
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Mapping, Sequence
 
@@ -14,21 +21,22 @@ logger = logging.getLogger(__name__)
 
 COORD_KEYS = frozenset({"time", "face", "height", "width", "lat", "lon"})
 
-# Process-local pool for DataLoader workers (set via init_worker_pool in worker_init_fn).
-_worker_pool: ThreadPoolExecutor | None = None
-_worker_pool_n_threads: int = 0
-_worker_pool_lock = threading.Lock()
+# Root attribute written by current converters.
+PER_VARIABLE_LAYOUT_ATTR = "per_variable"
+# Written by earlier converters and the b24 builder.
+_LEGACY_PER_VARIABLE_LAYOUT_ATTR = "named_arrays_healpix"
 
 _zarrs_pipeline_enabled = False
 _zarrs_import_warned = False
 
+
 def enable_zarrs_pipeline() -> bool:
     """Select the zarrs Rust codec pipeline when the optional package is installed.
 
-    zarr.config is per-process. Call from DataLoader worker_init_fn and from read
-    helpers (load_channel_data) so num_workers=0 still gets zarrs. Do not enable
-    in the parent process before forking DataLoader workers: fork inherits zarrs
-    state and can deadlock the first batch fetch.
+    zarr.config is per-process. Call from per-variable read helpers so a
+    num_workers=0 load still uses zarrs. Do not call this on stacked reads, and
+    do not enable it in the parent before forking DataLoader workers: fork
+    inherits zarrs state and can deadlock the first batch fetch.
     """
     global _zarrs_pipeline_enabled, _zarrs_import_warned
     if _zarrs_pipeline_enabled:
@@ -51,77 +59,51 @@ def enable_zarrs_pipeline() -> bool:
         return False
 
 
-def maybe_collect_worker_gc() -> None:
-    """No-op kept for call-site compatibility.
-
-    DataLoader workers disable cyclic GC in ``worker_init_fn`` and rely on
-    refcounting for large numpy buffers. A previous periodic ``gc.collect()``
-    here caused multi-hundred-ms stalls every few dozen batches; do not
-    reintroduce full collections on the getitem path.
-    """
-    return
+def _layout_attr(ds) -> str:
+    attrs = getattr(ds, "attrs", None) or {}
+    if not hasattr(attrs, "get"):
+        return ""
+    return str(attrs.get("layout", "") or "")
 
 
-def init_worker_pool(n_threads: int = 8) -> None:
-    """Create a persistent thread pool in the current process (DataLoader worker)."""
-    global _worker_pool, _worker_pool_n_threads
-    if n_threads <= 1:
-        return
-    with _worker_pool_lock:
-        if _worker_pool is not None:
-            if _worker_pool_n_threads == n_threads:
-                return
-            _worker_pool.shutdown(wait=False)
-            _worker_pool = None
-        _worker_pool = ThreadPoolExecutor(max_workers=n_threads)
-        _worker_pool_n_threads = n_threads
+def _has_per_variable_layout_attr(ds) -> bool:
+    layout = _layout_attr(ds)
+    return (
+        layout == PER_VARIABLE_LAYOUT_ATTR
+        or layout == _LEGACY_PER_VARIABLE_LAYOUT_ATTR
+        or layout.startswith("per_variable")
+    )
 
 
-def shutdown_worker_pool(wait: bool = True) -> None:
-    """Tear down the process-local pool (tests / worker shutdown)."""
-    global _worker_pool, _worker_pool_n_threads
-    with _worker_pool_lock:
-        if _worker_pool is not None:
-            _worker_pool.shutdown(wait=wait)
-            _worker_pool = None
-            _worker_pool_n_threads = 0
-
-
-def worker_pool_active() -> bool:
-    """True when a persistent pool is installed in this process."""
-    return _worker_pool is not None
-
-
-def _atexit_shutdown() -> None:
-    shutdown_worker_pool(wait=False)
-
-
-atexit.register(_atexit_shutdown)
-
-
-def is_monolithic_layout(ds) -> bool:
-    """True when store uses a single ``inputs`` array."""
+def is_stacked_layout(ds) -> bool:
+    """True when prognostic fields are packed on a channel axis in ``inputs``."""
     return "inputs" in ds
 
 
-def is_named_arrays_layout(ds) -> bool:
-    """True for name-only per-field stores (no channel_* metadata arrays)."""
-    attrs = getattr(ds, "attrs", None) or {}
-    layout = attrs.get("layout", "") if hasattr(attrs, "get") else ""
-    return layout == "named_arrays_healpix"
-
-
 def is_per_variable_layout(ds) -> bool:
-    """True when prognostic fields are stored as separate arrays (not monolithic)."""
-    if is_monolithic_layout(ds):
+    """True when the root ``layout`` attribute marks one array per field.
+
+    A store without ``inputs`` is not per-variable unless it declares
+    ``layout=per_variable`` (or the legacy ``named_arrays_healpix`` value).
+    """
+    if is_stacked_layout(ds):
         return False
-    if is_named_arrays_layout(ds):
+    return _has_per_variable_layout_attr(ds)
+
+
+def constants_are_stacked(ds) -> bool:
+    """True when constants are a ``constants`` array indexed by ``channel_c``.
+
+    Per-variable catalogs (``layout=per_variable`` or the older
+    ``named_arrays_healpix``) store each constant as a top-level array.
+    A store that still has a ``constants`` array and does not declare a
+    per-variable layout keeps the stacked read.
+    """
+    if is_stacked_layout(ds):
         return True
-    attrs = getattr(ds, "attrs", None) or {}
-    layout = attrs.get("layout", "") if hasattr(attrs, "get") else ""
-    if layout == "per_variable_healpix" or str(layout).startswith("per_variable"):
-        return True
-    return True
+    if _has_per_variable_layout_attr(ds):
+        return False
+    return "constants" in ds
 
 
 def resolve_mask_field(
@@ -129,10 +111,10 @@ def resolve_mask_field(
     data_var: str,
     selection_dict: Mapping[str, Any] | None = None,
 ):
-    """Resolve a spatial mask field from monolithic or named_arrays_healpix stores.
+    """Resolve a spatial mask field from stacked or per-variable stores.
 
-    Monolithic stores use ``data_var`` (e.g. ``constants``) with optional
-    ``selection_dict`` (e.g. ``channel_c``). Named-array stores expose each
+    Stacked stores use ``data_var`` (e.g. ``constants``) with optional
+    ``selection_dict`` (e.g. ``channel_c``). Per-variable stores expose each
     constant as a top-level array; configs still use ``data_var: constants`` and
     ``selection_dict.channel_c`` to pick the field name.
     """
@@ -143,12 +125,12 @@ def resolve_mask_field(
             field = field.sel(**sel)
         return field
 
-    if is_named_arrays_layout(ds) and data_var == "constants" and "channel_c" in sel:
+    if is_per_variable_layout(ds) and data_var == "constants" and "channel_c" in sel:
         field_name = str(sel.pop("channel_c"))
         if field_name not in ds.data_vars:
             raise KeyError(
                 f"Mask field {field_name!r} not found in dataset; "
-                "named_arrays_healpix stores expose constants as top-level arrays."
+                "per-variable stores expose constants as top-level arrays."
             )
         field = ds[field_name]
         if sel:
@@ -163,17 +145,24 @@ def resolve_mask_field(
 
 def available_field_names(ds) -> set[str]:
     """Field names loadable from this store (prognostic + constant)."""
-    if is_monolithic_layout(ds):
+    if is_stacked_layout(ds):
         names = {str(x) for x in np.asarray(ds["channel_in"][:])}
         if "channel_out" in ds:
             names.update(str(x) for x in np.asarray(ds["channel_out"][:]))
         if "channel_c" in ds:
             names.update(str(x) for x in np.asarray(ds["channel_c"][:]))
         return names
-    return {str(k) for k in ds.keys() if k not in COORD_KEYS and k != "constants"}
+    if not is_per_variable_layout(ds):
+        return set()
+    # ``_shard_index`` is loader metadata, not a prognostic field.
+    return {
+        str(k)
+        for k in ds.keys()
+        if k not in COORD_KEYS and k != "constants" and not str(k).startswith("_")
+    }
 
 
-def _monolithic_channel_indices(ds, field_names: Sequence[str]) -> list[int]:
+def _stacked_channel_indices(ds, field_names: Sequence[str]) -> list[int]:
     cin = [str(x) for x in np.asarray(ds["channel_in"][:])]
     return [cin.index(n) for n in field_names]
 
@@ -188,59 +177,59 @@ def _slice_length(dim_size: int, time_sl) -> int:
 
 
 def _apply_channel_scaling(block: np.ndarray, scaling: Mapping, channel: int) -> np.ndarray:
-    block -= scaling["mean"][0, channel]
-    block /= scaling["std"][0, channel]
+    """In-place ``(x - mean) / std`` on one field, keeping ``block.dtype``.
+
+    ``scaling`` mean/std are shaped ``(1, C, 1, 1, 1)`` in channel order.
+    Casting the stats to ``block.dtype`` matches the stacked in-place scale
+    used by the previous joint ``inputs`` read.
+    """
+    mean = np.asarray(scaling["mean"][0, channel], dtype=block.dtype)
+    std = np.asarray(scaling["std"][0, channel], dtype=block.dtype)
+    block -= mean
+    block /= std
     return block
 
 
-def _run_loaders_parallel(loaders: list, n_threads: int) -> None:
-    if not loaders:
-        return
-    if n_threads <= 1:
-        for fn in loaders:
-            fn()
-        return
-    if _worker_pool is not None:
-        list(_worker_pool.map(lambda fn: fn(), loaders))
-        return
-    with ThreadPoolExecutor(max_workers=min(n_threads, len(loaders))) as ex:
-        list(ex.map(lambda fn: fn(), loaders))
+def _run_parallel(fns: list):
+    """Run one callable per field. A single field runs on this thread."""
+    if len(fns) <= 1:
+        return [fn() for fn in fns]
+    with ThreadPoolExecutor(max_workers=len(fns)) as ex:
+        return list(ex.map(lambda fn: fn(), fns))
 
 
-def _load_fields_parallel(
-    loaders: list,
-    n_threads: int,
-) -> list[np.ndarray]:
-    if n_threads <= 1:
-        return [fn() for fn in loaders]
-    if _worker_pool is not None:
-        return list(_worker_pool.map(lambda fn: fn(), loaders))
-    with ThreadPoolExecutor(max_workers=min(n_threads, len(loaders))) as ex:
-        return list(ex.map(lambda fn: fn(), loaders))
+def _require_layout(ds) -> None:
+    if is_stacked_layout(ds) or is_per_variable_layout(ds):
+        return
+    raise ValueError(
+        "Unrecognized healpix Zarr layout. Stacked stores have an 'inputs' "
+        "array; per-variable stores set the root attribute layout='per_variable'."
+    )
 
 
 def load_channel_data(
     ds,
     time_sl,
     field_names: Sequence[str],
-    n_threads: int = 8,
     scaling: Mapping | None = None,
 ) -> np.ndarray:
     """Load selected prognostic fields for a time window as (T, C, F, H, W)."""
-    enable_zarrs_pipeline()
     names = list(field_names)
+    _require_layout(ds)
     if len(names) == 0:
         if is_per_variable_layout(ds):
             raise ValueError("empty field name list")
         return np.asarray(ds["inputs"][time_sl])[:, []]
 
-    if is_monolithic_layout(ds):
-        indices = _monolithic_channel_indices(ds, names)
-        out = np.asarray(ds["inputs"][time_sl, indices])
+    if is_stacked_layout(ds):
+        indices = _stacked_channel_indices(ds, names)
+        out = np.array(np.asarray(ds["inputs"][time_sl, indices]))
         if scaling is not None:
-            out -= scaling["mean"]
-            out /= scaling["std"]
+            for i in range(len(names)):
+                _apply_channel_scaling(out[:, i], scaling, i)
         return out
+
+    from .zarr_shard_read import read_field_time
 
     ref = ds[names[0]]
     tlen = _slice_length(ref.shape[0], time_sl)
@@ -248,14 +237,38 @@ def load_channel_data(
     out = np.empty((tlen, len(names)) + spatial, dtype=ref.dtype)
 
     def _fill(i: int, n: str) -> None:
-        block = np.asarray(ds[n][time_sl])
+        block = read_field_time(ds, n, time_sl)
         if scaling is not None:
             block = _apply_channel_scaling(block, scaling, i)
         out[:, i] = block
 
-    loaders = [lambda i=i, n=n: _fill(i, n) for i, n in enumerate(names)]
-    _run_loaders_parallel(loaders, n_threads)
+    _run_parallel([lambda i=i, n=n: _fill(i, n) for i, n in enumerate(names)])
     return out
+
+
+def _scale_stacked_staging(
+    staging: np.ndarray,
+    names: Sequence[str],
+    input_names: Sequence[str],
+    output_names: Sequence[str],
+    input_scaling: Mapping | None,
+    output_scaling: Mapping | None,
+) -> None:
+    """Scale a stacked ``(T, C, F, H, W)`` staging array in place.
+
+    Stats stay in ``staging.dtype`` so a float32 store matches the previous
+    in-place ``inputs`` scale. A field that is both an input and an output
+    uses the input stats; both come from the same scaling dict.
+    """
+    if input_scaling is None and output_scaling is None:
+        return
+    in_pos = {n: i for i, n in enumerate(input_names)}
+    out_pos = {n: i for i, n in enumerate(output_names)}
+    for i, name in enumerate(names):
+        if name in in_pos and input_scaling is not None:
+            _apply_channel_scaling(staging[:, i], input_scaling, in_pos[name])
+        elif name in out_pos and output_scaling is not None:
+            _apply_channel_scaling(staging[:, i], output_scaling, out_pos[name])
 
 
 def load_windowed_channel_data(
@@ -265,17 +278,19 @@ def load_windowed_channel_data(
     input_time_idx: np.ndarray,
     output_names: Sequence[str] | None = None,
     output_time_idx: np.ndarray | None = None,
-    n_threads: int = 8,
     input_scaling: Mapping | None = None,
     output_scaling: Mapping | None = None,
     ic_diagnostic_names: Sequence[str] | None = None,
-) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+) -> (
+    tuple[np.ndarray, np.ndarray | None]
+    | tuple[np.ndarray, np.ndarray | None, np.ndarray]
+):
     """Load and scale fields directly into (B, T, C, F, H, W) sample windows.
 
-    For per-variable / named-array stores, each unique field is decoded and
-    scaled once on a worker thread, then scattered into channel-first scratch
-    buffers. For monolithic ``inputs`` stores, channels are read jointly and
-    gathered into the same window layout.
+    For per-variable stores, each unique field is decoded and scaled once on
+    a worker thread, then scattered into channel-first scratch buffers. For
+    stacked ``inputs`` stores, channels are read jointly, scaled on that
+    ``(T, C, ...)`` array, then gathered into the same window layout.
 
     Parameters
     ----------
@@ -290,83 +305,79 @@ def load_windowed_channel_data(
         Integer index arrays of shape ``(B, T)`` into the loaded time window.
     input_scaling, output_scaling :
         Optional ``{"mean", "std"}`` arrays indexed by channel position in
-        ``input_names`` / ``output_names`` (same layout as dataset scaling).
+        ``input_names`` / ``output_names``. Mean/std are shaped
+        ``(1, C, 1, 1, 1)``.
     ic_diagnostic_names :
-        Optional output-only channel names to also gather at ``input_time_idx``
-        (scaled with ``output_scaling``). Used for soft-constraint IC anchors.
+        Optional output-only channel names gathered at ``input_time_idx`` and
+        scaled with ``output_scaling``. Empty or omitted yields ``None``.
 
     Returns
     -------
-    inputs, targets, ic_diagnostics
+    inputs, targets
         ``inputs`` has shape ``(B, T_in, C_in, ...)``. ``targets`` is ``None``
-        when ``output_names`` is omitted. ``ic_diagnostics`` is ``None`` when
-        ``ic_diagnostic_names`` is empty/omitted; otherwise
-        ``(B, T_in, C_diag, ...)``.
+        when ``output_names`` is omitted. When ``ic_diagnostic_names`` is
+        non-empty the return is ``(inputs, targets, ic_diagnostics)`` with
+        ``ic_diagnostics`` shaped ``(B, T_in, C_diag, ...)``.
     """
-    enable_zarrs_pipeline()
     input_names = list(input_names)
+    ic_diag_names = list(ic_diagnostic_names or [])
+    _require_layout(ds)
     if len(input_names) == 0:
         raise ValueError("empty input field name list")
     if input_time_idx.ndim != 2:
         raise ValueError(
             f"input_time_idx must be (B, T), got shape {input_time_idx.shape}"
         )
-    ic_diag_names = list(ic_diagnostic_names or [])
 
-    if is_monolithic_layout(ds):
-        # Monolithic stores are already a joint array; stage once then gather.
-        names = list(dict.fromkeys(list(input_names) + list(output_names or [])))
-        staging = load_channel_data(
-            ds, time_sl, names, n_threads=n_threads, scaling=None
+    if is_stacked_layout(ds):
+        # Scale on (T, C, F, H, W) before the window gather. Mean/std shaped
+        # (1, C, 1, 1, 1) align with that axis; they do not align with
+        # (B, T, C, F, H, W).
+        names = list(dict.fromkeys(
+            list(input_names) + list(output_names or []) + ic_diag_names
+        ))
+        staging = np.array(load_channel_data(ds, time_sl, names, scaling=None))
+        _scale_stacked_staging(
+            staging,
+            names,
+            input_names,
+            list(output_names or []),
+            input_scaling,
+            output_scaling,
         )
         name_to_i = {n: i for i, n in enumerate(names)}
         in_c = np.asarray([name_to_i[n] for n in input_names], dtype=np.intp)
         inputs = staging[
             input_time_idx[:, :, np.newaxis], in_c[np.newaxis, np.newaxis, :]
         ]
-        if input_scaling is not None:
-            inputs = (inputs - input_scaling["mean"]) / input_scaling["std"]
         targets = None
         if output_names is not None:
             if output_time_idx is None:
                 raise ValueError("output_time_idx required when output_names is set")
-            out_c = np.asarray([name_to_i[n] for n in output_names], dtype=np.intp)
+            out_c = np.asarray(
+                [name_to_i[n] for n in output_names], dtype=np.intp
+            )
             targets = staging[
                 output_time_idx[:, :, np.newaxis], out_c[np.newaxis, np.newaxis, :]
             ]
-            if output_scaling is not None:
-                targets = (targets - output_scaling["mean"]) / output_scaling["std"]
-        ic_diagnostics = None
-        if ic_diag_names:
-            if output_names is None or output_scaling is None:
-                raise ValueError(
-                    "ic_diagnostic_names requires output_names and output_scaling"
-                )
-            ic_c = np.asarray([name_to_i[n] for n in ic_diag_names], dtype=np.intp)
-            ic_diagnostics = staging[
-                input_time_idx[:, :, np.newaxis], ic_c[np.newaxis, np.newaxis, :]
-            ]
-            out_idx = [list(output_names).index(n) for n in ic_diag_names]
-            # output_scaling mean/std are broadcastable on channel axis (index 1
-            # after expand to match (B,T,C,...)); select diagnostic channels.
-            mean = output_scaling["mean"]
-            std = output_scaling["std"]
-            # Shapes are typically (1, C, 1, 1, 1) after dataset expand_dims.
-            mean_c = np.take(mean, out_idx, axis=1)
-            std_c = np.take(std, out_idx, axis=1)
-            ic_diagnostics = (ic_diagnostics - mean_c) / std_c
+        if not ic_diag_names:
+            return inputs, targets
+        ic_c = np.asarray([name_to_i[n] for n in ic_diag_names], dtype=np.intp)
+        ic_diagnostics = staging[
+            input_time_idx[:, :, np.newaxis], ic_c[np.newaxis, np.newaxis, :]
+        ]
         return inputs, targets, ic_diagnostics
 
+    from .zarr_shard_read import read_field_time
+
+    batch_size, t_in = input_time_idx.shape
     ref = ds[input_names[0]]
     spatial = ref.shape[1:]
     dtype = ref.dtype
-    batch_size, t_in = input_time_idx.shape
     # Channel-first scratch buffers so each per-variable scatter write is a
     # single contiguous (B, T, F, H, W) store rather than a strided channel
     # slice of a (B, T, C, ...) array.
-    inputs_cf = np.empty(
-        (len(input_names), batch_size, t_in) + spatial, dtype=dtype
-    )
+    inputs_cf = np.empty((len(input_names), batch_size, t_in) + spatial, dtype=dtype)
 
     targets_cf = None
     out_names: list[str] = []
@@ -379,17 +390,15 @@ def load_windowed_channel_data(
             raise ValueError(
                 f"input/output batch mismatch: {batch_size} vs {batch_size_out}"
             )
-        targets_cf = np.empty(
-            (len(out_names), batch_size, t_out) + spatial, dtype=dtype
-        )
+        targets_cf = np.empty((len(out_names), batch_size, t_out) + spatial, dtype=dtype)
 
     ic_diag_cf = None
-    ic_name_to_c: dict[str, int] = {}
+    ic_pos: dict[str, int] = {}
     if ic_diag_names:
         ic_diag_cf = np.empty(
             (len(ic_diag_names), batch_size, t_in) + spatial, dtype=dtype
         )
-        ic_name_to_c = {n: i for i, n in enumerate(ic_diag_names)}
+        ic_pos = {n: i for i, n in enumerate(ic_diag_names)}
 
     # Unique fields → destinations in input and/or target channel axes.
     slots: dict[str, tuple[int | None, int | None]] = {}
@@ -399,50 +408,42 @@ def load_windowed_channel_data(
     for c, name in enumerate(out_names):
         in_c, out_c = slots.get(name, (None, None))
         slots[name] = (in_c, c)
-    # Ensure output-only IC diagnostics are loaded even if somehow omitted
-    # from output_names (should not happen when wired from the dataset).
     for name in ic_diag_names:
-        if name not in slots:
-            slots[name] = (None, None)
+        slots.setdefault(name, (None, None))
 
-    def _fill(name: str, in_c: int | None, out_c: int | None) -> None:
-        block = np.asarray(ds[name][time_sl])
+    def _place(block: np.ndarray, in_c: int | None, out_c: int | None, name: str) -> None:
         # Scale once. Shared input/output vars use the same physical mean/std;
         # prefer input_scaling when the field appears in both buffers.
         if in_c is not None and input_scaling is not None:
             block = _apply_channel_scaling(block, input_scaling, in_c)
         elif out_c is not None and output_scaling is not None:
             block = _apply_channel_scaling(block, output_scaling, out_c)
-        elif name in ic_name_to_c and output_scaling is not None and out_names:
-            block = _apply_channel_scaling(
-                block, output_scaling, out_names.index(name)
-            )
+        elif name in ic_pos and output_scaling is not None and out_names:
+            block = _apply_channel_scaling(block, output_scaling, out_names.index(name))
         if in_c is not None:
             inputs_cf[in_c] = block[input_time_idx]
         if out_c is not None:
             targets_cf[out_c] = block[output_time_idx]
-        if name in ic_name_to_c:
-            # Same scaled block; gather at input times for soft-constraint ICs.
-            ic_diag_cf[ic_name_to_c[name]] = block[input_time_idx]
+        if name in ic_pos:
+            ic_diag_cf[ic_pos[name]] = block[input_time_idx]
 
-    loaders = [
-        lambda n=n, ic=ic, oc=oc: _fill(n, ic, oc) for n, (ic, oc) in slots.items()
-    ]
-    _run_loaders_parallel(loaders, n_threads)
+    def _fill(name: str, in_c: int | None, out_c: int | None) -> None:
+        block = read_field_time(ds, name, time_sl)
+        _place(block, in_c, out_c, name)
+
+    _run_parallel(
+        [lambda n=n, ic=ic, oc=oc: _fill(n, ic, oc) for n, (ic, oc) in slots.items()]
+    )
     # (C, B, T, ...) -> (B, T, C, ...); view, no copy.
     inputs = np.transpose(inputs_cf, (1, 2, 0, 3, 4, 5))
-    targets = (
-        None if targets_cf is None else np.transpose(targets_cf, (1, 2, 0, 3, 4, 5))
-    )
-    ic_diagnostics = (
-        None if ic_diag_cf is None else np.transpose(ic_diag_cf, (1, 2, 0, 3, 4, 5))
-    )
+    targets = None if targets_cf is None else np.transpose(targets_cf, (1, 2, 0, 3, 4, 5))
+    if not ic_diag_names:
+        return inputs, targets
+    ic_diagnostics = np.transpose(ic_diag_cf, (1, 2, 0, 3, 4, 5))
     return inputs, targets, ic_diagnostics
 
 
-def load_constant_fields(
-    ds, field_names: Sequence[str], n_threads: int = 8
-) -> np.ndarray:
+def load_constant_fields(ds, field_names: Sequence[str]) -> np.ndarray:
     """Load constant fields as (C, F, H, W).
 
     Constants are read once during dataset setup in the parent process; keep the
@@ -452,13 +453,12 @@ def load_constant_fields(
     if len(names) == 0:
         raise ValueError("empty constant field name list")
 
-    if is_monolithic_layout(ds) or (
-        not is_named_arrays_layout(ds) and "constants" in ds
-    ):
+    if constants_are_stacked(ds):
         cc = [str(x) for x in np.asarray(ds["channel_c"][:])]
         indices = [cc.index(n) for n in names]
         return np.asarray(ds["constants"][indices])
 
-    loaders = [lambda n=n: np.asarray(ds[n]) for n in names]
-    parts = _load_fields_parallel(loaders, n_threads)
+    if not is_per_variable_layout(ds):
+        _require_layout(ds)
+    parts = _run_parallel([lambda n=n: np.asarray(ds[n]) for n in names])
     return np.stack(parts, axis=0)
