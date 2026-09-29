@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+
 import numpy as np
 import torch
 import xarray as xr
@@ -20,6 +22,19 @@ Both the prediction and input tensors are expected to be in the shape [B, F, T, 
 The input tensor may not be used for some constraints but is always expected as
 an input argument for consistency.
 '''
+
+
+def constraint_configs(constraints):
+    """Instantiable hard-constraint configs, in application order.
+
+    ``constraints`` is a sequence of Hydra configs, or a name-keyed mapping
+    whose keys are unused labels. ``None`` means the model has no constraints.
+    """
+    if constraints is None:
+        return None
+    if isinstance(constraints, Mapping):
+        return list(constraints.values())
+    return list(constraints)
 
 
 class ClampInteriorSTE(torch.autograd.Function):
