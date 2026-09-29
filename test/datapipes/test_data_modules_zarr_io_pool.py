@@ -30,7 +30,7 @@ from physicsnemo.datapipes.healpix.data_modules_zarr import TimeSeriesDataModule
 from physicsnemo.datapipes.healpix.zarr_layout import load_channel_data
 
 
-def _make_named_store(path, *, t: int = 4, f: int = 12, h: int = 4, w: int = 4):
+def _make_per_variable_store(path, *, t: int = 4, f: int = 12, h: int = 4, w: int = 4):
     dynamic = ["t2m", "u10m", "v10m"]
     data_vars = {}
     for i, name in enumerate(dynamic):
@@ -46,7 +46,7 @@ def _make_named_store(path, *, t: int = 4, f: int = 12, h: int = 4, w: int = 4):
             "height": np.arange(h),
             "width": np.arange(w),
         },
-        attrs={"layout": "named_arrays_healpix"},
+        attrs={"layout": "per_variable"},
     )
     ds.to_zarr(path, mode="w")
     return zarr.open_group(str(path), mode="r")
@@ -70,6 +70,8 @@ def _bare_datamodule(*, num_workers: int, dataloader_io_threads: int) -> TimeSer
     dm.prefetch_factor = None
     dm.in_order = None
     dm.dataloader_io_threads = dataloader_io_threads
+    dm.mp_sharing_strategy = None
+    dm.dataloader_multiprocessing_context = None
     dm.collate_fn = None
     return dm
 
@@ -88,7 +90,7 @@ def test_init_worker_pool_is_persistent_until_shutdown():
 
 
 def test_load_channel_data_reuses_persistent_pool(tmp_path):
-    ds = _make_named_store(tmp_path / "named")
+    ds = _make_per_variable_store(tmp_path / "per_var")
     zarr_layout.shutdown_worker_pool()
     try:
         zarr_layout.init_worker_pool(2)
@@ -105,10 +107,17 @@ def test_dataloader_worker_init_fn_installed_when_io_threads_enabled():
     assert loader.worker_init_fn is not None
 
 
-def test_dataloader_worker_init_fn_omitted_for_single_thread():
+def test_dataloader_worker_init_does_not_start_pool_for_single_thread():
+    """Workers still get an init fn; a single IO thread does not open a pool."""
     dm = _bare_datamodule(num_workers=2, dataloader_io_threads=1)
     loader, _ = dm._base_dataloader(dataset=_TinyDataset(), drop_last=False)
-    assert loader.worker_init_fn is None
+    assert loader.worker_init_fn is not None
+    zarr_layout.shutdown_worker_pool()
+    try:
+        loader.worker_init_fn(0)
+        assert zarr_layout.worker_pool_active() is False
+    finally:
+        zarr_layout.shutdown_worker_pool()
 
 
 def test_dataloader_worker_init_fn_omitted_without_workers():
