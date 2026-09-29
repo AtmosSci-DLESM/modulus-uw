@@ -16,6 +16,7 @@
 
 # System modules
 import logging
+import sys
 import warnings
 from pathlib import Path
 from typing import Optional, Sequence, Union
@@ -34,6 +35,37 @@ from .coupledtimeseries_dataset_zarr import CoupledTimeSeriesDatasetZarr
 from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
 
 logger = logging.getLogger(__name__)
+
+_VALID_MP_SHARING_STRATEGIES = frozenset({"file_descriptor", "file_system"})
+
+
+def _configure_torch_mp_sharing_strategy(strategy: str) -> None:
+    """Set PyTorch tensor sharing for DataLoader worker processes."""
+    if strategy not in _VALID_MP_SHARING_STRATEGIES:
+        raise ValueError(
+            "mp_sharing_strategy must be one of "
+            f"{sorted(_VALID_MP_SHARING_STRATEGIES)}, got {strategy!r}"
+        )
+    import torch
+
+    torch.multiprocessing.set_sharing_strategy(strategy)
+
+
+class _MpSharingWorkerInit:
+    """Picklable worker_init_fn. Spawn workers cannot use a lambda or closure."""
+
+    def __init__(self, mp_sharing_strategy: str) -> None:
+        self.mp_sharing_strategy = mp_sharing_strategy
+
+    def __call__(self, worker_id: int) -> None:
+        _configure_torch_mp_sharing_strategy(self.mp_sharing_strategy)
+
+
+def _default_dataloader_multiprocessing_context() -> Optional[str]:
+    """Spawn workers after CUDA init; Linux default fork inherits a broken CUDA state."""
+    if sys.platform in ("win32", "darwin"):
+        return None
+    return "spawn"
 
 
 class TimeSeriesDataModuleZarr:
@@ -70,6 +102,8 @@ class TimeSeriesDataModuleZarr:
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
         return_ic_diagnostics: bool = False,
+        mp_sharing_strategy: Optional[str] = None,
+        dataloader_multiprocessing_context: Optional[str] = None,
     ):
         """
         Parameters
@@ -167,6 +201,14 @@ class TimeSeriesDataModuleZarr:
         self.train_noise_seed = train_noise_seed
         self.in_order = in_order
         self.return_ic_diagnostics = return_ic_diagnostics
+        self.mp_sharing_strategy = mp_sharing_strategy
+        if dataloader_multiprocessing_context is None:
+            dataloader_multiprocessing_context = (
+                _default_dataloader_multiprocessing_context()
+                if num_workers > 0
+                else None
+            )
+        self.dataloader_multiprocessing_context = dataloader_multiprocessing_context
 
         self.train_dataset = None
         self.val_dataset = None
@@ -354,6 +396,14 @@ class TimeSeriesDataModuleZarr:
             dataloader_kwargs["prefetch_factor"] = self.prefetch_factor
         if self.in_order is not None:
             dataloader_kwargs["in_order"] = self.in_order
+        if self.num_workers > 0 and self.mp_sharing_strategy is not None:
+            dataloader_kwargs["worker_init_fn"] = _MpSharingWorkerInit(
+                self.mp_sharing_strategy
+            )
+        if self.num_workers > 0 and self.dataloader_multiprocessing_context is not None:
+            dataloader_kwargs["multiprocessing_context"] = (
+                self.dataloader_multiprocessing_context
+            )
         loader = DataLoader(**dataloader_kwargs)
 
         return loader, sampler
@@ -464,6 +514,8 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
         return_ic_diagnostics: bool = False,
+        mp_sharing_strategy: Optional[str] = None,
+        dataloader_multiprocessing_context: Optional[str] = None,
     ):
         """
         Parameters
@@ -565,6 +617,8 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             train_noise_seed,
             in_order,
             return_ic_diagnostics,
+            mp_sharing_strategy,
+            dataloader_multiprocessing_context,
         )
 
     def _get_coupled_vars(self):
