@@ -40,6 +40,43 @@ if DistributedManager.is_initialized():
     logger = RankZeroLoggingWrapper(logger, DistributedManager())
 
 
+def _constraint_name(name: str) -> str:
+    """Stable constraint id used to bind adaptive-loss scales."""
+    text = str(name).strip()
+    if not text or "/" in text:
+        raise ValueError(
+            "soft constraint name must be a non-empty string without '/'; "
+            f"got {name!r}"
+        )
+    return text
+
+
+def _hpa_token(level: float) -> str:
+    value = float(level)
+    if value.is_integer():
+        return str(int(value))
+    return format(value, "g")
+
+
+def hydrostatic_interface_names(hPa_levels: Sequence[float]) -> list[str]:
+    """Hydrostatic interface names in ``Tv_loss`` order.
+
+    Layer ``i`` is the interface between pressure levels ``i`` and ``i + 1``
+    after sorting ascending, the same order
+    ``DifferentialHydrostaticBalanceConstraint`` writes into ``Tv_avg``.
+    """
+    levels = sorted(float(level) for level in hPa_levels)
+    if len(levels) < 2:
+        raise ValueError(
+            "hydrostasy needs at least two pressure levels to name "
+            f"interfaces, got {list(hPa_levels)}"
+        )
+    return [
+        f"{_hpa_token(lo)}-{_hpa_token(hi)}"
+        for lo, hi in zip(levels, levels[1:])
+    ]
+
+
 def _error_tolerant(error: torch.Tensor) -> torch.Tensor:
     """Error-tolerant map used by hydrostasy soft losses: e / (1 + exp(1 - e))."""
     return error / (1.0 + torch.exp(1.0 - error))
@@ -102,6 +139,22 @@ class SoftConstraint(torch.nn.Module):
             f"{type(self).__name__} does not implement physical_rmse"
         )
 
+    def term_names(self) -> list[str]:
+        """Names of the per-term losses this constraint appends, in order."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement term_names() so adaptive "
+            "loss scales can bind to its terms"
+        )
+
+    def constraint_spec(self) -> tuple[str, list[str]]:
+        """``(name, term_names)`` for scale binding. Term order matches the loss."""
+        if not hasattr(self, "name"):
+            raise AttributeError(
+                f"{type(self).__name__} has no name; pass name= when "
+                "constructing it"
+            )
+        return (_constraint_name(self.name), [str(term) for term in self.term_names()])
+
 
 class HydrostasySoftConstraint(SoftConstraint):
     """
@@ -129,8 +182,10 @@ class HydrostasySoftConstraint(SoftConstraint):
         R: float = 287,
         g0: float = 9.81,
         topography_masking: bool = True,
+        name: str = "hydro",
     ):
         super().__init__()
+        self.name = _constraint_name(name)
         self.g0 = g0
         self.convert_topography_to_meters = convert_topography_to_meters
         self.topography_masking = topography_masking
@@ -273,6 +328,9 @@ class HydrostasySoftConstraint(SoftConstraint):
         x_scaled = x_scaled.transpose(1, 2)
         return x_scaled.reshape((-1, F, C_scaled, H, W))
 
+    def term_names(self) -> list[str]:
+        return hydrostatic_interface_names(self.pressure_levels)
+
     def constraint_loss(
         self,
         prediction: torch.Tensor,
@@ -362,8 +420,10 @@ class DryAirMassSoftConstraint(SoftConstraint):
         g0: float = 9.81,
         input_channels: Optional[Sequence[str]] = None,
         diagnostic_channels: Optional[Sequence[str]] = None,
+        name: str = "dry_air",
     ):
         super().__init__()
+        self.name = _constraint_name(name)
         self.channels = list(channels)
         self.input_channels = (
             list(input_channels) if input_channels is not None else list(channels)
@@ -516,6 +576,9 @@ class DryAirMassSoftConstraint(SoftConstraint):
         sp = self._ic_field("sp", input, input_diagnostics)
         tcwv = self._ic_field("tcwv", input, input_diagnostics)
         return self._global_mean_sp_dry_from_channels(sp, tcwv)
+
+    def term_names(self) -> list[str]:
+        return [self.name]
 
     def constraint_loss(
         self,
@@ -730,8 +793,10 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         convert_topography_to_meters: bool = True,
         input_channels: Optional[Sequence[str]] = None,
         diagnostic_channels: Optional[Sequence[str]] = None,
+        name: str = "aam",
     ):
         super().__init__()
+        self.name = _constraint_name(name)
         self.channels = list(channels)
         self.input_channels = (
             list(input_channels) if input_channels is not None else list(channels)
@@ -1119,6 +1184,9 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
             prev = curr
         return torch.stack(residuals, dim=1)
 
+    def term_names(self) -> list[str]:
+        return [self.name]
+
     def constraint_loss(
         self,
         prediction: torch.Tensor,
@@ -1234,6 +1302,39 @@ class LossWithSoftConstraints(torch.nn.Module):
             self.data_loss.setup(trainer)
         for constraint in self.constraints:
             constraint.setup(trainer)
+
+    def constraint_specs(self) -> list[tuple[str, list[str]]]:
+        """``(name, term_names)`` for each constraint, in concatenation order.
+
+        Adaptive loss weights bind relative scales to these names. Term order
+        inside a constraint matches the vector that constraint appends.
+        """
+        specs: list[tuple[str, list[str]]] = []
+        seen: set[str] = set()
+        for constraint in self.constraints:
+            spec_fn = getattr(constraint, "constraint_spec", None)
+            if spec_fn is None:
+                raise TypeError(
+                    f"{type(constraint).__name__} does not expose constraint_spec()"
+                )
+            name, term_names = spec_fn()
+            name = str(name)
+            terms = [str(term) for term in term_names]
+            if name in seen:
+                raise ValueError(
+                    f"duplicate soft-constraint name {name!r}; each constraint "
+                    "needs its own name"
+                )
+            if not terms:
+                raise ValueError(f"soft constraint {name!r} exposes no terms")
+            if any("/" in term for term in terms):
+                raise ValueError(
+                    f"soft constraint {name!r} term names must not contain '/': "
+                    f"{terms}"
+                )
+            seen.add(name)
+            specs.append((name, terms))
+        return specs
 
     def _constraint_parts(
         self,
