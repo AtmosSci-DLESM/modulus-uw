@@ -280,7 +280,8 @@ def load_windowed_channel_data(
     output_time_idx: np.ndarray | None = None,
     input_scaling: Mapping | None = None,
     output_scaling: Mapping | None = None,
-) -> tuple[np.ndarray, np.ndarray | None]:
+    ic_diagnostic_names: Sequence[str] | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Load and scale fields directly into (B, T, C, F, H, W) sample windows.
 
     For per-variable stores, each unique field is decoded and scaled once on
@@ -303,14 +304,19 @@ def load_windowed_channel_data(
         Optional ``{"mean", "std"}`` arrays indexed by channel position in
         ``input_names`` / ``output_names``. Mean/std are shaped
         ``(1, C, 1, 1, 1)``.
+    ic_diagnostic_names :
+        Optional output-only channel names gathered at ``input_time_idx`` and
+        scaled with ``output_scaling``. Empty or omitted yields ``None``.
 
     Returns
     -------
-    inputs, targets
+    inputs, targets, ic_diagnostics
         ``inputs`` has shape ``(B, T_in, C_in, ...)``. ``targets`` is ``None``
-        when ``output_names`` is omitted.
+        when ``output_names`` is omitted. ``ic_diagnostics`` is ``None`` when
+        ``ic_diagnostic_names`` is empty; otherwise ``(B, T_in, C_diag, ...)``.
     """
     input_names = list(input_names)
+    ic_diag_names = list(ic_diagnostic_names or [])
     _require_layout(ds)
     if len(input_names) == 0:
         raise ValueError("empty input field name list")
@@ -323,7 +329,9 @@ def load_windowed_channel_data(
         # Scale on (T, C, F, H, W) before the window gather. Mean/std shaped
         # (1, C, 1, 1, 1) align with that axis; they do not align with
         # (B, T, C, F, H, W).
-        names = list(dict.fromkeys(list(input_names) + list(output_names or [])))
+        names = list(dict.fromkeys(
+            list(input_names) + list(output_names or []) + ic_diag_names
+        ))
         staging = np.array(load_channel_data(ds, time_sl, names, scaling=None))
         _scale_stacked_staging(
             staging,
@@ -348,7 +356,13 @@ def load_windowed_channel_data(
             targets = staging[
                 output_time_idx[:, :, np.newaxis], out_c[np.newaxis, np.newaxis, :]
             ]
-        return inputs, targets
+        ic_diagnostics = None
+        if ic_diag_names:
+            ic_c = np.asarray([name_to_i[n] for n in ic_diag_names], dtype=np.intp)
+            ic_diagnostics = staging[
+                input_time_idx[:, :, np.newaxis], ic_c[np.newaxis, np.newaxis, :]
+            ]
+        return inputs, targets, ic_diagnostics
 
     from .zarr_shard_read import read_field_time
 
@@ -374,6 +388,14 @@ def load_windowed_channel_data(
             )
         targets_cf = np.empty((len(out_names), batch_size, t_out) + spatial, dtype=dtype)
 
+    ic_diag_cf = None
+    ic_pos: dict[str, int] = {}
+    if ic_diag_names:
+        ic_diag_cf = np.empty(
+            (len(ic_diag_names), batch_size, t_in) + spatial, dtype=dtype
+        )
+        ic_pos = {n: i for i, n in enumerate(ic_diag_names)}
+
     # Unique fields → destinations in input and/or target channel axes.
     slots: dict[str, tuple[int | None, int | None]] = {}
     for c, name in enumerate(input_names):
@@ -382,22 +404,28 @@ def load_windowed_channel_data(
     for c, name in enumerate(out_names):
         in_c, out_c = slots.get(name, (None, None))
         slots[name] = (in_c, c)
+    for name in ic_diag_names:
+        slots.setdefault(name, (None, None))
 
-    def _place(block: np.ndarray, in_c: int | None, out_c: int | None) -> None:
+    def _place(block: np.ndarray, in_c: int | None, out_c: int | None, name: str) -> None:
         # Scale once. Shared input/output vars use the same physical mean/std;
         # prefer input_scaling when the field appears in both buffers.
         if in_c is not None and input_scaling is not None:
             block = _apply_channel_scaling(block, input_scaling, in_c)
         elif out_c is not None and output_scaling is not None:
             block = _apply_channel_scaling(block, output_scaling, out_c)
+        elif name in ic_pos and output_scaling is not None and out_names:
+            block = _apply_channel_scaling(block, output_scaling, out_names.index(name))
         if in_c is not None:
             inputs_cf[in_c] = block[input_time_idx]
         if out_c is not None:
             targets_cf[out_c] = block[output_time_idx]
+        if name in ic_pos:
+            ic_diag_cf[ic_pos[name]] = block[input_time_idx]
 
     def _fill(name: str, in_c: int | None, out_c: int | None) -> None:
         block = read_field_time(ds, name, time_sl)
-        _place(block, in_c, out_c)
+        _place(block, in_c, out_c, name)
 
     _run_parallel(
         [lambda n=n, ic=ic, oc=oc: _fill(n, ic, oc) for n, (ic, oc) in slots.items()]
@@ -405,7 +433,10 @@ def load_windowed_channel_data(
     # (C, B, T, ...) -> (B, T, C, ...); view, no copy.
     inputs = np.transpose(inputs_cf, (1, 2, 0, 3, 4, 5))
     targets = None if targets_cf is None else np.transpose(targets_cf, (1, 2, 0, 3, 4, 5))
-    return inputs, targets
+    ic_diagnostics = (
+        None if ic_diag_cf is None else np.transpose(ic_diag_cf, (1, 2, 0, 3, 4, 5))
+    )
+    return inputs, targets, ic_diagnostics
 
 
 def load_constant_fields(ds, field_names: Sequence[str]) -> np.ndarray:
