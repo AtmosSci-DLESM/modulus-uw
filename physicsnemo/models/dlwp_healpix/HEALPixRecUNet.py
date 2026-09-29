@@ -567,10 +567,29 @@ class HEALPixRecUNet(Module):
             diagnostics = combined[:, :, :, self.input_channels:]
             out = th.cat([prognostics, diagnostics], dim=3)
 
-            # Apply constraints
+            # Apply constraints. Insolation and constants are taken from the
+            # pre-reorder folded input so a structural channel permutation
+            # does not move them. Only constraints that accept ``aux`` see it.
             if self.constraints is not None:
+                from physicsnemo.models.dlwp_healpix_layers.healpix_column_energy_constraint import (
+                    accepts_forcing,
+                    forcing_from_folded_input,
+                )
+
+                residual_src = locals().get("input_for_residual", input_tensor)
+                aux = forcing_from_folded_input(
+                    residual_src,
+                    input_channels=self.input_channels,
+                    input_time_dim=self.input_time_dim,
+                    decoder_input_channels=self.decoder_input_channels,
+                    n_constants=self.n_constants,
+                    num_faces=self.unfold.num_faces,
+                )
                 for constraint in self.constraints:
-                    out = constraint(out, orig_input)
+                    if accepts_forcing(constraint):
+                        out = constraint(out, orig_input, aux=aux)
+                    else:
+                        out = constraint(out, orig_input)
 
             outputs.append(out)
             # th.cuda.nvtx.range_pop()
