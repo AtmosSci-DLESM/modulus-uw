@@ -7,13 +7,11 @@ layouts fall back to the zarr codec path. Stacked ``inputs`` reads never come he
 
 from __future__ import annotations
 
-import mmap
 import os
 import threading
 
 import numpy as np
 
-_DIRECT_ALIGN = 4096
 _MAX_U64 = np.uint64(2**64 - 1)
 _COORD_KEYS = frozenset({"time", "face", "height", "width", "lat", "lon"})
 
@@ -110,41 +108,15 @@ def _read_index_tail(path: str, index_nbytes: int) -> bytes:
         os.close(fd)
 
 
-def _pread_direct(path: str, offset: int, length: int) -> bytes:
-    """One aligned O_DIRECT read. Raises OSError so the caller can fall back."""
-    if not hasattr(os, "O_DIRECT"):
-        raise OSError("O_DIRECT is not available")
-    aligned = _DIRECT_ALIGN
-    start = (offset // aligned) * aligned
-    end = ((offset + length + aligned - 1) // aligned) * aligned
-    buf = mmap.mmap(-1, end - start)
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
-        try:
-            nread = os.preadv(fd, [memoryview(buf)], start)
-        finally:
-            os.close(fd)
-        need = (offset - start) + length
-        if nread < need:
-            raise OSError(f"short O_DIRECT read of {path}")
-        rel = offset - start
-        return bytes(memoryview(buf)[rel : rel + length])
-    finally:
-        buf.close()
-
-
 def _pread_span(path: str, offset: int, length: int) -> bytes:
-    """Read ``length`` bytes at ``offset``. Prefer one O_DIRECT syscall."""
+    """One buffered read of ``length`` bytes at ``offset``."""
     if length <= 0:
         return b""
+    fd = os.open(path, os.O_RDONLY)
     try:
-        return _pread_direct(path, offset, length)
-    except OSError:
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            return _pread_exact(fd, length, offset)
-        finally:
-            os.close(fd)
+        return _pread_exact(fd, length, offset)
+    finally:
+        os.close(fd)
 
 
 def _time_slice_bounds(n_time: int, time_sl: slice) -> tuple[int, int] | None:
