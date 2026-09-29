@@ -337,6 +337,85 @@ def test_log_and_pending_buffers_keep_identity_across_forwards():
     assert float(wrap.weights[0]) > float(wrap.weights[1])
 
 
+class _SpecTerms(_FixedTerms):
+    def __init__(self, terms: torch.Tensor, specs):
+        super().__init__(terms)
+        self._specs = list(specs)
+
+    def constraint_specs(self):
+        return self._specs
+
+
+def test_named_scales_follow_constraint_order_not_yaml_order():
+    inner = _SpecTerms(
+        torch.ones(6),
+        [
+            ("hydro", ["50-100", "850-1000"]),
+            ("dry_air", ["dry_air"]),
+            ("aam", ["aam"]),
+        ],
+    )
+    # YAML lists the groups in a different order than the constraint modules.
+    wrap = AdaptiveLossWeights(
+        inner=inner,
+        n_data_variables=2,
+        constraint_groups=[
+            {"name": "aam", "scales": 0.25},
+            {"name": "dry_air", "scales": [0.5]},
+            {
+                "name": "hydro",
+                "scales": {"850-1000": 0.01, "50-100": 0.001},
+            },
+        ],
+        warmup_epochs=1,
+        steps_per_epoch=2,
+        variable_names=["a", "b"],
+    )
+    assert torch.allclose(
+        wrap.relative_scales,
+        torch.tensor([1.0, 1.0, 0.001, 0.01, 0.5, 0.25]),
+    )
+    assert wrap.term_names[-4:] == [
+        "hydro/50-100",
+        "hydro/850-1000",
+        "dry_air",
+        "aam",
+    ]
+    assert "loss_constraint/hydro/50-100" in wrap.log_buffers
+    assert "loss_constraint/hydro/0" not in wrap.log_buffers
+
+
+def test_named_scales_reject_mismatches():
+    hydro = _SpecTerms(
+        torch.ones(3),
+        [("hydro", ["50-100", "100-150"])],
+    )
+    with pytest.raises(ValueError, match="mapping"):
+        AdaptiveLossWeights(
+            inner=hydro,
+            n_data_variables=1,
+            constraint_groups=[{"name": "hydro", "scales": [0.001, 0.001]}],
+            steps_per_epoch=1,
+        )
+    with pytest.raises(ValueError, match="missing"):
+        AdaptiveLossWeights(
+            inner=hydro,
+            n_data_variables=1,
+            constraint_groups=[{"name": "hydro", "scales": {"50-100": 0.001}}],
+            steps_per_epoch=1,
+        )
+    with pytest.raises(ValueError, match="extra"):
+        AdaptiveLossWeights(
+            inner=_SpecTerms(torch.ones(2), [("dry_air", ["dry_air"])]),
+            n_data_variables=1,
+            constraint_groups=[
+                {"name": "dry_air", "scales": 0.001},
+                {"name": "aam", "scales": 0.001},
+            ],
+            steps_per_epoch=1,
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph")
 def test_eval_graph_capture_does_not_orphan_train_log_buffers():
     device = torch.device("cuda")
