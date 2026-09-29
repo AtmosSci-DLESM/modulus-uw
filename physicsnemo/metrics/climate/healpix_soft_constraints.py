@@ -793,8 +793,10 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         convert_topography_to_meters: bool = True,
         input_channels: Optional[Sequence[str]] = None,
         diagnostic_channels: Optional[Sequence[str]] = None,
+        name: str = "aam",
     ):
         super().__init__()
+        self.name = _constraint_name(name)
         self.channels = list(channels)
         self.input_channels = (
             list(input_channels) if input_channels is not None else list(channels)
@@ -1181,6 +1183,9 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
             residuals.append(dmdt - torques[:, t])
             prev = curr
         return torch.stack(residuals, dim=1)
+
+    def term_names(self) -> list[str]:
+        return [self.name]
 
     def constraint_loss(
         self,
