@@ -213,4 +213,5 @@ def test_earth_aam_positive_for_positive_sp():
 def test_aam_constraint_spec_is_its_name():
     aam = AxialAngularMomentumSoftConstraint.__new__(AxialAngularMomentumSoftConstraint)
     aam.name = "aam"
-    assert aam.constraint_spec() == ("aam", ["aam"])
+    aam.relative_scales = 0.001
+    assert aam.constraint_spec() == ("aam", ["aam"], 0.001)
