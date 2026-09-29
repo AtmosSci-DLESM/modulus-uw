@@ -28,6 +28,9 @@ from physicsnemo.models.dlwp_healpix_layers import (
     HEALPixUnfoldFaces,
     warn_deprecated_enable_healpixpad,
 )
+from physicsnemo.models.dlwp_healpix_layers.healpix_constraints import (
+    constraint_configs,
+)
 from physicsnemo.models.meta import ModelMetaData
 from physicsnemo.models.module import Module
 
@@ -384,15 +387,17 @@ class HEALPixRecUNet(Module):
 
     def set_constraints(self, constraints: list[DictConfig] = None):
         """
-        Sets constraints (e.g., non-negative) to be applied to the model outputs
+        Sets constraints (e.g., non-negative) to be applied to the model outputs.
 
         Parameters
         ----------
-        constraints: list[DictConfig]
-            List of hydra instantiable DictConfigs specifying constraints
+        constraints: list[DictConfig] or dict[str, DictConfig], optional
+            Hydra configs for constraints, as a list in application order or a
+            name-keyed mapping. Mapping keys are unused labels.
         """
-        if constraints is not None:
-            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
+        specs = constraint_configs(constraints)
+        if specs is not None:
+            self.constraints = [instantiate(spec) for spec in specs]
 
     def _initialize_hidden(
         self, inputs: Sequence, outputs: Sequence, step: int, conditions_cln: Sequence = None
