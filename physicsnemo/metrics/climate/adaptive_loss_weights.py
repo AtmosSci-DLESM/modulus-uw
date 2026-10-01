@@ -191,6 +191,9 @@ class AdaptiveLossWeights(torch.nn.Module):
         # the capture-time values for the rest of the run.
         self.log_buffers: Dict[str, torch.Tensor] = {}
         self._log_tags: List[str] = []
+        # Python mirror of the ema_initialized buffer. post_backward_update
+        # reads this instead of syncing the device buffer on every step.
+        self._ema_ready = False
 
         if self._n_data_arg is not None:
             self._build(self._n_data_arg)
@@ -458,6 +461,19 @@ class AdaptiveLossWeights(torch.nn.Module):
         self._bind_log_buffers()
         # Warmup weights: 1 on variables, s_k on constraints.
         self.weights.copy_(self.relative_loss_scale)
+        self._sync_ema_ready_flag()
+
+    def _sync_ema_ready_flag(self) -> None:
+        """Read ema_initialized once. Resume calls this from load_state_dict."""
+        if not self._built:
+            self._ema_ready = False
+            return
+        self._ema_ready = bool(int(self.ema_initialized.detach().cpu()))
+
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        out = super().load_state_dict(state_dict, *args, **kwargs)
+        self._sync_ema_ready_flag()
+        return out
 
     def _ema_beta(self) -> float:
         if self.steps_per_epoch is None or self.steps_per_epoch < 1:
@@ -496,31 +512,36 @@ class AdaptiveLossWeights(torch.nn.Module):
         weighted: torch.Tensor,
         scalar: torch.Tensor,
     ) -> None:
-        # ``copy_`` into the buffers bound at setup. Assigning a new dict here
-        # is not replayed, so the eval-graph capture would leave the trainer
-        # reading capture-time tensors for every later training step.
+        # One write into the buffer bound at setup. A fresh tensor here would
+        # not be replayed, and a per-channel copy_ is a kernel per log tag.
         C = self.n_data_variables
         c_float = float(C)
-        values: List[torch.Tensor] = [
-            scalar.detach(),
-            (weighted[:C].sum() / c_float).detach(),
-        ]
+        cursor = 0
+
+        def _put_scalar(val: torch.Tensor) -> None:
+            nonlocal cursor
+            self._log_values[cursor].copy_(val.detach())
+            cursor += 1
+
+        _put_scalar(scalar)
+        _put_scalar(weighted[:C].sum() / c_float)
         for _name, sl, term_names in self._group_slices:
-            values.append((weighted[sl].sum() / c_float).detach())
+            _put_scalar(weighted[sl].sum() / c_float)
             if len(term_names) > 1:
-                for i in range(len(term_names)):
-                    values.append((weighted[sl.start + i] / c_float).detach())
-        for i in range(self.n_terms):
-            values.append(self.weights[i].detach())
-            values.append(weighted[i].detach())
-            values.append(unweighted[i].detach())
-        if len(values) != self._log_values.numel():
+                block = (weighted[sl] / c_float).detach()
+                self._log_values[cursor : cursor + block.numel()].copy_(block)
+                cursor += block.numel()
+        tail = self._log_values[cursor:]
+        if tail.numel() != 3 * self.n_terms:
             raise RuntimeError(
-                f"AdaptiveLossWeights produced {len(values)} log values "
-                f"for {self._log_values.numel()} slots."
+                f"AdaptiveLossWeights log tail has {tail.numel()} slots for "
+                f"{self.n_terms} terms."
             )
-        for i, val in enumerate(values):
-            self._log_values[i].copy_(val)
+        # Tag order is weight, weighted, unweighted for each term.
+        grid = tail.view(self.n_terms, 3)
+        grid[:, 0].copy_(self.weights.detach())
+        grid[:, 1].copy_(weighted.detach())
+        grid[:, 2].copy_(unweighted.detach())
 
     def forward(
         self,
@@ -587,9 +608,10 @@ class AdaptiveLossWeights(torch.nn.Module):
             dist.all_reduce(terms, op=dist.ReduceOp.SUM)
             terms = terms / dist.get_world_size()
 
-        if int(self.ema_initialized.item()) == 0:
+        if not self._ema_ready:
             self.ema.copy_(terms)
             self.ema_initialized.fill_(1)
+            self._ema_ready = True
         else:
             beta = self._ema_beta()
             self.ema.mul_(beta).add_(terms, alpha=1.0 - beta)
