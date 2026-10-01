@@ -766,15 +766,15 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
         #   out = 0.5 * (g0 + g1)      (where valid1==1)
         # and valid1==1 positions are extremely sparse.
         i0 = self._index0.view(1, 1, -1).expand(B, C, -1)
-        g0 = flat.gather(dim=2, index=i0.to(device=data.device))
+        g0 = flat.gather(dim=2, index=i0.to(device=data.device).long())
 
         pos_v1 = self._pos_v1
         if pos_v1.numel() > 0:
             Nv1 = int(pos_v1.numel())
-            g0_sub = g0.index_select(dim=2, index=pos_v1.to(device=data.device))
+            g0_sub = g0.index_select(dim=2, index=pos_v1.to(device=data.device).long())
 
             i1_sub = self._index1_pos_v1.view(1, 1, Nv1).expand(B, C, Nv1)
-            g1_sub = flat.gather(dim=2, index=i1_sub.to(device=data.device))
+            g1_sub = flat.gather(dim=2, index=i1_sub.to(device=data.device).long())
 
             # out[pos_v1] = 0.5 * (g0_sub + g1_sub)
             #             = g0_sub + 0.5 * (g1_sub - g0_sub)
