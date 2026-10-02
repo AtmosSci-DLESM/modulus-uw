@@ -150,7 +150,7 @@ def test_TimeSeriesDataset_missing_time(tmp_path):
 
 
 def _make_minimal_healpix_zarr(path, channel_in, n_time=8):
-    """Write a tiny monolithic HEALPix zarr suitable for TimeSeriesDatasetZarr."""
+    """Write a tiny stacked HEALPix zarr suitable for TimeSeriesDatasetZarr."""
     face, height, width = 1, 2, 2
     times = pd.date_range("1979-01-01", periods=n_time, freq="6h")
     n_chan = len(channel_in)
