@@ -109,7 +109,10 @@ class RingMeanPCHIPUpsample(nn.Module):
         """``[B, C, N]`` coarse pixels → ``[B, C, N_fine]`` in the same pixel order."""
         means = _ring_means(faces, self.src_ring, self.src_counts)
         anomaly = faces - means.index_select(-1, self.src_ring)
-        fine_anom = self.regrid(anomaly)
+        # Same weights as earth2grid's regridder. A short gather stays in the
+        # CUDA graph; embedding_bag's per-sample-weight backward is slow and
+        # its runtime varies across ranks, which stalls the DDP step.
+        fine_anom = _bilinear_regrid(anomaly, self.regrid.index, self.regrid.weight)
         fine_mean = _ring_means(fine_anom, self.dst_ring, self.dst_counts)
         zonal = _pchip_to_fine(
             means,
@@ -122,6 +125,25 @@ class RingMeanPCHIPUpsample(nn.Module):
         return fine_anom - fine_mean.index_select(-1, self.dst_ring) + zonal.index_select(
             -1, self.dst_ring
         )
+
+
+def _bilinear_regrid(
+    values: torch.Tensor, index: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Weighted sum of ``P`` source pixels. ``values`` is ``[B, C, N_in]``.
+
+    ``index`` and ``weight`` are the earth2grid regridder buffers, shape
+    ``(*N_out, P)``. ``P`` is 4 for HEALPix bilinear, so the loop is a handful
+    of gathers rather than one ``embedding_bag``.
+    """
+    *out_shape, n_neighbors = index.shape
+    flat = values.reshape(-1, values.shape[-1])
+    src_index = index.reshape(-1, n_neighbors)
+    src_weight = weight.reshape(-1, n_neighbors).to(dtype=flat.dtype)
+    acc = flat.new_zeros(flat.shape[0], src_index.shape[0])
+    for neighbor in range(n_neighbors):
+        acc += flat[:, src_index[:, neighbor]] * src_weight[:, neighbor]
+    return acc.view(*values.shape[:-1], *out_shape)
 
 
 def _ring_means(values: torch.Tensor, ring: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
@@ -185,6 +207,73 @@ def _pchip_to_fine(means, h, interval, interval_t, clamp_left, clamp_right):
     values = torch.where(clamp_left, means[..., :1], values)
     values = torch.where(clamp_right, means[..., -1:], values)
     return values
+
+
+class RingMeanPCHIPUpsampleFaces(nn.Module):
+    """Ring-mean PCHIP upsample on folded faces, with no convolution.
+
+    ``nside`` is the coarse face size, the same convention as the decoder
+    upsample blocks. Activation, kernel, and padding arguments are accepted
+    and ignored so a decoder upsample config can target this class without
+    keeping the learned 3×3.
+    """
+
+    def __init__(
+        self,
+        geometry_layer=None,
+        in_channels: int = 1,
+        out_channels: int | None = None,
+        kernel_size: int = 3,
+        dilation: int = 1,
+        scale_factor: int = 2,
+        mode: str = "nearest",
+        activation: nn.Module | None = None,
+        odd_fraction: float = 0.25,
+        enable_nhwc: bool = False,
+        hpx_padding_mode: str | None = None,
+        compile_padding: bool = False,
+        nside: int = 32,
+        enable_healpixpad: bool | None = None,
+        **kwargs,
+    ):
+        super().__init__()
+        del geometry_layer, kernel_size, dilation, mode, activation, odd_fraction
+        del hpx_padding_mode, compile_padding, enable_healpixpad, kwargs
+        if out_channels is not None and int(out_channels) != int(in_channels):
+            raise ValueError(
+                "ring-mean PCHIP upsample keeps the channel count, "
+                f"got in_channels={in_channels} out_channels={out_channels}"
+            )
+        self.in_channels = int(in_channels)
+        self.enable_nhwc = bool(enable_nhwc)
+        self.resample = RingMeanPCHIPUpsample(nside=int(nside), scale_factor=int(scale_factor))
+
+    def forward(self, x, sin_lat_gate=None):
+        del sin_lat_gate
+        channels_last = x.is_contiguous(memory_format=torch.channels_last) or self.enable_nhwc
+        x = x.contiguous()
+        batch_faces, channels, height, width = x.shape
+        if channels != self.in_channels:
+            raise ValueError(f"expected {self.in_channels} channels, got {channels}")
+        if height != self.resample.nside or width != self.resample.nside:
+            raise ValueError(
+                f"expected face size {self.resample.nside}, got {(height, width)}"
+            )
+        if batch_faces % 12 != 0:
+            raise ValueError(f"batch*faces must be divisible by 12, got {batch_faces}")
+        batch = batch_faces // 12
+        pixels = x.view(batch, 12, channels, height, width).permute(0, 2, 1, 3, 4).reshape(
+            batch, channels, -1
+        )
+        orig_dtype = pixels.dtype
+        with torch.amp.autocast("cuda", enabled=False):
+            fine = self.resample(pixels.float())
+        fine_n = self.resample.fine_nside
+        fine = fine.to(dtype=orig_dtype).view(batch, channels, 12, fine_n, fine_n)
+        fine = fine.permute(0, 2, 1, 3, 4).contiguous().view(batch_faces, channels, fine_n, fine_n)
+        if channels_last:
+            fine = fine.to(memory_format=torch.channels_last)
+        return fine
 
 
 class ReflectionSteerableRingMeanPCHIPConv(nn.Module):
