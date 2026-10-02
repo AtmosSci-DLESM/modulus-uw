@@ -20,8 +20,8 @@ from earth2grid.healpix import HEALPIX_PAD_XY
 
 from physicsnemo.models.layers.activations import Tanh
 
-from .reflection_ops import bank_sizes
 from .healpix_paddings import warn_deprecated_enable_healpixpad
+from .reflection_ops import REFL_FACE_ORDER, bank_sizes, hpx_spatial_reflect
 from .reflection_steerable_blocks import _PaddedReflectionSteerableConv
 from .reflection_steerable_conv import (
     ParitySplitActivation,
@@ -212,6 +212,7 @@ class RingMeanPCHIPUpsampleFaces(nn.Module):
         compile_padding: bool = False,
         nside: int = 32,
         enable_healpixpad: bool | None = None,
+        reflection_equivariant: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -224,10 +225,18 @@ class RingMeanPCHIPUpsampleFaces(nn.Module):
             )
         self.in_channels = int(in_channels)
         self.enable_nhwc = bool(enable_nhwc)
+        self.reflection_equivariant = bool(reflection_equivariant)
         self.resample = RingMeanPCHIPUpsample(nside=int(nside), scale_factor=int(scale_factor))
+        if self.reflection_equivariant:
+            # Same buffer as the downsample projector so CUDA-graph capture
+            # does not allocate the face order on the forward.
+            self.register_buffer(
+                "_refl_face_order",
+                torch.tensor(REFL_FACE_ORDER, dtype=torch.long),
+                persistent=False,
+            )
 
-    def forward(self, x, sin_lat_gate=None):
-        del sin_lat_gate
+    def _upsample_faces(self, x: torch.Tensor) -> torch.Tensor:
         channels_last = x.is_contiguous(memory_format=torch.channels_last) or self.enable_nhwc
         x = x.contiguous()
         batch_faces, channels, height, width = x.shape
@@ -252,6 +261,32 @@ class RingMeanPCHIPUpsampleFaces(nn.Module):
         if channels_last:
             fine = fine.to(memory_format=torch.channels_last)
         return fine
+
+    def forward(self, x, sin_lat_gate=None):
+        del sin_lat_gate
+        y = self._upsample_faces(x)
+        if not self.reflection_equivariant:
+            return y
+        # Π(up)(x) = ½(up(x) + ρ up(ρ x)). Bare PCHIP does not intertwine with
+        # equatorial reflection; this is the downsample's projector, not a 3×3.
+        fo = self._refl_face_order
+        y_r = self._upsample_faces(hpx_spatial_reflect(x, face_order=fo))
+        return 0.5 * (y + hpx_spatial_reflect(y_r, face_order=fo))
+
+
+class ReflectionSteerableRingMeanPCHIPUpsampleFaces(RingMeanPCHIPUpsampleFaces):
+    """Parameter-free reflection-equivariant ring-mean PCHIP upsample.
+
+    ``ReflectionSteerableRingMeanPCHIPConv`` is this resample plus a learned
+    3×3. A hard constraint cannot train that conv, so this class keeps the
+    resample and the spatial Z₂ projector used by ``DealiasedDownsample``.
+    """
+
+    reflection_steerable = True
+
+    def __init__(self, *args, reflection_equivariant: bool = True, **kwargs):
+        del reflection_equivariant
+        super().__init__(*args, reflection_equivariant=True, **kwargs)
 
 
 class ReflectionSteerableRingMeanPCHIPConv(nn.Module):
