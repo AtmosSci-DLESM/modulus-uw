@@ -69,6 +69,14 @@ class InputSkipTruncateConstraint(torch.nn.Module):
         self._pred_idx = tuple(pred_idx)
         self._orig_idx = tuple(orig_idx)
 
+        if isinstance(down_sampling_block, torch.nn.Module) or isinstance(
+            up_sampling_block, torch.nn.Module
+        ):
+            raise TypeError(
+                "down_sampling_block and up_sampling_block must be configs. "
+                "Set _recursive_: false on the truncate constraint so nside and "
+                "channel count are injected before the blocks are built."
+            )
         scale = _cfg_int(up_sampling_block, "scale_factor", 2)
         stride = _cfg_int(down_sampling_block, "stride", 2)
         if scale != stride:
