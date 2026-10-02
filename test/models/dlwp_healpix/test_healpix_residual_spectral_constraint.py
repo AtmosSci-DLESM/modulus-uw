@@ -26,6 +26,7 @@ import torch
 from physicsnemo.models.dlwp_healpix_layers.healpix_residual_spectral_constraint import (
     InputSkipSpectralLowPassConstraint,
     ResidualSpectralLowPassConstraint,
+    raised_cosine_window,
 )
 
 NSIDE = 8
@@ -189,3 +190,34 @@ def test_input_skip_drops_high_ell_of_state_keeps_residual():
     p_kept = _ell_power(mod, out[:, :, :, :1])
     assert torch.allclose(p_kept[CUTOFF:], p_res[CUTOFF:], rtol=1e-3, atol=1e-5)
     assert torch.allclose(p_kept[:CUTOFF], p_res[:CUTOFF], rtol=1e-3, atol=1e-5)
+
+
+def test_raised_cosine_is_one_at_32_half_at_48_zero_at_64():
+    ell = torch.arange(96)
+    window = raised_cosine_window(ell, 32, 64)
+    assert window[32].item() == pytest.approx(1.0)
+    assert window[48].item() == pytest.approx(0.5)
+    assert window[64].item() == pytest.approx(0.0)
+    assert torch.all(window[:32] == 1)
+    assert torch.all(window[64:] == 0)
+
+
+def test_omitted_taper_stays_a_brick_wall():
+    mod = _make_mod()
+    mask = mod.ell_mask[0, :, 0]
+    assert torch.all(mask[:CUTOFF] == 1)
+    assert torch.all(mask[CUTOFF:] == 0)
+
+
+def test_taper_end_replaces_brick_wall_on_that_channel_only():
+    mod = _make_mod(
+        cutoffs={"PRESsfc": 8, "TMP2m": 4},
+        taper_ends={"PRESsfc": 16},
+    )
+    press = mod.ell_mask[0, :, 0]
+    temp = mod.ell_mask[1, :, 0]
+    assert press[8].item() == pytest.approx(1.0)
+    assert press[12].item() == pytest.approx(0.5)
+    assert press[16].item() == pytest.approx(0.0)
+    assert torch.all(temp[:4] == 1)
+    assert torch.all(temp[4:] == 0)
