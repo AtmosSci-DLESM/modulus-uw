@@ -29,6 +29,10 @@ this step's residual.
 
 Per-variable cutoffs are compile-friendly buffers; SHT matches the FACE→RING
 path in ``healpix_loss``.
+
+``taper_ends`` replaces the brick wall with a raised cosine. ``cutoffs[name]``
+is then the last degree kept in full, and ``taper_ends[name]`` is the first
+degree set to zero. Degrees in between use ``½(1 + cos(π(ℓ − start)/(end − start)))``.
 """
 
 from __future__ import annotations
@@ -42,6 +46,21 @@ from cuhpx import SHTCUDA, iSHTCUDA
 from earth2grid.healpix import HEALPIX_PAD_XY, PixelOrder
 
 
+def raised_cosine_window(ell: torch.Tensor, start: int, end: int) -> torch.Tensor:
+    """Weight 1 through ``start``, 0 from ``end`` up, cosine in between.
+
+    At the midpoint the weight is 1/2. ``ell`` is an integer degree tensor.
+    """
+    if end <= start:
+        raise ValueError(f"taper end {end} must be greater than start {start}")
+    width = float(end - start)
+    t = (ell.to(torch.float32) - float(start)) / width
+    window = 0.5 * (1.0 + torch.cos(t * math.pi))
+    window = torch.where(ell <= start, torch.ones_like(window), window)
+    window = torch.where(ell >= end, torch.zeros_like(window), window)
+    return window
+
+
 class ResidualSpectralLowPassConstraint(torch.nn.Module):
     def __init__(
         self,
@@ -51,6 +70,7 @@ class ResidualSpectralLowPassConstraint(torch.nn.Module):
         nside: int = 64,
         lmax: int | None = None,
         mmax: int | None = None,
+        taper_ends: dict[str, int] | None = None,
     ):
         """
         Parameters
@@ -58,7 +78,12 @@ class ResidualSpectralLowPassConstraint(torch.nn.Module):
         cutoffs: dict[str, int]
             Prognostic variable → exclusive spherical-harmonic cutoff. Modes
             with ``ℓ < cutoff`` are kept; ``ℓ >= cutoff`` of the residual is
-            zeroed. Example: ``{"PRESsfc": 128}``.
+            zeroed.             Example: ``{"PRESsfc": 128}``. With ``taper_ends``, this is the last
+            degree whose weight is 1, not a brick wall.
+        taper_ends: dict[str, int], optional
+            Prognostic → first degree whose weight is 0. Omitted variables keep
+            the brick wall ``ℓ < cutoff``. The cosine is centered halfway
+            between the cutoff and this end.
         in_channels: list[str]
             Prognostic / RecUNet input channel names. Residuals are taken from
             these channels of ``input``.
@@ -90,6 +115,13 @@ class ResidualSpectralLowPassConstraint(torch.nn.Module):
         pred_idx: list[int] = []
         orig_idx: list[int] = []
         cutoff_list: list[int] = []
+        taper_ends = {} if taper_ends is None else dict(taper_ends)
+        unknown_taper = set(taper_ends) - set(cutoffs)
+        if unknown_taper:
+            raise ValueError(
+                f"taper_ends {sorted(unknown_taper)} are not in cutoffs {sorted(cutoffs)}"
+            )
+        taper_list: list[int | None] = []
         for name, raw_cut in cutoffs.items():
             if name not in self.out_names:
                 raise ValueError(
@@ -108,9 +140,21 @@ class ResidualSpectralLowPassConstraint(torch.nn.Module):
                     f"cutoff for {name!r} is {cut} but SHT lmax is {self.lmax}; "
                     "keep ℓ < cutoff so cutoff must be <= lmax"
                 )
+            end = taper_ends.get(name)
+            if end is not None:
+                end = int(end)
+                if end <= cut:
+                    raise ValueError(
+                        f"taper end for {name!r} is {end} but cutoff start is {cut}"
+                    )
+                if end > self.lmax:
+                    raise ValueError(
+                        f"taper end for {name!r} is {end} but SHT lmax is {self.lmax}"
+                    )
             pred_idx.append(self.out_names.index(name))
             orig_idx.append(self.in_names.index(name))
             cutoff_list.append(cut)
+            taper_list.append(end)
 
         # Python tuples so torch.compile unrolls constant integer slices.
         self._pred_idx = tuple(pred_idx)
@@ -118,8 +162,14 @@ class ResidualSpectralLowPassConstraint(torch.nn.Module):
         self._cutoffs = tuple(cutoff_list)
 
         ell = torch.arange(self.lmax)
-        # [n_sel, lmax, 1] — broadcast over m. Keep ℓ < cutoff.
-        ell_mask = torch.stack([(ell < cut).to(torch.float32) for cut in self._cutoffs], dim=0)
+        # [n_sel, lmax, 1] — broadcast over m.
+        masks = []
+        for cut, end in zip(self._cutoffs, taper_list):
+            if end is None:
+                masks.append((ell < cut).to(torch.float32))
+            else:
+                masks.append(raised_cosine_window(ell, cut, end))
+        ell_mask = torch.stack(masks, dim=0)
         self.register_buffer("ell_mask", ell_mask.unsqueeze(-1), persistent=False)
 
         src_grid = earth2grid.healpix.Grid(
