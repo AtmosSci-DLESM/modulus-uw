@@ -109,7 +109,10 @@ class RingMeanPCHIPUpsample(nn.Module):
         """``[B, C, N]`` coarse pixels → ``[B, C, N_fine]`` in the same pixel order."""
         means = _ring_means(faces, self.src_ring, self.src_counts)
         anomaly = faces - means.index_select(-1, self.src_ring)
-        fine_anom = self.regrid(anomaly)
+        # Same weights as earth2grid's regridder. A short gather stays in the
+        # CUDA graph; embedding_bag's per-sample-weight backward is slow and
+        # its runtime varies across ranks, which stalls the DDP step.
+        fine_anom = _bilinear_regrid(anomaly, self.regrid.index, self.regrid.weight)
         fine_mean = _ring_means(fine_anom, self.dst_ring, self.dst_counts)
         zonal = _pchip_to_fine(
             means,
@@ -122,6 +125,25 @@ class RingMeanPCHIPUpsample(nn.Module):
         return fine_anom - fine_mean.index_select(-1, self.dst_ring) + zonal.index_select(
             -1, self.dst_ring
         )
+
+
+def _bilinear_regrid(
+    values: torch.Tensor, index: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Weighted sum of ``P`` source pixels. ``values`` is ``[B, C, N_in]``.
+
+    ``index`` and ``weight`` are the earth2grid regridder buffers, shape
+    ``(*N_out, P)``. ``P`` is 4 for HEALPix bilinear, so the loop is a handful
+    of gathers rather than one ``embedding_bag``.
+    """
+    *out_shape, n_neighbors = index.shape
+    flat = values.reshape(-1, values.shape[-1])
+    src_index = index.reshape(-1, n_neighbors)
+    src_weight = weight.reshape(-1, n_neighbors).to(dtype=flat.dtype)
+    acc = flat.new_zeros(flat.shape[0], src_index.shape[0])
+    for neighbor in range(n_neighbors):
+        acc += flat[:, src_index[:, neighbor]] * src_weight[:, neighbor]
+    return acc.view(*values.shape[:-1], *out_shape)
 
 
 def _ring_means(values: torch.Tensor, ring: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
