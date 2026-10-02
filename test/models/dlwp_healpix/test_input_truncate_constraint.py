@@ -1,6 +1,10 @@
 """Input-skip truncate keeps constants, drops the learned upsample, and skips diagnostics."""
 
+import pytest
 import torch
+from hydra.errors import InstantiationException
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
 
 from physicsnemo.models.dlwp_healpix_layers.healpix_input_truncate_constraint import (
     InputSkipTruncateConstraint,
@@ -59,3 +63,33 @@ def test_skip_roundtrip_on_prognostics_only():
     pred_res = torch.cat([state + residual, diag[:, :, :1]], dim=3)
     out_res = mod(pred_res, state)
     assert torch.allclose(out_res[:, :, :, :2], roundtrip + residual, atol=1e-5)
+
+
+def test_hydra_leaves_resample_blocks_unbuilt_until_nside_is_known():
+    cfg = OmegaConf.create(
+        {
+            "_target_": "physicsnemo.models.dlwp_healpix_layers.healpix_input_truncate_constraint.InputSkipTruncateConstraint",
+            "_recursive_": False,
+            "down_sampling_block": {
+                "_target_": "physicsnemo.models.dlwp_healpix_layers.healpix_blocks.DealiasedDownsample",
+                "resample_filter": [1.0, 2.0, 1.0],
+                "stride": 2,
+                "reflection_equivariant": True,
+            },
+            "up_sampling_block": {
+                "_target_": "physicsnemo.models.dlwp_healpix_layers.healpix_ring_mean_pchip.RingMeanPCHIPUpsampleFaces",
+                "scale_factor": 2,
+            },
+            "in_channels": ["a"],
+            "out_channels": ["a"],
+            "nside": NSIDE,
+            "hpx_padding_mode": "isolatitude",
+            "compile_padding": False,
+        }
+    )
+    mod = instantiate(cfg)
+    assert mod.nside == NSIDE
+    built = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    built._recursive_ = True
+    with pytest.raises(InstantiationException, match="_recursive_"):
+        instantiate(built)
