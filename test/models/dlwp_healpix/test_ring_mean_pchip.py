@@ -1,0 +1,65 @@
+"""Ring-mean PCHIP keeps a zonal map zonal and does not overshoot a step."""
+
+import math
+
+import numpy as np
+import torch
+
+import earth2grid
+from earth2grid.healpix import HEALPIX_PAD_XY
+from physicsnemo.models.dlwp_healpix_layers.healpix_ring_mean_pchip import (
+    RingMeanPCHIPUpsample,
+    _geographic_latitude,
+)
+from physicsnemo.models.layers.activations import Tanh
+
+
+def _ring_spread(values: torch.Tensor, lat: np.ndarray) -> float:
+    """Largest within-ring standard deviation of a flat pixel vector."""
+    key = np.round(lat, decimals=8)
+    spread = 0.0
+    flat = values.detach().cpu().numpy().reshape(-1)
+    for ring in np.unique(key):
+        spread = max(spread, float(np.std(flat[key == ring])))
+    return spread
+
+
+def test_zonal_cosine_stays_constant_on_each_fine_ring():
+    nside = 8
+    src = earth2grid.healpix.Grid(level=int(math.log2(nside)), pixel_order=HEALPIX_PAD_XY)
+    dst = earth2grid.healpix.Grid(level=int(math.log2(nside * 2)), pixel_order=HEALPIX_PAD_XY)
+    src_lat = _geographic_latitude(src)
+    field = np.cos(src_lat)
+    layer = RingMeanPCHIPUpsample(nside=nside)
+    out = layer(torch.from_numpy(field.astype(np.float32)).view(1, 1, -1))
+    assert _ring_spread(out, _geographic_latitude(dst)) < 1e-6
+
+
+def test_zonal_step_does_not_overshoot():
+    nside = 8
+    src = earth2grid.healpix.Grid(level=int(math.log2(nside)), pixel_order=HEALPIX_PAD_XY)
+    lat = _geographic_latitude(src)
+    field = np.where(lat >= 0.0, 1.0, -1.0).astype(np.float32)
+    layer = RingMeanPCHIPUpsample(nside=nside)
+    out = layer(torch.from_numpy(field).view(1, 1, -1))
+    assert float(out.min()) >= -1.0 - 1e-5
+    assert float(out.max()) <= 1.0 + 1e-5
+
+
+def test_steerable_wrapper_matches_conv_output_shape():
+    from physicsnemo.models.dlwp_healpix_layers.healpix_ring_mean_pchip import (
+        ReflectionSteerableRingMeanPCHIPConv,
+    )
+
+    nside = 4
+    block = ReflectionSteerableRingMeanPCHIPConv(
+        in_channels=4,
+        out_channels=4,
+        nside=nside,
+        activation=Tanh(),
+        hpx_padding_mode="isolatitude",
+    )
+    x = torch.randn(12, 4, nside, nside)
+    y = block(x)
+    assert y.shape == (12, 4, nside * 2, nside * 2)
+    assert torch.isfinite(y).all()
