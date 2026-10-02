@@ -323,3 +323,85 @@ def test_stacked_getitem_matches_joint_inputs_scale(tmp_path):
     assert inputs[0].dtype == np.float32
     assert targets.dtype == np.float32
 
+
+def _make_sharded_field(path, *, t: int = 20, shard_time: int = 8, f: int = 2, h: int = 2, w: int = 2):
+    """Per-variable array with inner time chunk 1 and a time shard, zstd level 0."""
+    from zarr.codecs import ZstdCodec
+
+    data = np.arange(t * f * h * w, dtype=np.float32).reshape(t, f, h, w)
+    data[3] = np.nan
+    zarr.create_array(
+        store=str(path),
+        name="t2m",
+        shape=data.shape,
+        chunks=(1, f, h, w),
+        shards=(shard_time, f, h, w),
+        dtype="float32",
+        zarr_format=3,
+        compressors=[ZstdCodec(level=0)],
+        fill_value=np.nan,
+        dimension_names=["time", "face", "height", "width"],
+    )
+    array = zarr.open_array(f"{path}/t2m", mode="a")
+    array[:] = data
+    group = zarr.open_group(str(path), mode="a")
+    group.attrs["layout"] = "per_variable"
+    return data
+
+
+def test_read_sharded_time_slice_matches_array(tmp_path):
+    from physicsnemo.datapipes.healpix.zarr_shard_read import read_sharded_time_slice
+
+    data = _make_sharded_field(tmp_path / "shard")
+    array = zarr.open_array(f"{tmp_path / 'shard'}/t2m", mode="r")
+    sl = slice(2, 12)
+    got = read_sharded_time_slice(array, sl)
+    assert got is not None
+    ref = np.asarray(array[sl])
+    assert got.shape == ref.shape
+    assert np.array_equal(got, ref, equal_nan=True)
+    loaded = load_channel_data(zarr.open_group(str(tmp_path / "shard"), mode="r"), sl, ["t2m"])
+    assert np.array_equal(loaded[:, 0], ref, equal_nan=True)
+    assert np.array_equal(loaded[:, 0], data[sl], equal_nan=True)
+
+
+def test_sharded_window_matches_arrays(tmp_path):
+    from zarr.codecs import ZstdCodec
+
+    path = tmp_path / "multi"
+    t, f, h, w, shard_time = 20, 2, 2, 2, 8
+    stored = {}
+    for i, name in enumerate(("t2m", "u10m")):
+        data = (np.arange(t * f * h * w, dtype=np.float32) + i * 1000).reshape(t, f, h, w)
+        data[3] = np.nan
+        stored[name] = data
+        zarr.create_array(
+            store=str(path),
+            name=name,
+            shape=data.shape,
+            chunks=(1, f, h, w),
+            shards=(shard_time, f, h, w),
+            dtype="float32",
+            zarr_format=3,
+            compressors=[ZstdCodec(level=0)],
+            fill_value=np.nan,
+            dimension_names=["time", "face", "height", "width"],
+        )
+        zarr.open_array(f"{path}/{name}", mode="a")[:] = data
+    group = zarr.open_group(str(path), mode="a")
+    group.attrs["layout"] = "per_variable"
+    group = zarr.open_group(str(path), mode="r")
+    sl = slice(2, 12)
+    loaded = load_channel_data(group, sl, ["t2m", "u10m"])
+    for c, name in enumerate(("t2m", "u10m")):
+        assert np.array_equal(loaded[:, c], stored[name][sl], equal_nan=True)
+    idx_in = np.array([[0, 1], [2, 3]])
+    idx_out = np.array([[4, 6], [5, 7]])
+    inputs, targets = load_windowed_channel_data(
+        group, sl, ["t2m", "u10m"], idx_in, ["u10m", "t2m"], idx_out
+    )
+    for c, name in enumerate(("t2m", "u10m")):
+        assert np.array_equal(inputs[:, :, c], stored[name][sl][idx_in], equal_nan=True)
+    for c, name in enumerate(("u10m", "t2m")):
+        assert np.array_equal(targets[:, :, c], stored[name][sl][idx_out], equal_nan=True)
+
