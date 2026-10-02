@@ -9,6 +9,11 @@ from omegaconf import OmegaConf
 from physicsnemo.models.dlwp_healpix_layers.healpix_input_truncate_constraint import (
     InputSkipTruncateConstraint,
 )
+from physicsnemo.models.dlwp_healpix_layers.healpix_ring_mean_pchip import (
+    ReflectionSteerableRingMeanPCHIPUpsampleFaces,
+    RingMeanPCHIPUpsampleFaces,
+)
+from physicsnemo.models.dlwp_healpix_layers.reflection_ops import hpx_spatial_reflect
 
 NSIDE = 8
 
@@ -93,3 +98,22 @@ def test_hydra_leaves_resample_blocks_unbuilt_until_nside_is_known():
     built._recursive_ = True
     with pytest.raises(InstantiationException, match="_recursive_"):
         instantiate(built)
+
+
+def test_steerable_faces_upsample_is_the_spatial_projector():
+    torch.manual_seed(0)
+    x = torch.randn(12, 1, NSIDE, NSIDE)
+    plain = RingMeanPCHIPUpsampleFaces(in_channels=1, nside=NSIDE, scale_factor=2)
+    steep = ReflectionSteerableRingMeanPCHIPUpsampleFaces(
+        in_channels=1, nside=NSIDE, scale_factor=2
+    )
+    assert steep.reflection_steerable
+    assert not any(param.requires_grad for param in steep.parameters())
+    y = plain(x)
+    fo = steep._refl_face_order
+    expected = 0.5 * (
+        y + hpx_spatial_reflect(plain(hpx_spatial_reflect(x, face_order=fo)), face_order=fo)
+    )
+    assert torch.allclose(steep(x), expected, atol=1e-5)
+    ones = torch.ones_like(x)
+    assert torch.allclose(steep(ones), torch.ones(12, 1, NSIDE * 2, NSIDE * 2), atol=1e-5)
