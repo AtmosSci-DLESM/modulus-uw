@@ -9,6 +9,7 @@ import earth2grid
 from earth2grid.healpix import HEALPIX_PAD_XY
 from physicsnemo.models.dlwp_healpix_layers.healpix_ring_mean_pchip import (
     RingMeanPCHIPUpsample,
+    _bilinear_regrid,
     _geographic_latitude,
 )
 from physicsnemo.models.layers.activations import Tanh
@@ -44,6 +45,22 @@ def test_zonal_step_does_not_overshoot():
     out = layer(torch.from_numpy(field).view(1, 1, -1))
     assert float(out.min()) >= -1.0 - 1e-5
     assert float(out.max()) <= 1.0 + 1e-5
+
+
+def test_bilinear_gather_matches_regridder_forward_and_backward():
+    nside = 32
+    layer = RingMeanPCHIPUpsample(nside=nside)
+    n_in = 12 * nside * nside
+    source = torch.randn(2, 8, n_in)
+    left = source.detach().clone().requires_grad_(True)
+    right = source.detach().clone().requires_grad_(True)
+    gathered = _bilinear_regrid(left, layer.regrid.index, layer.regrid.weight)
+    reference = layer.regrid(right)
+    assert torch.allclose(gathered, reference, rtol=1e-5, atol=1e-5)
+    grad_out = torch.randn_like(gathered)
+    gathered.backward(grad_out)
+    reference.backward(grad_out)
+    assert torch.allclose(left.grad, right.grad, rtol=1e-5, atol=1e-5)
 
 
 def test_steerable_wrapper_matches_conv_output_shape():
