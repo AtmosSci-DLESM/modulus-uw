@@ -265,6 +265,7 @@ class RingMeanPCHIPUpsampleFaces(nn.Module):
         nside: int = 32,
         enable_healpixpad: bool | None = None,
         reflection_equivariant: bool = False,
+        resample_in_fp32: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -278,7 +279,11 @@ class RingMeanPCHIPUpsampleFaces(nn.Module):
         self.in_channels = int(in_channels)
         self.enable_nhwc = bool(enable_nhwc)
         self.reflection_equivariant = bool(reflection_equivariant)
-        self.resample = RingMeanPCHIPUpsample(nside=int(nside), scale_factor=int(scale_factor))
+        self.resample = RingMeanPCHIPUpsample(
+            nside=int(nside),
+            scale_factor=int(scale_factor),
+            resample_in_fp32=resample_in_fp32,
+        )
         if self.reflection_equivariant:
             # Same buffer as the downsample projector so CUDA-graph capture
             # does not allocate the face order on the forward.
@@ -305,10 +310,14 @@ class RingMeanPCHIPUpsampleFaces(nn.Module):
             batch, channels, -1
         )
         orig_dtype = pixels.dtype
-        with torch.amp.autocast("cuda", enabled=False):
-            fine = self.resample(pixels.float())
+        if self.resample.resample_in_fp32:
+            with torch.amp.autocast("cuda", enabled=False):
+                fine = self.resample(pixels.float())
+            fine = fine.to(dtype=orig_dtype)
+        else:
+            fine = self.resample(pixels)
         fine_n = self.resample.fine_nside
-        fine = fine.to(dtype=orig_dtype).view(batch, channels, 12, fine_n, fine_n)
+        fine = fine.view(batch, channels, 12, fine_n, fine_n)
         fine = fine.permute(0, 2, 1, 3, 4).contiguous().view(batch_faces, channels, fine_n, fine_n)
         if channels_last:
             fine = fine.to(memory_format=torch.channels_last)
