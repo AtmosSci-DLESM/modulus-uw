@@ -111,13 +111,17 @@ class RingMeanPCHIPUpsample(nn.Module):
 
     def forward(self, faces: torch.Tensor) -> torch.Tensor:
         """``[B, C, N]`` coarse pixels → ``[B, C, N_fine]`` in the same pixel order."""
-        if self.resample_in_fp32 and faces.dtype != torch.float32:
-            faces = faces.float()
-        if self.resample_in_fp32 or faces.dtype == torch.float32:
+        if self.resample_in_fp32:
+            if faces.dtype != torch.float32:
+                faces = faces.float()
             return self._resample_field(faces)
-        # Pixel bilinear stays in the activation dtype. Ring means and the
-        # monotone cubic stay fp32, and only that small zonal vector is cast
-        # back for the add.
+        # The pixel field is bf16 even when the caller still holds fp32.
+        # A fp32 input used to take the same body as the default path, so the
+        # compiled train graph kept the full-resolution copies.
+        if faces.dtype != torch.bfloat16:
+            faces = faces.to(dtype=torch.bfloat16)
+        # Ring means and the monotone cubic stay fp32. Only that small zonal
+        # vector is cast back for the add.
         means = _ring_means(faces.float(), self.src_ring, self.src_counts)
         anomaly = faces - means.index_select(-1, self.src_ring).to(dtype=faces.dtype)
         fine_anom = _bilinear_regrid(anomaly, self.regrid.index, self.regrid.weight)
