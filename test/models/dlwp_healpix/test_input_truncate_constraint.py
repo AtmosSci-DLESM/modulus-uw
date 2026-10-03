@@ -94,6 +94,8 @@ def test_hydra_leaves_resample_blocks_unbuilt_until_nside_is_known():
     )
     mod = instantiate(cfg)
     assert mod.nside == NSIDE
+    constant = torch.full((1, 12, 1, 1, NSIDE, NSIDE), 3.0)
+    assert torch.allclose(mod(constant, constant), constant)
     built = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
     built._recursive_ = True
     with pytest.raises(InstantiationException, match="_recursive_"):
