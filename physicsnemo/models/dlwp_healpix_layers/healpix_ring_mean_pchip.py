@@ -117,7 +117,9 @@ class RingMeanPCHIPUpsample(nn.Module):
             return self._resample_field(faces)
         # The pixel field is bf16 even when the caller still holds fp32.
         # A fp32 input used to take the same body as the default path, so the
-        # compiled train graph kept the full-resolution copies.
+        # compiled train graph kept the full-resolution copies. Cast back to
+        # the caller dtype so a conv outside autocast still matches its bias.
+        orig_dtype = faces.dtype
         if faces.dtype != torch.bfloat16:
             faces = faces.to(dtype=torch.bfloat16)
         # Ring means and the monotone cubic stay fp32. Only that small zonal
@@ -134,11 +136,14 @@ class RingMeanPCHIPUpsample(nn.Module):
             self.clamp_left,
             self.clamp_right,
         )
-        return (
+        out = (
             fine_anom
             - fine_mean.index_select(-1, self.dst_ring)
             + zonal.index_select(-1, self.dst_ring).to(dtype=fine_anom.dtype)
         )
+        if out.dtype != orig_dtype:
+            out = out.to(dtype=orig_dtype)
+        return out
 
     def _resample_field(self, faces: torch.Tensor) -> torch.Tensor:
         means = _ring_means(faces, self.src_ring, self.src_counts)

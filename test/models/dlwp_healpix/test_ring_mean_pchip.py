@@ -94,10 +94,10 @@ def test_activation_dtype_resample_matches_fp32_and_backward():
     out = bf16(source.to(dtype=torch.bfloat16))
     assert out.dtype == torch.bfloat16
     assert torch.allclose(out.float(), reference, rtol=2e-2, atol=2e-2)
-    # A fp32 caller must not keep the full-resolution resample in fp32.
+    # fp32 in, same dtype out. The full-resolution work stays bf16 in between.
     from_fp32 = bf16(source)
-    assert from_fp32.dtype == torch.bfloat16
-    assert torch.allclose(from_fp32.float(), reference, rtol=2e-2, atol=2e-2)
+    assert from_fp32.dtype == torch.float32
+    assert torch.allclose(from_fp32, reference, rtol=2e-2, atol=2e-2)
 
     grad_in = source.detach().to(dtype=torch.bfloat16).requires_grad_(True)
     bf16(grad_in).sum().backward()
