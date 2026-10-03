@@ -68,6 +68,14 @@ class InputSkipTruncateConstraint(torch.nn.Module):
             orig_idx.append(self.in_names.index(name))
         self._pred_idx = tuple(pred_idx)
         self._orig_idx = tuple(orig_idx)
+        # Buffers, not forward allocations: CUDA-graph capture cannot allocate
+        # the index tensor while the train graph is being recorded.
+        self.register_buffer(
+            "_pred_index", torch.tensor(pred_idx, dtype=torch.long), persistent=False
+        )
+        self.register_buffer(
+            "_orig_index", torch.tensor(orig_idx, dtype=torch.long), persistent=False
+        )
 
         if isinstance(down_sampling_block, torch.nn.Module) or isinstance(
             up_sampling_block, torch.nn.Module
@@ -86,8 +94,14 @@ class InputSkipTruncateConstraint(torch.nn.Module):
         if scale < 2 or self.nside % scale != 0:
             raise ValueError(f"cannot resample nside {self.nside} by {scale}")
         n_sel = len(self._pred_idx)
+        # A single depthwise channel (groups=1) makes Inductor's scheduler raise
+        # KeyError while compiling the train backward. Duplicate the channel for
+        # the resample only; both blocks are channel-wise, so the kept channel
+        # matches a true one-channel round trip.
+        self._pad_channel = n_sel == 1
+        n_mod = 2 if self._pad_channel else n_sel
         shared = dict(
-            in_channels=n_sel,
+            in_channels=n_mod,
             enable_nhwc=bool(enable_nhwc),
             hpx_padding_mode=hpx_padding_mode,
             compile_padding=bool(compile_padding),
@@ -96,7 +110,7 @@ class InputSkipTruncateConstraint(torch.nn.Module):
         self.up = instantiate(
             up_sampling_block,
             nside=self.nside // scale,
-            out_channels=n_sel,
+            out_channels=n_mod,
             **shared,
         )
         learned = [name for name, param in self.named_parameters() if param.requires_grad]
@@ -106,25 +120,26 @@ class InputSkipTruncateConstraint(torch.nn.Module):
                 f"found {learned}"
             )
 
-    def _select(self, tensor: torch.Tensor, indices: tuple[int, ...]) -> torch.Tensor:
-        return torch.cat([tensor[:, :, :, i : i + 1] for i in indices], dim=3)
+    def _select(self, tensor: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        return tensor.index_select(3, index)
 
     def _replace(
-        self, tensor: torch.Tensor, indices: tuple[int, ...], values: torch.Tensor
+        self, tensor: torch.Tensor, index: torch.Tensor, values: torch.Tensor
     ) -> torch.Tensor:
-        out = tensor
-        for j, i in enumerate(indices):
-            out = torch.cat(
-                [out[:, :, :, :i], values[:, :, :, j : j + 1], out[:, :, :, i + 1 :]],
-                dim=3,
-            )
-        return out
+        # index_copy on dim 3. An empty leading slice (PRESsfc is channel 0)
+        # is what a cat-based replace would build, and Inductor drops that op.
+        return torch.index_copy(tensor, 3, index, values)
 
     def _roundtrip(self, state: torch.Tensor) -> torch.Tensor:
         """``[B, F, T, C, H, W]`` through the configured down and up blocks."""
+        if self._pad_channel:
+            state = state.repeat(1, 1, 1, 2, 1, 1)
         batch, faces, time, channels, height, width = state.shape
         folded = state.permute(0, 2, 1, 3, 4, 5).reshape(batch * time * faces, channels, height, width)
         restored = self.up(self.down(folded))
+        if self._pad_channel:
+            restored = restored[:, :1]
+            channels = 1
         if restored.shape[-2:] != (height, width) or restored.shape[1] != channels:
             raise RuntimeError(
                 f"round trip returned {tuple(restored.shape)}, "
@@ -150,9 +165,9 @@ class InputSkipTruncateConstraint(torch.nn.Module):
             orig = input.float()
             if orig.shape[2] != prediction.shape[2]:
                 orig = orig[:, :, -1:]
-            orig_sel = self._select(orig, self._orig_idx)
-            pred_sel = self._select(prediction, self._pred_idx)
+            orig_sel = self._select(orig, self._orig_index)
+            pred_sel = self._select(prediction, self._pred_index)
             filtered = self._roundtrip(orig_sel)
             updated = filtered + (pred_sel - orig_sel)
-            out = self._replace(prediction, self._pred_idx, updated)
+            out = self._replace(prediction, self._pred_index, updated)
         return out.to(dtype=orig_dtype)
