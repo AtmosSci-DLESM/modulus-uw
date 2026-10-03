@@ -80,3 +80,23 @@ def test_steerable_wrapper_matches_conv_output_shape():
     y = block(x)
     assert y.shape == (12, 4, nside * 2, nside * 2)
     assert torch.isfinite(y).all()
+
+
+def test_activation_dtype_resample_matches_fp32_and_backward():
+    nside = 8
+    n_in = 12 * nside * nside
+    src = earth2grid.healpix.Grid(level=int(math.log2(nside)), pixel_order=HEALPIX_PAD_XY)
+    field = np.cos(_geographic_latitude(src)).astype(np.float32)
+    source = torch.from_numpy(field).view(1, 1, -1)
+    fp32 = RingMeanPCHIPUpsample(nside=nside, resample_in_fp32=True)
+    bf16 = RingMeanPCHIPUpsample(nside=nside, resample_in_fp32=False)
+    reference = fp32(source)
+    out = bf16(source.to(dtype=torch.bfloat16))
+    assert out.dtype == torch.bfloat16
+    assert torch.allclose(out.float(), reference, rtol=2e-2, atol=2e-2)
+
+    grad_in = source.detach().to(dtype=torch.bfloat16).requires_grad_(True)
+    bf16(grad_in).sum().backward()
+    assert grad_in.grad is not None
+    assert torch.isfinite(grad_in.grad).all()
+    assert grad_in.grad.shape[-1] == n_in
