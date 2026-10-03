@@ -307,9 +307,14 @@ class DryAirMassConstraint(torch.nn.Module):
 
         self.g0 = 9.81
 
+    @torch.compiler.disable
     def forward(self, prediction, input):
         '''
-        Tensors are expected to be in the shape [B, F, T, C, H, W]
+        Tensors are expected to be in the shape [B, F, T, C, H, W].
+
+        Left eager on purpose. Folding this into the compiled train step
+        extends the inductor plan across every integration step and the
+        train CUDA graph no longer has room for the rollout graph.
         '''
         # Only sp and tcwv are promoted to fp32. A full-field float() is saved
         # for every integration step and fills the train CUDA graph.
