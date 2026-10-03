@@ -333,8 +333,8 @@ class DryAirMassConstraint(torch.nn.Module):
             sp_corrected = torch.clamp(sp - correction, min=0.0)
             sp_corrected = (sp_corrected - self.ps_mean) / self.ps_std
 
-        sp_out = sp_corrected.to(dtype=orig_dtype)
-        return torch.cat(
-            [prediction[:, :, :, :i], sp_out, prediction[:, :, :, i + 1 :]],
-            dim=3,
-        )
+        # Same mask write as before, but on the incoming dtype. The fp32
+        # full-field copy was reserved in the train graph for every step.
+        sp_corrected = sp_corrected.to(dtype=orig_dtype)
+        mask = self.sp_channel_mask.to(device=prediction.device, dtype=orig_dtype)
+        return prediction * (1.0 - mask) + sp_corrected * mask
