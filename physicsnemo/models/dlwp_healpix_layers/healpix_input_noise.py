@@ -358,7 +358,9 @@ class SpectralInputNoise(torch.nn.Module):
                 f"expected state [B, 12, T, {self.n_channels}, {self.nside}, "
                 f"{self.nside}], got {tuple(state.shape)}"
             )
-        with torch.no_grad():
+        # The transform runs in fp32: under autocast its internal matmuls would drop to
+        # bf16, which complex views reject, and the noise needs no gradient or bf16 speed.
+        with torch.no_grad(), torch.amp.autocast(device_type=state.device.type, enabled=False):
             noise = self._sample(batch, state.device)
             level = self._level(batch, state.device)
             if not (isinstance(level, float) and level == 1.0):
