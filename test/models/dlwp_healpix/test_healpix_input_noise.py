@@ -262,6 +262,21 @@ def test_state_dtype_and_broadcast_over_time(spectrum_path):
 
 
 @requires_sht
+@pytest.mark.parametrize("compiled", [False, True])
+def test_works_under_bf16_autocast_and_matches_fp32_statistics(spectrum_path, compiled):
+    # Training runs under autocast (and torch.compile); the transform must stay in fp32.
+    module = _make(spectrum_path)
+    apply = torch.compile(module, backend="eager") if compiled else module
+    state = torch.zeros(16, 12, 1, len(CHANNELS), NSIDE, NSIDE, device="cuda")
+    torch.manual_seed(0)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = apply(state)
+    assert out.dtype == torch.float32
+    target = _expected_degree_variance(0, SCALING["a"]["std"]).sum().item()
+    assert out[:, :, 0, 0].var().item() == pytest.approx(target, rel=0.1)
+
+
+@requires_sht
 def test_noise_gradient_passes_through_state(spectrum_path):
     module = _make(spectrum_path)
     state = torch.zeros(1, 12, 1, len(CHANNELS), NSIDE, NSIDE, device="cuda", requires_grad=True)
