@@ -291,6 +291,10 @@ class SpectralInputNoise(torch.nn.Module):
         object.__setattr__(self, "_transform_device", device)
 
     def _log_summary(self) -> None:
+        # One line per job, not per rank.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
         mean_scale = 0.5 * (self.scale_lo + self.scale_hi)
         rms = ", ".join(f"{c}={v:.3g}" for c, v in self.expected_rms.items())
         logger.info(
