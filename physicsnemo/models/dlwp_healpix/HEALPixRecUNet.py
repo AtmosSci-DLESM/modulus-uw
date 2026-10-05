@@ -72,6 +72,7 @@ class HEALPixRecUNet(Module):
         couplings: list = [],
         residual_prediction: bool = True,
         couplings_time_first: bool = True,
+        input_noise: DictConfig | None = None,
         constraints: list[DictConfig] = None,
         hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
@@ -117,6 +118,13 @@ class HEALPixRecUNet(Module):
             If the model should predict the residual between the input and the output. Default: True
         couplings_time_first: bool, optional
             Whether coupled data is in [T, B, C, F, H, W] rather than [B, F, T, C, H, W] format
+        input_noise: DictConfig, optional
+            Hydra instantiable noise layer (e.g. ``SpectralInputNoise``) that perturbs the prognostic
+            state fed to each model step, in training mode only. The first step's initial state is
+            perturbed once (one draw serves the hidden-state warm-up and the current time) and every
+            fed-back prediction gets a fresh draw. Targets and the returned predictions stay clean,
+            so the model learns to remove the perturbation, and the residual connection and any
+            constraints see the perturbed input. Default None adds no noise.
         constraints: list[DictConfig], optional
             List of hydra instantiable DictConfigs specifying constraints 
             (e.g., nonnegativity) to be applied to the model outputs
@@ -217,6 +225,19 @@ class HEALPixRecUNet(Module):
 
         self.constraints = None
         self.set_constraints(constraints)
+
+        self.input_noise = instantiate(input_noise) if input_noise is not None else None
+
+    def _perturb_state(self, state: th.Tensor) -> th.Tensor:
+        """Apply ``input_noise`` to a prognostic state; identity when absent or not training.
+
+        The hidden-state re-initialization inside ``_initialize_hidden`` reads fed-back
+        predictions directly and is not perturbed: with a finite ``reset_cycle`` that
+        covers the whole training window it only ever uses the (perturbed) initial state.
+        """
+        if self.input_noise is None or not self.training:
+            return state
+        return self.input_noise(state)
 
     @property
     def integration_steps(self):
@@ -484,6 +505,8 @@ class HEALPixRecUNet(Module):
         """
         self.reset()
         outputs = []
+        # One draw on the initial state serves the warm-up and the first step.
+        inputs = [self._perturb_state(inputs[0])] + list(inputs[1:])
         for step in range(self.integration_steps):
             # th.cuda.nvtx.range_push(f"Integration step: {step}")
             # (Re-)initialize recurrent hidden states
@@ -524,14 +547,14 @@ class HEALPixRecUNet(Module):
             else:
                 if len(self.couplings) > 0:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[-1][:, :, :, :self.input_channels]]
+                        inputs=[self._perturb_state(outputs[-1][:, :, :, :self.input_channels])]
                         + list(inputs[1:3])
                         + [inputs[3][self.presteps + step]],
                         step=step + self.presteps,
                     )
                 else:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[-1][:, :, :, :self.input_channels]] + list(inputs[1:]),
+                        inputs=[self._perturb_state(outputs[-1][:, :, :, :self.input_channels])] + list(inputs[1:]),
                         step=step + self.presteps,
                     )
             # th.cuda.nvtx.range_pop()
