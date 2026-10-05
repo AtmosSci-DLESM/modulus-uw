@@ -277,6 +277,78 @@ def test_works_under_bf16_autocast_and_matches_fp32_statistics(spectrum_path, co
 
 
 @requires_sht
+def test_window_open_at_every_degree_adds_noise_from_degree_one(tmp_path):
+    # ell_start=0, ell_full=1: full strength at every degree >= 1, nothing at degree 0.
+    ell = torch.arange(LMAX).double()
+    spectrum = torch.zeros(3, LMAX, dtype=torch.float64)
+    spectrum[0, (ell >= 1) & (ell <= 120)] = 1e-3 * 64.0 / ell[(ell >= 1) & (ell <= 120)]
+    spectrum[1, (ell >= 20) & (ell <= 120)] = 2e-3  # nothing missing below degree 20
+    names = ["a", "b", "c"]  # c has no missing variance anywhere
+    path = str(tmp_path / "low.nc")
+    save_noise_spectrum(path, names, spectrum)
+    scaling = {n: {"mean": 0.0, "std": 1.0} for n in names}
+    module = SpectralInputNoise(
+        path, names, scaling, ell_start=0, ell_full=1, variance_scale_range=(1.0, 1.0)
+    )
+    batch = 64
+    torch.manual_seed(0)
+    out = module(torch.zeros(batch, 12, 1, 3, NSIDE, NSIDE, device="cuda"))
+    noise = out[:, :, 0].permute(0, 2, 1, 3, 4)  # [B, C, 12, H, W]
+
+    for ch in (0, 1):
+        target = spectrum[ch]
+        measured = _analyse(noise[:, ch])
+        assert noise[:, ch].var().item() == pytest.approx(target.sum().item(), rel=0.05)
+        for lo, hi in ((1, 5), (5, 10), (10, 20), (20, 40), (40, 80), (80, 121)):
+            if target[lo:hi].sum() > 0:
+                assert measured[lo:hi].sum().item() == pytest.approx(target[lo:hi].sum().item(), rel=0.10)
+            else:
+                assert measured[lo:hi].sum().item() < 1e-3 * target.sum().item()
+        # Degree 0 stays empty: the spatial mean (pinned by the budget constraints) is unchanged.
+        assert measured[0].item() < 1e-6 * target.sum().item()
+    means = noise.reshape(batch, 3, -1).mean(-1)
+    assert means.abs().max().item() < 1e-3 * noise[:, 0].std().item()
+    # A channel with zero missing variance gets exactly zero noise at every degree.
+    assert torch.all(noise[:, 2] == 0)
+
+
+@requires_sht
+def test_window_open_at_every_degree_adds_noise_from_degree_one(tmp_path):
+    # ell_start=0, ell_full=1: full strength at every degree >= 1, nothing at degree 0.
+    ell = torch.arange(LMAX).double()
+    spectrum = torch.zeros(3, LMAX, dtype=torch.float64)
+    spectrum[0, (ell >= 1) & (ell <= 120)] = 1e-3 * 64.0 / ell[(ell >= 1) & (ell <= 120)]
+    spectrum[1, (ell >= 20) & (ell <= 120)] = 2e-3  # nothing missing below degree 20
+    names = ["a", "b", "c"]  # c has no missing variance anywhere
+    path = str(tmp_path / "low.nc")
+    save_noise_spectrum(path, names, spectrum)
+    scaling = {n: {"mean": 0.0, "std": 1.0} for n in names}
+    module = SpectralInputNoise(
+        path, names, scaling, ell_start=0, ell_full=1, variance_scale_range=(1.0, 1.0)
+    )
+    batch = 64
+    torch.manual_seed(0)
+    out = module(torch.zeros(batch, 12, 1, 3, NSIDE, NSIDE, device="cuda"))
+    noise = out[:, :, 0].permute(0, 2, 1, 3, 4)  # [B, C, 12, H, W]
+
+    for ch in (0, 1):
+        target = spectrum[ch]
+        measured = _analyse(noise[:, ch])
+        assert noise[:, ch].var().item() == pytest.approx(target.sum().item(), rel=0.05)
+        for lo, hi in ((1, 5), (5, 10), (10, 20), (20, 40), (40, 80), (80, 121)):
+            if target[lo:hi].sum() > 0:
+                assert measured[lo:hi].sum().item() == pytest.approx(target[lo:hi].sum().item(), rel=0.10)
+            else:
+                assert measured[lo:hi].sum().item() < 1e-3 * target.sum().item()
+        # Degree 0 stays empty: the spatial mean (pinned by the budget constraints) is unchanged.
+        assert measured[0].item() < 1e-6 * target.sum().item()
+    means = noise.reshape(batch, 3, -1).mean(-1)
+    assert means.abs().max().item() < 1e-3 * noise[:, 0].std().item()
+    # A channel with zero missing variance gets exactly zero noise at every degree.
+    assert torch.all(noise[:, 2] == 0)
+
+
+@requires_sht
 def test_noise_gradient_passes_through_state(spectrum_path):
     module = _make(spectrum_path)
     state = torch.zeros(1, 12, 1, len(CHANNELS), NSIDE, NSIDE, device="cuda", requires_grad=True)
