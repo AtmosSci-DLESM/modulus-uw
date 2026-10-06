@@ -85,6 +85,7 @@ class HEALPixRecUNet(Module):
         enable_nhwc: bool = False,
         couplings: list = [],
         residual_prediction: bool = True,
+        fp32_residual_state: bool = False,
         couplings_time_first: bool = True,
         constraints: list[DictConfig] = None,
         hpx_padding_mode: str | None = None,
@@ -147,6 +148,13 @@ class HEALPixRecUNet(Module):
             sequence of dictionaries that describe coupling mechanisms
         residual_prediction: bool, optional
             If the model should predict the residual between the input and the output. Default: True
+        fp32_residual_state: bool, optional
+            Form the residual sum and the diagnostics outside the autocast dtype. Under bf16 autocast
+            the decoder output is bf16, and adding the input in place rounds the carried state to bf16
+            every step, which drops increments below half an ulp (about 25 to 200 Pa for surface
+            pressure) and makes long rollouts drift. When True the prognostics are summed in at least
+            fp32 and constraints see that precision; the convolutions stay in the autocast dtype.
+            Default: False keeps the previous behavior.
         couplings_time_first: bool, optional
             Whether coupled data is in [T, B, C, F, H, W] rather than [B, F, T, C, H, W] format
         constraints: list[DictConfig], optional
@@ -233,6 +241,7 @@ class HEALPixRecUNet(Module):
         self.presteps = presteps
         self.enable_nhwc = enable_nhwc
         self.residual_prediction = residual_prediction
+        self.fp32_residual_state = fp32_residual_state
         self.couplings_time_first = couplings_time_first
         self.hpx_padding_mode = hpx_padding_mode
         self.compile_padding = compile_padding
@@ -974,9 +983,17 @@ class HEALPixRecUNet(Module):
             combined = self._reshape_outputs(decodings) # [B*F, T*C, H, W] -> [B, F, T, C, H, W]
             prognostics = combined[:, :, :, :self.input_channels]
             orig_input = self._reshape_outputs(input_for_residual[:, : self.input_channels * self.input_time_dim])
-            if self.residual_prediction:
-                prognostics += orig_input
             diagnostics = combined[:, :, :, self.input_channels:]
+            if self.fp32_residual_state:
+                # Out of place and at least fp32 so the carried state is not rounded to the
+                # autocast dtype; promotion keeps an fp64 model in fp64.
+                state_dtype = th.promote_types(orig_input.dtype, th.float32)
+                prognostics = prognostics.to(state_dtype)
+                diagnostics = diagnostics.to(state_dtype)
+                if self.residual_prediction:
+                    prognostics = prognostics + orig_input.to(state_dtype)
+            elif self.residual_prediction:
+                prognostics += orig_input
             out = th.cat([prognostics, diagnostics], dim=3)
 
             # Apply constraints

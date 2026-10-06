@@ -650,3 +650,71 @@ def test_HEALPixRecUNet_forward(
 
     del model, inputs
     torch.cuda.empty_cache()
+
+
+@import_or_fail("omegaconf")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+@pytest.mark.parametrize("fp32_residual_state", [False, True])
+def test_HEALPixRecUNet_fp32_residual_state(
+    device,
+    fp32_residual_state,
+    encoder_dict,
+    decoder_dict,
+    test_data,
+    insolation_data,
+    constant_data,
+    pytestconfig,
+):
+    in_channels = 2
+    n_constants = 2
+    input_time_dim = 2
+    output_time_dim = 4
+    batch_size = 2
+    size = 16
+
+    fix_random_seeds(seed=42)
+    x = test_data(
+        batch_size=batch_size,
+        time_dim=2 * input_time_dim,
+        channels=in_channels,
+        img_size=size,
+        device=device,
+    )
+    decoder_inputs = insolation_data(
+        batch_size=batch_size,
+        time_dim=2 * output_time_dim,
+        img_size=size,
+        device=device,
+    )
+    constants = constant_data(channels=n_constants, img_size=size, device=device)
+
+    model = HEALPixRecUNet(
+        encoder=encoder_dict,
+        decoder=decoder_dict,
+        input_channels=in_channels,
+        output_channels=in_channels,
+        n_constants=n_constants,
+        decoder_input_channels=1,
+        input_time_dim=input_time_dim,
+        output_time_dim=output_time_dim,
+        enable_healpixpad=True,
+        delta_time="6h",
+        reset_cycle="6h",
+        fp32_residual_state=fp32_residual_state,
+    ).to(device)
+    # A zero decoder output leaves only the residual add, so the first step must return
+    # the input state: exactly with fp32_residual_state, bf16-rounded without it.
+    model.decoder.register_forward_hook(lambda module, args, out: torch.zeros_like(out))
+
+    device_type = torch.device(device).type
+    with torch.autocast(device_type, dtype=torch.bfloat16):
+        output = model([x, decoder_inputs, constants])
+
+    carried = x[:, :, input_time_dim : 2 * input_time_dim, :in_channels]
+    first_step = output[:, :, :input_time_dim, :in_channels]
+    if fp32_residual_state:
+        assert output.dtype == torch.float32
+        assert torch.equal(first_step, carried)
+    else:
+        assert output.dtype == torch.bfloat16
+        assert not torch.equal(first_step.float(), carried)
