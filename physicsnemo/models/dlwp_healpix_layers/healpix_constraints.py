@@ -304,45 +304,39 @@ class DryAirMassConstraint(torch.nn.Module):
 
         self.g0 = 9.81
 
+    @torch.compiler.disable
     def forward(self, prediction, input):
         '''
-        Tensors are expected to be in the shape [B, F, T, C, H, W]
+        Tensors are expected to be in the shape [B, F, T, C, H, W].
+
+        Left eager on purpose. Folding this into the compiled train step
+        extends the inductor plan across every integration step and the
+        train CUDA graph no longer has room for the rollout graph.
         '''
-        
-        # Need to scale to physical units and compute small differences of large
-        # surface pressures (in Pa), so disable autocast and force float32 precision
-        with torch.amp.autocast('cuda', enabled=False):
-            prediction = prediction.float()
-            input = input.float()
+        # Only sp and tcwv are promoted to fp32. A full-field float() is saved
+        # for every integration step and fills the train CUDA graph.
+        orig_dtype = prediction.dtype
+        i = self.sp_channel_index
+        j = self.tcwv_channel_index
+        with torch.amp.autocast("cuda", enabled=False):
+            sp = prediction[:, :, :, i : i + 1].float()
+            tcwv = prediction[:, :, :, j : j + 1].float()
+            sp_0 = input[:, :, -1:, i : i + 1].float()
+            tcwv_0 = input[:, :, -1:, j : j + 1].float()
 
-            # Slice on dim 3 with constant bounds (compile-friendly; avoids
-            # index_select + buffer index in backward).
-            sp = prediction[:, :, :, self.sp_channel_index : self.sp_channel_index + 1, :, :]
             sp = sp * self.ps_std + self.ps_mean
-            tcwv = prediction[:, :, :, self.tcwv_channel_index : self.tcwv_channel_index + 1, :, :]
             tcwv = tcwv * self.tcwv_std + self.tcwv_mean
-
-            # Get sp and tcwv from last time step of input tensor. Used to 
-            # compute initial dry air mass which is to be conserved.
-            sp_0 = input[:, :, -1:, self.sp_channel_index : self.sp_channel_index + 1, :, :]
             sp_0 = sp_0 * self.ps_std + self.ps_mean
-            tcwv_0 = input[:, :, -1:, self.tcwv_channel_index : self.tcwv_channel_index + 1, :, :]
             tcwv_0 = tcwv_0 * self.tcwv_std + self.tcwv_mean
 
-            # Get predicted and initial dry sp
             sp_dry = sp - self.g0 * tcwv
             sp_0_dry = sp_0 - self.g0 * tcwv_0
-            # Correction is spatial average of dry air mass difference
-            correction = (sp_dry - sp_0_dry).mean(dim=[1,4,5], keepdim=True)
-            sp_corrected = sp - correction
-
-            # Ensure sp is non-negative and rescale back to normalized space
-            sp_corrected = torch.clamp(sp_corrected, min=0.)
+            correction = (sp_dry - sp_0_dry).mean(dim=[1, 4, 5], keepdim=True)
+            sp_corrected = torch.clamp(sp - correction, min=0.0)
             sp_corrected = (sp_corrected - self.ps_mean) / self.ps_std
 
-            mask = self.sp_channel_mask.to(
-                device=prediction.device, dtype=prediction.dtype
-            )
-            out = prediction * (1.0 - mask) + sp_corrected * mask
-
-            return out
+        # Same mask write as before, but on the incoming dtype. The fp32
+        # full-field copy was reserved in the train graph for every step.
+        sp_corrected = sp_corrected.to(dtype=orig_dtype)
+        mask = self.sp_channel_mask.to(device=prediction.device, dtype=orig_dtype)
+        return prediction * (1.0 - mask) + sp_corrected * mask

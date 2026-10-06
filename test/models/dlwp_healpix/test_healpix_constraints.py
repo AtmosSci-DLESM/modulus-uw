@@ -96,6 +96,12 @@ def test_dry_air_mass_matches_reference_index_copy():
     assert torch.allclose(out, ref)
     assert not out.data_ptr() == prediction.data_ptr()
 
+    prediction_bf = prediction.to(dtype=torch.bfloat16)
+    inp_bf = inp.to(dtype=torch.bfloat16)
+    out_bf = mod(prediction_bf, inp_bf)
+    assert out_bf.dtype == torch.bfloat16
+    assert torch.allclose(out_bf.float(), ref, rtol=2e-2, atol=2e-2)
+
 
 def test_dry_air_mass_non_sp_channels_unchanged():
     channels = ["tcwv", "sp", "x"]

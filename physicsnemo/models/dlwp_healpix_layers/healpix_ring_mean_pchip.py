@@ -58,8 +58,12 @@ class RingMeanPCHIPUpsample(nn.Module):
     end ring's value.
     """
 
-    def __init__(self, nside: int, scale_factor: int = 2):
+    def __init__(self, nside: int, scale_factor: int = 2, resample_in_fp32: bool = True):
         super().__init__()
+        # Full-field fp32 copies of every decoder step fill the train CUDA-graph
+        # pool. The zonal cubic stays fp32 either way; only the pixel field can
+        # stay in the activation dtype.
+        self.resample_in_fp32 = bool(resample_in_fp32)
         if scale_factor != 2:
             raise ValueError(f"ring-mean PCHIP scale_factor must be 2, got {scale_factor}")
         nside = int(nside)
@@ -107,6 +111,41 @@ class RingMeanPCHIPUpsample(nn.Module):
 
     def forward(self, faces: torch.Tensor) -> torch.Tensor:
         """``[B, C, N]`` coarse pixels → ``[B, C, N_fine]`` in the same pixel order."""
+        if self.resample_in_fp32:
+            if faces.dtype != torch.float32:
+                faces = faces.float()
+            return self._resample_field(faces)
+        # The pixel field is bf16 even when the caller still holds fp32.
+        # A fp32 input used to take the same body as the default path, so the
+        # compiled train graph kept the full-resolution copies. Cast back to
+        # the caller dtype so a conv outside autocast still matches its bias.
+        orig_dtype = faces.dtype
+        if faces.dtype != torch.bfloat16:
+            faces = faces.to(dtype=torch.bfloat16)
+        # Ring means and the monotone cubic stay fp32. Only that small zonal
+        # vector is cast back for the add.
+        means = _ring_means(faces.float(), self.src_ring, self.src_counts)
+        anomaly = faces - means.index_select(-1, self.src_ring).to(dtype=faces.dtype)
+        fine_anom = _bilinear_regrid(anomaly, self.regrid.index, self.regrid.weight)
+        fine_mean = _ring_means(fine_anom, self.dst_ring, self.dst_counts)
+        zonal = _pchip_to_fine(
+            means,
+            self.h,
+            self.interval,
+            self.interval_t,
+            self.clamp_left,
+            self.clamp_right,
+        )
+        out = (
+            fine_anom
+            - fine_mean.index_select(-1, self.dst_ring)
+            + zonal.index_select(-1, self.dst_ring).to(dtype=fine_anom.dtype)
+        )
+        if out.dtype != orig_dtype:
+            out = out.to(dtype=orig_dtype)
+        return out
+
+    def _resample_field(self, faces: torch.Tensor) -> torch.Tensor:
         means = _ring_means(faces, self.src_ring, self.src_counts)
         anomaly = faces - means.index_select(-1, self.src_ring)
         # Same weights as earth2grid's regridder. A short gather stays in the
@@ -235,6 +274,7 @@ class RingMeanPCHIPUpsampleFaces(nn.Module):
         nside: int = 32,
         enable_healpixpad: bool | None = None,
         reflection_equivariant: bool = False,
+        resample_in_fp32: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -248,7 +288,11 @@ class RingMeanPCHIPUpsampleFaces(nn.Module):
         self.in_channels = int(in_channels)
         self.enable_nhwc = bool(enable_nhwc)
         self.reflection_equivariant = bool(reflection_equivariant)
-        self.resample = RingMeanPCHIPUpsample(nside=int(nside), scale_factor=int(scale_factor))
+        self.resample = RingMeanPCHIPUpsample(
+            nside=int(nside),
+            scale_factor=int(scale_factor),
+            resample_in_fp32=resample_in_fp32,
+        )
         if self.reflection_equivariant:
             # Same buffer as the downsample projector so CUDA-graph capture
             # does not allocate the face order on the forward.
@@ -275,10 +319,14 @@ class RingMeanPCHIPUpsampleFaces(nn.Module):
             batch, channels, -1
         )
         orig_dtype = pixels.dtype
-        with torch.amp.autocast("cuda", enabled=False):
-            fine = self.resample(pixels.float())
+        if self.resample.resample_in_fp32:
+            with torch.amp.autocast("cuda", enabled=False):
+                fine = self.resample(pixels.float())
+            fine = fine.to(dtype=orig_dtype)
+        else:
+            fine = self.resample(pixels)
         fine_n = self.resample.fine_nside
-        fine = fine.to(dtype=orig_dtype).view(batch, channels, 12, fine_n, fine_n)
+        fine = fine.view(batch, channels, 12, fine_n, fine_n)
         fine = fine.permute(0, 2, 1, 3, 4).contiguous().view(batch_faces, channels, fine_n, fine_n)
         if channels_last:
             fine = fine.to(memory_format=torch.channels_last)
@@ -337,6 +385,7 @@ class ReflectionSteerableRingMeanPCHIPConv(nn.Module):
         compile_padding: bool = False,
         nside: int = 64,
         enable_healpixpad: bool | None = None,
+        resample_in_fp32: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -348,7 +397,9 @@ class ReflectionSteerableRingMeanPCHIPConv(nn.Module):
             )
         self.odd_fraction = float(odd_fraction)
         self.enable_nhwc = bool(enable_nhwc)
-        self.resample = RingMeanPCHIPUpsample(nside=nside, scale_factor=scale_factor)
+        self.resample = RingMeanPCHIPUpsample(
+            nside=nside, scale_factor=scale_factor, resample_in_fp32=resample_in_fp32
+        )
         in_even, _ = bank_sizes(in_channels, self.odd_fraction)
         out_even, _ = bank_sizes(out_channels, self.odd_fraction)
         self.conv = _PaddedReflectionSteerableConv(
@@ -389,10 +440,14 @@ class ReflectionSteerableRingMeanPCHIPConv(nn.Module):
             batch, channels, -1
         )
         orig_dtype = pixels.dtype
-        with torch.amp.autocast("cuda", enabled=False):
-            fine = self.resample(pixels.float())
+        if self.resample.resample_in_fp32:
+            with torch.amp.autocast("cuda", enabled=False):
+                fine = self.resample(pixels.float())
+            fine = fine.to(dtype=orig_dtype)
+        else:
+            fine = self.resample(pixels)
         fine_n = self.resample.fine_nside
-        fine = fine.to(dtype=orig_dtype).view(batch, channels, 12, fine_n, fine_n)
+        fine = fine.view(batch, channels, 12, fine_n, fine_n)
         fine = fine.permute(0, 2, 1, 3, 4).contiguous().view(batch_faces, channels, fine_n, fine_n)
         if channels_last:
             fine = fine.to(memory_format=torch.channels_last)
