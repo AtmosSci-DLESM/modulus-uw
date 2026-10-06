@@ -680,6 +680,12 @@ class HEALPixRecUNet(Module):
             ),
         )
 
+        if self.fp32_residual_state:
+            # Both the decoder output and the residual input pass through here, so the
+            # residual add runs in at least fp32 instead of the autocast dtype. Promotion
+            # keeps an fp64 model in fp64, and the cast is a copy of the decoder output.
+            res = res.to(th.promote_types(res.dtype, th.float32))
+
         return res
 
     def set_constraints(self, constraints: list[DictConfig] = None):
@@ -1004,10 +1010,6 @@ class HEALPixRecUNet(Module):
             
             # Residual prediction
             combined = self._reshape_outputs(decodings) # [B*F, T*C, H, W] -> [B, F, T, C, H, W]
-            if self.fp32_residual_state:
-                # A copy in at least fp32, so the residual add below is not rounded to the autocast
-                # dtype; promotion keeps an fp64 model in fp64 and leaves the decoder output intact.
-                combined = combined.to(th.promote_types(combined.dtype, th.float32))
             prognostics = combined[:, :, :, :self.input_channels]
             orig_input = self._reshape_outputs(input_for_residual[:, : self.input_channels * self.input_time_dim])
             if self.residual_prediction:
