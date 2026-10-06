@@ -469,9 +469,10 @@ class WeightedCRPSLoss(th.nn.MSELoss):
 
         n = self.n_members
         
-        # Manual Cast
-        prediction = prediction.to(th.float32)
-        target = target.to(th.float32)
+        # Manual Cast, if dtype is the same the original tensor is returned without copying and the unerlying data will be modified.
+        # This will cause problems if the tensor is used after the cast so we force a copy.
+        prediction = prediction.to(th.float32, copy=(prediction.dtype == th.float32))
+        target = target.to(th.float32, copy=(target.dtype == th.float32))
         
         # Apply channel weights across channel dims
         prediction *= self.loss_weights[None, None, None, None, :, None, None]
@@ -756,9 +757,10 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
         n = self.n_members
 
-        # Manual cast
-        prediction = prediction.to(th.float32)
-        target = target.to(th.float32)
+        # Manual Cast, if dtype is the same the original tensor is returned without copying and the unerlying data will be modified.
+        # This will cause problems if the tensor is used after the cast so we force a copy.
+        prediction = prediction.to(th.float32, copy=(prediction.dtype == th.float32))
+        target = target.to(th.float32, copy=(target.dtype == th.float32))
 
         # Apply channel weights across channel dims
         prediction *= self.loss_weights[None, None, None, None, :, None, None]
@@ -963,8 +965,10 @@ class SpreadSkillRatioLoss(th.nn.MSELoss):
                 f"got {prediction.shape} and {target.shape}"
             )
 
-        prediction = prediction.to(th.float32)
-        target = target.to(th.float32)
+        # Manual Cast, if dtype is the same the original tensor is returned without copying and the underlying data will be modified.
+        # This will cause problems if the tensor is used after the cast so we force a copy.
+        prediction = prediction.to(th.float32, copy=(prediction.dtype == th.float32))
+        target = target.to(th.float32, copy=(target.dtype == th.float32))
 
         # Apply channel weights before computing spread and skill.
         prediction *= self.loss_weights[None, None, None, None, :, None, None]
@@ -1205,8 +1209,10 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
 
         n = self.n_members
 
-        prediction = prediction.to(th.float32)
-        target = target.to(th.float32)
+        # Manual Cast, if dtype is the same the original tensor is returned without copying and the underlying data will be modified.
+        # This will cause problems if the tensor is used after the cast so we force a copy.
+        prediction = prediction.to(th.float32, copy=(prediction.dtype == th.float32))
+        target = target.to(th.float32, copy=(target.dtype == th.float32))
 
         # Extract patches (HEALPix-aware)
         pred_patches = self._extract_patches_prediction(prediction)  # [Cond,B,F,T,C,H,W,D]
