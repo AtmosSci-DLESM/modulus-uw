@@ -187,6 +187,22 @@ class ResidualSpectralLowPassConstraint(torch.nn.Module):
             nside=self.nside, lmax=self.lmax, mmax=self.mmax, quad_weights="ring"
         )
 
+    def _pin_spectral_fp32(self) -> None:
+        """Keep the SHT and HEALPix reorder in float32.
+
+        Those kernels reject a mix of float and double. They are built in
+        float32; a later ``module.to(fp64)`` recasts their buffers.
+        """
+        if self.sht.pct_weights.dtype == torch.float32:
+            return
+        self.sht.float()
+        self.isht.float()
+        self.reorder_to_ring.float()
+        self.reorder_from_ring.float()
+
+    def _fp32_regrid(self, regridder: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        return regridder(x.contiguous())
+
     def _to_alm(self, faces: torch.Tensor) -> torch.Tensor:
         """SHT of ``[B, F, T, C, H, W]`` → complex ``[B, T, C, lmax, mmax]``."""
         x = torch.movedim(faces, 1, -3)
@@ -195,13 +211,13 @@ class ResidualSpectralLowPassConstraint(torch.nn.Module):
                 f"expected 12 faces of nside={self.nside}, got spatial {tuple(x.shape[-3:])}"
             )
         x = x.reshape(*x.shape[:-3], -1)
-        x = self.reorder_to_ring(x.contiguous())
+        x = self._fp32_regrid(self.reorder_to_ring, x)
         return self.sht(x)
 
     def _from_alm(self, alm: torch.Tensor) -> torch.Tensor:
         """Inverse SHT ``[B, T, C, lmax, mmax]`` → ``[B, F, T, C, H, W]``."""
         x = self.isht(alm)
-        x = self.reorder_from_ring(x)
+        x = self._fp32_regrid(self.reorder_from_ring, x)
         x = x.reshape(*x.shape[:-1], 12, self.nside, self.nside)
         return torch.movedim(x, -3, 1)
 
@@ -235,6 +251,7 @@ class ResidualSpectralLowPassConstraint(torch.nn.Module):
             prefix). If time lengths differ, the last input time is used.
         """
         orig_dtype = prediction.dtype
+        self._pin_spectral_fp32()
         with torch.amp.autocast("cuda", enabled=False):
             prediction = prediction.float()
             orig = input.float()
