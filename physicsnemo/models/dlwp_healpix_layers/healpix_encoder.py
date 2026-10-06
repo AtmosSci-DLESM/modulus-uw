@@ -201,7 +201,11 @@ class UNetEncoder(th.nn.Module):
         for n, layer_group in enumerate(self.encoder):
             interim_output = inputs
             if self.per_level_checkpointing[n]:
-                interim_output = checkpoint(self._forward_layer_pass, layer_group, interim_output, conditions_cln, use_reentrant=False)
+                # Save the RNG state before checkpointing to preserve it across forward passes
+                # This is necessary to enable cuda graph capture with RNG state preservation with checkpointing
+                rng_state = th.random.get_rng_state()
+                interim_output = checkpoint(self._forward_layer_pass, layer_group, interim_output, conditions_cln, use_reentrant=False, preserve_rng_state=False)
+                th.random.set_rng_state(rng_state)
             else:
                 interim_output = self._forward_layer_pass(layer_group, interim_output, conditions_cln)
             outputs.append(interim_output)

@@ -229,7 +229,11 @@ class UNetDecoder(th.nn.Module):
         for n, layer in enumerate(self.decoder):
             skip_connection = inputs[-1 - n] if layer["upsamp"] is not None else None
             if self.per_level_checkpointing[n]:
-                x = checkpoint(self._forward_layer_pass, layer, x, skip_connection, conditions_cln, use_reentrant=False)
+                # Save the RNG state before checkpointing to preserve it across forward passes
+                # This is necessary to enable cuda graph capture with RNG state preservation with checkpointing
+                rng_state = th.random.get_rng_state()
+                x = checkpoint(self._forward_layer_pass, layer, x, skip_connection, conditions_cln, use_reentrant=False, preserve_rng_state=False)
+                th.random.set_rng_state(rng_state)
             else:
                 x = self._forward_layer_pass(layer, x, skip_connection, conditions_cln)
 
