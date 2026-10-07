@@ -22,10 +22,37 @@ import torch as th
 from .healpix_layers import HEALPixLayer
 from .healpix_paddings import warn_deprecated_enable_healpixpad
 from .normalization import ConditionalLayerNorm
+from .reflection_ops import REFL_FACE_ORDER, hpx_spatial_reflect
 
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
+from hydra.utils import get_class
+
+
+class _ReflectionEquivariantDownStage(th.nn.Module):
+    """Wrap one downsample stage with the discrete Z₂ Reynolds projector.
+
+    ``Π(down)(x) = ½(down(x) + ρ down(ρ x))`` with spatial HEALPix ``ρ``
+    (``hpx_spatial_reflect``). Makes stride-2 triangle BlurPool intertwine with
+    equatorial reflection on even faces, where bare even-lattice subsampling does not.
+    """
+
+    def __init__(self, stage: th.nn.Module):
+        super().__init__()
+        self.stage = stage
+        # Registered buffer avoids GPU allocation during forward (CUDA graph capture).
+        self.register_buffer(
+            "_refl_face_order",
+            th.tensor(REFL_FACE_ORDER, dtype=th.long),
+            persistent=False,
+        )
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        fo = self._refl_face_order
+        y = self.stage(x)
+        y_r = self.stage(hpx_spatial_reflect(x, face_order=fo))
+        return 0.5 * (y + hpx_spatial_reflect(y_r, face_order=fo))
 
 #
 # Helper: standard LayerNorm over channel dimension for (B, C, H, W)
@@ -1156,7 +1183,12 @@ class DealiasedDownsample(th.nn.Module):
     to one, and applies it depthwise with stride ``stride``.
 
     Typical filters from Zhang et al.: rectangle-2 ``[1, 1]``, triangle-3 ``[1, 2, 1]``,
-    binomial-5 ``[1, 4, 6, 4, 1]``. 
+    binomial-5 ``[1, 4, 6, 4, 1]``.
+
+    When ``reflection_equivariant=True``, each stride-2 stage is wrapped in the
+    discrete Z₂ Reynolds projector so the layer intertwines with equatorial
+    HEALPix reflection (bare stride-2 even-lattice sampling does not). Default
+    ``False`` preserves the CRPS BlurPool operator.
     """
 
     def __init__(
@@ -1170,6 +1202,7 @@ class DealiasedDownsample(th.nn.Module):
         compile_padding: bool = False,
         nside: int | None = None,
         enable_healpixpad: bool | None = None,
+        reflection_equivariant: bool = False,
     ):
         """
         Parameters
@@ -1194,6 +1227,10 @@ class DealiasedDownsample(th.nn.Module):
             ``"isolatitude"``, otherwise ignored. Default ``None``.
         enable_healpixpad: bool, optional
             Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
+        reflection_equivariant: bool, optional
+            If True, apply ``Π(down)=½(down + ρ down ρ)`` per stride-2 stage so
+            the downsample intertwines with equatorial reflection. Default False
+            keeps the single-path CRPS operator.
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
@@ -1206,27 +1243,33 @@ class DealiasedDownsample(th.nn.Module):
         if stride < 1 or (math.log2(stride) % 1) != 0:
             raise ValueError("stride must be a positive power of 2")
 
+        self.reflection_equivariant = bool(reflection_equivariant)
         n_layers = int(math.log2(stride))
         pool_layers = []
+        stage_nside = nside
         for _ in range(n_layers):
-            pool_layers.append(
-                geometry_layer(
-                    layer=DealiasBlurConv2d,
-                    in_channels=in_channels,
-                    out_channels=in_channels,
-                    kernel_size=m,
-                    stride=2,
-                    padding=0,
-                    groups=in_channels,
-                    bias=False,
-                    dilation=1,
-                    resample_filter=filt,
-                    enable_nhwc=enable_nhwc,
-                    hpx_padding_mode=hpx_padding_mode,
-                    compile_padding=compile_padding,
-                    nside=nside,
-                )
+            stage = geometry_layer(
+                layer=DealiasBlurConv2d,
+                in_channels=in_channels,
+                out_channels=in_channels,
+                kernel_size=m,
+                stride=2,
+                padding=0,
+                groups=in_channels,
+                bias=False,
+                dilation=1,
+                resample_filter=filt,
+                enable_nhwc=enable_nhwc,
+                hpx_padding_mode=hpx_padding_mode,
+                compile_padding=compile_padding,
+                nside=stage_nside,
             )
+            if self.reflection_equivariant:
+                stage = _ReflectionEquivariantDownStage(stage)
+            pool_layers.append(stage)
+            # Isolatitude pad needs the native face size of this stage's input.
+            if stage_nside is not None:
+                stage_nside = int(stage_nside) // 2
 
         self.pool = th.nn.Sequential(*pool_layers)
 
@@ -1446,7 +1489,12 @@ class Interpolate(th.nn.Module):
     This is done as a class so that scale and mode can be stored
     """
 
-    def __init__(self, scale_factor: Union[int, Tuple], mode: str = "nearest"):
+    def __init__(
+        self,
+        scale_factor: Union[int, Tuple],
+        mode: str = "nearest",
+        **kwargs,
+    ):
         """
         Parameters:
         ----------
@@ -1454,6 +1502,8 @@ class Interpolate(th.nn.Module):
             Multiplier for spatial size, passed to torch.nn.functional.interpolate
         mode: str, optional
             Interpolation mode used for upsampling, passed to torch.nn.functional.interpolate
+        **kwargs:
+            Ignored extras (e.g. ``in_channels``/``out_channels`` passed by UNetDecoder).
         """
         super().__init__()
         self.interp = th.nn.functional.interpolate

@@ -35,6 +35,22 @@ def _cln_affine(x_norm, gamma_raw, beta, scale_center, n_faces):
     return gamma * x_norm + beta
 
 
+def _make_layernorm(channel_depth: int, norm_op: str, eps: float):
+    """Build a channels-last LayerNorm without learnable affine parameters."""
+    if channel_depth <= 0:
+        return None
+    if norm_op == "torch":
+        return th.nn.LayerNorm(channel_depth, elementwise_affine=False, eps=eps)
+    if norm_op == "apex":
+        if not _APEX_AVAILABLE:
+            raise ImportError(
+                "Apex FusedLayerNorm requested but apex is not available, "
+                "please install it from https://github.com/NVIDIA/apex"
+            )
+        return FusedLayerNorm(channel_depth, elementwise_affine=False)
+    raise ValueError(f"Unsupported norm_op={norm_op!r}")
+
+
 class ConditionalLayerNorm(th.nn.Module):
     def __init__(
         self,
@@ -47,6 +63,7 @@ class ConditionalLayerNorm(th.nn.Module):
         norm_op:str = "torch",
         init_cln_to_zero: bool = False,
         scale_center: float = 0.0,
+        n_even: int | None = None,
     ):
         """
         Conditional LayerNorm with MLP-based conditioning.
@@ -71,8 +88,15 @@ class ConditionalLayerNorm(th.nn.Module):
             If True, initialize the last layer of the MLPs to zero.
             At the start of training, the noise will be ignored
         scale_center : float = 0.0
-            Center of the scale parameter. Set to 1.0 and use `init_cln_to_zero=True`
-            to make CLN behave like standard LayerNorm at initialization.
+            Center of the multiplicative scale: ``(scale_center + γ) * x_norm + β``.
+            Prefer ``1.0`` so the scale is identity-centered even when the MLP
+            last layer is not zero-initialized.
+        n_even : int or None, optional
+            If set, treat channels as ``[even | odd]`` with ``n_even`` even
+            channels (ReflectionSteerable layout). LayerNorm is applied per bank
+            (mixed-bank LN is not ρ-equivariant), and odd-channel β is forced to
+            zero (a nonzero shift would break oddness under reflection).
+            Default ``None`` keeps the legacy single-bank LN path.
         """
         super().__init__()
         self.eps = eps
@@ -89,16 +113,26 @@ class ConditionalLayerNorm(th.nn.Module):
         self.n_faces = n_faces
         self.scale_center = scale_center
 
+        if n_even is not None and (n_even < 0 or n_even > channel_depth):
+            raise ValueError(
+                f"n_even must be in [0, channel_depth={channel_depth}], got {n_even}"
+            )
+        self.n_even = n_even
+        self.n_odd = (channel_depth - n_even) if n_even is not None else 0
+
         if init_cln_to_zero:
             self.gamma_beta_mlp[-1].weight.data.zero_()
             self.gamma_beta_mlp[-1].bias.data.zero_()
 
-        if norm_op == "torch":
-            self.norm = th.nn.LayerNorm(channel_depth, elementwise_affine=False)
-        elif norm_op == "apex":
-            if not _APEX_AVAILABLE:
-                raise ImportError("Apex FusedLayerNorm requested but apex is not available, please install it from https://github.com/NVIDIA/apex")
-            self.norm = FusedLayerNorm(channel_depth, elementwise_affine=False)
+        if self.n_even is None:
+            self.norm = _make_layernorm(channel_depth, norm_op, eps)
+            self.norm_even = None
+            self.norm_odd = None
+        else:
+            # Bank-separate LN preserves even/odd typing under reflection.
+            self.norm = None
+            self.norm_even = _make_layernorm(self.n_even, norm_op, eps)
+            self.norm_odd = _make_layernorm(self.n_odd, norm_op, eps)
 
     def _make_mlp(self, in_dim: int, hidden_dims: List[int], out_dim: int, activation: th.nn.Module) -> th.nn.Sequential:
 
@@ -214,11 +248,31 @@ class ConditionalLayerNorm(th.nn.Module):
         x_nhwc = x.permute(0, 2, 3, 1)
         if not is_channels_last:
             x_nhwc = x_nhwc.contiguous()
-        x_norm = self.norm(x_nhwc)
+
+        if self.n_even is None:
+            x_norm = self.norm(x_nhwc)
+        else:
+            # Per-bank LN: mixed-channel LN would mix even/odd statistics and break ρ-eqv.
+            parts = []
+            if self.n_even > 0:
+                parts.append(self.norm_even(x_nhwc[..., : self.n_even]))
+            if self.n_odd > 0:
+                parts.append(self.norm_odd(x_nhwc[..., self.n_even :]))
+            x_norm = parts[0] if len(parts) == 1 else th.cat(parts, dim=-1)
 
         # Fused gamma/beta MLP: single forward pass, then split
         gamma_beta = self.gamma_beta_mlp(conditions)  # (B*n_cond, 2*C)
         gamma_raw, beta = gamma_beta.chunk(2, dim=-1)  # each (B*n_cond, C)
+
+        if self.n_even is not None and self.n_odd > 0:
+            # Odd β must be zero: a constant shift on an odd field is even under ρ.
+            if self.n_even == 0:
+                beta = th.zeros_like(beta)
+            else:
+                beta = th.cat(
+                    [beta[:, : self.n_even], th.zeros_like(beta[:, self.n_even :])],
+                    dim=-1,
+                )
 
         # Fused affine: expand across faces + scale_center + multiply + add
         result = _cln_affine(x_norm, gamma_raw, beta, self.scale_center, self.n_faces)

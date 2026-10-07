@@ -20,6 +20,7 @@ from .activations import (
     Identity,
     SquarePlus,
     Stan,
+    Tanh,
     get_activation,
 )
 from .conv_layers import ConvBlock, CubeEmbedding
