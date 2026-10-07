@@ -405,3 +405,84 @@ def test_sharded_window_matches_arrays(tmp_path):
     for c, name in enumerate(("u10m", "t2m")):
         assert np.array_equal(targets[:, :, c], stored[name][sl][idx_out], equal_nan=True)
 
+def test_load_windowed_channel_data_ic_diagnostics(tmp_path):
+    ds = _make_per_variable_store(tmp_path / "named", t=8)
+    time_sl = slice(0, 6)
+    input_time_idx = np.asarray([[0], [1]], dtype=np.intp)
+    output_time_idx = np.asarray([[2], [3]], dtype=np.intp)
+    output_scaling = {
+        "mean": np.zeros((1, 3, 1, 1, 1), dtype=np.float32),
+        "std": np.ones((1, 3, 1, 1, 1), dtype=np.float32),
+    }
+    inputs, targets, ic_diag = load_windowed_channel_data(
+        ds,
+        time_sl,
+        input_names=["t2m"],
+        input_time_idx=input_time_idx,
+        output_names=["t2m", "u10m", "v10m"],
+        output_time_idx=output_time_idx,
+        output_scaling=output_scaling,
+        ic_diagnostic_names=["u10m", "v10m"],
+    )
+    assert ic_diag.shape[2] == 2
+    staging = load_channel_data(ds, time_sl, ["t2m", "u10m", "v10m"])
+    exp_ic = staging[input_time_idx[:, :, None], np.asarray([1, 2])[None, None, :]]
+    np.testing.assert_array_equal(ic_diag, exp_ic)
+    assert inputs.shape[2] == 1
+    assert targets.shape[2] == 3
+
+
+def test_TimeSeriesDataset_return_ic_diagnostics(tmp_path):
+    omegaconf = pytest.importorskip("omegaconf")
+    pd = pytest.importorskip("pandas")
+    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
+        TimeSeriesDatasetZarr,
+    )
+
+    output_variables = ["tcwv", "msl", "sp"]
+    dataset_path = tmp_path / "ic_diag.zarr"
+    n_time, face, height, width = 12, 1, 2, 2
+    data = np.zeros((n_time, 3, face, height, width), dtype=np.float32)
+    for i in range(3):
+        data[:, i] = float(i + 1)
+    xr.Dataset(
+        data_vars={
+            "inputs": (("time", "channel_in", "face", "height", "width"), data),
+            "lat": (("face", "height", "width"), np.zeros((face, height, width))),
+            "lon": (("face", "height", "width"), np.zeros((face, height, width))),
+        },
+        coords={
+            "time": pd.date_range("1979-01-01", periods=n_time, freq="6h"),
+            "channel_in": output_variables,
+            "face": np.arange(face),
+            "height": np.arange(height),
+            "width": np.arange(width),
+        },
+    ).to_zarr(dataset_path)
+    scaling = omegaconf.DictConfig(
+        {name: {"mean": 0.0, "std": 1.0} for name in output_variables}
+    )
+    common = dict(
+        dataset_path=str(dataset_path),
+        data_time_step="6h",
+        time_step="6h",
+        gap="6h",
+        scaling=scaling,
+        input_variables=["tcwv"],
+        output_variables=output_variables,
+        start_date="1979-01-01",
+        end_date="1979-01-03",
+        batch_size=1,
+        input_time_dim=1,
+        output_time_dim=1,
+    )
+    dataset = TimeSeriesDatasetZarr(**common, return_ic_diagnostics=True)
+    assert dataset.ic_diagnostic_variables == ["msl", "sp"]
+    inputs, targets, ic_diag = dataset[0]
+    assert ic_diag.shape[3] == 2
+    assert float(ic_diag[0, 0, -1, 0].mean()) == pytest.approx(2.0)
+    assert float(ic_diag[0, 0, -1, 1].mean()) == pytest.approx(3.0)
+    assert inputs[0].dtype == np.float32
+    assert ic_diag.dtype == np.float32
+    batch = TimeSeriesDatasetZarr(**common, return_ic_diagnostics=False)[0]
+    assert len(batch) == 2
