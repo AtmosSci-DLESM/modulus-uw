@@ -37,6 +37,7 @@ Details on the HEALPix can be found at https://iopscience.iop.org/article/10.108
 from __future__ import annotations
 
 import logging
+import math
 import os
 
 import torch as th
@@ -120,6 +121,9 @@ def pop_deprecated_enable_healpixpad_from_kwargs(kwargs: dict) -> bool | None:
     return None
 
 
+POLE_CORRECTION_MODE = "isolatitude_pole_correction"
+
+
 def make_hpx_padding_layer(
     padding: int,
     hpx_padding_mode: str,
@@ -134,12 +138,13 @@ def make_hpx_padding_layer(
     padding : int
         Symmetric pad width on each face edge (``p >= 1``).
     hpx_padding_mode : str
-        One of ``"earth2grid"``, ``"karlbauer"``, or ``"isolatitude"``.
+        One of ``"earth2grid"``, ``"karlbauer"``, ``"isolatitude"``, or
+        ``"isolatitude_pole_correction"`` (isolatitude with the pole halo slots
+        refilled by :class:`HEALPixPaddingIsolatitude`'s ``pole_correction``).
     enable_nhwc : bool
         Passed to padding modules that support channels-last output.
     nside : int or None, optional
-        Native face height/width. Required when ``hpx_padding_mode=="isolatitude"``;
-        ignored otherwise.
+        Native face height/width. Required for the isolatitude modes; ignored otherwise.
 
     Returns
     -------
@@ -149,8 +154,9 @@ def make_hpx_padding_layer(
     Raises
     ------
     ValueError
-        Unknown mode, isolatitude without ``nside``, or earth2grid when earth2grid
-        is unavailable or CUDA is not available.
+        Unknown mode, an isolatitude mode without ``nside``, ``isolatitude_pole_correction``
+        with ``padding != 1``, or earth2grid when earth2grid is unavailable or CUDA is
+        not available.
     """
     if hpx_padding_mode == "earth2grid":
         if not have_earth2grid or not th.cuda.is_available():
@@ -162,20 +168,22 @@ def make_hpx_padding_layer(
         return HEALPixPaddingv2(padding=padding, enable_nhwc=enable_nhwc)
     if hpx_padding_mode == "karlbauer":
         return HEALPixPadding(padding=padding, enable_nhwc=enable_nhwc)
-    if hpx_padding_mode == "isolatitude":
+    if hpx_padding_mode in ("isolatitude", POLE_CORRECTION_MODE):
         if nside is None:
             raise ValueError(
-                'hpx_padding_mode="isolatitude" requires nside (positive int, '
+                f'hpx_padding_mode="{hpx_padding_mode}" requires nside (positive int, '
                 "native face height/width) to build gather indices."
             )
         return HEALPixPaddingIsolatitude(
             padding=padding,
             nside=nside,
             enable_nhwc=enable_nhwc,
+            pole_correction=hpx_padding_mode == POLE_CORRECTION_MODE,
         )
     raise ValueError(
         f"Unsupported hpx_padding_mode={hpx_padding_mode!r}; "
-        "expected one of 'earth2grid', 'karlbauer', 'isolatitude'."
+        "expected one of 'earth2grid', 'karlbauer', 'isolatitude', "
+        "'isolatitude_pole_correction'."
     )
 
 
@@ -684,6 +692,79 @@ class HEALPixPadding(th.nn.Module):
         return ret
 
 
+def build_pole_correction_tables(nside: int) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+    """
+    Slots and weights of the isolatitude pole correction at ``padding == 1``.
+
+    Returns ``(dst, src, w)``: ``dst`` [24] int32, the flat index of each halo slot in
+    the padded ``[12, nside + 2, nside + 2]`` face stack; ``src`` [24, 12] int32, the
+    flat index in the unpadded ``[12, nside, nside]`` stack of the 12 pixels it is
+    built from (4 on ring 1, then the 8 on ring 2); ``w`` [24, 12] float32, the weights.
+
+    Slots are ordered per pole (north faces 0-3, then south faces 8-11), per face: the
+    two ring-0 slots (weights of ``P``), then the corner (weights of ``C = 2P - own``).
+
+    Geometry used, for a polar face ``f`` of the north pole (pole pixel at array corner
+    (0, 0), ring ``k = i + j + 1``): longitude of pixel (i, j) is
+    ``45 + 90 f + 45 (j - i) / k`` degrees. The south pole is the same with pixels
+    ``(n-1-i, n-1-j)`` and ``45 + 90 (f - 8) - 45 (j - i) / k``.
+    """
+    n = int(nside)
+    hp = n + 2
+    deg = math.pi / 180.0
+
+    def ring_pixels(north: bool):
+        """For each of the 4 polar faces: list of (flat index, longitude deg, ring)."""
+        out = []
+        for q in range(4):
+            face = q if north else 8 + q
+            pix = []
+            for k in (1, 2):
+                for i in range(k):
+                    j = k - 1 - i
+                    if north:
+                        row, col, lon = i, j, 45 + 90 * q + 45.0 * (j - i) / k
+                    else:
+                        row, col, lon = n - 1 - i, n - 1 - j, 45 + 90 * q - 45.0 * (j - i) / k
+                    pix.append((face * n * n + row * n + col, lon, k))
+            out.append(pix)
+        return out
+
+    dst, src, wts = [], [], []
+    for north in (True, False):
+        faces = ring_pixels(north)
+        pole_pixels = [[p for p in pix if p[2] == 1] for pix in faces]
+        for q in range(4):
+            face = q if north else 8 + q
+            lam0 = (45 + 90 * q) * deg
+            # pixel order: ring 1 (one per face), then ring 2 (two per face)
+            ring1 = [pole_pixels[g][0] for g in range(4)]
+            ring2 = [p for g in range(4) for p in faces[g] if p[2] == 2]
+            order = ring1 + ring2
+            wP = []
+            for flat_idx, lon, k in order:
+                c = math.cos(lon * deg - lam0)
+                wP.append(0.5 + c if k == 1 else -0.125 - 0.25 * c)
+            own = faces[q][0][0]
+            wC = [2.0 * w for w in wP]
+            for t, (flat_idx, _, _) in enumerate(order):
+                if flat_idx == own:
+                    wC[t] -= 1.0
+            if north:
+                slots = [(0, 1), (1, 0), (0, 0)]
+            else:
+                slots = [(hp - 2, hp - 1), (hp - 1, hp - 2), (hp - 1, hp - 1)]
+            for t, (r, c_) in enumerate(slots):
+                dst.append(face * hp * hp + r * hp + c_)
+                src.append([o[0] for o in order])
+                wts.append(wC if t == 2 else wP)
+    return (
+        th.tensor(dst, dtype=th.int32),
+        th.tensor(src, dtype=th.int32),
+        th.tensor(wts, dtype=th.float64).to(th.float32),
+    )
+
+
 class HEALPixPaddingIsolatitude(th.nn.Module):
     """
     Isolatitude HEALPix padding via **precomputed gather** indices.
@@ -693,6 +774,37 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
     in-place in NCHW or NHWC so the training path does not permute, clone, then
     copy to channels-last. CPU (and ``PHYSICSNEMO_ISOLATITUDE_PAD=aten``) keep
     the original ATen gather implementation.
+
+    **Pole correction** (``pole_correction=True``, ``padding == 1``). Plain isolatitude
+    padding is exact at the poles except for three halo slots per polar face:
+    the two ring-0 slots next to the pole pixel hold the neighbouring face's pole
+    pixel (90 degrees of longitude away), and the corner holds the pixel across the
+    pole, whose stored east/north frame is rotated by 180 degrees relative to the
+    centre pixel (so a wind component arrives with the wrong sign). The corrected
+    mode refills those 3 slots on each of the 4 polar faces of each pole (24 slots)
+    with a fixed linear rule that is exact to first order for scalars and for wind
+    components alike, in the centre pixel's own east/north frame.
+
+    Rings around the pole are numbered ``k = 1, 2, ...`` outward (ring ``k`` has
+    ``4k`` equally spaced pixels). For a polar face whose pole pixel ("own") sits at
+    longitude ``lam0``, let ``m0_k`` be the mean of ring ``k`` and
+    ``m1_k = (2 / N_k) * sum_j x_j * cos(lam_j - lam0)`` its *wave-1 value at lam0*:
+    the amplitude, read along the face's own meridian, of the single-wave
+    (one high and one low per circle) part of the ring. Near the pole, as functions
+    of colatitude, a smooth scalar has ``m0`` flat and ``m1`` growing linearly from
+    zero; a smooth wind component (in each pixel's local east/north frame) has
+    ``m0`` growing linearly and ``m1`` constant. Extrapolating both harmonics to the
+    pole with a straight line through rings 1 and 2 therefore gives the pole value
+    of a scalar and the pole wind in the face's frame with the same weights::
+
+        P = (2 m0_1 - m0_2) + (2 m1_1 - m1_2)    -> both ring-0 slots
+        C = 2 P - own                            -> the across-pole corner
+
+    ``C`` continues the face's own meridian straight through the pole, so the
+    across pixel and its flipped frame are not used. Both are fixed weighted sums
+    of the same 12 pixels (4 on ring 1, 8 on ring 2), with weights summing to 1:
+    constants, zonal uniformity, the equatorial reflection and 90 degree rotation
+    are preserved exactly. Every other halo pixel is unchanged.
     """
 
     def __init__(
@@ -700,6 +812,7 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
         padding: int,
         nside: int,
         enable_nhwc: bool = False,
+        pole_correction: bool = False,
     ):
         """
         Parameters
@@ -711,10 +824,14 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             this size at init; ``forward`` rejects other ``H``.
         enable_nhwc : bool, optional
             Channels-last output when True.
+        pole_correction : bool, optional
+            Refill the 24 polar halo slots as described in the class docstring.
+            Requires ``padding == 1`` and ``nside >= 2``.
         """
         super().__init__()
         self.p = padding
         self.enable_nhwc = enable_nhwc
+        self.pole_correction = bool(pole_correction)
         if not isinstance(nside, int) or nside < 1:
             raise ValueError(
                 f"nside must be a positive int, got {nside!r}"
@@ -723,6 +840,11 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
         if not isinstance(padding, int) or padding < 1:
             raise ValueError(
                 f"invalid value for 'padding', expected int > 0 but got {padding}"
+            )
+        if self.pole_correction and (padding != 1 or nside < 2):
+            raise ValueError(
+                "the pole correction needs padding == 1 and nside >= 2, got "
+                f"padding={padding}, nside={nside}"
             )
         idx, valid = build_isolatitude_gather_index(padding, nside)
         self.register_buffer("_index0", idx[0], persistent=False) # always 1
@@ -742,6 +864,20 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             self._index1.index_select(0, pos_v1) if pos_v1.numel() > 0 else self._index1[:0],
             persistent=False,
         )
+
+        if self.pole_correction:
+            dst, src, w = build_pole_correction_tables(nside)
+            # The 12 slots of a pole are combinations of the same 12 pixels (the fused kernel relies on it).
+            src_p = src.view(2, 12, 12)
+            if not bool((src_p == src_p[:, :1]).all()):
+                raise RuntimeError("pole correction slots of one pole must share their source pixels")
+            self.register_buffer("_pole_dst", dst, persistent=False)
+            self.register_buffer("_pole_src", src, persistent=False)
+            self.register_buffer("_pole_w", w, persistent=False)
+            # The fused kernel skips outputs whose first source is -1; the pole kernel owns them.
+            idx0_tri = self._index0.clone()
+            idx0_tri[dst.long()] = -1
+            self.register_buffer("_index0_tri", idx0_tri, persistent=False)
 
     def forward(self, data: th.Tensor) -> th.Tensor:
         """
@@ -785,6 +921,17 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             and os.environ.get("PHYSICSNEMO_ISOLATITUDE_PAD", "triton") != "aten"
         )
         if use_fused:
+            if self.pole_correction:
+                return isolatitude_pad_triton(
+                    data,
+                    self._index0_tri,
+                    self._index1_or_neg1,
+                    self.p,
+                    self.enable_nhwc,
+                    self._pole_dst,
+                    self._pole_src,
+                    self._pole_w,
+                )
             return isolatitude_pad_triton(
                 data,
                 self._index0,
@@ -819,6 +966,16 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             out_flat.index_add_(dim=2, index=pos_v1.to(device=data.device), source=delta)
         else:
             out_flat = g0
+
+        if self.pole_correction:
+            # Fixed weighted sum of 12 pixels per slot; half precision accumulates in fp32
+            # like the fused kernel, fp32 and fp64 stay in their own dtype.
+            acc = th.float32 if data.dtype in (th.float16, th.bfloat16) else data.dtype
+            src = flat.gather(
+                dim=2, index=self._pole_src.reshape(1, 1, -1).expand(B, C, -1).long()
+            ).reshape(B, C, *self._pole_src.shape)
+            fills = (src.to(acc) * self._pole_w.to(acc)).sum(-1).to(out_flat.dtype)
+            out_flat = out_flat.index_copy(2, self._pole_dst.long(), fills)
 
         Hp, Wp = H + 2 * self.p, W + 2 * self.p
         out = out_flat.reshape(B, C, F, Hp, Wp).permute(0, 2, 1, 3, 4).reshape(

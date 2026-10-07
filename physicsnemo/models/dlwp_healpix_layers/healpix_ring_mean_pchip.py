@@ -21,6 +21,7 @@ from earth2grid.healpix import HEALPIX_PAD_XY
 from physicsnemo.models.layers.activations import Tanh
 
 from .healpix_paddings import warn_deprecated_enable_healpixpad
+from .healpix_polar_cap import POLE_CORRECTION_MODE, PolarCapUpCorrection
 from .reflection_ops import REFL_FACE_ORDER, bank_sizes, hpx_spatial_reflect
 from .reflection_steerable_blocks import _PaddedReflectionSteerableConv
 from .reflection_steerable_conv import (
@@ -56,9 +57,20 @@ class RingMeanPCHIPUpsample(nn.Module):
 
     ``scale_factor`` must be 2. Queries poleward of the coarse rings take the
     end ring's value.
+
+    ``pole_correction=True`` follows the resample with
+    :class:`~.healpix_polar_cap.PolarCapUpCorrection`, which sets waves 0 and 1 of the
+    innermost fine ring by linear extrapolation in colatitude from the coarse rings and
+    the wave-1 part of the next few fine rings by linear interpolation in colatitude.
     """
 
-    def __init__(self, nside: int, scale_factor: int = 2, resample_in_fp32: bool = True):
+    def __init__(
+        self,
+        nside: int,
+        scale_factor: int = 2,
+        resample_in_fp32: bool = True,
+        pole_correction: bool = False,
+    ):
         super().__init__()
         # Full-field fp32 copies of every decoder step fill the train CUDA-graph
         # pool. The zonal cubic stays fp32 either way; only the pixel field can
@@ -108,9 +120,16 @@ class RingMeanPCHIPUpsample(nn.Module):
             "clamp_right", torch.from_numpy(clamp_right.astype(np.bool_)), persistent=False
         )
         self.regrid = earth2grid.get_regridder(src, dst).float()
+        self.cap = PolarCapUpCorrection(nside) if pole_correction else None
 
     def forward(self, faces: torch.Tensor) -> torch.Tensor:
         """``[B, C, N]`` coarse pixels → ``[B, C, N_fine]`` in the same pixel order."""
+        out = self._resample(faces)
+        if self.cap is not None:
+            out = self.cap(out, faces)
+        return out
+
+    def _resample(self, faces: torch.Tensor) -> torch.Tensor:
         if self.resample_in_fp32:
             if faces.dtype != torch.float32:
                 faces = faces.float()
@@ -254,7 +273,8 @@ class RingMeanPCHIPUpsampleFaces(nn.Module):
     ``nside`` is the coarse face size, the same convention as the decoder
     upsample blocks. Activation, kernel, and padding arguments are accepted
     and ignored so a decoder upsample config can target this class without
-    keeping the learned 3×3.
+    keeping the learned 3×3. ``hpx_padding_mode="isolatitude_pole_correction"`` turns on the
+    polar-cap correction of the resample (the other padding modes are still ignored here).
     """
 
     def __init__(
@@ -279,7 +299,9 @@ class RingMeanPCHIPUpsampleFaces(nn.Module):
     ):
         super().__init__()
         del geometry_layer, kernel_size, dilation, mode, activation, odd_fraction
-        del hpx_padding_mode, compile_padding, enable_healpixpad, kwargs
+        del compile_padding, enable_healpixpad, kwargs
+        # Only the pole-correction mode matters here: the resample reads unpadded faces.
+        pole_correction = hpx_padding_mode == POLE_CORRECTION_MODE
         if out_channels is not None and int(out_channels) != int(in_channels):
             raise ValueError(
                 "ring-mean PCHIP upsample keeps the channel count, "
@@ -292,6 +314,7 @@ class RingMeanPCHIPUpsampleFaces(nn.Module):
             nside=int(nside),
             scale_factor=int(scale_factor),
             resample_in_fp32=resample_in_fp32,
+            pole_correction=pole_correction,
         )
         if self.reflection_equivariant:
             # Same buffer as the downsample projector so CUDA-graph capture
@@ -398,7 +421,10 @@ class ReflectionSteerableRingMeanPCHIPConv(nn.Module):
         self.odd_fraction = float(odd_fraction)
         self.enable_nhwc = bool(enable_nhwc)
         self.resample = RingMeanPCHIPUpsample(
-            nside=nside, scale_factor=scale_factor, resample_in_fp32=resample_in_fp32
+            nside=nside,
+            scale_factor=scale_factor,
+            resample_in_fp32=resample_in_fp32,
+            pole_correction=hpx_padding_mode == POLE_CORRECTION_MODE,
         )
         in_even, _ = bank_sizes(in_channels, self.odd_fraction)
         out_even, _ = bank_sizes(out_channels, self.odd_fraction)
