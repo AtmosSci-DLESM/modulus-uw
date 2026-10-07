@@ -25,6 +25,7 @@ import pytest
 import torch
 
 from physicsnemo.models.dlwp_healpix_layers.healpix_constraints import (
+    BoundConstraint,
     DryAirMassConstraint,
     NonnegativeConstraint,
 )
@@ -33,7 +34,9 @@ from physicsnemo.models.dlwp_healpix_layers.healpix_constraints import (
 def _reference_forward(prediction, channels, constrained_names, scaling):
     constrained_set = set(constrained_names)
     per = [
-        (0.0 - scaling[c]["mean"]) / scaling[c]["std"] if c in constrained_set else float("-inf")
+        (0.0 - scaling[c]["mean"]) / scaling[c]["std"]
+        if c in constrained_set
+        else float("-inf")
         for c in channels
     ]
     t = torch.tensor(per, dtype=torch.float32, device=prediction.device).view(
@@ -42,7 +45,33 @@ def _reference_forward(prediction, channels, constrained_names, scaling):
     return torch.maximum(prediction, t.to(dtype=prediction.dtype))
 
 
-def _reference_dry_air_mass_forward(prediction, input_tensor, channels, scaling, g0=9.81):
+def _reference_bound_forward(prediction, channels, bounds, scaling):
+    def _norm(name, limit, fallback):
+        if name not in bounds or limit is None:
+            return fallback
+        return (limit - scaling[name]["mean"]) / scaling[name]["std"]
+
+    mins = [
+        _norm(c, bounds[c][0] if c in bounds else None, float("-inf")) for c in channels
+    ]
+    maxs = [
+        _norm(c, bounds[c][1] if c in bounds else None, float("inf")) for c in channels
+    ]
+    min_t = torch.tensor(mins, dtype=torch.float32, device=prediction.device).view(
+        1, 1, 1, -1, 1, 1
+    )
+    max_t = torch.tensor(maxs, dtype=torch.float32, device=prediction.device).view(
+        1, 1, 1, -1, 1, 1
+    )
+    return torch.minimum(
+        torch.maximum(prediction, min_t.to(dtype=prediction.dtype)),
+        max_t.to(dtype=prediction.dtype),
+    )
+
+
+def _reference_dry_air_mass_forward(
+    prediction, input_tensor, channels, scaling, g0=9.81
+):
     """Legacy in-place write path; used only to validate the functional implementation."""
     sp_idx = channels.index("sp")
     tcwv_idx = channels.index("tcwv")
@@ -84,7 +113,9 @@ def test_dry_air_mass_matches_reference_index_copy():
         "sp": {"mean": 100000.0, "std": 5000.0},
         "tcwv": {"mean": 25.0, "std": 15.0},
     }
-    mod = DryAirMassConstraint(in_channels=channels, out_channels=channels, scaling=scaling)
+    mod = DryAirMassConstraint(
+        in_channels=channels, out_channels=channels, scaling=scaling
+    )
     torch.manual_seed(42)
     b, f, t, h, w = 2, 1, 3, 4, 4
     c = len(channels)
@@ -102,7 +133,9 @@ def test_dry_air_mass_non_sp_channels_unchanged():
         "sp": {"mean": 1e5, "std": 1e3},
         "tcwv": {"mean": 20.0, "std": 10.0},
     }
-    mod = DryAirMassConstraint(in_channels=channels, out_channels=channels, scaling=scaling)
+    mod = DryAirMassConstraint(
+        in_channels=channels, out_channels=channels, scaling=scaling
+    )
     torch.manual_seed(7)
     prediction = torch.randn(1, 1, 2, len(channels), 3, 3)
     inp = torch.randn_like(prediction)
@@ -118,7 +151,9 @@ def test_dry_air_mass_sp_channel_mask_buffer():
         "sp": {"mean": 0.0, "std": 1.0},
         "tcwv": {"mean": 0.0, "std": 1.0},
     }
-    mod = DryAirMassConstraint(in_channels=channels, out_channels=channels, scaling=scaling)
+    mod = DryAirMassConstraint(
+        in_channels=channels, out_channels=channels, scaling=scaling
+    )
     m = mod.sp_channel_mask.view(-1)
     assert m.sum().item() == 1.0
     assert m[channels.index("sp")].item() == 1.0
@@ -130,7 +165,9 @@ def test_dry_air_mass_torch_compile_forward():
         "sp": {"mean": 100000.0, "std": 5000.0},
         "tcwv": {"mean": 25.0, "std": 15.0},
     }
-    mod = DryAirMassConstraint(in_channels=channels, out_channels=channels, scaling=scaling)
+    mod = DryAirMassConstraint(
+        in_channels=channels, out_channels=channels, scaling=scaling
+    )
     torch.manual_seed(0)
     prediction = torch.randn(1, 1, 2, 2, 3, 3)
     inp = torch.randn(1, 1, 2, 2, 3, 3)
@@ -151,20 +188,52 @@ def test_dry_air_mass_torch_compile_backward():
         "tcwv": {"mean": 25.0, "std": 15.0},
     }
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    mod = DryAirMassConstraint(in_channels=channels, out_channels=channels, scaling=scaling).to(device)
+    mod = DryAirMassConstraint(
+        in_channels=channels, out_channels=channels, scaling=scaling
+    ).to(device)
     try:
         compiled = torch.compile(mod)
     except Exception:
         pytest.skip("torch.compile not available or failed to compile")
     torch.manual_seed(1)
-    prediction = torch.randn(
-        1, 1, 2, 2, 4, 4, device=device, requires_grad=True
-    )
+    prediction = torch.randn(1, 1, 2, 2, 4, 4, device=device, requires_grad=True)
     inp = torch.randn(1, 1, 2, 2, 4, 4, device=device)
     out = compiled(prediction, inp)
     out.sum().backward()
     assert prediction.grad is not None
     assert torch.isfinite(prediction.grad).all()
+
+
+def test_dry_air_mass_default_scaling_warns_and_uses_identity_scaling(caplog):
+    channels = ["tcwv", "sp"]
+    with caplog.at_level(logging.WARNING):
+        mod = DryAirMassConstraint(
+            in_channels=channels, out_channels=channels, scaling=None
+        )
+    assert "No scaling provided for DryAirMassConstraint" in caplog.text
+    assert mod.ps_mean.item() == pytest.approx(0.0)
+    assert mod.ps_std.item() == pytest.approx(1.0)
+    assert mod.tcwv_mean.item() == pytest.approx(0.0)
+    assert mod.tcwv_std.item() == pytest.approx(1.0)
+
+    explicit = DryAirMassConstraint(
+        in_channels=channels,
+        out_channels=channels,
+        scaling={name: {"mean": 0.0, "std": 1.0} for name in channels},
+    )
+    torch.manual_seed(3)
+    prediction = torch.randn(1, 1, 2, len(channels), 3, 3)
+    inp = torch.randn_like(prediction)
+    torch.testing.assert_close(mod(prediction, inp), explicit(prediction, inp))
+
+
+def test_dry_air_mass_out_channels_none_falls_back_to_in_channels():
+    channels = ["a", "sp", "tcwv"]
+    scaling = {name: {"mean": 0.0, "std": 1.0} for name in ("sp", "tcwv")}
+    mod = DryAirMassConstraint(in_channels=channels, out_channels=None, scaling=scaling)
+    assert mod.channels == channels
+    assert mod.sp_channel_index == channels.index("sp")
+    assert mod.tcwv_channel_index == channels.index("tcwv")
 
 
 def test_nonnegative_threshold_buffer_matches_formula():
@@ -202,9 +271,7 @@ def test_nonnegative_forward_matches_reference():
     torch.manual_seed(0)
     prediction = torch.randn(2, 1, 1, 3, 4, 4)
     out = mod(prediction, prediction)
-    expected = _reference_forward(
-        prediction, channels, {"a", "c"}, scaling
-    )
+    expected = _reference_forward(prediction, channels, {"a", "c"}, scaling)
     assert torch.equal(out, expected)
     assert not out.data_ptr() == prediction.data_ptr()
 
@@ -266,6 +333,64 @@ def test_nonnegative_warning_when_variables_missing(caplog):
         )
     assert "missing" in caplog.text
     assert "not found in model channels" in caplog.text
+
+
+def test_nonnegative_default_scaling_warns_and_clamps_at_zero(caplog):
+    channels = ["a", "b", "c"]
+    with caplog.at_level(logging.WARNING):
+        mod = NonnegativeConstraint(
+            variables=["a", "c"],
+            in_channels=channels,
+            out_channels=channels,
+        )
+    assert "No scaling provided for NonnegativeConstraint" in caplog.text
+
+    flat = mod.thresholds.view(-1)
+    assert flat[0].item() == pytest.approx(0.0)
+    assert torch.isneginf(flat[1])
+    assert flat[2].item() == pytest.approx(0.0)
+
+    explicit = NonnegativeConstraint(
+        variables=["a", "c"],
+        in_channels=channels,
+        out_channels=channels,
+        scaling={name: {"mean": 0.0, "std": 1.0} for name in ("a", "c")},
+    )
+    torch.manual_seed(0)
+    prediction = torch.randn(2, 1, 1, len(channels), 4, 4)
+    torch.testing.assert_close(
+        mod(prediction, prediction), explicit(prediction, prediction)
+    )
+
+
+def test_nonnegative_default_scaling_with_missing_variable(caplog):
+    """The default scaling dict is built from the filtered variable list."""
+    channels = ["a"]
+    with caplog.at_level(logging.WARNING):
+        mod = NonnegativeConstraint(
+            variables=["a", "ghost"],
+            in_channels=channels,
+            out_channels=channels,
+        )
+    assert "No scaling provided for NonnegativeConstraint" in caplog.text
+    assert "not found in model channels" in caplog.text
+    assert mod.variables == ["a"]
+    assert mod.thresholds.view(-1).tolist() == [0.0]
+
+
+def test_nonnegative_out_channels_none_falls_back_to_in_channels():
+    channels = ["a", "b"]
+    scaling = {name: {"mean": 0.0, "std": 1.0} for name in channels}
+    mod = NonnegativeConstraint(
+        variables=["b"],
+        in_channels=channels,
+        out_channels=None,
+        scaling=scaling,
+    )
+    assert mod.channels == channels
+    prediction = torch.tensor([[[[[[-5.0]], [[-5.0]]]]]])
+    out = mod(prediction, prediction)
+    torch.testing.assert_close(out, torch.tensor([[[[[[-5.0]], [[0.0]]]]]]))
 
 
 def test_nonnegative_no_constrained_variables_all_neg_inf():
@@ -351,9 +476,7 @@ def test_nonnegative_keep_grad_through_clamp_passes_gradient():
     )
     x_plain = raw.clone().requires_grad_(True)
     plain(x_plain, x_plain).sum().backward()
-    torch.testing.assert_close(
-        x_plain.grad, torch.tensor([[[[[[0.0, 1.0]]]]]])
-    )
+    torch.testing.assert_close(x_plain.grad, torch.tensor([[[[[[0.0, 1.0]]]]]]))
 
     ste = NonnegativeConstraint(
         variables=["x"],
@@ -367,6 +490,296 @@ def test_nonnegative_keep_grad_through_clamp_passes_gradient():
     torch.testing.assert_close(out, torch.tensor([[[[[[0.0, 1.0]]]]]]))
     out.sum().backward()
     torch.testing.assert_close(x_ste.grad, torch.ones_like(raw))
+
+
+def test_bound_threshold_buffers_match_formula():
+    channels = ["sic", "t", "sit"]
+    scaling = {
+        "sic": {"mean": 1.0, "std": 2.0},
+        "t": {"mean": 3.0, "std": 4.0},
+        "sit": {"mean": 5.0, "std": 6.0},
+    }
+    mod = BoundConstraint(
+        bounds={"sic": [0.0, 1.0], "sit": [0.0, None]},
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+    )
+    mins = mod.min_thresholds.view(-1)
+    maxs = mod.max_thresholds.view(-1)
+
+    assert mins[0].item() == pytest.approx((0.0 - 1.0) / 2.0)
+    assert maxs[0].item() == pytest.approx((1.0 - 1.0) / 2.0)
+    # Unconstrained channel is left wide open in both directions
+    assert torch.isneginf(mins[1])
+    assert torch.isposinf(maxs[1])
+    # Open-ended upper bound
+    assert mins[2].item() == pytest.approx((0.0 - 5.0) / 6.0)
+    assert torch.isposinf(maxs[2])
+
+
+def test_bound_forward_matches_reference():
+    channels = ["a", "b", "c"]
+    scaling = {
+        "a": {"mean": 0.5, "std": 0.25},
+        "b": {"mean": 0.0, "std": 1.0},
+        "c": {"mean": 10.0, "std": 2.0},
+    }
+    bounds = {"a": [0.0, 1.0], "c": [8.0, 12.0]}
+    mod = BoundConstraint(
+        bounds=bounds,
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+    )
+    torch.manual_seed(0)
+    prediction = torch.randn(2, 1, 1, 3, 4, 4)
+    out = mod(prediction, prediction)
+    expected = _reference_bound_forward(prediction, channels, bounds, scaling)
+    assert torch.equal(out, expected)
+    assert not out.data_ptr() == prediction.data_ptr()
+
+
+def test_bound_none_upper_bound_left_unclamped():
+    channels = ["x"]
+    scaling = {"x": {"mean": 0.0, "std": 1.0}}
+    mod = BoundConstraint(
+        bounds={"x": [0.0, None]},
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+    )
+    prediction = torch.tensor([[[[[[-5.0, 2.0, 1e6]]]]]])
+    out = mod(prediction, prediction)
+    torch.testing.assert_close(out, torch.tensor([[[[[[0.0, 2.0, 1e6]]]]]]))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_bound_forward_dtype_cast(dtype):
+    channels = ["x"]
+    scaling = {"x": {"mean": 1.0, "std": 2.0}}
+    mod = BoundConstraint(
+        bounds={"x": [0.0, 2.0]},
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+    )
+    prediction = torch.tensor([[[[[[-3.0, 0.0, 3.0]]]]]], dtype=dtype)
+    out = mod(prediction, prediction)
+    assert out.dtype == dtype
+    assert out[0, 0, 0, 0, 0, 0].item() == pytest.approx((0.0 - 1.0) / 2.0)
+    assert out[0, 0, 0, 0, 0, 1].item() == pytest.approx(0.0)
+    assert out[0, 0, 0, 0, 0, 2].item() == pytest.approx((2.0 - 1.0) / 2.0)
+
+
+def test_bound_variables_not_in_channels_ignored(caplog):
+    channels = ["only"]
+    scaling = {"only": {"mean": 2.0, "std": 1.0}}
+    with caplog.at_level(logging.WARNING):
+        mod = BoundConstraint(
+            bounds={"only": [0.0, 4.0], "missing": [0.0, 1.0]},
+            in_channels=channels,
+            out_channels=channels,
+            scaling=scaling,
+        )
+    assert "missing" in caplog.text
+    assert "not found in model channels" in caplog.text
+    assert mod.min_thresholds.view(-1).numel() == 1
+    assert mod.min_thresholds.view(-1)[0].item() == pytest.approx((0.0 - 2.0) / 1.0)
+
+
+def test_bound_out_channels_none_falls_back_to_in_channels():
+    channels = ["a", "b"]
+    scaling = {name: {"mean": 0.0, "std": 1.0} for name in channels}
+    mod = BoundConstraint(
+        bounds={"b": [-1.0, 1.0]},
+        in_channels=channels,
+        out_channels=None,
+        scaling=scaling,
+    )
+    assert mod.channels == channels
+    prediction = torch.tensor([[[[[[5.0]], [[5.0]]]]]])
+    out = mod(prediction, prediction)
+    torch.testing.assert_close(out, torch.tensor([[[[[[5.0]], [[1.0]]]]]]))
+
+
+def test_bound_default_scaling_warns_and_uses_physical_bounds(caplog):
+    """Regression test: the default scaling block once ran before self.variables existed."""
+    channels = ["sic", "t"]
+    with caplog.at_level(logging.WARNING):
+        mod = BoundConstraint(
+            bounds={"sic": [0.0, 1.0]},
+            in_channels=channels,
+            out_channels=channels,
+        )
+    assert "No scaling provided for BoundConstraint" in caplog.text
+
+    mins = mod.min_thresholds.view(-1)
+    maxs = mod.max_thresholds.view(-1)
+    assert mins[0].item() == pytest.approx(0.0)
+    assert maxs[0].item() == pytest.approx(1.0)
+    assert torch.isneginf(mins[1])
+    assert torch.isposinf(maxs[1])
+
+
+def test_bound_default_scaling_with_missing_variable(caplog):
+    channels = ["only"]
+    with caplog.at_level(logging.WARNING):
+        mod = BoundConstraint(
+            bounds={"only": [0.0, 4.0], "ghost": [0.0, 1.0]},
+            in_channels=channels,
+            out_channels=channels,
+        )
+    assert "No scaling provided for BoundConstraint" in caplog.text
+    assert "not found in model channels" in caplog.text
+    assert mod.variables == ["only"]
+    assert mod.min_thresholds.view(-1).tolist() == [0.0]
+    assert mod.max_thresholds.view(-1).tolist() == [4.0]
+
+
+def test_bound_inverted_bounds_raises():
+    channels = ["a", "b"]
+    scaling = {name: {"mean": 0.0, "std": 1.0} for name in channels}
+    with pytest.raises(ValueError, match="is greater than physical max"):
+        BoundConstraint(
+            bounds={"a": [1.0, -1.0], "b": [-1.0, 1.0]},
+            in_channels=channels,
+            out_channels=channels,
+            scaling=scaling,
+        )
+
+
+def test_bound_open_ended_limits_do_not_trigger_inverted_warning(caplog):
+    """None limits must not be compared against each other."""
+    channels = ["a", "b"]
+    scaling = {name: {"mean": 0.0, "std": 1.0} for name in channels}
+    with caplog.at_level(logging.WARNING):
+        BoundConstraint(
+            bounds={"a": [0.0, None], "b": [None, 1.0]},
+            in_channels=channels,
+            out_channels=channels,
+            scaling=scaling,
+        )
+    assert "is greater than physical max" not in caplog.text
+
+
+def test_bound_none_bounds_is_noop():
+    channels = ["a", "b"]
+    scaling = {name: {"mean": 0.0, "std": 1.0} for name in channels}
+    mod = BoundConstraint(
+        bounds=None,
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+    )
+    assert torch.all(torch.isneginf(mod.min_thresholds.view(-1)))
+    assert torch.all(torch.isposinf(mod.max_thresholds.view(-1)))
+    prediction = torch.randn(1, 1, 1, len(channels), 2, 2)
+    out = mod(prediction, prediction)
+    assert torch.equal(out, prediction)
+
+
+def test_bound_no_constrained_variables_is_noop():
+    channels = ["a", "b"]
+    scaling = {name: {"mean": 0.0, "std": 1.0} for name in channels}
+    mod = BoundConstraint(
+        bounds={"ghost": [0.0, 1.0]},
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+    )
+    assert torch.all(torch.isneginf(mod.min_thresholds.view(-1)))
+    assert torch.all(torch.isposinf(mod.max_thresholds.view(-1)))
+    prediction = torch.randn(1, 1, 1, 2, 2, 2)
+    out = mod(prediction, prediction)
+    assert torch.equal(out, prediction)
+
+
+def test_bound_torch_compile_forward():
+    channels = ["x", "y"]
+    scaling = {
+        "x": {"mean": 0.0, "std": 1.0},
+        "y": {"mean": 1.0, "std": 2.0},
+    }
+    mod = BoundConstraint(
+        bounds={"x": [-1.0, 1.0]},
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+    )
+    prediction = torch.randn(1, 1, 1, 2, 2, 2)
+    ref = mod(prediction, prediction)
+    try:
+        compiled = torch.compile(mod)
+    except Exception:
+        pytest.skip("torch.compile not available or failed to compile")
+    out = compiled(prediction, prediction)
+    assert torch.allclose(out, ref)
+
+
+def test_bound_keep_grad_through_clamp_passes_gradient():
+    """Saturated cells get zero grad with plain clamp, identity with STE."""
+    channels = ["x"]
+    scaling = {"x": {"mean": 0.0, "std": 1.0}}
+    # One below-min cell, one interior cell, one above-max cell
+    raw = torch.tensor([[[[[[-2.0, 0.5, 2.0]]]]]])
+    clamped = torch.tensor([[[[[[-1.0, 0.5, 1.0]]]]]])
+
+    plain = BoundConstraint(
+        bounds={"x": [-1.0, 1.0]},
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+        keep_grad_through_clamp=False,
+    )
+    x_plain = raw.clone().requires_grad_(True)
+    out_plain = plain(x_plain, x_plain)
+    torch.testing.assert_close(out_plain, clamped)
+    out_plain.sum().backward()
+    torch.testing.assert_close(x_plain.grad, torch.tensor([[[[[[0.0, 1.0, 0.0]]]]]]))
+
+    ste = BoundConstraint(
+        bounds={"x": [-1.0, 1.0]},
+        in_channels=channels,
+        out_channels=channels,
+        scaling=scaling,
+        keep_grad_through_clamp=True,
+    )
+    x_ste = raw.clone().requires_grad_(True)
+    out_ste = ste(x_ste, x_ste)
+    torch.testing.assert_close(out_ste, clamped)
+    out_ste.sum().backward()
+    torch.testing.assert_close(x_ste.grad, torch.ones_like(raw))
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda scaling: NonnegativeConstraint(
+            variables=["sp"],
+            in_channels=["sp", "tcwv"],
+            out_channels=["sp", "tcwv"],
+            scaling=scaling,
+        ),
+        lambda scaling: BoundConstraint(
+            bounds={"sp": [0.0, 1.0]},
+            in_channels=["sp", "tcwv"],
+            out_channels=["sp", "tcwv"],
+            scaling=scaling,
+        ),
+        lambda scaling: DryAirMassConstraint(
+            in_channels=["sp", "tcwv"],
+            out_channels=["sp", "tcwv"],
+            scaling=scaling,
+        ),
+    ],
+    ids=["nonnegative", "bound", "dry_air_mass"],
+)
+def test_no_scaling_warning_when_scaling_provided(build, caplog):
+    scaling = {name: {"mean": 1.0, "std": 2.0} for name in ("sp", "tcwv")}
+    with caplog.at_level(logging.WARNING):
+        build(scaling)
+    assert "No scaling provided" not in caplog.text
 
 
 def test_replace_value_keep_gradient_identity_backward():

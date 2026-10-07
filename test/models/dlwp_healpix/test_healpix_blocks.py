@@ -284,6 +284,110 @@ def test_Multi_SymmetricConvNeXtBlock_forward(device, test_data, pytestconfig):
     assert outvar.shape == out_shape
 
 
+def _first_conv(module):
+    """First torch.nn.Conv2d inside a (geometry-layer wrapped) module."""
+    return next(m for m in module.modules() if isinstance(m, torch.nn.Conv2d))
+
+
+def _count_convs(module):
+    return sum(1 for m in module.modules() if isinstance(m, torch.nn.Conv2d))
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_SymmetricConvNeXtBlock_use_initial_one_conv(device, test_data, pytestconfig):
+    """use_initial_one_conv prepends a 1x1 in->in conv to the main path, and is
+    off by default so existing configs build an unchanged graph.
+    """
+    from physicsnemo.models.dlwp_healpix_layers import (
+        SymmetricConvNeXtBlock,
+    )
+
+    in_channels = 2
+    latent_channels = 1
+    tensor_size = 16
+    block_kwargs = {
+        "in_channels": in_channels,
+        "latent_channels": latent_channels,
+        "hpx_padding_mode": "karlbauer",
+    }
+
+    without = SymmetricConvNeXtBlock(**block_kwargs).to(device)
+    default = SymmetricConvNeXtBlock(
+        **block_kwargs, use_initial_one_conv=False
+    ).to(device)
+    with_one_conv = SymmetricConvNeXtBlock(
+        **block_kwargs, use_initial_one_conv=True
+    ).to(device)
+
+    # Default matches an explicit False, and the flag adds exactly one conv
+    assert _count_convs(default) == _count_convs(without)
+    assert len(default.convblock) == len(without.convblock)
+    assert _count_convs(with_one_conv) == _count_convs(without) + 1
+    assert len(with_one_conv.convblock) == len(without.convblock) + 1
+
+    # The added conv leads the main path and preserves the channel count
+    entry_conv = _first_conv(with_one_conv.convblock[0])
+    assert entry_conv.kernel_size == (1, 1)
+    assert entry_conv.in_channels == in_channels
+    assert entry_conv.out_channels == in_channels
+
+    invar = test_data(img_size=tensor_size, device=device)
+    out_shape = torch.Size([12, 1, tensor_size, tensor_size])
+    assert without(invar).shape == out_shape
+    assert with_one_conv(invar).shape == out_shape
+
+    del without, default, with_one_conv, invar
+    torch.cuda.empty_cache()
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_Multi_SymmetricConvNeXtBlock_use_initial_one_conv(
+    device, test_data, pytestconfig
+):
+    """The flag reaches every sub-block of the multi-block wrapper."""
+    from physicsnemo.models.dlwp_healpix_layers import (
+        Multi_SymmetricConvNeXtBlock,
+    )
+
+    in_channels = 2
+    latent_channels = 1
+    out_channels = 1
+    n_layers = 2
+    tensor_size = 16
+    block_kwargs = {
+        "in_channels": in_channels,
+        "latent_channels": latent_channels,
+        "out_channels": out_channels,
+        "n_layers": n_layers,
+        "hpx_padding_mode": "karlbauer",
+    }
+
+    without = Multi_SymmetricConvNeXtBlock(**block_kwargs).to(device)
+    with_one_conv = Multi_SymmetricConvNeXtBlock(
+        **block_kwargs, use_initial_one_conv=True
+    ).to(device)
+
+    # One added conv per sub-block
+    assert _count_convs(with_one_conv) == _count_convs(without) + n_layers
+
+    for n, block in enumerate(with_one_conv.blocks):
+        entry_conv = _first_conv(block.convblock[0])
+        assert entry_conv.kernel_size == (1, 1), f"sub-block {n}"
+        # Sub-block 0 takes the block input, later ones take the previous output
+        expected_channels = in_channels if n == 0 else out_channels
+        assert entry_conv.in_channels == expected_channels, f"sub-block {n}"
+        assert entry_conv.out_channels == expected_channels, f"sub-block {n}"
+
+    invar = test_data(img_size=tensor_size, device=device)
+    out_shape = torch.Size([12, 1, tensor_size, tensor_size])
+    assert with_one_conv(invar).shape == out_shape
+
+    del without, with_one_conv, invar
+    torch.cuda.empty_cache()
+
+
 @import_or_fail("hydra")
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 def test_BasicConvBlock_initialization(device, pytestconfig):

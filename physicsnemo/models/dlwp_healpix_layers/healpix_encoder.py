@@ -200,7 +200,9 @@ class UNetEncoder(th.nn.Module):
         outputs = []
         for n, layer_group in enumerate(self.encoder):
             interim_output = inputs
-            if self.per_level_checkpointing[n]:
+            # when use_reentrant=False, checkpoint() will still checkpoint the layer
+            # to disable checkpointing, we manually check if we are in training mode and the gradient is enabled
+            if self.per_level_checkpointing[n] and self.training and th.is_grad_enabled():
                 interim_output = checkpoint(self._forward_layer_pass, layer_group, interim_output, conditions_cln, use_reentrant=False)
             else:
                 interim_output = self._forward_layer_pass(layer_group, interim_output, conditions_cln)
