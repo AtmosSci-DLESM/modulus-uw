@@ -21,6 +21,7 @@ import torch
 import torch as th
 from .healpix_layers import HEALPixLayer
 from .healpix_paddings import warn_deprecated_enable_healpixpad
+from .healpix_polar_cap import POLE_CORRECTION_MODE, PolarCapDownCorrection
 from .normalization import ConditionalLayerNorm
 from .reflection_ops import REFL_FACE_ORDER, hpx_spatial_reflect
 
@@ -53,6 +54,17 @@ class _ReflectionEquivariantDownStage(th.nn.Module):
         y = self.stage(x)
         y_r = self.stage(hpx_spatial_reflect(x, face_order=fo))
         return 0.5 * (y + hpx_spatial_reflect(y_r, face_order=fo))
+
+class _PolarCapDownStage(th.nn.Module):
+    """One downsample stage followed by the polar-cap correction (`healpix_polar_cap`)."""
+
+    def __init__(self, stage: th.nn.Module, fine_nside: int):
+        super().__init__()
+        self.stage = stage
+        self.cap = PolarCapDownCorrection(fine_nside)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        return self.cap(x, self.stage(x))
 
 #
 # Helper: standard LayerNorm over channel dimension for (B, C, H, W)
@@ -1189,6 +1201,12 @@ class DealiasedDownsample(th.nn.Module):
     discrete Z₂ Reynolds projector so the layer intertwines with equatorial
     HEALPix reflection (bare stride-2 even-lattice sampling does not). Default
     ``False`` preserves the CRPS BlurPool operator.
+
+    With ``hpx_padding_mode="isolatitude_pole_correction"`` the pad inside each stage uses the
+    pole-corrected halo, and each stage's output is followed by
+    :class:`~.healpix_polar_cap.PolarCapDownCorrection`, which rebuilds waves 0 and 1 of the
+    coarse polar rings from the fine field. That mode needs ``nside`` and a 3-tap filter
+    (its padding is one pixel wide).
     """
 
     def __init__(
@@ -1244,6 +1262,9 @@ class DealiasedDownsample(th.nn.Module):
             raise ValueError("stride must be a positive power of 2")
 
         self.reflection_equivariant = bool(reflection_equivariant)
+        self.pole_correction = hpx_padding_mode == POLE_CORRECTION_MODE
+        if self.pole_correction and nside is None:
+            raise ValueError(f'hpx_padding_mode="{POLE_CORRECTION_MODE}" requires nside')
         n_layers = int(math.log2(stride))
         pool_layers = []
         stage_nside = nside
@@ -1266,6 +1287,8 @@ class DealiasedDownsample(th.nn.Module):
             )
             if self.reflection_equivariant:
                 stage = _ReflectionEquivariantDownStage(stage)
+            if self.pole_correction:
+                stage = _PolarCapDownStage(stage, fine_nside=stage_nside)
             pool_layers.append(stage)
             # Isolatitude pad needs the native face size of this stage's input.
             if stage_nside is not None:
