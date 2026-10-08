@@ -21,6 +21,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 from torch.utils.checkpoint import checkpoint
 
+from .healpix_layers import check_for_rng_consumers
 from .healpix_paddings import warn_deprecated_enable_healpixpad
 
 
@@ -105,6 +106,9 @@ class UNetEncoder(th.nn.Module):
         # Generate the per_level_checkpointing list, simplifies forward logic
         self.per_level_checkpointing = per_level_checkpointing if per_level_checkpointing is not None else [False] * len(n_channels)
 
+        # All layers are identical, so we can just set the flag once
+        self.preserve_rng_state = False
+
         if dilations is None:
             # Defaults to [1, 1, 1...] in accordance with the number of unet levels
             dilations = [1 for _ in range(len(n_channels))]
@@ -149,6 +153,16 @@ class UNetEncoder(th.nn.Module):
             old_channels = curr_channel
 
             self.encoder.append(th.nn.Sequential(*modules))
+
+        # The checkpointed regions use preserve_rng_state=False to avoid a 30% performance penalty
+        # (see the helper's docstring). The forward and backward passes are exact only while the
+        # region draws no RNG, so check if the region draws RNG and if enable preserve_rng_state accordingly.
+        for n, enabled in enumerate(self.per_level_checkpointing):
+            if enabled:
+                # all layers are identical, so we check the result from the last layer for simplicity
+                self.preserve_rng_state = check_for_rng_consumers(
+                    self.encoder[n], f"UNetEncoder level {n}"
+                )
 
         self.encoder = th.nn.ModuleList(self.encoder)
 
@@ -201,11 +215,15 @@ class UNetEncoder(th.nn.Module):
         for n, layer_group in enumerate(self.encoder):
             interim_output = inputs
             if self.per_level_checkpointing[n]:
-                # Save the RNG state before checkpointing to preserve it across forward passes
-                # This is necessary to enable cuda graph capture with RNG state preservation with checkpointing
-                rng_state = th.random.get_rng_state()
-                interim_output = checkpoint(self._forward_layer_pass, layer_group, interim_output, conditions_cln, use_reentrant=False, preserve_rng_state=False)
-                th.random.set_rng_state(rng_state)
+                # Disable reentrancy and rng preservation conditionally to allow for cuda graph capture with checkpointing
+                interim_output = checkpoint(
+                    self._forward_layer_pass,
+                    layer_group,
+                    interim_output,
+                    conditions_cln,
+                    use_reentrant=False,
+                    preserve_rng_state=self.preserve_rng_state
+                )
             else:
                 interim_output = self._forward_layer_pass(layer_group, interim_output, conditions_cln)
             outputs.append(interim_output)
