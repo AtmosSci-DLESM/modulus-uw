@@ -24,6 +24,7 @@ import xarray as xr
 
 from physicsnemo.metrics.climate.healpix_loss import WeightedMSE
 from physicsnemo.metrics.climate.healpix_soft_constraints import (
+    DryAirMassShiftSoftConstraint,
     DryAirMassSoftConstraint,
     HydrostasySoftConstraint,
     LossWithSoftConstraints,
@@ -597,3 +598,58 @@ def test_loss_constraint_specs_follow_module_order():
             data_loss=WeightedMSE(weights=[1.0]),
             constraints=[_Named("hydro", ["50-100"]), _Named("hydro", ["100-150"])],
         ).constraint_specs()
+
+
+def test_dry_air_shift_soft_constraint_penalizes_pre_correction_shift():
+    from types import SimpleNamespace
+
+    from physicsnemo.models.dlwp_healpix_layers.healpix_constraints import (
+        DryAirMassConstraint,
+    )
+
+    channels = ["sp", "tcwv", "x"]
+    scaling = {
+        "sp": {"mean": 1e5, "std": 1e3},
+        "tcwv": {"mean": 20.0, "std": 10.0},
+    }
+    hard = DryAirMassConstraint(channels, channels, scaling)
+    model = SimpleNamespace(constraints=[hard], integration_steps=2)
+    soft = DryAirMassShiftSoftConstraint(alpha=2.0)
+    soft.setup(SimpleNamespace(model=model, device=torch.device("cpu")))
+
+    inp = torch.zeros(1, 1, 1, 3, 4, 4)
+    raw = torch.zeros(1, 1, 1, 3, 4, 4, requires_grad=True)
+    # sp raised by 3 Pa (normalized 3e-3) with tcwv unchanged.
+    first = raw.detach().clone()
+    first[:, :, :, 0] += 3e-3
+    first.requires_grad_(True)
+    out1 = hard(first, inp)
+    out2 = hard(raw, out1.detach())
+
+    # Hard constraint output conserves dry mass, so the data-independent
+    # soft dry-air path would see no violation; the recorded shift does.
+    assert torch.allclose(out1[:, :, :, 0].mean(), inp[:, :, :, 0].mean(), atol=1e-6)
+    prediction = torch.cat([out1, out2], dim=2)
+    loss = soft.constraint_loss(prediction, None)
+    assert loss.item() > 0
+    loss.backward()
+    assert first.grad is not None and first.grad.abs().sum() > 0
+
+    # No shift -> no loss.
+    hard.shift_record.clear()
+    zero = torch.zeros(1, 1, 1, 3, 4, 4)
+    hard(zero, inp)
+    hard(zero, inp)
+    assert soft.constraint_loss(torch.zeros(1, 1, 2, 3, 4, 4), None).item() == 0.0
+
+    # Mismatched time length is an error, not a silent mis-pairing.
+    with pytest.raises(RuntimeError):
+        soft.constraint_loss(torch.zeros(1, 1, 3, 3, 4, 4), None)
+
+
+def test_dry_air_shift_physical_rmse_matches_recorded_shifts():
+    shifts = [torch.full((1, 1, 1, 1, 1, 1), x) for x in (1.0, -2.0, 3.0, -4.0)]
+    c = DryAirMassShiftSoftConstraint()
+    c._hard = [type("H", (), {"shift_record": shifts})()]
+    out = c.physical_rmse(torch.zeros(1, 12, 4, 1, 2, 2))
+    assert float(out) == pytest.approx(np.sqrt(np.mean([1.0, 4.0, 9.0, 16.0])))
