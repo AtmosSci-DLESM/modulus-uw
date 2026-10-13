@@ -832,10 +832,25 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         name: str = "aam",
         relative_loss_scale=None,
         derived_surface_pressure: Optional[Dict] = None,
+        mountain_torque_sign: float = 1.0,
+        mountain_torque_anomaly: bool = False,
+        reference_temperature: float = 288.0,
+        reference_pressure: float = 101325.0,
     ):
         super().__init__()
         self.name = _constraint_name(name)
         self.relative_loss_scale = relative_loss_scale
+        # +1 keeps the original mountain-torque term T_m = +a^2 sum(ps dh/dlambda dOmega). The torque on the atmosphere
+        # is -a^2 int ps dh/dlambda dOmega; on ERA5 the budget residual is smaller with -1 (see calibrate_soft_constraint_alphas.py,
+        # AAM_SIGN_CHECK=1), but the default stays +1 so existing configs and checkpoints train as before.
+        self.mountain_torque_sign = float(mountain_torque_sign)
+        # With ``mountain_torque_anomaly`` the torque uses ps - ps_ref(h), ps_ref = p_ref exp(-g h / (R T_ref)). Any function of h
+        # alone gives zero torque analytically (its ring integral against dh/dlambda is a total derivative), but the large
+        # hydrostatic part of ps does not cancel numerically on the grid: on ERA5 that artifact is ~ +2e19 N m, as large as the
+        # physical torques. The anomaly form removes it and raises the ERA5 budget R^2 from 0.58 to 0.75.
+        self.mountain_torque_anomaly = bool(mountain_torque_anomaly)
+        self._ref_temperature = float(reference_temperature)
+        self._ref_pressure = float(reference_pressure)
         self.channels = list(channels)
         self.input_channels = (
             list(input_channels) if input_channels is not None else list(channels)
@@ -1033,6 +1048,14 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
             topo[0, :, 0, :, :].contiguous(),
             persistent=False,
         )
+        self.register_buffer(
+            "ps_ref",
+            (
+                self._ref_pressure
+                * torch.exp(-self.g0 * topo / (287.04 * self._ref_temperature))
+            ).view(1, 12, 1, 1, self.nside, self.nside),
+            persistent=False,
+        )
 
     def setup(self, trainer) -> None:
         device = trainer.device
@@ -1049,6 +1072,7 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         self.alpha = self.alpha.to(device=device)
         self.cos_phi = self.cos_phi.to(device=device)
         self._surface_height = self._surface_height.to(device=device)
+        self.ps_ref = self.ps_ref.to(device=device)
         if self.derived:
             self._dsp_pred.to(device)
             self._dsp_in.to(device)
@@ -1214,8 +1238,9 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         t_f = -(self.a ** 3) * ((iews + iegwss) * self.cos_phi * self.d_omega).sum(
             dim=(1, 3, 4, 5)
         )
-        t_m = (self.a ** 2) * (
-            sp * self.dh_dlambda * self.d_omega
+        sp_torque = sp - self.ps_ref if self.mountain_torque_anomaly else sp
+        t_m = self.mountain_torque_sign * (self.a ** 2) * (
+            sp_torque * self.dh_dlambda * self.d_omega
         ).sum(dim=(1, 3, 4, 5))
         return t_f + t_m
 

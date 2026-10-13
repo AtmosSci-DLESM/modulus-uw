@@ -93,3 +93,33 @@ def test_aam_derived_runs_without_sp_channel(tmp_path):
     loss.backward()
     assert torch.isfinite(pred.grad).all()
     assert torch.isfinite(mod.physical_rmse(pred, pred, input=inp))
+
+
+def test_mountain_torque_anomaly_form_removes_the_static_hydrostatic_part(tmp_path):
+    prog, out = _channels()
+    rng = np.random.default_rng(0)
+    topo = (rng.random((12, 1, NSIDE, NSIDE)) * 2000.0).astype(np.float32)          # metres * g0 via convert_topography_to_meters
+    ds = xr.Dataset({"constants": (("face", "channel_c", "height", "width"), topo * 9.81)}, coords={"channel_c": ["z"]})
+    path = tmp_path / "mount.zarr"
+    ds.to_zarr(path)
+
+    def build(**kw):
+        m = AxialAngularMomentumSoftConstraint(
+            hPa_levels=LEVELS, channels=out, scaling=_scaling(out), dataset_path=str(path), surface_geopotential_name="z",
+            surface_geopotential_mean=0.0, surface_geopotential_std=1.0, input_channels=prog, alpha=1.0e19,
+            derived_surface_pressure=_derived_cfg(tmp_path), **kw)
+        m.setup(_Trainer(torch.device("cpu"), out))
+        m.dh_dlambda = torch.randn_like(m.dh_dlambda)                                # the SHT derivative only exists on CUDA
+        return m
+
+    plain, anomaly = build(), build(mountain_torque_anomaly=True)
+    sp_hydro = anomaly.ps_ref.clone()                                                  # surface pressure that depends on h only
+    # patch the derived pressure to return the h-only reference
+    for m in (plain, anomaly):
+        m._sp_from_prediction = lambda tensor, _s=sp_hydro: _s.expand(tensor.shape[0], 12, tensor.shape[2], 1, NSIDE, NSIDE).clone()
+    pred = torch.zeros(1, 12, 2, len(out), NSIDE, NSIDE)
+    assert float(anomaly._torques_from_prediction(pred).abs().max()) < 1.0e-3 * float(plain._torques_from_prediction(pred).abs().max())
+    # the sign option flips the mountain part
+    neg = build(mountain_torque_sign=-1.0)
+    neg.dh_dlambda = plain.dh_dlambda.clone(); neg._sp_from_prediction = plain._sp_from_prediction
+    assert torch.allclose(neg._torques_from_prediction(pred), -plain._torques_from_prediction(pred))
