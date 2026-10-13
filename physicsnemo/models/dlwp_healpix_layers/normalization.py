@@ -26,7 +26,7 @@ except ImportError:
     _APEX_AVAILABLE = False
 
 
-#@th.compile
+@th.compile
 def _cln_affine(x_norm, gamma_raw, beta, scale_center, n_faces):
     """Fused affine transform: expand gamma/beta across faces and apply to normalized input."""
     C = gamma_raw.shape[-1]
