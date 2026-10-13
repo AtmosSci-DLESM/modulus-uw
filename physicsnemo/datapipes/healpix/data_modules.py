@@ -75,6 +75,67 @@ def open_time_series_dataset_classic_prebuilt(
     return result
 
 
+def _select_constants_with_optional_source(
+    dataset: xr.Dataset,
+    constants: Optional[DictConfig],
+    source_directory: Optional[str] = None,
+    source_dataset_name: Optional[str] = None,
+    source_map: Optional[DictConfig] = None,
+) -> xr.Dataset:
+    """Select constants, optionally filling missing channels from another zarr."""
+    if constants is None:
+        return dataset
+
+    available_constants = (
+        set(dataset.channel_c.values) if "channel_c" in dataset.coords else set()
+    )
+    requested_constants = list(constants.values())
+    missing_constants = [
+        constant for constant in requested_constants if constant not in available_constants
+    ]
+
+    if missing_constants and (
+        source_directory is None or source_dataset_name is None
+    ):
+        raise ValueError(f"Constants not found in dataset: {set(missing_constants)}")
+
+    source_dataset = None
+    if missing_constants:
+        source_dataset = open_time_series_dataset_classic_prebuilt(
+            directory=source_directory,
+            dataset_name=source_dataset_name,
+            constants=True,
+        )
+        if "channel_c" not in source_dataset.coords:
+            raise ValueError(
+                "Constant source dataset has no channel_c coordinate: "
+                f"{Path(source_directory, source_dataset_name + '.zarr')}"
+            )
+
+    selected_constants = []
+    for alias, constant in constants.items():
+        if constant in available_constants:
+            selected = dataset["constants"].sel(channel_c=constant)
+        else:
+            source_constant = (
+                source_map.get(constant, source_map.get(alias, constant))
+                if source_map is not None
+                else constant
+            )
+            if source_constant not in set(source_dataset.channel_c.values):
+                raise ValueError(
+                    f"Constant {constant!r} not found in dataset and source "
+                    f"constant {source_constant!r} not found in source dataset"
+                )
+            selected = source_dataset["constants"].sel(channel_c=source_constant)
+        selected_constants.append(selected.expand_dims(channel_c=[constant]))
+
+    constants_da = xr.concat(selected_constants, dim="channel_c")
+    return dataset.drop_vars(["constants", "channel_c"], errors="ignore").assign(
+        constants=constants_da
+    )
+
+
 class TimeSeriesDataModule:
     """pytorch-lightning module for complete model train, validation, and test data loading. Uses
     dlwp.data.data_loading.TimeSeriesDataset under-the-hood. Loaded data files follow the naming scheme
@@ -109,6 +170,9 @@ class TimeSeriesDataModule:
         pin_memory: bool = True,
         prebuilt_dataset: bool = True,  # kept for backwards compatibility
         forecast_init_times: Optional[Sequence] = None,
+        constants_source_directory: Optional[str] = None,
+        constants_source_dataset_name: Optional[str] = None,
+        constants_source_map: Optional[DictConfig] = None,
     ):
         """
         Parameters
@@ -199,6 +263,9 @@ class TimeSeriesDataModule:
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.forecast_init_times = forecast_init_times
+        self.constants_source_directory = constants_source_directory
+        self.constants_source_dataset_name = constants_source_dataset_name
+        self.constants_source_map = constants_source_map
 
         self.train_dataset = None
         self.val_dataset = None
@@ -259,15 +326,13 @@ class TimeSeriesDataModule:
             channel_in=self.input_variables,
             channel_out=self.output_variables,
         )
-        if self.constants is not None:
-            # Verify that all constants are available in the dataset
-            missing_constants = set(list(self.constants.values())) - set(
-                dataset.channel_c.values
-            )
-            if missing_constants:
-                raise ValueError(f"Constants not found in dataset: {missing_constants}")
-
-            dataset = dataset.sel(channel_c=list(self.constants.values()))
+        dataset = _select_constants_with_optional_source(
+            dataset,
+            self.constants,
+            self.constants_source_directory,
+            self.constants_source_dataset_name,
+            self.constants_source_map,
+        )
 
         if self.splits is not None and self.forecast_init_times is None:
             self.train_dataset = TimeSeriesDataset(
@@ -491,6 +556,9 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
         add_train_noise: Optional[bool] = False,
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
+        constants_source_directory: Optional[str] = None,
+        constants_source_dataset_name: Optional[str] = None,
+        constants_source_map: Optional[DictConfig] = None,
     ):
         """
         Parameters
@@ -594,6 +662,9 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
             pin_memory,
             prebuilt_dataset,
             forecast_init_times,
+            constants_source_directory,
+            constants_source_dataset_name,
+            constants_source_map,
         )
 
     def _get_coupled_vars(self):
@@ -638,14 +709,13 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
             channel_in=self.input_variables + coupled_variables,
             channel_out=self.output_variables,
         )
-        if self.constants is not None:
-            # Verify that all constants are available in the dataset
-            missing_constants = set(list(self.constants.values())) - set(
-                dataset.channel_c.values
-            )
-            if missing_constants:
-                raise ValueError(f"Constants not found in dataset: {missing_constants}")
-            dataset = dataset.sel(channel_c=list(self.constants.values()))
+        dataset = _select_constants_with_optional_source(
+            dataset,
+            self.constants,
+            self.constants_source_directory,
+            self.constants_source_dataset_name,
+            self.constants_source_map,
+        )
 
         if self.splits is not None and self.forecast_init_times is None:
             self.train_dataset = CoupledTimeSeriesDataset(
