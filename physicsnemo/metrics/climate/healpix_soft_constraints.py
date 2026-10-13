@@ -1338,6 +1338,278 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
             )
 
 
+def _geographic_latitude(grid) -> np.ndarray:
+    """Geographic latitude in radians for an earth2grid HEALPix grid."""
+    lat = np.asarray(grid.lat, dtype=np.float64)
+    peak = float(np.nanmax(np.abs(lat)))
+    if peak > math.pi + 0.1:
+        lat = np.deg2rad(lat)
+    if float(np.nanmin(lat)) >= -0.1 and peak > math.pi / 2 + 0.1:
+        lat = math.pi / 2 - lat
+    return lat
+
+
+def _ring_index(lat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Pixel -> ring id, and the latitude of each ring, south to north.
+
+    Same helpers as in ``healpix_ring_mean_pchip``; kept here so the soft constraints do not depend on the
+    ring-mean upsampling module.
+    """
+    key = np.round(lat, decimals=8)
+    uniq = np.unique(key)
+    order = np.argsort(uniq)
+    rank = np.empty(uniq.size, dtype=np.int64)
+    rank[order] = np.arange(uniq.size)
+    inv = rank[np.searchsorted(uniq, key)]
+    return inv.astype(np.int64), uniq[order]
+
+
+class CapAxialAngularMomentumSoftConstraint(AxialAngularMomentumSoftConstraint):
+    """
+    Axial angular-momentum budget of every latitude cap bounded by a HEALPix ring boundary.
+
+    For the cap poleward of a latitude circle ``phi_b`` the planetary angular momentum carried across the circle is
+    ``Omega a^2 cos^2(phi_b)`` times the net mass flux into the cap, and exact mass continuity replaces that flux by
+    the cap's surface-pressure tendency (no column-integrated meridional flux is needed). With ``M_r`` the cap's
+    relative angular momentum the budget per transition is::
+
+        d/dt [ M_r + (Omega a^4 / g) sum_cap ps (cos^2 phi - cos^2 phi_b) dOmega ] = F_rel(phi_b) + T_f + T_m
+
+    ``F_rel = +-(2 pi a^2 cos^2 phi_b / g) [int u v dp]_{phi_b}`` is the relative-momentum flux through the
+    boundary (zonal mean of the column ``u v``; + for northern caps, - for southern), ``T_f`` the surface-stress torque and ``T_m``
+    the mountain torque (``mountain_torque_sign`` / ``mountain_torque_anomaly`` as in the parent class). The
+    residual of every one of the ``4 nside - 2`` ring boundaries is compared with its own ``alpha`` (``alpha[b]``,
+    ascending boundary latitude). The loss is the mean over batch, time and boundaries of
+    ``phi((R_b / alpha_b)^2)``, so it is a single constraint term whatever the number of boundaries.
+
+    All reductions run in float64: the residuals are ~1e18 N m while the angular momentum itself is ~1e28. Each
+    state's column and ring reductions are recomputed in the backward pass (as in ``DerivedSurfacePressure``) so the
+    training graph keeps only ``[B, 5, rings]`` tensors per state. Every index is a registered buffer, so the loss and
+    its backward capture in a CUDA graph.
+    """
+
+    # Latitudes [deg] whose boundary RMS is reported as per-term values (N and S), for TensorBoard.
+    REPORT_LATITUDES = (65.0, 50.0, 35.0, 20.0)
+
+    def __init__(
+        self,
+        hPa_levels: Sequence[float],
+        channels: Sequence[str],
+        scaling: Dict[str, Dict[str, float]],
+        dataset_path: str,
+        surface_geopotential_name: str,
+        alpha=1.0,
+        name: str = "cap_aam",
+        **kwargs,
+    ):
+        kwargs.setdefault("mountain_torque_sign", -1.0)
+        kwargs.setdefault("mountain_torque_anomaly", True)
+        super().__init__(
+            hPa_levels=hPa_levels,
+            channels=channels,
+            scaling=scaling,
+            dataset_path=dataset_path,
+            surface_geopotential_name=surface_geopotential_name,
+            alpha=1.0,
+            name=name,
+            **kwargs,
+        )
+        n = self.nside
+        n_rings, n_bnd = 4 * n - 1, 4 * n - 2
+        # v at every pressure level: prediction indices and initial condition.
+        v_idxs = []
+        for pl in self.pressure_levels:
+            vname = f"v{int(pl)}"
+            if vname not in self.channels:
+                raise ValueError(f"Cap AAM requires channel {vname!r} in channels={self.channels!r}")
+            v_idxs.append(self.channels.index(vname))
+        self.register_buffer("v_channel_indices", torch.tensor(v_idxs, dtype=torch.long), persistent=False)
+        if not self.derived:
+            u_idxs = [self.channels.index(f"u{int(p)}") for p in self.pressure_levels]
+            sel = u_idxs + v_idxs + [self.sp_channel_index, self.iews_channel_index, self.iegwss_channel_index]
+            self.register_buffer("selected_channels", torch.tensor(sel, dtype=torch.long), persistent=False)
+        for pl in self.pressure_levels:
+            vname = f"v{int(pl)}"
+            self._ic_field_names.append(vname)
+            if vname in self.input_channels:
+                self._ic_input_index[vname] = self.input_channels.index(vname)
+            else:
+                self._ic_input_index[vname] = None
+                if not self.needs_input_diagnostics:
+                    self.needs_input_diagnostics = True
+                    input_set = set(self.input_channels)
+                    self.diagnostic_channels = [c for c in self.channels if c not in input_set]
+                if vname not in self.diagnostic_channels:
+                    raise ValueError(f"Cap AAM requires IC field {vname!r} in input_channels or diagnostic_channels.")
+                self._ic_diag_index[vname] = self.diagnostic_channels.index(vname)
+        v_stats = [(float(scaling[f"v{int(p)}"]["mean"]), float(scaling[f"v{int(p)}"]["std"])) for p in self.pressure_levels]
+        self.register_buffer("v_mean", torch.tensor([m for m, _ in v_stats], dtype=torch.float32).view(1, 1, 1, -1, 1, 1), persistent=False)
+        self.register_buffer("v_std", torch.tensor([s_ for _, s_ in v_stats], dtype=torch.float32).view(1, 1, 1, -1, 1, 1), persistent=False)
+
+        # Ring geometry. Ring ids ascend from the south pole; boundary b lies between rings b and b + 1.
+        grid = earth2grid.healpix.Grid(level=int(np.log2(n)), pixel_order=HEALPIX_PAD_XY)
+        ring, ring_lat = _ring_index(_geographic_latitude(grid))
+        if ring_lat.size != n_rings:
+            raise ValueError(f"Expected {n_rings} HEALPix rings at nside={n}, found {ring_lat.size}.")
+        bnd_lat = 0.5 * (ring_lat[1:] + ring_lat[:-1])
+        self.n_rings, self.n_boundaries = n_rings, n_bnd
+        self.register_buffer("ring_id", torch.as_tensor(ring, dtype=torch.long), persistent=False)
+        self.register_buffer("ring_cos", torch.as_tensor(np.cos(ring_lat), dtype=torch.float64), persistent=False)
+        self.register_buffer("ring_count", torch.as_tensor(np.bincount(ring, minlength=n_rings), dtype=torch.float64), persistent=False)
+        self.register_buffer("bnd_cos2", torch.as_tensor(np.cos(bnd_lat) ** 2, dtype=torch.float64), persistent=False)
+        self.register_buffer("bnd_north", torch.as_tensor(bnd_lat > 0.0), persistent=False)
+        self.register_buffer("bnd_lat_deg", torch.as_tensor(np.rad2deg(bnd_lat), dtype=torch.float64), persistent=False)
+        report = [int(np.argmin(np.abs(np.rad2deg(bnd_lat) - s_ * lat))) for s_ in (-1.0, 1.0) for lat in self.REPORT_LATITUDES[::(1 if s_ < 0 else -1)]]
+        self.register_buffer("report_index", torch.tensor(report, dtype=torch.long), persistent=False)
+        self.report_names = [f"{'S' if s_ < 0 else 'N'}{int(lat)}" for s_ in (-1.0, 1.0) for lat in self.REPORT_LATITUDES[::(1 if s_ < 0 else -1)]]
+
+        alpha_v = np.broadcast_to(np.asarray([float(a) for a in alpha] if not np.isscalar(alpha) else float(alpha), dtype=np.float64), (n_bnd,))
+        self.alpha = torch.as_tensor(np.array(alpha_v), dtype=torch.float64)
+
+    def setup(self, trainer) -> None:
+        super().setup(trainer)
+        device = trainer.device
+        for name in ("v_channel_indices", "selected_channels", "v_mean", "v_std", "ring_id", "ring_cos", "ring_count", "bnd_cos2", "bnd_north", "bnd_lat_deg", "report_index"):
+            if hasattr(self, name):
+                setattr(self, name, getattr(self, name).to(device=device))
+        self.alpha = self.alpha.to(device=device, dtype=torch.float64)
+
+    # ------------------------------------------------------------------
+    def _ring_sums(self, u, v, sp, tau) -> torch.Tensor:
+        """Sums over the pixels of every ring of five fields ``[B, 5, rings]`` (float64), for one state.
+
+        ``u``, ``v`` ``[B,F,1,L,H,W]`` physical; ``sp`` ``[B,F,1,1,H,W]``; ``tau`` the eastward surface stress
+        ``[B,F,1,1,H,W]`` or ``None`` (initial condition). Fields: column ``int u dp``, column ``int u v dp``,
+        ``ps``, ``tau``, mountain-torque integrand ``(ps - ps_ref) dh/dlambda`` (``ps`` without ``ps_ref`` when
+        the anomaly form is off).
+        """
+        # Column products run in float32 (their ~1e-7 relative error is far below the budget noise); the ring sums,
+        # which feed differences of ~1e28 totals, accumulate in float64.
+        dp = layer_delta_p_pa(self.p_levels_hpa, sp)
+        u_l = 0.5 * (u[:, :, :, :-1] + u[:, :, :, 1:])
+        uv = u * v
+        uv_l = 0.5 * (uv[:, :, :, :-1] + uv[:, :, :, 1:])
+        sp_t = sp - self.ps_ref if self.mountain_torque_anomaly else sp
+        fields = [
+            (u_l * dp).sum(dim=3),
+            (uv_l * dp).sum(dim=3),
+            sp[:, :, :, 0],
+            torch.zeros_like(sp[:, :, :, 0]) if tau is None else tau[:, :, :, 0],
+            (sp_t * self.dh_dlambda)[:, :, :, 0],
+        ]
+        b = sp.shape[0]
+        flat = torch.stack([f.reshape(b, 1, -1) for f in fields], dim=1).reshape(b, len(fields), -1).double()
+        out = flat.new_zeros(b, len(fields), self.n_rings)
+        return out.scatter_add_(2, self.ring_id.view(1, 1, -1).expand(b, len(fields), -1), flat)
+
+    def _step_sums(self, step: torch.Tensor) -> torch.Tensor:
+        """Ring sums of one predicted time step ``[B,F,1,C,H,W]`` (all channels)."""
+        u = self._denorm_u(step[:, :, :, self.u_channel_indices])
+        v = step[:, :, :, self.v_channel_indices] * self.v_std + self.v_mean
+        iews, iegwss = self._denorm_stress(
+            step[:, :, :, self.iews_channel_index : self.iews_channel_index + 1],
+            step[:, :, :, self.iegwss_channel_index : self.iegwss_channel_index + 1],
+        )
+        return self._ring_sums(u, v, self._sp_from_prediction(step), iews + iegwss)
+
+    def _step_sums_selected(self, x: torch.Tensor) -> torch.Tensor:
+        """Ring sums of one time step from the gathered channels ``[B,F,1,2L+3,H,W]`` = u(L), v(L), sp, iews, iegwss."""
+        n = len(self.pressure_levels)
+        u = self._denorm_u(x[:, :, :, :n])
+        v = x[:, :, :, n : 2 * n] * self.v_std + self.v_mean
+        sp = self._denorm_sp(x[:, :, :, 2 * n : 2 * n + 1])
+        iews, iegwss = self._denorm_stress(x[:, :, :, 2 * n + 1 : 2 * n + 2], x[:, :, :, 2 * n + 2 : 2 * n + 3])
+        return self._ring_sums(u, v, sp, iews + iegwss)
+
+    def _ic_sums(self, input, input_diagnostics) -> torch.Tensor:
+        if self.derived:
+            sp = self._dsp_in.sp(input[:, :, -1:])
+        else:
+            sp = self._denorm_sp(self._ic_field("sp", input, input_diagnostics))
+        u = self._denorm_u(torch.cat([self._ic_field(f"u{int(p)}", input, input_diagnostics) for p in self.pressure_levels], dim=3))
+        v = torch.cat([self._ic_field(f"v{int(p)}", input, input_diagnostics) for p in self.pressure_levels], dim=3) * self.v_std + self.v_mean
+        return self._ring_sums(u, v, sp, None)
+
+    def _cap_sums(self, x: torch.Tensor):
+        """``[..., rings]`` -> (northern caps (rings > b), southern caps (rings <= b)), each ``[..., boundaries]``."""
+        south = torch.cumsum(x, dim=-1)[..., :-1]
+        north = torch.flip(torch.cumsum(torch.flip(x, dims=[-1]), dim=-1), dims=[-1])[..., 1:]
+        return north, south
+
+    def _ring_budget(self, prediction, input, input_diagnostics):
+        """Per-ring budget terms ``(a, b, q)``, each ``[B, T, rings]`` (float64).
+
+        ``a`` = d/dt(relative AAM + planetary AAM weighted by cos^2 phi_r) - T_f - T_m of each ring (summing it over all rings
+        gives the global budget residual of the parent class); ``b`` = d/dt of the planetary AAM weight per unit
+        cos^2 phi_b (the ring's surface-pressure tendency); ``q`` the zonal-mean column ``u v`` at the two time levels.
+        """
+        grad = torch.is_grad_enabled() and prediction.requires_grad
+        states = [self._ic_sums(input, input_diagnostics)]
+        if self.derived:
+            steps, fn = [prediction[:, :, t : t + 1] for t in range(prediction.shape[2])], self._step_sums
+        else:
+            # Gather the 2L+3 channels the budget needs once and unbind over time: slicing the full prediction
+            # tensor per time step would make autograd allocate a full-size zero gradient for every step.
+            sel = prediction[:, :, :, self.selected_channels]
+            steps, fn = [x.unsqueeze(2) for x in sel.unbind(dim=2)], self._step_sums_selected
+        for step in steps:
+            if grad:
+                states.append(torch.utils.checkpoint.checkpoint(fn, step, use_reentrant=False))
+            else:
+                states.append(fn(step))
+        s = torch.stack(states, dim=1)  # [B, T+1, 5, rings]
+        a, g, om, dt, d_om = self.a, self.g0, self.omega, self.delta_t_seconds, self.d_omega
+        cos_r = self.ring_cos
+        d_u, d_p = s[:, 1:, 0] - s[:, :-1, 0], s[:, 1:, 2] - s[:, :-1, 2]
+        t_f = -(a ** 3) * d_om * cos_r * s[:, 1:, 3]
+        t_m = self.mountain_torque_sign * (a ** 2) * d_om * 0.5 * (s[:, :-1, 4] + s[:, 1:, 4])
+        per_ring_a = (a ** 3 / g) * d_om * cos_r * d_u / dt + (om * a ** 4 / g) * d_om * cos_r ** 2 * d_p / dt - t_f - t_m
+        per_ring_b = (om * a ** 4 / g) * d_om * d_p / dt
+        return per_ring_a, per_ring_b, s[:, :, 1] / self.ring_count
+
+    def _boundary_residuals(self, prediction, input, input_diagnostics) -> torch.Tensor:
+        """Cap budget residual ``R_b`` [N m] per transition and ring boundary; ``[B, T, boundaries]`` float64."""
+        per_ring_a, per_ring_b, q_mean = self._ring_budget(prediction, input, input_diagnostics)
+        a_n, a_s = self._cap_sums(per_ring_a)
+        b_n, b_s = self._cap_sums(per_ring_b)
+        q_hat = 0.5 * (q_mean[..., 1:] + q_mean[..., :-1])  # boundary value from the two adjacent rings
+        flux = (2.0 * math.pi * self.a ** 2 * self.bnd_cos2 / self.g0) * 0.5 * (q_hat[:, :-1] + q_hat[:, 1:])
+        r_n = a_n - self.bnd_cos2 * b_n - flux
+        r_s = a_s - self.bnd_cos2 * b_s + flux
+        return torch.where(self.bnd_north, r_n, r_s)
+
+    def term_names(self) -> list[str]:
+        return [self.name]
+
+    def constraint_loss(self, prediction, target, *, input, input_diagnostics=None, average_channels: bool = True) -> torch.Tensor:
+        del target
+        if input is None:
+            raise ValueError("CapAxialAngularMomentumSoftConstraint requires prognostic input.")
+        if self.needs_input_diagnostics and input_diagnostics is None:
+            raise ValueError("CapAxialAngularMomentumSoftConstraint requires input_diagnostics.")
+        with torch.amp.autocast("cuda", enabled=False):
+            if prediction.ndim != 6:
+                raise AssertionError("Expected predictions to have 6 dimensions")
+            r = self._boundary_residuals(prediction.float(), input.float(), None if input_diagnostics is None else input_diagnostics.float())
+            loss = self.weight * _error_tolerant((r / self.alpha) ** 2).mean()
+            return loss.float() if average_channels else loss.float().reshape(())
+
+    def physical_rmse(self, prediction, target=None, *, input, input_diagnostics=None, average_channels: bool = True, **kwargs) -> torch.Tensor:
+        """RMS of the cap residual [N m] (all boundaries); per reported latitude when ``average_channels=False``.
+
+        Same transitions as the loss; no alpha, tolerant map or weight. ``report_names`` labels the per-term values.
+        """
+        del target, kwargs
+        if input is None:
+            raise ValueError("CapAxialAngularMomentumSoftConstraint.physical_rmse requires input.")
+        with torch.amp.autocast("cuda", enabled=False):
+            r = self._boundary_residuals(prediction.float(), input.float(), None if input_diagnostics is None else input_diagnostics.float())
+            ms = (r * r).mean(dim=(0, 1))
+            if average_channels:
+                return torch.sqrt(ms.mean()).float()
+            return torch.sqrt(ms[self.report_index]).float()
+
+
 class LossWithSoftConstraints(torch.nn.Module):
     """
     Loss-agnostic wrapper that adds zero or more soft constraints to a data loss.
