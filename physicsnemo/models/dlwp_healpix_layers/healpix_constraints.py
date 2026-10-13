@@ -1,3 +1,4 @@
+import collections
 from collections.abc import Mapping
 
 import numpy as np
@@ -304,6 +305,23 @@ class DryAirMassConstraint(torch.nn.Module):
 
         self.g0 = 9.81
 
+        # Off by default. DryAirMassShiftSoftConstraint turns it on so the
+        # pre-correction global-mean dry-mass change (the shift this module
+        # removes) can be penalized: the corrected output carries no gradient
+        # towards the mean, so without it the network's raw mass tendency is
+        # never trained.
+        self.record_shift = False
+        self.shift_record = collections.deque()
+
+    def enable_shift_record(self, n_steps: int) -> None:
+        """Keep the shifts of the latest ``n_steps`` forward calls (one model call).
+
+        A bounded deque holds exactly the latest model call, so older autograd
+        graphs are released and nothing has to be reset between calls.
+        """
+        self.record_shift = True
+        self.shift_record = collections.deque(maxlen=int(n_steps))
+
     @torch.compiler.disable
     def forward(self, prediction, input):
         '''
@@ -332,6 +350,9 @@ class DryAirMassConstraint(torch.nn.Module):
             sp_dry = sp - self.g0 * tcwv
             sp_0_dry = sp_0 - self.g0 * tcwv_0
             correction = (sp_dry - sp_0_dry).mean(dim=[1, 4, 5], keepdim=True)
+            if self.record_shift:
+                # [B, 1, T, 1, 1, 1] in Pa, still attached to the prediction.
+                self.shift_record.append(correction)
             sp_corrected = torch.clamp(sp - correction, min=0.0)
             sp_corrected = (sp_corrected - self.ps_mean) / self.ps_std
 
