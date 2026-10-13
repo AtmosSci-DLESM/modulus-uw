@@ -30,6 +30,7 @@ from earth2grid.healpix import HEALPIX_PAD_XY, PixelOrder
 
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.launch.logging import RankZeroLoggingWrapper
+from physicsnemo.metrics.climate.derived_surface_pressure import DerivedSurfacePressure
 from physicsnemo.metrics.climate.hydrostasy import (
     DifferentialHydrostaticBalanceConstraint,
     _load_topography,
@@ -433,6 +434,7 @@ class DryAirMassSoftConstraint(SoftConstraint):
         diagnostic_channels: Optional[Sequence[str]] = None,
         name: str = "dry_air",
         relative_loss_scale=None,
+        derived_surface_pressure: Optional[Dict] = None,
     ):
         super().__init__()
         self.name = _constraint_name(name)
@@ -441,10 +443,22 @@ class DryAirMassSoftConstraint(SoftConstraint):
         self.input_channels = (
             list(input_channels) if input_channels is not None else list(channels)
         )
-        self.sp_channel_index = self.channels.index("sp")
-        self.tcwv_channel_index = self.channels.index("tcwv")
         self.weight = float(weight)
         self.g0 = float(g0)
+        self.derived = derived_surface_pressure is not None
+        if self.derived:
+            # sp and tcwv are not model channels: the dry surface pressure sp - g*tcwv is derived hydrostatically
+            # from the predicted (and initial) z, t, q and the orography (see derived_surface_pressure.py).
+            self.needs_input_diagnostics = False
+            self.diagnostic_channels = []
+            self._ic_input_index = {}
+            self._ic_diag_index = {}
+            self._dsp_pred = DerivedSurfacePressure(channels=self.channels, scaling=scaling, **derived_surface_pressure)
+            self._dsp_in = DerivedSurfacePressure(channels=self.input_channels, scaling=scaling, **derived_surface_pressure)
+            self.register_buffer("alpha", torch.tensor(float(alpha), dtype=torch.float32), persistent=False)
+            return
+        self.sp_channel_index = self.channels.index("sp")
+        self.tcwv_channel_index = self.channels.index("tcwv")
 
         # IC field -> index in prognostic input, or None if diagnostic-only.
         self._ic_input_index: Dict[str, Optional[int]] = {}
@@ -510,6 +524,11 @@ class DryAirMassSoftConstraint(SoftConstraint):
 
     def setup(self, trainer) -> None:
         device = trainer.device
+        if self.derived:
+            self.alpha = self.alpha.to(device=device)
+            self._dsp_pred.to(device)
+            self._dsp_in.to(device)
+            return
         self.ps_mean = self.ps_mean.to(device=device)
         self.ps_std = self.ps_std.to(device=device)
         self.tcwv_mean = self.tcwv_mean.to(device=device)
@@ -555,6 +574,8 @@ class DryAirMassSoftConstraint(SoftConstraint):
         tensor : torch.Tensor
             Shape ``[B, F, T, C, H, W]`` (normalized), channel order ``channels``.
         """
+        if self.derived:
+            return self._dsp_pred.sp_dry(tensor).mean(dim=(1, 4, 5), keepdim=True)
         sp = tensor[
             :, :, :, self.sp_channel_index : self.sp_channel_index + 1, :, :
         ]
@@ -586,6 +607,8 @@ class DryAirMassSoftConstraint(SoftConstraint):
         input: torch.Tensor,
         input_diagnostics: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if self.derived:
+            return self._dsp_in.sp_dry(input[:, :, -1:]).mean(dim=(1, 4, 5), keepdim=True)
         sp = self._ic_field("sp", input, input_diagnostics)
         tcwv = self._ic_field("tcwv", input, input_diagnostics)
         return self._global_mean_sp_dry_from_channels(sp, tcwv)
@@ -808,6 +831,7 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         diagnostic_channels: Optional[Sequence[str]] = None,
         name: str = "aam",
         relative_loss_scale=None,
+        derived_surface_pressure: Optional[Dict] = None,
     ):
         super().__init__()
         self.name = _constraint_name(name)
@@ -845,15 +869,23 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
                 raise ValueError(
                     f"Axial AAM requires diagnostic {stress!r} in channels"
                 )
-        if "sp" not in self.channels:
-            raise ValueError("Axial AAM requires 'sp' in prediction channels")
-
-        self.sp_channel_index = self.channels.index("sp")
+        # With ``derived_surface_pressure`` the surface pressure is derived hydrostatically from the predicted
+        # (and initial) z, t, q and the orography, so the model needs no ``sp`` channel.
+        self.derived = derived_surface_pressure is not None
+        if self.derived:
+            self._dsp_pred = DerivedSurfacePressure(channels=self.channels, scaling=scaling, **derived_surface_pressure)
+            self._dsp_in = DerivedSurfacePressure(channels=self.input_channels, scaling=scaling, **derived_surface_pressure)
+        else:
+            if "sp" not in self.channels:
+                raise ValueError("Axial AAM requires 'sp' in prediction channels")
+            self.sp_channel_index = self.channels.index("sp")
         self.iews_channel_index = self.channels.index("avg_iews-6h")
         self.iegwss_channel_index = self.channels.index("avg_iegwss-6h")
 
         # IC: sp and each u level from prognostic input or diagnostics.
-        self._ic_field_names = ["sp"] + [f"u{int(pl)}" for pl in self.pressure_levels]
+        self._ic_field_names = ([] if self.derived else ["sp"]) + [
+            f"u{int(pl)}" for pl in self.pressure_levels
+        ]
         self._ic_input_index: Dict[str, Optional[int]] = {}
         missing_from_input: list[str] = []
         for name in self._ic_field_names:
@@ -905,14 +937,15 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
             ).view(1, 1, 1, -1, 1, 1),
             persistent=False,
         )
+        # The sp scaling is only needed when sp is a model channel; the placeholders keep the buffers uniform.
         self.register_buffer(
             "ps_mean",
-            torch.tensor(_stat("sp", "mean"), dtype=torch.float32),
+            torch.tensor(0.0 if self.derived else _stat("sp", "mean"), dtype=torch.float32),
             persistent=False,
         )
         self.register_buffer(
             "ps_std",
-            torch.tensor(_stat("sp", "std"), dtype=torch.float32),
+            torch.tensor(1.0 if self.derived else _stat("sp", "std"), dtype=torch.float32),
             persistent=False,
         )
         self.register_buffer(
@@ -1016,6 +1049,9 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         self.alpha = self.alpha.to(device=device)
         self.cos_phi = self.cos_phi.to(device=device)
         self._surface_height = self._surface_height.to(device=device)
+        if self.derived:
+            self._dsp_pred.to(device)
+            self._dsp_in.to(device)
 
         if self.needs_input_diagnostics:
             diag_vars = getattr(trainer, "ic_diagnostic_variables", None)
@@ -1130,20 +1166,28 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         )
         return m_r + m_omega
 
+    def _sp_from_prediction(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Surface pressure [Pa] ``[B,F,T,1,H,W]``: derived from z/t/q, or the model's ``sp`` channel."""
+        if self.derived:
+            return self._dsp_pred.sp(tensor)
+        return self._denorm_sp(
+            tensor[:, :, :, self.sp_channel_index : self.sp_channel_index + 1, :, :]
+        )
+
     def _aam_from_prediction(self, tensor: torch.Tensor) -> torch.Tensor:
         u_norm = tensor[:, :, :, self.u_channel_indices, :, :]
         u = self._denorm_u(u_norm)
-        sp = self._denorm_sp(
-            tensor[:, :, :, self.sp_channel_index : self.sp_channel_index + 1, :, :]
-        )
-        return self._total_aam_from_physical(u, sp)
+        return self._total_aam_from_physical(u, self._sp_from_prediction(tensor))
 
     def _aam_from_ic(
         self,
         input: torch.Tensor,
         input_diagnostics: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        sp = self._denorm_sp(self._ic_field("sp", input, input_diagnostics))
+        if self.derived:
+            sp = self._dsp_in.sp(input[:, :, -1:])
+        else:
+            sp = self._denorm_sp(self._ic_field("sp", input, input_diagnostics))
         u_list = []
         for pl in self.pressure_levels:
             u_list.append(self._ic_field(f"u{int(pl)}", input, input_diagnostics))
@@ -1153,11 +1197,7 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
 
     def _torques_from_prediction(self, prediction: torch.Tensor) -> torch.Tensor:
         """Friction + mountain torque at each predicted time; shape ``[B, T]``."""
-        sp = self._denorm_sp(
-            prediction[
-                :, :, :, self.sp_channel_index : self.sp_channel_index + 1, :, :
-            ]
-        )
+        sp = self._sp_from_prediction(prediction)
         iews_n = prediction[
             :, :, :, self.iews_channel_index : self.iews_channel_index + 1, :, :
         ]
