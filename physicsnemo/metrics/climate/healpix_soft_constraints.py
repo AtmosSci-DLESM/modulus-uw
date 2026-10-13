@@ -686,6 +686,117 @@ class DryAirMassSoftConstraint(SoftConstraint):
             return torch.sqrt((stacked ** 2).mean())
 
 
+class DryAirMassShiftSoftConstraint(SoftConstraint):
+    """
+    Penalty on the shift a hard :class:`DryAirMassConstraint` has to apply.
+
+    The hard constraint subtracts the global-mean change in dry surface pressure
+    ``sp - g0 * tcwv`` from ``sp`` every step. The corrected output therefore
+    conserves dry mass whatever the network does, and neither the data loss nor
+    :class:`DryAirMassSoftConstraint` sees the network's own mass tendency. This
+    term penalizes that pre-correction tendency (per integration step, in Pa) with
+    the same error-tolerant map, so the network learns to produce mass-neutral
+    tendencies instead of relying on a uniform shift that cannot remove their
+    latitudinal structure.
+
+    The shifts are recorded by the model's ``DryAirMassConstraint`` during the
+    forward pass; :meth:`setup` finds that module on ``trainer.model`` and turns
+    recording on. It must run in the same step as the forward pass that produced
+    the prediction (train, eval and CUDA-graph capture all do).
+    """
+
+    needs_input = False
+
+    def __init__(
+        self,
+        weight: float = 1.0,
+        alpha: float = 0.383431,
+        name: str = "dry_air_shift",
+        relative_loss_scale=None,
+    ):
+        super().__init__()
+        self.name = _constraint_name(name)
+        self.relative_loss_scale = relative_loss_scale
+        self.weight = float(weight)
+        self.register_buffer(
+            "alpha",
+            torch.tensor(float(alpha), dtype=torch.float32),
+            persistent=False,
+        )
+        # Plain list: the hard constraint belongs to the model, not to this loss.
+        self._hard: list = []
+
+    def setup(self, trainer) -> None:
+        from physicsnemo.models.dlwp_healpix_layers.healpix_constraints import (
+            DryAirMassConstraint,
+        )
+
+        self.alpha = self.alpha.to(device=trainer.device)
+        model = trainer.model
+        while True:  # DDP / torch.compile wrappers
+            inner = getattr(model, "module", None)
+            if inner is None:
+                inner = getattr(model, "_orig_mod", None)
+            if inner is None:
+                break
+            model = inner
+        hard = [
+            c
+            for c in (getattr(model, "constraints", None) or [])
+            if isinstance(c, DryAirMassConstraint)
+        ]
+        if len(hard) != 1:
+            raise ValueError(
+                "DryAirMassShiftSoftConstraint needs exactly one "
+                f"DryAirMassConstraint in model.constraints, found {len(hard)}."
+            )
+        self._hard = hard
+        hard[0].enable_shift_record(model.integration_steps)
+
+    def term_names(self) -> list[str]:
+        return [self.name]
+
+    def _shifts(self, prediction: torch.Tensor) -> torch.Tensor:
+        """Recorded shifts of the latest model call, ``[B, 1, T, 1, 1, 1]`` in Pa."""
+        if not self._hard or not self._hard[0].shift_record:
+            raise RuntimeError(
+                "No recorded dry-air shift: setup(trainer) has not run or the "
+                "criterion was called before a model forward pass."
+            )
+        shifts = torch.cat(list(self._hard[0].shift_record), dim=2)
+        if shifts.shape[2] != prediction.shape[2]:
+            raise RuntimeError(
+                f"Recorded dry-air shifts cover {shifts.shape[2]} time steps but "
+                f"the prediction has {prediction.shape[2]}; the criterion has to "
+                "be evaluated on the output of the latest model call."
+            )
+        return shifts
+
+    def constraint_loss(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        average_channels: bool = True,
+    ) -> torch.Tensor:
+        del target
+        with torch.amp.autocast("cuda", enabled=False):
+            shifts = self._shifts(prediction).float()
+            loss = self.weight * _error_tolerant((shifts / self.alpha) ** 2).mean()
+            return loss if average_channels else loss.reshape(())
+
+    def physical_rmse(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """RMS of the pre-correction global-mean dry-mass shift [Pa]: the quantity the loss penalizes, without alpha, map or weight."""
+        del target, kwargs
+        shifts = self._shifts(prediction).double()
+        return torch.sqrt((shifts * shifts).mean()).to(dtype=torch.float32)
+
+
 # ---------------------------------------------------------------------------
 # Axial angular momentum (AAM)
 # ---------------------------------------------------------------------------
