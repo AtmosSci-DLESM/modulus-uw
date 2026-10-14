@@ -480,3 +480,103 @@ def test_strict_bounds_actual_scaling_model_reconstruction_and_gradients():
         output.sum().backward()
         assert torch.isfinite(residual.grad).all()
         history = output.detach()
+
+
+def test_module_archive_json_extra_state_and_feedback_parity(tmp_path):
+    """Standard Module archives preserve all scientific keys and feedback outputs."""
+    import json
+
+    from physicsnemo.models.module import Module
+
+    mask = torch.ones(3, 12, 4, 4, dtype=torch.bool)
+    mask[:, 0, :2, :2] = False
+    model = GlorysOceanModel(
+        ["sic", "sst", "mlotst"],
+        ["z"],
+        torch.tensor([0.05, 280, 43]),
+        torch.tensor([0.21, 4, 51]),
+        mask,
+        hidden_channels=4,
+        depth=1,
+        sst_nlat=33,
+        sst_nlon=64,
+    )
+    assert isinstance(model, Module)
+    assert model.device == torch.device("cpu")
+    assert "device_buffer" not in model.state_dict()
+    assert not any(key.startswith("inner_model.") for key in model.state_dict())
+    original_keys = set(model.state_dict())
+    with torch.no_grad():
+        model.head.weight.normal_(0, 0.03)
+        model.state_policy.mean[:, :, 0].add_(0.001)
+    args = json.loads(json.dumps(model.checkpoint_args()))
+    assert args["__args__"]["mean"] == model.state_policy.mean.flatten().tolist()
+    archive = tmp_path / "ocean.mdlus"
+    model.save(str(archive))
+    restored = Module.from_checkpoint(str(archive))
+    assert set(restored.state_dict()) == original_keys
+    for key, value in model.state_dict().items():
+        if torch.is_tensor(value):
+            torch.testing.assert_close(
+                restored.state_dict()[key], value, rtol=0, atol=0
+            )
+        else:
+            assert restored.state_dict()[key] == value
+    assert restored.checkpoint_args() == args
+    missing_stencil = copy.deepcopy(restored.state_dict())
+    missing_stencil.pop("state_policy.sst_interpolator.passes.0.lower")
+    with pytest.raises(RuntimeError, match="state keys differ"):
+        restored.load_state_dict(missing_stencil, strict=False)
+    history = torch.randn(1, 2, 3, 12, 4, 4)
+    forcing = torch.randn(1, 2, 1, 12, 4, 4)
+    for _ in range(3):
+        expected = model(history, forcing)
+        actual = restored(history, forcing)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        history = expected.detach()
+
+
+def test_module_loader_rejects_missing_keys_even_with_nonstrict_request(tmp_path):
+    """Generic strict=False archive loading cannot omit scientific state or policy."""
+    import io
+    import json
+    import tarfile
+
+    from physicsnemo.models.module import Module
+
+    model, _ = setup_model()
+    state = model.state_dict()
+    for missing in (
+        "_extra_state",
+        "state_policy._extra_state",
+        "state_policy.mask",
+        "state_policy.mean",
+        "head.weight",
+    ):
+        invalid = copy.deepcopy(state)
+        invalid.pop(missing)
+        with pytest.raises(RuntimeError, match="state keys differ"):
+            model.load_state_dict(invalid, strict=False)
+    invalid = copy.deepcopy(state)
+    invalid["state_policy._extra_state"]["policy"] = "unsupported-policy"
+    with pytest.raises(ValueError, match="policy/channel ordering differs"):
+        model.load_state_dict(invalid, strict=False)
+    invalid = copy.deepcopy(state)
+    invalid.pop("state_policy.mask")
+    buffer = io.BytesIO()
+    torch.save(invalid, buffer)
+    payloads = {
+        "model.pt": buffer.getvalue(),
+        "args.json": json.dumps(model.checkpoint_args()).encode(),
+        "metadata.json": json.dumps(
+            {"mdlus_file_version": Module.__model_checkpoint_version__}
+        ).encode(),
+    }
+    archive = tmp_path / "missing-mask.mdlus"
+    with tarfile.open(archive, "w") as tar:
+        for name, payload in payloads.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+    with pytest.raises(RuntimeError, match="state keys differ"):
+        Module.from_checkpoint(str(archive))

@@ -28,6 +28,8 @@ import torch
 from torch import nn
 
 from physicsnemo.models.dlwp_healpix_layers.healpix_layers import HEALPixLayer
+from physicsnemo.models.meta import ModelMetaData
+from physicsnemo.models.module import Module
 
 
 def _names(names):
@@ -313,7 +315,7 @@ class _SpatialResidual(nn.Module):
         return self.activation(x + self.layers(x))
 
 
-class GlorysOceanModel(nn.Module):
+class GlorysOceanModel(Module):
     """HEALPix residual network with two histories and two prescribed leads.
 
     Reduced capacity: hidden_channels=8, depth=2. Full starting capacity:
@@ -338,7 +340,9 @@ class GlorysOceanModel(nn.Module):
         sst_nlat=721,
         sst_nlon=1440,
     ):
-        super().__init__()
+        super().__init__(meta=ModelMetaData(name="GlorysOceanModel"))
+        # Module.device remains available without changing scientific state keys.
+        self.register_buffer("device_buffer", self.device_buffer, persistent=False)
         self.channels = _names(channels)
         self.forcing_channels = _names(forcing_channels)
         if hidden_channels < 1 or depth < 1:
@@ -369,6 +373,55 @@ class GlorysOceanModel(nn.Module):
         self.head = nn.Conv2d(hidden_channels, 2 * count, kernel_size=1)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
+        self.checkpoint_args()
+
+    def checkpoint_args(self):
+        """Refresh JSON-ready archive constructor args from current policy buffers.
+
+        Writers call this before snapshotting to avoid stale captured arrays.
+        Full selected-domain mask and scaling allow dataset-independent archive
+        construction. Scientific extra-state dictionaries stay in model.pt.
+        """
+        self._args = {
+            "__name__": type(self).__name__,
+            "__module__": type(self).__module__,
+            "__args__": {
+                "channels": list(self.channels),
+                "forcing_channels": list(self.forcing_channels),
+                "mean": self.state_policy.mean.detach().cpu().flatten().tolist(),
+                "std": self.state_policy.std.detach().cpu().flatten().tolist(),
+                "mask": self.state_policy.mask[0, 0].detach().cpu().tolist(),
+                "hidden_channels": int(self.hidden_channels),
+                "depth": int(self.depth),
+                "hpx_padding_mode": self.hpx_padding_mode,
+                "sst_nlat": int(self.state_policy.sst_nlat),
+                "sst_nlon": int(self.state_policy.sst_nlon),
+            },
+        }
+        return self._args
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Require every scientific tensor/extra-state even for generic archives.
+
+        PhysicsNeMo Module.from_checkpoint requests strict=False; ocean state
+        cannot safely default missing masks, scaling, policy or gap stencils.
+        Scientific state keys are unchanged from the original v3 plain module.
+        """
+        expected, supplied = set(self.state_dict()), set(state_dict)
+        if expected != supplied:
+            missing = sorted(expected - supplied)
+            unexpected = sorted(supplied - expected)
+            raise RuntimeError(
+                f"Ocean checkpoint state keys differ: missing={missing}, unexpected={unexpected}"
+            )
+        result = super().load_state_dict(state_dict, strict=True, assign=assign)
+        self.checkpoint_args()
+        return result
+
+    def save(self, file_name=None, verbose=False):
+        """Save a standard Module archive with refreshed constructor metadata."""
+        self.checkpoint_args()
+        return super().save(file_name=file_name, verbose=verbose)
 
     def get_extra_state(self):
         """Save architecture, residual reference and prescribed channel order."""

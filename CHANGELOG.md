@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- GLORYS models support standard PhysicsNeMo Module archives with JSON-ready
+  construction metadata and strict scientific state loading, preserving v3
+  model state keys and interpolation precision.
+
 - Deterministic two-lead GLORYS HEALPix residual model with shared physical
   constraints, differentiable ETL SST land interpolation, neutral land feedback
   for other channels, masked channel sums and resumable fixed
