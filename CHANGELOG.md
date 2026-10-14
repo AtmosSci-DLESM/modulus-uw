@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Deterministic two-lead GLORYS HEALPix residual model with shared physical
+  constraints, differentiable ETL SST land interpolation, neutral land feedback
+  for other channels, masked channel sums and resumable fixed
+  inverse-validation channel weights. Lazy DLWP exports isolate optional legacy
+  model dependencies.
+
 - Added ReGen score-based data assimilation example
 - General purpose patching API for patch-based diffusion
 - New positional embedding selection strategy for CorrDiff SongUNet models

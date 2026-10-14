@@ -14,7 +14,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .HEALPixRecUNet import HEALPixRecUNet
-from .HEALPixUNet import HEALPixUNet
+"""Lazy model exports keep optional legacy dependencies isolated."""
 
-__all__ = ["HEALPixRecUNet", "HEALPixUNet"]
+from importlib import import_module
+
+__all__ = ["HEALPixRecUNet", "HEALPixUNet", "GlorysOceanModel"]
+
+
+def __getattr__(name):
+    """Load model classes on demand, preserving the public legacy API."""
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = "glorys_ocean" if name == "GlorysOceanModel" else name
+    value = getattr(import_module(f"{__name__}.{module}"), name)
+    globals()[name] = value
+    return value
