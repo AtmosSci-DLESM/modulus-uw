@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - GLORYS models support standard PhysicsNeMo Module archives with JSON-ready
   construction metadata and strict scientific state loading, preserving v3
-  model state keys and interpolation precision.
+  ocean state policy and interpolation precision.
 
 - Deterministic two-lead GLORYS HEALPix residual model with shared physical
   constraints, differentiable ETL SST land interpolation, neutral land feedback
@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added Multi-Storage Client to allow checkpointing to/from Object Storage
 
 ### Changed
+
+- Lazy public layer exports preserve existing names while avoiding optional
+  transformer dependencies when importing torch-only activations.
+
+- GLORYS now composes the existing HEALPixRecUNet with native three-level
+  atmosphere encoder/decoder and ConvGRU blocks, replacing the compact CNN.
+  Canonical archives preserve the complete native model node; shared v3 ocean
+  state processing remains unchanged; native corresponding-history residuals
+  advance both histories by 192 hours.
 
 - Simplified CorrDiff config files, updated default values
 - Refactored CorrDiff losses and samplers to use the patching API

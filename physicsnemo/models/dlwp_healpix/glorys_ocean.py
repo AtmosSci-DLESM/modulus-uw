@@ -17,17 +17,16 @@
 
 """Deterministic two-lead ocean blocks and shared normalized state policy.
 
-Layouts are [batch, time, channel, face, height, width]. Both residuals refer
-explicitly to history[:, -1], never to their matching input-history positions.
+Layouts are [batch, time, channel, face, height, width]. Native RecUNet residuals
+add to corresponding histories, each representing a 192-hour block advance.
 Masks represent ocean validity, not land fraction; target validity may be dynamic.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 
 import torch
 from torch import nn
 
-from physicsnemo.models.dlwp_healpix_layers.healpix_layers import HEALPixLayer
 from physicsnemo.models.meta import ModelMetaData
 from physicsnemo.models.module import Module
 
@@ -289,99 +288,224 @@ class OceanStatePolicy(nn.Module):
         return state * self.std + self.mean
 
 
-class _SpatialResidual(nn.Module):
-    def __init__(self, width, padding_mode):
-        super().__init__()
-        self.layers = nn.Sequential(
-            HEALPixLayer(
-                nn.Conv2d,
-                hpx_padding_mode=padding_mode,
-                in_channels=width,
-                out_channels=width,
-                kernel_size=3,
-            ),
-            nn.GELU(),
-            HEALPixLayer(
-                nn.Conv2d,
-                hpx_padding_mode=padding_mode,
-                in_channels=width,
-                out_channels=width,
-                kernel_size=3,
-            ),
-        )
-        self.activation = nn.GELU()
-
-    def forward(self, x):
-        return self.activation(x + self.layers(x))
-
-
 class GlorysOceanModel(Module):
-    """HEALPix residual network with two histories and two prescribed leads.
+    """Compose the existing recurrent HEALPix UNet with ocean state processing.
 
-    Reduced capacity: hidden_channels=8, depth=2. Full starting capacity:
-    hidden_channels=64, depth=6 (performance/convergence unverified).
-    Each block uses existing HEALPixLayer face exchange. All 29 state channels
-    and both windows of the 3 atmosphere channels enter the same network.
-    Atmosphere remains available over land; it uses its own external scaling.
-    The additional land constant is 1 where no state channel is ocean-valid.
-    forward returns constrained normalized states, ready for feedback.
+    The native model node configures encoder, decoder and recurrent blocks.
+    Native residual leads reference corresponding histories. RecUNet resets
+    hidden state on every call; presteps=0 uses exactly the supplied histories.
     """
 
     def __init__(
         self,
-        channels: Sequence[str],
-        forcing_channels: Sequence[str],
+        channels,
+        forcing_channels,
         mean,
         std,
         mask,
-        hidden_channels=32,
-        depth=4,
-        hpx_padding_mode="karlbauer",
+        backbone_config,
         sst_nlat=721,
         sst_nlon=1440,
     ):
+        from hydra.utils import instantiate
+        from omegaconf import OmegaConf
+
+        from physicsnemo.models.dlwp_healpix.HEALPixRecUNet import HEALPixRecUNet
+
         super().__init__(meta=ModelMetaData(name="GlorysOceanModel"))
-        # Module.device remains available without changing scientific state keys.
         self.register_buffer("device_buffer", self.device_buffer, persistent=False)
         self.channels = _names(channels)
         self.forcing_channels = _names(forcing_channels)
-        if hidden_channels < 1 or depth < 1:
-            raise ValueError("hidden_channels and depth must be positive")
+        if OmegaConf.is_config(backbone_config):
+            backbone_config = OmegaConf.to_container(backbone_config, resolve=True)
+        # An archive must carry the full plain model node, not a live module.
+        import json
+
+        self.backbone_config = json.loads(json.dumps(backbone_config, allow_nan=False))
+        self._validate_backbone_config(mask)
         self.state_policy = OceanStatePolicy(
             self.channels, mean, std, mask, sst_nlat, sst_nlon
         )
-        self.hidden_channels = hidden_channels
-        self.depth = depth
-        self.hpx_padding_mode = hpx_padding_mode
-        count = len(self.channels)
         self.register_buffer(
             "land_constant",
             (~self.state_policy.mask.any(dim=2))
             .float()
             .reshape(1, 12, 1, *self.state_policy.mask.shape[-2:]),
         )
-        self.stem = HEALPixLayer(
-            nn.Conv2d,
-            hpx_padding_mode=hpx_padding_mode,
-            in_channels=2 * (count + len(self.forcing_channels)) + 1,
-            out_channels=hidden_channels,
-            kernel_size=3,
+        self.backbone = instantiate(self.backbone_config, _recursive_=False)
+        if type(self.backbone) is not HEALPixRecUNet:
+            raise ValueError("Ocean backbone must be the existing HEALPixRecUNet")
+        self.backbone.register_buffer(
+            "device_buffer", self.backbone.device_buffer, persistent=False
         )
-        self.blocks = nn.Sequential(
-            *[_SpatialResidual(hidden_channels, hpx_padding_mode) for _ in range(depth)]
-        )
-        self.head = nn.Conv2d(hidden_channels, 2 * count, kernel_size=1)
-        nn.init.zeros_(self.head.weight)
-        nn.init.zeros_(self.head.bias)
+        self._validate_backbone_layers()
         self.checkpoint_args()
 
-    def checkpoint_args(self):
-        """Refresh JSON-ready archive constructor args from current policy buffers.
+    def _validate_backbone_config(self, mask):
+        config = self.backbone_config
+        required = {
+            "_target_": "physicsnemo.models.dlwp_healpix.HEALPixRecUNet.HEALPixRecUNet",
+            "input_channels": len(self.channels),
+            "output_channels": len(self.channels),
+            "n_constants": 1,
+            "decoder_input_channels": len(self.forcing_channels),
+            "input_time_dim": 2,
+            "output_time_dim": 2,
+            "delta_time": "96h",
+            "reset_cycle": "192h",
+            "presteps": 0,
+            "residual_prediction": True,
+            "couplings": [],
+            "constraints": None,
+            "enable_nhwc": False,
+            "compile_padding": False,
+            "hpx_padding_mode": "karlbauer",
+        }
+        for name, value in required.items():
+            if config.get(name) != value or name not in config:
+                raise ValueError(f"Ocean backbone requires {name}={value!r}")
+        if config.get("_partial_", False):
+            raise ValueError("Ocean backbone cannot be a partial factory")
+        shape = torch.as_tensor(mask).shape
+        height, width = shape[-2:]
+        if height != width or height % 4 or height < 8:
+            raise ValueError(
+                "Ocean mask requires square faces divisible by four, size >=8"
+            )
+        if config.get("nside") != [height, height // 2, height // 4]:
+            raise ValueError(
+                "Ocean backbone requires all three mask-matched UNet levels"
+            )
+        targets = {
+            "encoder": "physicsnemo.models.dlwp_healpix_layers.healpix_encoder.UNetEncoder",
+            "decoder": "physicsnemo.models.dlwp_healpix_layers.healpix_decoder.UNetDecoder",
+        }
+        for side in ("encoder", "decoder"):
+            node = config[side]
+            if node.get("_target_") != targets[side]:
+                raise ValueError(
+                    f"Ocean {side} must be the existing UNet implementation"
+                )
+            block_target = "physicsnemo.models.dlwp_healpix_layers.healpix_blocks."
+            if (
+                node["conv_block"].get("_target_")
+                != block_target + "Multi_SymmetricConvNeXtBlock"
+            ):
+                raise ValueError("Ocean blocks must be Multi_SymmetricConvNeXtBlock")
+            activation = node["conv_block"].get("activation", {})
+            if (
+                activation.get("_target_")
+                != "physicsnemo.models.layers.activations.CappedGELU"
+            ):
+                raise ValueError("Ocean blocks must use CappedGELU")
+            if node["conv_block"].get("geometry_layer") is not None:
+                raise ValueError(
+                    "Ocean blocks use the existing default HEALPixLayer geometry"
+                )
+            if side == "encoder":
+                down = node["down_sampling_block"]
+                if (
+                    down.get("_target_") != block_target + "DealiasedDownsample"
+                    or down.get("stride", 2) != 2
+                ):
+                    raise ValueError(
+                        "Ocean encoder requires factor-two DealiasedDownsample"
+                    )
+            else:
+                up = node["up_sampling_block"]
+                if (
+                    up.get("_target_") != block_target + "SmoothedInterpolateConv"
+                    or up.get("scale_factor", 2) != 2
+                ):
+                    raise ValueError(
+                        "Ocean decoder requires factor-two SmoothedInterpolateConv"
+                    )
+                recurrent = node.get("recurrent_block") or {}
+                if recurrent.get("_target_") != block_target + "ConvGRUBlock":
+                    raise ValueError("Ocean decoder requires ConvGRUBlock")
+                output = node["output_layer"]
+                if (
+                    output.get("_target_") != block_target + "BasicConvBlock"
+                    or output.get("kernel_size") != 1
+                    or output.get("n_layers", 1) != 1
+                    or output.get("activation") is not None
+                ):
+                    raise ValueError(
+                        "Ocean decoder requires the linear one-layer 1x1 output"
+                    )
+            widths = node.get("n_channels", [])
+            layers = node.get("n_layers", [])
+            if (
+                len(widths) != 3
+                or len(layers) != 3
+                or any(
+                    not isinstance(v, int) or isinstance(v, bool) or v < 1
+                    for v in widths + layers
+                )
+            ):
+                raise ValueError(
+                    "Ocean encoder/decoder require three positive width/layer entries"
+                )
+            if node.get("recurrent_block") is not None and side == "encoder":
+                raise ValueError(
+                    "Existing UNetEncoder does not execute recurrent_block"
+                )
+            block = node["conv_block"]
+            if block.get("conditional_layer_norm") is not None:
+                raise ValueError(
+                    "Ocean backbone has no conditional normalization inputs"
+                )
+        if config["decoder"]["n_channels"] != list(
+            reversed(config["encoder"]["n_channels"])
+        ):
+            raise ValueError(
+                "Ocean encoder/decoder widths must agree across skip levels"
+            )
 
-        Writers call this before snapshotting to avoid stale captured arrays.
-        Full selected-domain mask and scaling allow dataset-independent archive
-        construction. Scientific extra-state dictionaries stay in model.pt.
-        """
+    def _validate_backbone_layers(self):
+        from physicsnemo.models.dlwp_healpix_layers.healpix_blocks import (
+            BasicConvBlock,
+            ConvGRUBlock,
+            DealiasedDownsample,
+            Multi_SymmetricConvNeXtBlock,
+            SmoothedInterpolateConv,
+        )
+        from physicsnemo.models.dlwp_healpix_layers.healpix_decoder import UNetDecoder
+        from physicsnemo.models.dlwp_healpix_layers.healpix_encoder import UNetEncoder
+        from physicsnemo.models.layers.activations import CappedGELU
+
+        if (
+            type(self.backbone.encoder) is not UNetEncoder
+            or type(self.backbone.decoder) is not UNetDecoder
+        ):
+            raise ValueError(
+                "Ocean backbone requires existing UNetEncoder and UNetDecoder"
+            )
+        for level, group in enumerate(self.backbone.encoder.encoder):
+            if type(group[-1]) is not Multi_SymmetricConvNeXtBlock:
+                raise ValueError("Ocean encoder requires Multi_SymmetricConvNeXtBlock")
+            if level and type(group[0]) is not DealiasedDownsample:
+                raise ValueError("Ocean encoder requires DealiasedDownsample")
+        for level, group in enumerate(self.backbone.decoder.decoder):
+            if type(group["conv"]) is not Multi_SymmetricConvNeXtBlock:
+                raise ValueError("Ocean decoder requires Multi_SymmetricConvNeXtBlock")
+            if type(group["recurrent"]) is not ConvGRUBlock:
+                raise ValueError(
+                    "Ocean decoder requires actual ConvGRUBlock at every level"
+                )
+            if level and type(group["upsamp"]) is not SmoothedInterpolateConv:
+                raise ValueError("Ocean decoder requires SmoothedInterpolateConv")
+        if type(self.backbone.decoder.output_layer) is not BasicConvBlock:
+            raise ValueError(
+                "Ocean decoder requires the existing BasicConvBlock output layer"
+            )
+        if not any(type(layer) is CappedGELU for layer in self.backbone.modules()):
+            raise ValueError("Ocean backbone requires CappedGELU activation")
+
+    def checkpoint_args(self):
+        """Refresh JSON-ready full native constructor and ocean policy arguments."""
+        import copy
+
         self._args = {
             "__name__": type(self).__name__,
             "__module__": type(self).__module__,
@@ -391,9 +515,7 @@ class GlorysOceanModel(Module):
                 "mean": self.state_policy.mean.detach().cpu().flatten().tolist(),
                 "std": self.state_policy.std.detach().cpu().flatten().tolist(),
                 "mask": self.state_policy.mask[0, 0].detach().cpu().tolist(),
-                "hidden_channels": int(self.hidden_channels),
-                "depth": int(self.depth),
-                "hpx_padding_mode": self.hpx_padding_mode,
+                "backbone_config": copy.deepcopy(self.backbone_config),
                 "sst_nlat": int(self.state_policy.sst_nlat),
                 "sst_nlon": int(self.state_policy.sst_nlon),
             },
@@ -401,83 +523,60 @@ class GlorysOceanModel(Module):
         return self._args
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        """Require every scientific tensor/extra-state even for generic archives.
-
-        PhysicsNeMo Module.from_checkpoint requests strict=False; ocean state
-        cannot safely default missing masks, scaling, policy or gap stencils.
-        Scientific state keys are unchanged from the original v3 plain module.
-        """
+        """Require every native backbone tensor and scientific extra-state key."""
         expected, supplied = set(self.state_dict()), set(state_dict)
         if expected != supplied:
-            missing = sorted(expected - supplied)
-            unexpected = sorted(supplied - expected)
             raise RuntimeError(
-                f"Ocean checkpoint state keys differ: missing={missing}, unexpected={unexpected}"
+                f"Ocean checkpoint state keys differ: missing={sorted(expected-supplied)}, "
+                f"unexpected={sorted(supplied-expected)}"
             )
         result = super().load_state_dict(state_dict, strict=True, assign=assign)
         self.checkpoint_args()
         return result
 
     def save(self, file_name=None, verbose=False):
-        """Save a standard Module archive with refreshed constructor metadata."""
+        """Save a canonical Module archive with full native architecture metadata."""
         self.checkpoint_args()
         return super().save(file_name=file_name, verbose=verbose)
 
     def get_extra_state(self):
-        """Save architecture, residual reference and prescribed channel order."""
+        """Persist native model config and native corresponding-history residual semantics."""
+        import copy
+
         return {
+            "architecture": "existing-healpix-recunet-ocean-v1",
             "channels": self.channels,
             "forcing_channels": self.forcing_channels,
-            "hidden_channels": self.hidden_channels,
-            "depth": self.depth,
-            "hpx_padding_mode": self.hpx_padding_mode,
-            "reference": "latest-history",
+            "backbone_config": copy.deepcopy(self.backbone_config),
+            "reference": "native-corresponding-history",
         }
 
     def set_extra_state(self, state):
-        """Prevent silent changes to reconstruction or forcing semantics on resume."""
+        """Reject architecture or temporal drift, including old CNN checkpoints."""
         if state != self.get_extra_state():
             raise ValueError("Checkpoint model configuration differs")
 
-    def reconstruct(self, history, residual):
-        """Add each normalized residual to the latest processed history state."""
-        history = self.state_policy(history)
-        if history.shape[1] != 2 or residual.shape != history.shape:
-            raise ValueError("history and residual must have matching two-time shapes")
-        return self._reconstruct_processed(history, residual)
-
-    def _reconstruct_processed(self, history, residual):
-        if (self.state_policy.mask & ~torch.isfinite(residual)).any():
-            raise FloatingPointError("Nonfinite valid ocean predicted residual")
-        return self.state_policy(history[:, -1:] + residual, strict=True)
-
     def forward(self, history, forcing):
+        """Process observations, execute native RecUNet and constrain both leads."""
         history = self.state_policy(history)
         batch, steps, count, faces, height, width = history.shape
         expected = (batch, 2, len(self.forcing_channels), faces, height, width)
-        if steps != 2 or forcing.shape != expected:
+        if steps != 2 or count != len(self.channels) or forcing.shape != expected:
             raise ValueError("Expected two history states and two forcing windows")
         forcing = torch.where(torch.isfinite(forcing), forcing, 0.0)
-        history_faces = history.permute(0, 3, 1, 2, 4, 5).reshape(
-            batch, faces, 2 * count, height, width
+        native = self.backbone(
+            [
+                history.permute(0, 3, 1, 2, 4, 5),
+                forcing.permute(0, 3, 1, 2, 4, 5),
+                self.land_constant[0],
+            ]
         )
-        forcing_faces = forcing.permute(0, 3, 1, 2, 4, 5).reshape(
-            batch, faces, -1, height, width
-        )
-        features = torch.cat(
-            (
-                history_faces,
-                forcing_faces,
-                self.land_constant.expand(batch, -1, -1, -1, -1),
-            ),
-            dim=2,
-        )
-        features = features.reshape(batch * faces, -1, height, width)
-        residual = self.head(self.blocks(torch.nn.functional.gelu(self.stem(features))))
-        residual = residual.reshape(batch, faces, 2, count, height, width).permute(
-            0, 2, 3, 1, 4, 5
-        )
-        return self._reconstruct_processed(history, residual)
+        states = native.permute(0, 2, 3, 1, 4, 5)
+        if states.shape != history.shape:
+            raise ValueError(
+                "Native RecUNet returned an incompatible two-lead state shape"
+            )
+        return self.state_policy(states, strict=True)
 
 
 def masked_channel_sums(prediction, target, mask):

@@ -14,44 +14,59 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .activations import (
-    CappedGELU,
-    CappedLeakyReLU,
-    Identity,
-    SquarePlus,
-    Stan,
-    get_activation,
-)
-from .conv_layers import ConvBlock, CubeEmbedding
-from .dgm_layers import DGMLayer
-from .fourier_layers import FourierFilter, FourierLayer, GaborFilter
-from .fully_connected_layers import (
-    Conv1dFCLayer,
-    Conv2dFCLayer,
-    Conv3dFCLayer,
-    ConvNdFCLayer,
-    ConvNdKernel1Layer,
-    FCLayer,
-)
-from .mlp_layers import Mlp
-from .resample_layers import (
-    DownSample2D,
-    DownSample3D,
-    UpSample2D,
-    UpSample3D,
-)
-from .siren_layers import SirenLayer, SirenLayerType
-from .spectral_layers import (
-    SpectralConv1d,
-    SpectralConv2d,
-    SpectralConv3d,
-    SpectralConv4d,
-)
-from .transformer_layers import (
-    DecoderLayer,
-    EncoderLayer,
-    FuserLayer,
-    SwinTransformer,
-)
-from .weight_fact import WeightFactLinear
-from .weight_norm import WeightNormLinear
+
+"""Public layer exports, importing optional implementations on first access."""
+
+from importlib import import_module
+
+_EXPORTS = {
+    "CappedGELU": "activations",
+    "CappedLeakyReLU": "activations",
+    "Identity": "activations",
+    "SquarePlus": "activations",
+    "Stan": "activations",
+    "get_activation": "activations",
+    "ConvBlock": "conv_layers",
+    "CubeEmbedding": "conv_layers",
+    "DGMLayer": "dgm_layers",
+    "FourierFilter": "fourier_layers",
+    "FourierLayer": "fourier_layers",
+    "GaborFilter": "fourier_layers",
+    "Conv1dFCLayer": "fully_connected_layers",
+    "Conv2dFCLayer": "fully_connected_layers",
+    "Conv3dFCLayer": "fully_connected_layers",
+    "ConvNdFCLayer": "fully_connected_layers",
+    "ConvNdKernel1Layer": "fully_connected_layers",
+    "FCLayer": "fully_connected_layers",
+    "Mlp": "mlp_layers",
+    "DownSample2D": "resample_layers",
+    "DownSample3D": "resample_layers",
+    "UpSample2D": "resample_layers",
+    "UpSample3D": "resample_layers",
+    "SirenLayer": "siren_layers",
+    "SirenLayerType": "siren_layers",
+    "SpectralConv1d": "spectral_layers",
+    "SpectralConv2d": "spectral_layers",
+    "SpectralConv3d": "spectral_layers",
+    "SpectralConv4d": "spectral_layers",
+    "DecoderLayer": "transformer_layers",
+    "EncoderLayer": "transformer_layers",
+    "FuserLayer": "transformer_layers",
+    "SwinTransformer": "transformer_layers",
+    "WeightFactLinear": "weight_fact",
+    "WeightNormLinear": "weight_norm",
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(f".{_EXPORTS[name]}", __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

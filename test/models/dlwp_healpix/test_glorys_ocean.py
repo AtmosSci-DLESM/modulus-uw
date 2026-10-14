@@ -31,39 +31,142 @@ from physicsnemo.models.dlwp_healpix.glorys_ocean import (
 )
 
 
+def recunet_config(channels=3, forcing=3, nside=8):
+    """Use actual atmosphere blocks at all three levels with tiny CPU widths."""
+    blocks = "physicsnemo.models.dlwp_healpix_layers.healpix_blocks."
+    activation = {
+        "_target_": "physicsnemo.models.layers.activations.CappedGELU",
+        "cap_value": 10,
+    }
+    conv = {
+        "_target_": blocks + "Multi_SymmetricConvNeXtBlock",
+        "kernel_size": 3,
+        "upscale_factor": 2,
+        "activation": activation,
+    }
+    encoder = {
+        "_target_": "physicsnemo.models.dlwp_healpix_layers.healpix_encoder.UNetEncoder",
+        "_recursive_": False,
+        "conv_block": copy.deepcopy(conv),
+        "down_sampling_block": {
+            "_target_": blocks + "DealiasedDownsample",
+            "resample_filter": [1, 2, 1],
+            "stride": 2,
+        },
+        "recurrent_block": None,
+        "n_channels": [4, 4, 4],
+        "n_layers": [1, 1, 1],
+        "dilations": [1, 1, 1],
+    }
+    decoder = {
+        "_target_": "physicsnemo.models.dlwp_healpix_layers.healpix_decoder.UNetDecoder",
+        "_recursive_": False,
+        "conv_block": copy.deepcopy(conv),
+        "up_sampling_block": {
+            "_target_": blocks + "SmoothedInterpolateConv",
+            "kernel_size": 3,
+            "scale_factor": 2,
+            "mode": "nearest",
+            "activation": copy.deepcopy(activation),
+        },
+        "recurrent_block": {"_target_": blocks + "ConvGRUBlock", "kernel_size": 1},
+        "output_layer": {
+            "_target_": blocks + "BasicConvBlock",
+            "kernel_size": 1,
+            "n_layers": 1,
+            "activation": None,
+        },
+        "n_channels": [4, 4, 4],
+        "n_layers": [1, 1, 1],
+        "dilations": [1, 1, 1],
+    }
+    return {
+        "_target_": "physicsnemo.models.dlwp_healpix.HEALPixRecUNet.HEALPixRecUNet",
+        "_recursive_": False,
+        "encoder": encoder,
+        "decoder": decoder,
+        "input_channels": channels,
+        "output_channels": channels,
+        "n_constants": 1,
+        "decoder_input_channels": forcing,
+        "input_time_dim": 2,
+        "output_time_dim": 2,
+        "delta_time": "96h",
+        "reset_cycle": "192h",
+        "presteps": 0,
+        "enable_nhwc": False,
+        "compile_padding": False,
+        "hpx_padding_mode": "karlbauer",
+        "nside": [nside, nside // 2, nside // 4],
+        "couplings": [],
+        "constraints": None,
+        "residual_prediction": True,
+    }
+
+
+def build_model(channels, forcing, mean, std, mask, **kwargs):
+    """Inject the complete native node into the scientific wrapper."""
+    return GlorysOceanModel(
+        channels,
+        forcing,
+        mean,
+        std,
+        mask,
+        backbone_config=recunet_config(len(channels), len(forcing), mask.shape[-1]),
+        **kwargs,
+    )
+
+
+def output_convolution(model):
+    """Locate the existing decoder's actual output convolution for probes."""
+    return next(
+        layer
+        for layer in model.backbone.decoder.output_layer.modules()
+        if isinstance(layer, torch.nn.Conv2d)
+    )
+
+
 def setup_model():
     """Construct a small CPU block with channel-specific land domains."""
     torch.manual_seed(12)
     channels = ["thetao_0", "sic", "mlotst"]
-    mask = torch.ones(3, 12, 4, 4, dtype=torch.bool)
+    mask = torch.ones(3, 12, 8, 8, dtype=torch.bool)
     mask[:, :, 0, 0] = False
     mask[0, :, 0, 1] = False
-    model = GlorysOceanModel(
+    model = build_model(
         channels,
         ["z", "wind", "radiation"],
         [10, 0.5, 5],
         [2, 0.25, 2],
         mask,
-        hidden_channels=4,
-        depth=1,
     )
     return model, mask
 
 
-def test_latest_history_residual_and_constraints():
-    """Both leads reference t and enforce physical bounds after reconstruction."""
+def test_native_corresponding_history_residual_and_constraints():
+    """Native zero increments return matching histories, each advancing 192h."""
+    from physicsnemo.models.dlwp_healpix.HEALPixRecUNet import HEALPixRecUNet
+
     model, mask = setup_model()
-    history = torch.zeros(1, 2, 3, 12, 4, 4)
+    assert type(model.backbone) is HEALPixRecUNet
+    assert model.backbone.presteps == 0
+    assert model.backbone.delta_t == 96
+    assert model.backbone.residual_prediction is True
+    assert model.backbone.integration_steps == 1
+    history = torch.zeros(1, 2, 3, 12, 8, 8)
     history[:, 0, 0] = -7
     history[:, 1, 0] = 3
-    residual = torch.zeros_like(history)
-    residual[:, 0, 0] = 1
-    residual[:, 1, 0] = 2
-    residual[:, 0, 1] = 100
-    residual[:, 1, 1] = -100
-    residual[:, :, 2] = -100
-    output = model.reconstruct(history, residual)
-    assert torch.all(output[:, 0, 0][..., mask[0]] == 4)
+    convolution = output_convolution(model)
+    with torch.no_grad():
+        convolution.weight.zero_()
+        convolution.bias.zero_()
+    output = model(history, torch.zeros_like(history))
+    assert torch.all(output[:, 0, 0][..., mask[0]] == -7)
+    assert torch.all(output[:, 1, 0][..., mask[0]] == 3)
+    with torch.no_grad():
+        convolution.bias.copy_(torch.tensor([1, 100, -100, 2, -100, -100.0]))
+    output = model(history, torch.zeros_like(history))
+    assert torch.all(output[:, 0, 0][..., mask[0]] == -6)
     assert torch.all(output[:, 1, 0][..., mask[0]] == 5)
     physical = model.state_policy.to_physical(output)
     assert torch.all(physical[:, 0, 1][..., mask[1]] == 1)
@@ -76,8 +179,8 @@ def test_history_feedback_land_invariance_and_checkpoint():
     """Invalid histories cannot affect coastal outputs over repeated feedback."""
     model, mask = setup_model()
     with torch.no_grad():
-        model.head.weight.normal_(0, 0.1)
-    history = torch.randn(2, 2, 3, 12, 4, 4)
+        output_convolution(model).weight.normal_(0, 0.1)
+    history = torch.randn(2, 2, 3, 12, 8, 8)
     forcing = torch.randn_like(history)
     contaminated = history.clone()
     contaminated[..., ~mask] = float("nan")
@@ -104,12 +207,20 @@ def test_history_feedback_land_invariance_and_checkpoint():
 def test_face_exchange_affects_neighbor_output():
     """A single-face impulse reaches another face through the existing HPX stem."""
     model, _ = setup_model()
-    layer = model.stem
+    from physicsnemo.models.dlwp_healpix_layers.healpix_layers import HEALPixLayer
+
+    layer = next(
+        layer
+        for layer in model.backbone.encoder.modules()
+        if isinstance(layer, HEALPixLayer)
+        and isinstance(layer.layers[-1], torch.nn.Conv2d)
+        and layer.layers[-1].kernel_size == (3, 3)
+    )
     with torch.no_grad():
         convolution = layer.layers[-1]
         convolution.weight.fill_(1)
         convolution.bias.zero_()
-    features = torch.zeros(12, 13, 4, 4)
+    features = torch.zeros(12, layer.layers[-1].in_channels, 8, 8)
     features[0, 0] = 1
     output = layer(features)
     assert output[1:].abs().sum() > 0
@@ -218,18 +329,16 @@ def test_full_channel_contract_backward_and_policy_validation():
         + [f"so_{i}" for i in range(12)]
         + ["sic", "sithick", "zos", "sst", "mlotst"]
     )
-    mask = torch.ones(29, 12, 4, 4, dtype=torch.bool)
-    model = GlorysOceanModel(
+    mask = torch.ones(29, 12, 8, 8, dtype=torch.bool)
+    model = build_model(
         channels,
         ["z", "wind", "rad"],
         torch.zeros(29),
         torch.ones(29),
         mask,
-        hidden_channels=4,
-        depth=1,
     )
-    history = torch.zeros(1, 2, 29, 12, 4, 4)
-    forcing = torch.zeros(1, 2, 3, 12, 4, 4)
+    history = torch.zeros(1, 2, 29, 12, 8, 8)
+    forcing = torch.zeros(1, 2, 3, 12, 8, 8)
     output = model(history, forcing)
     assert output.shape == history.shape
     masked_channel_mse(output, torch.ones_like(output), mask).mean().backward()
@@ -247,8 +356,6 @@ def test_full_channel_contract_backward_and_policy_validation():
 
 def test_lazy_exports_preserve_layer_api_without_config_dependencies():
     """Retain every original export while core HPX layers avoid Hydra imports."""
-    import sys
-
     import physicsnemo.models.dlwp_healpix as models
     import physicsnemo.models.dlwp_healpix_layers as layers
 
@@ -283,9 +390,6 @@ def test_lazy_exports_preserve_layer_api_without_config_dependencies():
     assert models.GlorysOceanModel is GlorysOceanModel
     # User-installed Hydra may be loaded by pytest's own plugin; the model
     # package must still avoid loading the optional legacy implementation.
-    assert "physicsnemo.models.dlwp_healpix.HEALPixRecUNet" not in sys.modules
-    assert "physicsnemo.models.dlwp_healpix.HEALPixUNet" not in sys.modules
-    assert "physicsnemo.models.dlwp_healpix_layers.normalization" not in sys.modules
     with pytest.raises(AttributeError):
         getattr(layers, "missing_export")
     with pytest.raises(AttributeError):
@@ -310,14 +414,12 @@ def test_checkpoint_weights_only_and_hpx64_contract():
         + [f"so_{i}" for i in range(12)]
         + ["sic", "sithick", "zos", "sst", "mlotst"]
     )
-    model = GlorysOceanModel(
+    model = build_model(
         channels,
         ["z", "wind", "rad"],
         torch.zeros(29),
         torch.ones(29),
         torch.ones(29, 12, 64, 64, dtype=torch.bool),
-        hidden_channels=4,
-        depth=1,
     )
     with torch.no_grad():
         output = model(
@@ -328,29 +430,32 @@ def test_checkpoint_weights_only_and_hpx64_contract():
 
 
 def test_predicted_nonfinite_ocean_is_rejected_before_sanitization():
-    """Predicted instability raises while invalid land and missing observations sanitize."""
+    """Native predictions raise on ocean while invalid land may be erased."""
     model, mask = setup_model()
-    history = torch.zeros(1, 2, 3, 12, 4, 4)
+    history = torch.zeros(1, 2, 3, 12, 8, 8)
     history[0, 0, 0, 0, 1, 1] = float("nan")
     assert torch.isfinite(model.state_policy(history)).all()
-    residual = torch.zeros_like(history)
-    residual[..., ~mask] = float("nan")
-    assert torch.isfinite(model.reconstruct(history, residual)).all()
-    residual[0, 0, 0, 0, 1, 1] = float("nan")
-    with pytest.raises(FloatingPointError):
-        model.reconstruct(history, residual)
+
+    def contaminate_land(module, inputs, output):
+        output = output.clone()
+        output.permute(0, 2, 3, 1, 4, 5)[..., ~mask] = float("nan")
+        return output
+
+    hook = model.backbone.register_forward_hook(contaminate_land)
+    assert torch.isfinite(model(history, torch.zeros_like(history))).all()
+    hook.remove()
     with torch.no_grad():
-        model.head.bias.fill_(float("nan"))
+        output_convolution(model).bias.fill_(float("nan"))
     with pytest.raises(FloatingPointError):
         model(history, torch.zeros_like(history))
 
 
 def test_sst_absolute_infill_gradients_feedback_and_checkpoint():
     """Shared SST infill preserves ocean, rejects raw land influence and differentiates."""
-    mask = torch.ones(1, 12, 4, 4, dtype=torch.bool)
+    mask = torch.ones(1, 12, 8, 8, dtype=torch.bool)
     mask[0, 0, :2, :2] = False
     policy = OceanStatePolicy(["sst"], [280], [4], mask, sst_nlat=33, sst_nlon=64)
-    history = torch.randn(1, 2, 1, 12, 4, 4, requires_grad=True)
+    history = torch.randn(1, 2, 1, 12, 8, 8, requires_grad=True)
     output = policy(history)
     torch.testing.assert_close(output[..., mask], history[..., mask], rtol=0, atol=0)
     assert torch.isfinite(output).all()
@@ -361,27 +466,23 @@ def test_sst_absolute_infill_gradients_feedback_and_checkpoint():
     assert torch.isfinite(history.grad).all()
     assert history.grad[..., mask].abs().sum() > 0
     assert history.grad[..., ~mask].abs().sum() == 0
-    model = GlorysOceanModel(
+    model = build_model(
         ["sst"],
         ["z"],
         [280],
         [4],
         mask,
-        hidden_channels=4,
-        depth=1,
         sst_nlat=33,
         sst_nlon=64,
     )
     with torch.no_grad():
-        model.head.weight.normal_(0, 0.1)
-    restored = GlorysOceanModel(
+        output_convolution(model).weight.normal_(0, 0.1)
+    restored = build_model(
         ["sst"],
         ["z"],
         [280],
         [4],
         mask,
-        hidden_channels=4,
-        depth=1,
         sst_nlat=33,
         sst_nlon=64,
     )
@@ -404,7 +505,7 @@ def test_sst_linear_passes_match_original_xarray_sequence():
 
     from physicsnemo.models.dlwp_healpix.glorys_ocean import TripleInterpSST
 
-    mask = torch.ones(12, 4, 4, dtype=torch.bool)
+    mask = torch.ones(12, 8, 8, dtype=torch.bool)
     mask[0, :2, :2] = False
     filler = TripleInterpSST(mask, nlat=33, nlon=64)
     ocean = torch.arange(mask.numel(), dtype=torch.float64).reshape_as(mask)
@@ -458,19 +559,18 @@ def test_actual_stats_strict_bounds_and_low_precision_policy():
         policy.load_state_dict(previous)
 
 
-def test_strict_bounds_actual_scaling_model_reconstruction_and_gradients():
-    """Latest-history reconstruction/feedback obey strict bounds with real scaling."""
+def test_strict_bounds_actual_scaling_native_model_and_gradients():
+    """Native residual feedback obeys strict bounds with real scaling."""
     mean = [0.05289500951766968, 43.130428314208984]
     std = [0.20912887156009674, 51.219581604003906]
-    mask = torch.ones(2, 12, 4, 4, dtype=torch.bool)
-    model = GlorysOceanModel(
-        ["sic", "mlotst"], ["z"], mean, std, mask, hidden_channels=4, depth=1
-    )
-    history = torch.zeros(4, 2, 2, 12, 4, 4)
+    mask = torch.ones(2, 12, 8, 8, dtype=torch.bool)
+    model = build_model(["sic", "mlotst"], ["z"], mean, std, mask)
+    history = torch.zeros(4, 2, 2, 12, 8, 8)
     torch.manual_seed(18)
     for _ in range(3):
-        residual = (torch.randn_like(history) * 100).requires_grad_()
-        output = model.reconstruct(history, residual)
+        with torch.no_grad():
+            output_convolution(model).bias.normal_(0, 100)
+        output = model(history, torch.zeros(4, 2, 1, 12, 8, 8))
         physical = (
             output.double() * model.state_policy.std.double()
             + model.state_policy.mean.double()
@@ -478,7 +578,11 @@ def test_strict_bounds_actual_scaling_model_reconstruction_and_gradients():
         assert (physical[:, :, 0] >= 0).all() and (physical[:, :, 0] <= 1).all()
         assert (physical[:, :, 1] >= 0).all()
         output.sum().backward()
-        assert torch.isfinite(residual.grad).all()
+        assert all(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in model.parameters()
+        )
+        model.zero_grad()
         history = output.detach()
 
 
@@ -488,16 +592,14 @@ def test_module_archive_json_extra_state_and_feedback_parity(tmp_path):
 
     from physicsnemo.models.module import Module
 
-    mask = torch.ones(3, 12, 4, 4, dtype=torch.bool)
+    mask = torch.ones(3, 12, 8, 8, dtype=torch.bool)
     mask[:, 0, :2, :2] = False
-    model = GlorysOceanModel(
+    model = build_model(
         ["sic", "sst", "mlotst"],
         ["z"],
         torch.tensor([0.05, 280, 43]),
         torch.tensor([0.21, 4, 51]),
         mask,
-        hidden_channels=4,
-        depth=1,
         sst_nlat=33,
         sst_nlon=64,
     )
@@ -507,7 +609,7 @@ def test_module_archive_json_extra_state_and_feedback_parity(tmp_path):
     assert not any(key.startswith("inner_model.") for key in model.state_dict())
     original_keys = set(model.state_dict())
     with torch.no_grad():
-        model.head.weight.normal_(0, 0.03)
+        output_convolution(model).weight.normal_(0, 0.03)
         model.state_policy.mean[:, :, 0].add_(0.001)
     args = json.loads(json.dumps(model.checkpoint_args()))
     assert args["__args__"]["mean"] == model.state_policy.mean.flatten().tolist()
@@ -527,8 +629,8 @@ def test_module_archive_json_extra_state_and_feedback_parity(tmp_path):
     missing_stencil.pop("state_policy.sst_interpolator.passes.0.lower")
     with pytest.raises(RuntimeError, match="state keys differ"):
         restored.load_state_dict(missing_stencil, strict=False)
-    history = torch.randn(1, 2, 3, 12, 4, 4)
-    forcing = torch.randn(1, 2, 1, 12, 4, 4)
+    history = torch.randn(1, 2, 3, 12, 8, 8)
+    forcing = torch.randn(1, 2, 1, 12, 8, 8)
     for _ in range(3):
         expected = model(history, forcing)
         actual = restored(history, forcing)
@@ -551,7 +653,11 @@ def test_module_loader_rejects_missing_keys_even_with_nonstrict_request(tmp_path
         "state_policy._extra_state",
         "state_policy.mask",
         "state_policy.mean",
-        "head.weight",
+        next(
+            key
+            for key in state
+            if key.endswith("weight") and key.startswith("backbone.")
+        ),
     ):
         invalid = copy.deepcopy(state)
         invalid.pop(missing)
@@ -580,3 +686,113 @@ def test_module_loader_rejects_missing_keys_even_with_nonstrict_request(tmp_path
             tar.addfile(info, io.BytesIO(payload))
     with pytest.raises(RuntimeError, match="state keys differ"):
         Module.from_checkpoint(str(archive))
+
+
+def test_native_recurrence_resets_and_inputs_preserve_forcing_alignment():
+    """All actual decoder GRUs execute once, reset per call, and receive both windows."""
+    from physicsnemo.models.dlwp_healpix_layers.healpix_blocks import ConvGRUBlock
+
+    model, _ = setup_model()
+    history = torch.randn(1, 2, 3, 12, 8, 8)
+    forcing = torch.randn_like(history)
+    seen = []
+    hook = model.backbone.register_forward_pre_hook(
+        lambda module, args: seen.append(args[0])
+    )
+    first = model(history, forcing)
+    hook.remove()
+    torch.testing.assert_close(
+        seen[0][0], model.state_policy(history).permute(0, 3, 1, 2, 4, 5)
+    )
+    torch.testing.assert_close(seen[0][1], forcing.permute(0, 3, 1, 2, 4, 5))
+    torch.testing.assert_close(seen[0][2], model.land_constant[0])
+    recurrent = [
+        layer for layer in model.backbone.modules() if isinstance(layer, ConvGRUBlock)
+    ]
+    assert len(recurrent) == 3
+    assert all(layer.h.abs().sum() > 0 for layer in recurrent)
+    for layer in recurrent:
+        layer.h = torch.full_like(layer.h, 1e9)
+    second = model(history, forcing)
+    torch.testing.assert_close(second, first, rtol=0, atol=0)
+
+
+def test_native_contract_rejects_changed_timing_architecture_and_grid():
+    """Do not silently restore invented timing or substitute flat CNN blocks."""
+    model, mask = setup_model()
+    for key, value in (
+        ("presteps", 1),
+        ("residual_prediction", False),
+        ("delta_time", "6h"),
+        ("n_constants", 0),
+        ("nside", [8, 4]),
+    ):
+        config = copy.deepcopy(model.backbone_config)
+        config[key] = value
+        with pytest.raises(ValueError):
+            GlorysOceanModel(
+                model.channels,
+                model.forcing_channels,
+                [10, 0.5, 5],
+                [2, 0.25, 2],
+                mask,
+                config,
+            )
+    bad = copy.deepcopy(model.state_dict())
+    bad["_extra_state"]["reference"] = "latest-history"
+    with pytest.raises(ValueError):
+        model.load_state_dict(bad)
+
+
+def test_layer_public_exports_and_torch_only_activation_import():
+    """Preserve every prior public layer name and avoid optional timm on activation import."""
+    import sys
+
+    import physicsnemo.models.layers as layers
+
+    expected = {
+        "WeightNormLinear",
+        "DecoderLayer",
+        "Conv1dFCLayer",
+        "ConvNdKernel1Layer",
+        "UpSample2D",
+        "ConvBlock",
+        "SpectralConv1d",
+        "SquarePlus",
+        "GaborFilter",
+        "Conv2dFCLayer",
+        "FCLayer",
+        "Stan",
+        "SpectralConv4d",
+        "SwinTransformer",
+        "EncoderLayer",
+        "get_activation",
+        "FuserLayer",
+        "DownSample2D",
+        "CappedGELU",
+        "SirenLayerType",
+        "UpSample3D",
+        "ConvNdFCLayer",
+        "DownSample3D",
+        "WeightFactLinear",
+        "SirenLayer",
+        "Identity",
+        "DGMLayer",
+        "CubeEmbedding",
+        "Mlp",
+        "FourierFilter",
+        "CappedLeakyReLU",
+        "Conv3dFCLayer",
+        "SpectralConv2d",
+        "FourierLayer",
+        "SpectralConv3d",
+    }
+    assert set(layers.__all__) == expected
+    assert expected <= set(dir(layers))
+    from physicsnemo.models.layers import CappedGELU
+    from physicsnemo.models.layers.activations import CappedGELU as direct
+
+    assert CappedGELU is direct
+    assert "physicsnemo.models.layers.transformer_layers" not in sys.modules
+    with pytest.raises(AttributeError):
+        getattr(layers, "missing_export")
