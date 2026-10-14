@@ -88,3 +88,30 @@ def test_drop_last_honored_when_dataloader_auto_batches():
     assert loader.drop_last is True
     # Incomplete final batch of size 1 is dropped (5 samples, batch_size 2).
     assert len(loader) == 2
+
+
+def test_raw_validation_rank_stride_keeps_every_sample_once_and_empty_shards():
+    dm = _bare_datamodule(dataloader_batch_size=None, drop_last=True)
+    dm.raw_target_mode = True
+    dm.val_dataset = _TinyDataset()
+    shards = []
+    for rank in range(8):
+        loader, sampler = dm.val_dataloader(num_shards=8, shard_id=rank)
+        observed = list(loader)
+        assert len(observed) == len(sampler)
+        shards.append(observed)
+    assert sorted(index for shard in shards for index in shard) == list(range(5))
+    assert shards[5:] == [[], [], []]
+
+
+def test_raw_train_keeps_existing_distributed_sampler():
+    from torch.utils.data.distributed import DistributedSampler
+
+    dm = _bare_datamodule(dataloader_batch_size=None, drop_last=True)
+    dm.raw_target_mode = True
+    dm.train_dataset = _TinyDataset()
+    dm.shuffle = False
+    loader, sampler = dm.train_dataloader(num_shards=2, shard_id=0)
+    assert type(sampler) is DistributedSampler
+    assert sampler.drop_last is True
+    assert len(list(loader)) == 2

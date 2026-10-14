@@ -25,7 +25,7 @@ import numpy as np
 
 # External modules
 from omegaconf import DictConfig
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
 from physicsnemo.distributed import DistributedManager
@@ -34,6 +34,28 @@ from .coupledtimeseries_dataset_zarr import CoupledTimeSeriesDatasetZarr
 from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
 
 logger = logging.getLogger(__name__)
+
+
+class RankStrideSampler(Sampler):
+    """Partition ordered evaluation samples without padding or duplication."""
+
+    def __init__(self, dataset, num_replicas, rank):
+        super().__init__()
+        if num_replicas < 1 or not 0 <= rank < num_replicas:
+            raise ValueError("invalid evaluation sampler rank or replica count")
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self):
+        return max(
+            0,
+            (len(self.dataset) - self.rank + self.num_replicas - 1)
+            // self.num_replicas,
+        )
 
 
 class TimeSeriesDataModuleZarr:
@@ -292,7 +314,7 @@ class TimeSeriesDataModuleZarr:
             self.val_dataset = dataset_class(
                 start_date=self.splits["val_date_start"],
                 end_date=self.splits["val_date_end"],
-                drop_last=self.drop_last,
+                drop_last=False if self.raw_target_mode else self.drop_last,
                 **common_kwargs,
             )
             self.test_dataset = dataset_class(
@@ -313,7 +335,13 @@ class TimeSeriesDataModuleZarr:
         self._create_datasets(common_kwargs, dataset_class, dist)
 
     def _base_dataloader(
-        self, dataset, num_shards=1, shard_id=0, shuffle=False, drop_last=False
+        self,
+        dataset,
+        num_shards=1,
+        shard_id=0,
+        shuffle=False,
+        drop_last=False,
+        pad_distributed_samples=True,
     ) -> DataLoader:
         """Setup a dataloader with common functionality
 
@@ -335,13 +363,16 @@ class TimeSeriesDataModuleZarr:
         """
         sampler = None
         if num_shards > 1:
-            sampler = DistributedSampler(
-                dataset,
-                num_replicas=num_shards,
-                rank=shard_id,
-                shuffle=shuffle,
-                drop_last=drop_last,
-            )
+            if pad_distributed_samples:
+                sampler = DistributedSampler(
+                    dataset,
+                    num_replicas=num_shards,
+                    rank=shard_id,
+                    shuffle=shuffle,
+                    drop_last=drop_last,
+                )
+            else:
+                sampler = RankStrideSampler(dataset, num_shards, shard_id)
             shuffle = False
 
         # Dataset-level batching uses dataloader_batch_size=None. PyTorch forbids
@@ -410,7 +441,8 @@ class TimeSeriesDataModuleZarr:
             num_shards=num_shards,
             shard_id=shard_id,
             shuffle=False,
-            drop_last=self.drop_last,
+            drop_last=False if self.raw_target_mode else self.drop_last,
+            pad_distributed_samples=not self.raw_target_mode,
         )
 
     def test_dataloader(self, num_shards=1, shard_id=0) -> DataLoader:
