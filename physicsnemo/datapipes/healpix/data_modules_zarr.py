@@ -69,6 +69,10 @@ class TimeSeriesDataModuleZarr:
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
+        raw_target_mode: bool = False,
+        target_mask_constant: Optional[str] = None,
+        target_mask_threshold: float = 0.5,
+        preserve_land_channels: Optional[Sequence] = None,
     ):
         """
         Parameters
@@ -165,6 +169,10 @@ class TimeSeriesDataModuleZarr:
         self.train_noise_params = train_noise_params
         self.train_noise_seed = train_noise_seed
         self.in_order = in_order
+        self.raw_target_mode = raw_target_mode
+        self.target_mask_constant = target_mask_constant
+        self.target_mask_threshold = target_mask_threshold
+        self.preserve_land_channels = preserve_land_channels
 
         self.train_dataset = None
         self.val_dataset = None
@@ -205,6 +213,10 @@ class TimeSeriesDataModuleZarr:
             "time_step": self.time_step,
             "gap": self.gap,
             "scaling": self.scaling,
+            "raw_target_mode": self.raw_target_mode,
+            "target_mask_constant": self.target_mask_constant,
+            "target_mask_threshold": self.target_mask_threshold,
+            "preserve_land_channels": self.preserve_land_channels,
         }
 
     def _validate_setup_requirements(self) -> None:
@@ -460,6 +472,10 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
+        raw_target_mode: bool = False,
+        target_mask_constant: Optional[str] = None,
+        target_mask_threshold: float = 0.5,
+        preserve_land_channels: Optional[Sequence] = None,
     ):
         """
         Parameters
@@ -560,6 +576,10 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             train_noise_params,
             train_noise_seed,
             in_order,
+            raw_target_mode=raw_target_mode,
+            target_mask_constant=target_mask_constant,
+            target_mask_threshold=target_mask_threshold,
+            preserve_land_channels=preserve_land_channels,
         )
 
     def _get_coupled_vars(self):

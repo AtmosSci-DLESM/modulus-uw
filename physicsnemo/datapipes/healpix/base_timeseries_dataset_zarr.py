@@ -105,6 +105,10 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
         meta: DatapipeMetaData = None,
+        raw_target_mode: bool = False,
+        target_mask_constant: Optional[str] = None,
+        target_mask_threshold: float = 0.5,
+        preserve_land_channels: Optional[Sequence] = None,
     ):
         """Initialize base time series dataset.
 
@@ -157,8 +161,16 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         """
         Datapipe.__init__(self, meta=meta)
 
+        self.raw_target_mode = raw_target_mode
+        self.target_mask_constant = target_mask_constant
+        self.target_mask_threshold = target_mask_threshold
+        self.preserve_land_channels = tuple(preserve_land_channels or ())
         self.dataset_path = dataset_path
-        self.scaling = OmegaConf.to_object(scaling) if scaling else None
+        self.scaling = (
+            (OmegaConf.to_object(scaling) if OmegaConf.is_config(scaling) else scaling)
+            if scaling
+            else None
+        )
         self.input_time_dim = input_time_dim
         self.output_time_dim = output_time_dim
         self.data_time_step = self._convert_time_step(data_time_step)
@@ -182,7 +194,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         # training still stages input ∪ output for supervised targets.
         self.staging_variables = (
             list(self.input_variables)
-            if self.forecast_mode
+            if self.forecast_mode or self.raw_target_mode
             else self.all_variables
         )
         self.all_scaling = None
@@ -235,12 +247,30 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         # Output indices are only used when loading supervised targets.
         self.output_variable_indices = (
             None
-            if self.forecast_mode
+            if self.forecast_mode or self.raw_target_mode
             else [
-                self.staging_variables.index(out_ch)
-                for out_ch in self.output_variables
+                self.staging_variables.index(out_ch) for out_ch in self.output_variables
             ]
         )
+
+        self.raw_target_variable_indices = None
+        self.raw_input_mask = None
+        if self.raw_target_mode:
+            if not self.forecast_mode:
+                target_names = list(self.ds["channel_out"][:])
+                self.raw_target_variable_indices = [
+                    target_names.index(name) for name in self.output_variables
+                ]
+            if self.target_mask_constant is not None:
+                names = list(self.ds["channel_c"][:])
+                physical_mask = np.asarray(
+                    self.ds["constants"][names.index(self.target_mask_constant)]
+                )
+                self.raw_input_mask = physical_mask < self.target_mask_threshold
+            if set(self.preserve_land_channels) - set(self.input_variables):
+                raise ValueError(
+                    "preserve_land_channels must be declared input variables"
+                )
 
         # Length of the data window needed for one sample
         if self.forecast_mode:
@@ -554,6 +584,17 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             if self.forecast_mode
             else item * self.batch_size + self.start_index
         )
+        if self.raw_target_mode:
+            if self.forecast_mode:
+                return (window_start_index, window_start_index + self._window_length), 1
+            available = self.start_index + self.total_samples - self._window_length + 1
+            actual_batch = min(self.batch_size, available - window_start_index)
+            if actual_batch < 1:
+                raise IndexError("raw target sample outside configured split")
+            return (
+                window_start_index,
+                window_start_index + self._window_length + actual_batch - 1,
+            ), actual_batch
         window_max_index = (
             window_start_index + self._window_length
             if self.forecast_mode
@@ -598,6 +639,8 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         if self.forecast_mode:
             return len(self._forecast_init_indices)
         length = (self.total_samples - self._window_length + 1) / self.batch_size
+        if self.raw_target_mode:
+            length = max(0, length)
         if self.drop_last:
             return int(np.floor(length))
         return int(np.ceil(length))

@@ -57,7 +57,7 @@ class BaseCoupler(ABC):
             forecasting batch size should be 1
         variables: Sequence
             sequence of strings that indicate the coupled variable
-            names in the dataset. All names should be in the dataset with 
+            names in the dataset. All names should be in the dataset with
             an optional time component at the end, eg ttr-48h
         presteps: int, optional
             the number of model steps used to initialize the hidden state.
@@ -75,7 +75,7 @@ class BaseCoupler(ABC):
             the right side of a averaging_window window.
             This is highly recommended for training, default True
         time_first: boolean, optional
-            Whether the coupled data should be permuted to have the time dimension first 
+            Whether the coupled data should be permuted to have the time dimension first
             [T, B, C, F, H, W] rather than [B, F, T, C, H, W]
         """
         # extract important meta data from ds
@@ -119,7 +119,9 @@ class BaseCoupler(ABC):
             # Check if any of the requested variables are not in the dataset
             missing_variables = set(self.variables) - set(channel_in)
             if len(missing_variables) > 0:
-                raise ValueError(f"Missing variables in dataset for coupling: {missing_variables}")
+                raise ValueError(
+                    f"Missing variables in dataset for coupling: {missing_variables}"
+                )
         else:
             raise TypeError(
                 f"Coupler only supports xarray Datasets or zarr Groups, got {type(self.ds)}"
@@ -250,7 +252,8 @@ class BaseCoupler(ABC):
             ds_index_range = ds_index_range[:, self.ds_variable_indices]
         else:
             ds_index_range = (
-                self.ds["inputs"].sel(channel_in=self.variables)
+                self.ds["inputs"]
+                .sel(channel_in=self.variables)
                 .isel(time=index_range)
                 .compute()
             )
@@ -410,11 +413,14 @@ class ConstantCoupler(BaseCoupler):
             format is [B, F, T, C, H, W]
         """
         # create buffer for coupling
-        coupled_fields = coupled_fields[
-            :, :, :, self.coupled_channel_indices, :, :
-        ] 
+        coupled_fields = coupled_fields[:, :, :, self.coupled_channel_indices, :, :]
         self.preset_coupled_fields = th.empty(
-            [coupled_fields.shape[0], self.spatial_dims[0], self.coupled_integration_dim, self.timevar_dim]
+            [
+                coupled_fields.shape[0],
+                self.spatial_dims[0],
+                self.coupled_integration_dim,
+                self.timevar_dim,
+            ]
             + list(self.spatial_dims[1:])
         )
         # we use a constant set of values so we just copy time 0
@@ -422,7 +428,9 @@ class ConstantCoupler(BaseCoupler):
         # broadcast the first time step to the entire coupled integration dimension
         self.preset_coupled_fields[:, :, :, :, :, :] = coupled_fields[:, :, :1, :, :, :]
         if self.time_first:
-            self.preset_coupled_fields = self.preset_coupled_fields.permute(2, 0, 3, 1, 4, 5)
+            self.preset_coupled_fields = self.preset_coupled_fields.permute(
+                2, 0, 3, 1, 4, 5
+            )
         # flag for construct integrated coupling method to use this array
         self.coupled_mode = True
 
@@ -491,13 +499,20 @@ class TrailingAverageCoupler(BaseCoupler):
         self.averaging_window = pd.Timedelta(averaging_window)
 
         if self.use_zarr:
-            cf_dates = cftime.num2pydate(
-                self.ds["time"][:],
-                units=self.ds["time"].attrs["units"],
-                calendar=self.ds["time"].attrs["calendar"],
-            )
-            dates = [np.datetime64(date.isoformat()) for date in cf_dates]
-            self.time_da = np.asarray(dates)
+            raw_time = self.ds["time"][:]
+            if np.issubdtype(raw_time.dtype, np.datetime64):
+                self.time_da = raw_time.astype("datetime64[ns]")
+            else:
+                attrs = self.ds["time"].attrs
+                units, calendar = attrs["units"], attrs["calendar"]
+                units = units[0] if isinstance(units, (list, tuple)) else units
+                calendar = (
+                    calendar[0] if isinstance(calendar, (list, tuple)) else calendar
+                )
+                cf_dates = cftime.num2pydate(raw_time, units=units, calendar=calendar)
+                self.time_da = np.asarray(
+                    [np.datetime64(date.isoformat()) for date in cf_dates]
+                )
         else:
             self.time_da = self.ds["time"].values
         self._set_time_increments()
@@ -583,10 +598,10 @@ class TrailingAverageCoupler(BaseCoupler):
                 for s in self.averaging_slices[j]
             ]
             coupled_averaging_periods.append(th.concat(averaging_periods, dim=3))
-        self.preset_coupled_fields = th.concat(
-            coupled_averaging_periods, dim=2
-        )
+        self.preset_coupled_fields = th.concat(coupled_averaging_periods, dim=2)
         if self.time_first:
-            self.preset_coupled_fields = self.preset_coupled_fields.permute(2, 0, 3, 1, 4, 5)
+            self.preset_coupled_fields = self.preset_coupled_fields.permute(
+                2, 0, 3, 1, 4, 5
+            )
         # flag for construct integrated coupling method to use this array
         self.coupled_mode = True

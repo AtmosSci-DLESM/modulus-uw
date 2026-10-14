@@ -79,6 +79,10 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         add_train_noise: bool = False,
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
+        raw_target_mode: bool = False,
+        target_mask_constant: Optional[str] = None,
+        target_mask_threshold: float = 0.5,
+        preserve_land_channels: Optional[Sequence] = None,
     ):
         """Initialize coupled time series dataset.
 
@@ -137,6 +141,10 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
             train_noise_params=train_noise_params,
             train_noise_seed=train_noise_seed,
             meta=meta,
+            raw_target_mode=raw_target_mode,
+            target_mask_constant=target_mask_constant,
+            target_mask_threshold=target_mask_threshold,
+            preserve_land_channels=preserve_land_channels,
         )
 
         # calculate static indices for coupling
@@ -227,6 +235,9 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         time_index, this_batch = self._get_time_index(item)
         batch = {"time": slice(*time_index)}
         self.last_batch = batch
+        self.last_batch_size = this_batch
+        if self.raw_target_mode:
+            self.integration_step = 1
 
         torch.cuda.nvtx.range_push(
             "CoupledTimeSeriesDataset:__getitem__:retrieve_coupled"
@@ -328,6 +339,7 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
             [
                 c.construct_integrated_couplings(
                     batch=batch,
+                    bsize=self.last_batch_size,
                 )
                 for c in self.couplings
             ],

@@ -72,6 +72,10 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
         meta: DatapipeMetaData = MetaData(),
+        raw_target_mode: bool = False,
+        target_mask_constant: Optional[str] = None,
+        target_mask_threshold: float = 0.5,
+        preserve_land_channels: Optional[Sequence] = None,
     ):
         """Initialize time series dataset.
 
@@ -99,6 +103,10 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             train_noise_params=train_noise_params,
             train_noise_seed=train_noise_seed,
             meta=meta,
+            raw_target_mode=raw_target_mode,
+            target_mask_constant=target_mask_constant,
+            target_mask_threshold=target_mask_threshold,
+            preserve_land_channels=preserve_land_channels,
         )
 
     def __getitem__(
@@ -179,9 +187,30 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         input_array = staging_ds[:, self.input_variable_indices]
         torch.cuda.nvtx.range_pop()
 
+        if self.raw_target_mode:
+            finite = np.isfinite(input_array)
+            if self.raw_input_mask is not None:
+                valid = np.broadcast_to(self.raw_input_mask, input_array.shape).copy()
+                for name in self.preserve_land_channels:
+                    valid[:, self.input_variables.index(name)] = True
+                finite &= valid
+            input_array = np.where(finite, input_array, 0).astype("float32")
+
         if not self.forecast_mode:
             torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_target")
-            target_array = staging_ds[:, self.output_variable_indices]
+            if self.raw_target_mode:
+                target_array = np.asarray(
+                    self.ds["targets"].oindex[
+                        slice(*time_index), self.raw_target_variable_indices, :, :, :
+                    ],
+                    dtype=np.float32,
+                )
+                if self.target_scaling is not None:
+                    target_array -= self.target_scaling["mean"]
+                    target_array /= self.target_scaling["std"]
+                # Preserve raw NaNs for finite/domain-aware criteria. No imputation.
+            else:
+                target_array = staging_ds[:, self.output_variable_indices]
             torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()
 
