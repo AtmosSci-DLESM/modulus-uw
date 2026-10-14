@@ -20,19 +20,37 @@ from importlib import import_module
 
 _EXPORTS = {
     **dict.fromkeys(
-        ["AvgPool", "BasicConvBlock", "ConvGRUBlock", "ConvNeXtBlock",
-         "DealiasedDownsample", "DoubleConvNeXtBlock", "Interpolate", "MaxPool",
-         "Multi_SymmetricConvNeXtBlock", "SymmetricConvNeXtBlock",
-         "TransposedConvUpsample", "SmoothedInterpolateConv"], "healpix_blocks"
+        [
+            "AvgPool",
+            "BasicConvBlock",
+            "ConvGRUBlock",
+            "ConvNeXtBlock",
+            "DealiasedDownsample",
+            "DoubleConvNeXtBlock",
+            "Interpolate",
+            "MaxPool",
+            "Multi_SymmetricConvNeXtBlock",
+            "SymmetricConvNeXtBlock",
+            "TransposedConvUpsample",
+            "SmoothedInterpolateConv",
+        ],
+        "healpix_blocks",
     ),
     "UNetDecoder": "healpix_decoder",
     "UNetEncoder": "healpix_encoder",
     "HEALPixLayer": "healpix_layers",
     **dict.fromkeys(
-        ["HEALPixFoldFaces", "HEALPixPadding", "HEALPixPaddingIsolatitude",
-         "HEALPixPaddingv2", "HEALPixUnfoldFaces", "have_earth2grid",
-         "make_hpx_padding_layer", "warn_deprecated_enable_healpixpad"],
-        "healpix_paddings"
+        [
+            "HEALPixFoldFaces",
+            "HEALPixPadding",
+            "HEALPixPaddingIsolatitude",
+            "HEALPixPaddingv2",
+            "HEALPixUnfoldFaces",
+            "have_earth2grid",
+            "make_hpx_padding_layer",
+            "warn_deprecated_enable_healpixpad",
+        ],
+        "healpix_paddings",
     ),
 }
 __all__ = list(_EXPORTS)

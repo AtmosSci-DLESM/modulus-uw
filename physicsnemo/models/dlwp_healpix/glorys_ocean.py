@@ -105,7 +105,9 @@ class TripleInterpSST(nn.Module):
         if width < 2 or width & (width - 1):
             raise ValueError("SST nside must be a power of two")
         if nlat < 2 or nlon < 2 or not mask.any():
-            raise ValueError("Interpolation needs ocean cells and valid latlon dimensions")
+            raise ValueError(
+                "Interpolation needs ocean cells and valid latlon dimensions"
+            )
         self.width, self.nlat, self.nlon = width, nlat, nlon
         hpx = earth2grid.healpix.Grid(
             level=width.bit_length() - 1,
@@ -127,12 +129,18 @@ class TripleInterpSST(nn.Module):
             passes.append(stencil)
         self.passes = nn.Sequential(*passes)
         if not np.all(valid):
-            raise ValueError("TripleInterp cannot fill selected ocean domain completely")
+            raise ValueError(
+                "TripleInterp cannot fill selected ocean domain completely"
+            )
 
     def get_extra_state(self):
         """Persist the ETL grid, stencil and missing-domain contract."""
-        return {"width": self.width, "nlat": self.nlat, "nlon": self.nlon,
-                "algorithm": "etl-triple-linear-selected-domain-v1"}
+        return {
+            "width": self.width,
+            "nlat": self.nlat,
+            "nlon": self.nlon,
+            "algorithm": "etl-triple-linear-selected-domain-v1",
+        }
 
     def set_extra_state(self, state):
         """Reject inconsistent interpolation configuration on resume."""
@@ -157,6 +165,27 @@ class TripleInterpSST(nn.Module):
         return result.to(dtype)
 
 
+def _safe_normalized_boundary(mean, std, boundary, lower):
+    """Round a normalized bound inward for both float32 and float64 decoding."""
+    mean64, std64 = mean.detach().double(), std.detach().double()
+    value = ((boundary - mean64) / std64).float()
+    direction = torch.full_like(value, float("inf") if lower else -float("inf"))
+    # A float32 multiply may round outward even when exact decoding is safe.
+    # Validate both decoders, rather than assuming one rounded quotient suffices.
+    for _ in range(8):
+        decoded32 = value * std.float() + mean.float()
+        decoded64 = value.double() * std64 + mean64
+        outside = (
+            ((decoded32 < boundary) | (decoded64 < boundary))
+            if lower
+            else ((decoded32 > boundary) | (decoded64 > boundary))
+        )
+        if not outside.any():
+            return value
+        value = torch.where(outside, torch.nextafter(value, direction), value)
+    raise FloatingPointError("Cannot represent safe normalized physical boundary")
+
+
 class OceanStatePolicy(nn.Module):
     """Process observations, reconstructed states and feedback identically.
 
@@ -164,6 +193,7 @@ class OceanStatePolicy(nn.Module):
     is recomputed by the shared TripleInterpSST from current valid ocean values. Valid sic is
     clamped in physical units to [0,1], and valid mlotst to [0,infinity).
     Scaling, per-channel domains and channel order persist in state_dict.
+    Bounds are inward-rounded for both float32 and float64 physical decode.
     strict=True rejects nonfinite valid predictions before processing.
     Nonfinite observed values are replaced with normalized zero; loss validity
     must independently exclude missing targets before their sanitization.
@@ -202,8 +232,12 @@ class OceanStatePolicy(nn.Module):
 
     def get_extra_state(self):
         """Persist channel order and the shared policy contract."""
-        return {"channels": self.channels, "policy": "sst-triple-interp-other-neutral-v2",
-                "sst_nlat": self.sst_nlat, "sst_nlon": self.sst_nlon}
+        return {
+            "channels": self.channels,
+            "policy": "sst-triple-interp-other-neutral-safe-bounds-v3",
+            "sst_nlat": self.sst_nlat,
+            "sst_nlon": self.sst_nlon,
+        }
 
     def set_extra_state(self, state):
         """Reject checkpoints with incompatible channel order or policy."""
@@ -214,18 +248,29 @@ class OceanStatePolicy(nn.Module):
         if state.ndim != 6 or state.shape[2:] != self.mask.shape[2:]:
             raise ValueError("state must be [B,T,C,12,H,W] matching policy mask")
         if strict and (self.mask & ~torch.isfinite(state)).any():
-            raise FloatingPointError("Nonfinite valid ocean prediction before state policy")
+            raise FloatingPointError(
+                "Nonfinite valid ocean prediction before state policy"
+            )
+        # Autocast/low-precision observations must not quantize safe boundaries.
+        if state.dtype in (torch.float16, torch.bfloat16):
+            state = state.float()
         clean = torch.where(self.mask & torch.isfinite(state), state, 0.0)
-        # Only constrained channels require a physical-space round trip.
+        # Linear scaling makes normalized bounds equivalent to physical clamps.
         result = []
         for index, name in enumerate(self.channels):
             value = clean[:, :, index : index + 1]
             if name in ("sic", "mlotst"):
                 mean = self.mean[:, :, index : index + 1]
                 std = self.std[:, :, index : index + 1]
-                physical = value * std + mean
-                physical = physical.clamp(0, 1) if name == "sic" else physical.clamp_min(0)
-                value = (physical - mean) / std
+                lower = _safe_normalized_boundary(mean, std, 0.0, lower=True)
+                value = torch.maximum(value, lower)
+                if name == "sic":
+                    upper = _safe_normalized_boundary(mean, std, 1.0, lower=False)
+                    if (lower > upper).any():
+                        raise FloatingPointError(
+                            "SIC interval has no representable normalized value"
+                        )
+                    value = torch.minimum(value, upper)
             if name == "sst" and self.sst_interpolator is not None:
                 mean = self.mean[:, :, index : index + 1]
                 std = self.std[:, :, index : index + 1]
@@ -246,11 +291,21 @@ class _SpatialResidual(nn.Module):
     def __init__(self, width, padding_mode):
         super().__init__()
         self.layers = nn.Sequential(
-            HEALPixLayer(nn.Conv2d, hpx_padding_mode=padding_mode,
-                         in_channels=width, out_channels=width, kernel_size=3),
+            HEALPixLayer(
+                nn.Conv2d,
+                hpx_padding_mode=padding_mode,
+                in_channels=width,
+                out_channels=width,
+                kernel_size=3,
+            ),
             nn.GELU(),
-            HEALPixLayer(nn.Conv2d, hpx_padding_mode=padding_mode,
-                         in_channels=width, out_channels=width, kernel_size=3),
+            HEALPixLayer(
+                nn.Conv2d,
+                hpx_padding_mode=padding_mode,
+                in_channels=width,
+                out_channels=width,
+                kernel_size=3,
+            ),
         )
         self.activation = nn.GELU()
 
@@ -270,35 +325,61 @@ class GlorysOceanModel(nn.Module):
     forward returns constrained normalized states, ready for feedback.
     """
 
-    def __init__(self, channels: Sequence[str], forcing_channels: Sequence[str],
-                 mean, std, mask, hidden_channels=32, depth=4,
-                 hpx_padding_mode="karlbauer", sst_nlat=721, sst_nlon=1440):
+    def __init__(
+        self,
+        channels: Sequence[str],
+        forcing_channels: Sequence[str],
+        mean,
+        std,
+        mask,
+        hidden_channels=32,
+        depth=4,
+        hpx_padding_mode="karlbauer",
+        sst_nlat=721,
+        sst_nlon=1440,
+    ):
         super().__init__()
         self.channels = _names(channels)
         self.forcing_channels = _names(forcing_channels)
         if hidden_channels < 1 or depth < 1:
             raise ValueError("hidden_channels and depth must be positive")
-        self.state_policy = OceanStatePolicy(self.channels, mean, std, mask, sst_nlat, sst_nlon)
+        self.state_policy = OceanStatePolicy(
+            self.channels, mean, std, mask, sst_nlat, sst_nlon
+        )
         self.hidden_channels = hidden_channels
         self.depth = depth
         self.hpx_padding_mode = hpx_padding_mode
         count = len(self.channels)
-        self.register_buffer("land_constant", (~self.state_policy.mask.any(dim=2))
-                             .float().reshape(1, 12, 1, *self.state_policy.mask.shape[-2:]))
-        self.stem = HEALPixLayer(nn.Conv2d, hpx_padding_mode=hpx_padding_mode,
-                                in_channels=2 * (count + len(self.forcing_channels)) + 1,
-                                out_channels=hidden_channels, kernel_size=3)
-        self.blocks = nn.Sequential(*[_SpatialResidual(hidden_channels, hpx_padding_mode)
-                                     for _ in range(depth)])
+        self.register_buffer(
+            "land_constant",
+            (~self.state_policy.mask.any(dim=2))
+            .float()
+            .reshape(1, 12, 1, *self.state_policy.mask.shape[-2:]),
+        )
+        self.stem = HEALPixLayer(
+            nn.Conv2d,
+            hpx_padding_mode=hpx_padding_mode,
+            in_channels=2 * (count + len(self.forcing_channels)) + 1,
+            out_channels=hidden_channels,
+            kernel_size=3,
+        )
+        self.blocks = nn.Sequential(
+            *[_SpatialResidual(hidden_channels, hpx_padding_mode) for _ in range(depth)]
+        )
         self.head = nn.Conv2d(hidden_channels, 2 * count, kernel_size=1)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
     def get_extra_state(self):
         """Save architecture, residual reference and prescribed channel order."""
-        return {"channels": self.channels, "forcing_channels": self.forcing_channels,
-                "hidden_channels": self.hidden_channels, "depth": self.depth,
-                "hpx_padding_mode": self.hpx_padding_mode, "reference": "latest-history"}
+        return {
+            "channels": self.channels,
+            "forcing_channels": self.forcing_channels,
+            "hidden_channels": self.hidden_channels,
+            "depth": self.depth,
+            "hpx_padding_mode": self.hpx_padding_mode,
+            "reference": "latest-history",
+        }
 
     def set_extra_state(self, state):
         """Prevent silent changes to reconstruction or forcing semantics on resume."""
@@ -324,13 +405,25 @@ class GlorysOceanModel(nn.Module):
         if steps != 2 or forcing.shape != expected:
             raise ValueError("Expected two history states and two forcing windows")
         forcing = torch.where(torch.isfinite(forcing), forcing, 0.0)
-        history_faces = history.permute(0, 3, 1, 2, 4, 5).reshape(batch, faces, 2 * count, height, width)
-        forcing_faces = forcing.permute(0, 3, 1, 2, 4, 5).reshape(batch, faces, -1, height, width)
-        features = torch.cat((history_faces, forcing_faces,
-                              self.land_constant.expand(batch, -1, -1, -1, -1)), dim=2)
+        history_faces = history.permute(0, 3, 1, 2, 4, 5).reshape(
+            batch, faces, 2 * count, height, width
+        )
+        forcing_faces = forcing.permute(0, 3, 1, 2, 4, 5).reshape(
+            batch, faces, -1, height, width
+        )
+        features = torch.cat(
+            (
+                history_faces,
+                forcing_faces,
+                self.land_constant.expand(batch, -1, -1, -1, -1),
+            ),
+            dim=2,
+        )
         features = features.reshape(batch * faces, -1, height, width)
         residual = self.head(self.blocks(torch.nn.functional.gelu(self.stem(features))))
-        residual = residual.reshape(batch, faces, 2, count, height, width).permute(0, 2, 3, 1, 4, 5)
+        residual = residual.reshape(batch, faces, 2, count, height, width).permute(
+            0, 2, 3, 1, 4, 5
+        )
         return self._reconstruct_processed(history, residual)
 
 
@@ -378,8 +471,14 @@ class FixedInverseValidationWeights(nn.Module):
     configuration through state_dict; incompatible resume configuration fails.
     """
 
-    def __init__(self, channels, equal_epochs=10, floor=1e-8, max_weight=100.0,
-                 manual_multipliers: Mapping[str, float] | None = None):
+    def __init__(
+        self,
+        channels,
+        equal_epochs=10,
+        floor=1e-8,
+        max_weight=100.0,
+        manual_multipliers: Mapping[str, float] | None = None,
+    ):
         super().__init__()
         self.channels = _names(channels)
         if equal_epochs < 1 or int(equal_epochs) != equal_epochs:
@@ -392,8 +491,14 @@ class FixedInverseValidationWeights(nn.Module):
         multipliers = torch.tensor([manual.get(name, 1.0) for name in self.channels])
         if not torch.isfinite(multipliers).all() or (multipliers <= 0).any():
             raise ValueError("Manual multipliers must be finite and positive")
-        self.equal_epochs, self.floor, self.max_weight = int(equal_epochs), float(floor), float(max_weight)
-        self.manual_config = tuple(float(manual.get(name, 1.0)) for name in self.channels)
+        self.equal_epochs, self.floor, self.max_weight = (
+            int(equal_epochs),
+            float(floor),
+            float(max_weight),
+        )
+        self.manual_config = tuple(
+            float(manual.get(name, 1.0)) for name in self.channels
+        )
         self.register_buffer("manual", multipliers)
         self.register_buffer("weights", torch.ones(len(self.channels)))
         self.register_buffer("reference_mse", torch.zeros(len(self.channels)))
@@ -407,10 +512,14 @@ class FixedInverseValidationWeights(nn.Module):
 
     def get_extra_state(self):
         """Record the channel ordering, formula and schedule configuration."""
-        return {"channels": self.channels, "equal_epochs": self.equal_epochs,
-                "floor": self.floor, "max_weight": self.max_weight,
-                "manual": self.manual_config,
-                "formula": "mean-normalized-inverse-cap-then-manual-v1"}
+        return {
+            "channels": self.channels,
+            "equal_epochs": self.equal_epochs,
+            "floor": self.floor,
+            "max_weight": self.max_weight,
+            "manual": self.manual_config,
+            "formula": "mean-normalized-inverse-cap-then-manual-v1",
+        }
 
     def set_extra_state(self, state):
         """Reject altered resume configuration before silent recalibration."""
@@ -422,13 +531,22 @@ class FixedInverseValidationWeights(nn.Module):
         """Freeze once after the configured completed equal-weight epoch."""
         if bool(self.frozen) or epoch < self.equal_epochs:
             return False
-        reference = torch.as_tensor(validation_mse, device=self.weights.device,
-                                    dtype=self.weights.dtype)
-        if reference.shape != self.weights.shape or not torch.isfinite(reference).all() or (reference < 0).any():
-            raise ValueError("Calibration needs finite nonnegative MSE for every channel")
+        reference = torch.as_tensor(
+            validation_mse, device=self.weights.device, dtype=self.weights.dtype
+        )
+        if (
+            reference.shape != self.weights.shape
+            or not torch.isfinite(reference).all()
+            or (reference < 0).any()
+        ):
+            raise ValueError(
+                "Calibration needs finite nonnegative MSE for every channel"
+            )
         safe = reference.double().clamp_min(self.floor)
         relative_inverse = safe.min() / safe
-        balanced = (relative_inverse / relative_inverse.mean()).clamp_max(self.max_weight)
+        balanced = (relative_inverse / relative_inverse.mean()).clamp_max(
+            self.max_weight
+        )
         effective = (balanced * self.manual.double()).to(self.weights.dtype)
         if not torch.isfinite(effective).all() or (effective <= 0).any():
             raise ValueError("Effective balancing weights exceed numeric range")

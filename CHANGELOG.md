@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Inward-round GLORYS SIC and mixed-layer-depth normalized bounds so float32
+  and float64 physical decoding cannot violate physical limits at clamp edges.
+  State policy v3 explicitly rejects older checkpoint policy metadata.
+
 ### Security
 
 ### Dependencies
