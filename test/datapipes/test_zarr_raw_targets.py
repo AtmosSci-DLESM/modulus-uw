@@ -148,8 +148,14 @@ def test_actual_module_forecast_coupler_datetime_and_next_integration(source):
             ),
         )
     ]
-    module = CoupledTimeSeriesDataModuleZarr(
-        dataset_path=path,
+    from hydra.utils import instantiate
+
+    module = instantiate(
+        {
+            "_target_": "physicsnemo.datapipes.healpix.data_modules_zarr.CoupledTimeSeriesDataModuleZarr",
+            "_recursive_": False,
+        },
+        dataset_path=str(path),
         batch_size=1,
         dataloader_batch_size=None,
         input_variables=["sst", "q"],
@@ -160,13 +166,14 @@ def test_actual_module_forecast_coupler_datetime_and_next_integration(source):
         output_time_dim=2,
         data_time_step="24h",
         time_step="96h",
-        forecast_init_times=[np.datetime64("1993-01-05")],
+        forecast_init_times=["1993-01-05"],
         couplings=couplings,
         num_workers=0,
         pin_memory=False,
         raw_target_mode=True,
         target_mask_constant="land_sea_mask",
         preserve_land_channels=["sst"],
+        _convert_="all",
     )
     loader, sampler = module.test_dataloader()
     inputs = next(iter(loader))

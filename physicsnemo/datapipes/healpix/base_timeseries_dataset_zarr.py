@@ -428,7 +428,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                 )
             self._forecast_init_indices = np.array(
                 [
-                    int(np.where(self.time_da == s)[0][0])
+                    int(np.where(self.time_da == np.datetime64(s))[0][0])
                     for s in self.forecast_init_times
                 ],
                 dtype="int",
