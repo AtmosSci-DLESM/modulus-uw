@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Distributed initialization accepts an optional process-group timeout and
+  supports CPU gloo without CUDA device arguments. Console logging retains
+  plain output when optional terminal coloring is unavailable.
+
 - Ocean models use native LIST inputs and real prepared atmosphere couplings,
   with actual supplied LSM constants and native inferencer metadata. Coupled
   HEALPixRecUNet now permits zero decoder variables without dummy insolation.

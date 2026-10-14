@@ -306,7 +306,7 @@ class DistributedManager(object):
             return "gloo"
 
     @staticmethod
-    def initialize_env():
+    def initialize_env(timeout=None):
         """Setup method using generic initialization"""
         rank = int(os.environ.get("RANK"))
         world_size = int(os.environ.get("WORLD_SIZE"))
@@ -315,10 +315,10 @@ class DistributedManager(object):
             if local_rank is not None:
                 local_rank = int(local_rank)
             else:
-                local_rank = rank % torch.cuda.device_count()
+                local_rank = rank % max(1, torch.cuda.device_count())
 
         else:
-            local_rank = rank % torch.cuda.device_count()
+            local_rank = rank % max(1, torch.cuda.device_count())
 
         # Read env variables
         addr = os.environ.get("MASTER_ADDR")
@@ -331,10 +331,11 @@ class DistributedManager(object):
             addr=addr,
             port=port,
             backend=DistributedManager.get_available_backend(),
+            timeout=timeout,
         )
 
     @staticmethod
-    def initialize_open_mpi(addr, port):
+    def initialize_open_mpi(addr, port, timeout=None):
         """Setup method using OpenMPI initialization"""
         rank = int(os.environ.get("OMPI_COMM_WORLD_RANK"))
         world_size = int(os.environ.get("OMPI_COMM_WORLD_SIZE"))
@@ -348,10 +349,11 @@ class DistributedManager(object):
             port=port,
             backend=DistributedManager.get_available_backend(),
             method="openmpi",
+            timeout=timeout,
         )
 
     @staticmethod
-    def initialize_slurm(port):
+    def initialize_slurm(port, timeout=None):
         """Setup method using SLURM initialization"""
         rank = int(os.environ.get("SLURM_PROCID"))
         world_size = int(os.environ.get("SLURM_NPROCS"))
@@ -366,10 +368,11 @@ class DistributedManager(object):
             port=port,
             backend=DistributedManager.get_available_backend(),
             method="slurm",
+            timeout=timeout,
         )
 
     @staticmethod
-    def initialize():
+    def initialize(timeout=None):
         """
         Initialize distributed manager
 
@@ -405,23 +408,23 @@ class DistributedManager(object):
         )
         if initialization_method is None:
             try:
-                DistributedManager.initialize_env()
+                DistributedManager.initialize_env(timeout=timeout)
             except TypeError:
                 if "SLURM_PROCID" in os.environ:
-                    DistributedManager.initialize_slurm(port)
+                    DistributedManager.initialize_slurm(port, timeout=timeout)
                 elif "OMPI_COMM_WORLD_RANK" in os.environ:
-                    DistributedManager.initialize_open_mpi(addr, port)
+                    DistributedManager.initialize_open_mpi(addr, port, timeout=timeout)
                 else:
                     warn(
                         "Could not initialize using ENV, SLURM or OPENMPI methods. Assuming this is a single process job"
                     )
                     DistributedManager._shared_state["_is_initialized"] = True
         elif initialization_method == "ENV":
-            DistributedManager.initialize_env()
+            DistributedManager.initialize_env(timeout=timeout)
         elif initialization_method == "SLURM":
-            DistributedManager.initialize_slurm(port)
+            DistributedManager.initialize_slurm(port, timeout=timeout)
         elif initialization_method == "OPENMPI":
-            DistributedManager.initialize_open_mpi(addr, port)
+            DistributedManager.initialize_open_mpi(addr, port, timeout=timeout)
         else:
             raise RuntimeError(
                 "Unknown initialization method "
@@ -529,6 +532,7 @@ class DistributedManager(object):
         port="12355",
         backend="nccl",
         method="env",
+        timeout=None,
     ):
         """Set up PyTorch distributed process group and update manager attributes"""
         os.environ["MASTER_ADDR"] = addr
@@ -543,7 +547,7 @@ class DistributedManager(object):
             manager._rank = rank
             manager._world_size = world_size
             if local_rank is None:
-                manager._local_rank = rank % torch.cuda.device_count()
+                manager._local_rank = rank % max(1, torch.cuda.device_count())
             else:
                 manager._local_rank = local_rank
 
@@ -553,20 +557,19 @@ class DistributedManager(object):
 
         if manager._distributed:
             # Setup distributed process group
+            kwargs = dict(rank=manager.rank, world_size=manager.world_size)
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            if manager.device.type == "cuda":
+                kwargs["device_id"] = manager.device
             try:
-                dist.init_process_group(
-                    backend,
-                    rank=manager.rank,
-                    world_size=manager.world_size,
-                    device_id=manager.device,
-                )
+                dist.init_process_group(backend, **kwargs)
             except TypeError:
                 # device_id only introduced in PyTorch 2.3
-                dist.init_process_group(
-                    backend,
-                    rank=manager.rank,
-                    world_size=manager.world_size,
-                )
+                if "device_id" not in kwargs:
+                    raise
+                kwargs.pop("device_id")
+                dist.init_process_group(backend, **kwargs)
 
         if torch.cuda.is_available():
             # Set device for this process and empty cache to optimize memory usage

@@ -17,7 +17,15 @@
 import logging
 import os
 
-from termcolor import colored
+try:
+    from termcolor import colored
+except ModuleNotFoundError as exc:
+    if exc.name != "termcolor":
+        raise
+
+    def colored(message, color):
+        """Retain plain logs when optional console coloring is unavailable."""
+        return str(message)
 
 
 class PythonLogger:
