@@ -1572,7 +1572,11 @@ class SmoothedInterpolate(th.nn.Module):
         self.smoother_kernel = self.smoother_kernel.repeat((in_channels,1,1,1))
 
     def forward(self, x: th.Tensor) -> th.Tensor:
-        self.smoother_kernel = self.smoother_kernel.to(device=x.device, dtype=x.dtype)
+        # Cached constants must remain usable by autograd after inference.
+        with torch.inference_mode(False):
+            self.smoother_kernel = self.smoother_kernel.to(device=x.device, dtype=x.dtype)
+            if torch.is_inference(self.smoother_kernel):
+                self.smoother_kernel = self.smoother_kernel.clone()
 
         # Interpolate, smooth, trim in order
         x = self.interp(x, scale_factor=self.scale_factor, mode=self.mode)

@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Native HEALPix smoothing caches ordinary immutable kernels across inference
+  and training, preserving resampling values and checkpoint state keys.
+
 - Ocean wrappers delegate native HEALPixRecUNet architecture and execution
   options to the shared implementation, validating only the ocean interface.
 
