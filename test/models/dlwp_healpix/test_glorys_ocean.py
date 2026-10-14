@@ -717,15 +717,18 @@ def test_native_recurrence_resets_and_inputs_preserve_forcing_alignment():
     torch.testing.assert_close(second, first, rtol=0, atol=0)
 
 
-def test_native_contract_rejects_changed_timing_architecture_and_grid():
-    """Do not silently restore invented timing or substitute flat CNN blocks."""
+def test_ocean_interface_rejects_changed_timing_channels_and_mask_grid():
+    """Reject incompatible sampling interfaces without validating native architecture."""
     model, mask = setup_model()
     for key, value in (
         ("presteps", 1),
         ("residual_prediction", False),
         ("delta_time", "6h"),
         ("n_constants", 0),
-        ("nside", [8, 4]),
+        ("input_channels", 4),
+        ("output_channels", 4),
+        ("decoder_input_channels", 2),
+        ("nside", [16, 8, 4]),
     ):
         config = copy.deepcopy(model.backbone_config)
         config[key] = value
@@ -796,3 +799,53 @@ def test_layer_public_exports_and_torch_only_activation_import():
     assert "physicsnemo.models.layers.transformer_layers" not in sys.modules
     with pytest.raises(AttributeError):
         getattr(layers, "missing_export")
+
+
+def test_native_architecture_and_nhwc_options_are_consumed():
+    """Let native modules execute configured families, layout and reset options."""
+    config = recunet_config()
+    config["enable_nhwc"] = True
+    config["reset_cycle"] = "384h"
+    for side in ("encoder", "decoder"):
+        config[side]["conv_block"] = {
+            "_target_": "physicsnemo.models.dlwp_healpix_layers.healpix_blocks.BasicConvBlock",
+            "kernel_size": 3,
+            "activation": {
+                "_target_": "physicsnemo.models.layers.activations.CappedGELU",
+                "cap_value": 10,
+            },
+        }
+    model = GlorysOceanModel(
+        ["thetao_0", "sic", "mlotst"],
+        ["z", "wind", "radiation"],
+        [10, 0.5, 5],
+        [2, 0.25, 2],
+        torch.ones(3, 12, 8, 8),
+        config,
+    )
+    assert model.backbone.enable_nhwc is True
+    assert model.backbone.reset_cycle == 384
+    assert model.backbone.encoder.encoder[0][-1].__class__.__name__ == "BasicConvBlock"
+    assert model.backbone_config == config
+    output = model(torch.zeros(1, 2, 3, 12, 8, 8), torch.zeros(1, 2, 3, 12, 8, 8))
+    assert output.shape == (1, 2, 3, 12, 8, 8)
+    assert torch.isfinite(output).all()
+
+
+def test_native_padding_and_level_errors_are_delegated():
+    """Unsupported native settings fail in the shared constructor, not ocean guards."""
+    from hydra.errors import InstantiationException
+
+    mask = torch.ones(3, 12, 8, 8)
+    for key, value in (("hpx_padding_mode", "unsupported"), ("nside", [8, 4])):
+        config = recunet_config()
+        config[key] = value
+        with pytest.raises(InstantiationException):
+            GlorysOceanModel(
+                ["thetao_0", "sic", "mlotst"],
+                ["z", "wind", "radiation"],
+                [10, 0.5, 5],
+                [2, 0.25, 2],
+                mask,
+                config,
+            )

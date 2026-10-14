@@ -322,7 +322,6 @@ class GlorysOceanModel(Module):
         import json
 
         self.backbone_config = json.loads(json.dumps(backbone_config, allow_nan=False))
-        self._validate_backbone_config(mask)
         self.state_policy = OceanStatePolicy(
             self.channels, mean, std, mask, sst_nlat, sst_nlon
         )
@@ -338,169 +337,34 @@ class GlorysOceanModel(Module):
         self.backbone.register_buffer(
             "device_buffer", self.backbone.device_buffer, persistent=False
         )
-        self._validate_backbone_layers()
+        self._validate_ocean_contract()
         self.checkpoint_args()
 
-    def _validate_backbone_config(self, mask):
-        config = self.backbone_config
+    def _validate_ocean_contract(self):
+        """Check only the interface required by ocean sampling and state policy.
+
+        Native RecUNet and its configured modules own architecture, execution
+        options and their validation. Presets select the verified configuration.
+        """
         required = {
-            "_target_": "physicsnemo.models.dlwp_healpix.HEALPixRecUNet.HEALPixRecUNet",
             "input_channels": len(self.channels),
             "output_channels": len(self.channels),
             "n_constants": 1,
             "decoder_input_channels": len(self.forcing_channels),
             "input_time_dim": 2,
             "output_time_dim": 2,
-            "delta_time": "96h",
-            "reset_cycle": "192h",
+            "delta_t": 96,
             "presteps": 0,
             "residual_prediction": True,
             "couplings": [],
-            "constraints": None,
-            "enable_nhwc": False,
-            "compile_padding": False,
-            "hpx_padding_mode": "karlbauer",
         }
         for name, value in required.items():
-            if config.get(name) != value or name not in config:
+            if getattr(self.backbone, name) != value:
                 raise ValueError(f"Ocean backbone requires {name}={value!r}")
-        if config.get("_partial_", False):
-            raise ValueError("Ocean backbone cannot be a partial factory")
-        shape = torch.as_tensor(mask).shape
-        height, width = shape[-2:]
-        if height != width or height % 4 or height < 8:
+        if self.state_policy.mask.shape[-2:] != (self.backbone.nside[0],) * 2:
             raise ValueError(
-                "Ocean mask requires square faces divisible by four, size >=8"
+                "Ocean policy mask and native full-resolution nside differ"
             )
-        if config.get("nside") != [height, height // 2, height // 4]:
-            raise ValueError(
-                "Ocean backbone requires all three mask-matched UNet levels"
-            )
-        targets = {
-            "encoder": "physicsnemo.models.dlwp_healpix_layers.healpix_encoder.UNetEncoder",
-            "decoder": "physicsnemo.models.dlwp_healpix_layers.healpix_decoder.UNetDecoder",
-        }
-        for side in ("encoder", "decoder"):
-            node = config[side]
-            if node.get("_target_") != targets[side]:
-                raise ValueError(
-                    f"Ocean {side} must be the existing UNet implementation"
-                )
-            block_target = "physicsnemo.models.dlwp_healpix_layers.healpix_blocks."
-            if (
-                node["conv_block"].get("_target_")
-                != block_target + "Multi_SymmetricConvNeXtBlock"
-            ):
-                raise ValueError("Ocean blocks must be Multi_SymmetricConvNeXtBlock")
-            activation = node["conv_block"].get("activation", {})
-            if (
-                activation.get("_target_")
-                != "physicsnemo.models.layers.activations.CappedGELU"
-            ):
-                raise ValueError("Ocean blocks must use CappedGELU")
-            if node["conv_block"].get("geometry_layer") is not None:
-                raise ValueError(
-                    "Ocean blocks use the existing default HEALPixLayer geometry"
-                )
-            if side == "encoder":
-                down = node["down_sampling_block"]
-                if (
-                    down.get("_target_") != block_target + "DealiasedDownsample"
-                    or down.get("stride", 2) != 2
-                ):
-                    raise ValueError(
-                        "Ocean encoder requires factor-two DealiasedDownsample"
-                    )
-            else:
-                up = node["up_sampling_block"]
-                if (
-                    up.get("_target_") != block_target + "SmoothedInterpolateConv"
-                    or up.get("scale_factor", 2) != 2
-                ):
-                    raise ValueError(
-                        "Ocean decoder requires factor-two SmoothedInterpolateConv"
-                    )
-                recurrent = node.get("recurrent_block") or {}
-                if recurrent.get("_target_") != block_target + "ConvGRUBlock":
-                    raise ValueError("Ocean decoder requires ConvGRUBlock")
-                output = node["output_layer"]
-                if (
-                    output.get("_target_") != block_target + "BasicConvBlock"
-                    or output.get("kernel_size") != 1
-                    or output.get("n_layers", 1) != 1
-                    or output.get("activation") is not None
-                ):
-                    raise ValueError(
-                        "Ocean decoder requires the linear one-layer 1x1 output"
-                    )
-            widths = node.get("n_channels", [])
-            layers = node.get("n_layers", [])
-            if (
-                len(widths) != 3
-                or len(layers) != 3
-                or any(
-                    not isinstance(v, int) or isinstance(v, bool) or v < 1
-                    for v in widths + layers
-                )
-            ):
-                raise ValueError(
-                    "Ocean encoder/decoder require three positive width/layer entries"
-                )
-            if node.get("recurrent_block") is not None and side == "encoder":
-                raise ValueError(
-                    "Existing UNetEncoder does not execute recurrent_block"
-                )
-            block = node["conv_block"]
-            if block.get("conditional_layer_norm") is not None:
-                raise ValueError(
-                    "Ocean backbone has no conditional normalization inputs"
-                )
-        if config["decoder"]["n_channels"] != list(
-            reversed(config["encoder"]["n_channels"])
-        ):
-            raise ValueError(
-                "Ocean encoder/decoder widths must agree across skip levels"
-            )
-
-    def _validate_backbone_layers(self):
-        from physicsnemo.models.dlwp_healpix_layers.healpix_blocks import (
-            BasicConvBlock,
-            ConvGRUBlock,
-            DealiasedDownsample,
-            Multi_SymmetricConvNeXtBlock,
-            SmoothedInterpolateConv,
-        )
-        from physicsnemo.models.dlwp_healpix_layers.healpix_decoder import UNetDecoder
-        from physicsnemo.models.dlwp_healpix_layers.healpix_encoder import UNetEncoder
-        from physicsnemo.models.layers.activations import CappedGELU
-
-        if (
-            type(self.backbone.encoder) is not UNetEncoder
-            or type(self.backbone.decoder) is not UNetDecoder
-        ):
-            raise ValueError(
-                "Ocean backbone requires existing UNetEncoder and UNetDecoder"
-            )
-        for level, group in enumerate(self.backbone.encoder.encoder):
-            if type(group[-1]) is not Multi_SymmetricConvNeXtBlock:
-                raise ValueError("Ocean encoder requires Multi_SymmetricConvNeXtBlock")
-            if level and type(group[0]) is not DealiasedDownsample:
-                raise ValueError("Ocean encoder requires DealiasedDownsample")
-        for level, group in enumerate(self.backbone.decoder.decoder):
-            if type(group["conv"]) is not Multi_SymmetricConvNeXtBlock:
-                raise ValueError("Ocean decoder requires Multi_SymmetricConvNeXtBlock")
-            if type(group["recurrent"]) is not ConvGRUBlock:
-                raise ValueError(
-                    "Ocean decoder requires actual ConvGRUBlock at every level"
-                )
-            if level and type(group["upsamp"]) is not SmoothedInterpolateConv:
-                raise ValueError("Ocean decoder requires SmoothedInterpolateConv")
-        if type(self.backbone.decoder.output_layer) is not BasicConvBlock:
-            raise ValueError(
-                "Ocean decoder requires the existing BasicConvBlock output layer"
-            )
-        if not any(type(layer) is CappedGELU for layer in self.backbone.modules()):
-            raise ValueError("Ocean backbone requires CappedGELU activation")
 
     def checkpoint_args(self):
         """Refresh JSON-ready full native constructor and ocean policy arguments."""

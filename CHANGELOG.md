@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Ocean wrappers delegate native HEALPixRecUNet architecture and execution
+  options to the shared implementation, validating only the ocean interface.
+
 - Lazy public layer exports preserve existing names while avoiding optional
   transformer dependencies when importing torch-only activations.
 
