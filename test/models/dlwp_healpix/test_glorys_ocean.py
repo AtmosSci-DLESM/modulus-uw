@@ -88,7 +88,7 @@ def recunet_config(channels=3, forcing=3, nside=8):
         "input_channels": channels,
         "output_channels": channels,
         "n_constants": 1,
-        "decoder_input_channels": forcing,
+        "decoder_input_channels": 0,
         "input_time_dim": 2,
         "output_time_dim": 2,
         "delta_time": "96h",
@@ -98,7 +98,22 @@ def recunet_config(channels=3, forcing=3, nside=8):
         "compile_padding": False,
         "hpx_padding_mode": "karlbauer",
         "nside": [nside, nside // 2, nside // 4],
-        "couplings": [],
+        "couplings": [
+            {
+                "coupler": "TrailingAverageCoupler",
+                "params": {
+                    "variables": ["z", "wind", "radiation"][:forcing]
+                    if forcing > 1
+                    else ["z"],
+                    "input_times": ["96h", "192h"],
+                    "averaging_window": "96h",
+                    "prepared_coupled_data": True,
+                    "presteps": 0,
+                    "input_time_dim": 2,
+                    "output_time_dim": 2,
+                },
+            }
+        ],
         "constraints": None,
         "residual_prediction": True,
     }
@@ -106,15 +121,44 @@ def recunet_config(channels=3, forcing=3, nside=8):
 
 def build_model(channels, forcing, mean, std, mask, **kwargs):
     """Inject the complete native node into the scientific wrapper."""
+    config = recunet_config(len(channels), len(forcing), mask.shape[-1])
+    config["couplings"][0]["params"]["variables"] = list(forcing)
     return GlorysOceanModel(
         channels,
         forcing,
         mean,
         std,
         mask,
-        backbone_config=recunet_config(len(channels), len(forcing), mask.shape[-1]),
+        backbone_config=config,
         **kwargs,
     )
+
+
+def native_inputs(model, history, forcing, compact=False):
+    """Create only real declared fields in the existing native LIST layout."""
+    batch, steps, count, faces, height, width = history.shape
+    if forcing.shape[1] != 2:
+        raise ValueError("Two actual forcing windows are required")
+    prognostics = history.permute(0, 3, 1, 2, 4, 5)
+    # A real-valued LSM test field, not the old binary model-derived indicator.
+    ocean = model.state_policy.mask[0, 0].any(dim=0)
+    constants = torch.where(ocean, 0.2, 0.8).unsqueeze(1).to(history)
+    coupled = forcing.reshape(
+        batch, 2 * len(model.forcing_channels), faces, height, width
+    ).unsqueeze(0)
+    if compact:
+        return [prognostics, constants, coupled]
+    return [
+        prognostics,
+        history.new_empty(batch, faces, steps, 0, height, width),
+        constants,
+        coupled,
+    ]
+
+
+def run_model(model, history, forcing):
+    """Invoke the sole native LIST model API and unpack for physical assertions."""
+    return model(native_inputs(model, history, forcing)).permute(0, 2, 3, 1, 4, 5)
 
 
 def output_convolution(model):
@@ -160,12 +204,12 @@ def test_native_corresponding_history_residual_and_constraints():
     with torch.no_grad():
         convolution.weight.zero_()
         convolution.bias.zero_()
-    output = model(history, torch.zeros_like(history))
+    output = run_model(model, history, torch.zeros_like(history))
     assert torch.all(output[:, 0, 0][..., mask[0]] == -7)
     assert torch.all(output[:, 1, 0][..., mask[0]] == 3)
     with torch.no_grad():
         convolution.bias.copy_(torch.tensor([1, 100, -100, 2, -100, -100.0]))
-    output = model(history, torch.zeros_like(history))
+    output = run_model(model, history, torch.zeros_like(history))
     assert torch.all(output[:, 0, 0][..., mask[0]] == -6)
     assert torch.all(output[:, 1, 0][..., mask[0]] == 5)
     physical = model.state_policy.to_physical(output)
@@ -185,8 +229,8 @@ def test_history_feedback_land_invariance_and_checkpoint():
     contaminated = history.clone()
     contaminated[..., ~mask] = float("nan")
     for _ in range(3):
-        clean_output = model(history, forcing)
-        output = model(contaminated, forcing)
+        clean_output = run_model(model, history, forcing)
+        output = run_model(model, contaminated, forcing)
         torch.testing.assert_close(output, clean_output, rtol=0, atol=0)
         assert torch.isfinite(output).all()
         assert torch.all(output[..., ~mask] == 0)
@@ -201,7 +245,9 @@ def test_history_feedback_land_invariance_and_checkpoint():
         contaminated[..., ~mask] = 1e10
     restored, _ = setup_model()
     restored.load_state_dict(copy.deepcopy(model.state_dict()))
-    torch.testing.assert_close(restored(history, forcing), model(history, forcing))
+    torch.testing.assert_close(
+        run_model(restored, history, forcing), run_model(model, history, forcing)
+    )
 
 
 def test_face_exchange_affects_neighbor_output():
@@ -339,7 +385,7 @@ def test_full_channel_contract_backward_and_policy_validation():
     )
     history = torch.zeros(1, 2, 29, 12, 8, 8)
     forcing = torch.zeros(1, 2, 3, 12, 8, 8)
-    output = model(history, forcing)
+    output = run_model(model, history, forcing)
     assert output.shape == history.shape
     masked_channel_mse(output, torch.ones_like(output), mask).mean().backward()
     assert all(
@@ -349,9 +395,9 @@ def test_full_channel_contract_backward_and_policy_validation():
     with pytest.raises(ValueError):
         OceanStatePolicy(["sst"], [0], [0], mask[:1])
     with pytest.raises(ValueError):
-        model(history[:, :1], forcing)
+        run_model(model, history[:, :1], forcing)
     with pytest.raises(ValueError):
-        model(history, forcing[:, :1])
+        run_model(model, history, forcing[:, :1])
 
 
 def test_lazy_exports_preserve_layer_api_without_config_dependencies():
@@ -422,8 +468,8 @@ def test_checkpoint_weights_only_and_hpx64_contract():
         torch.ones(29, 12, 64, 64, dtype=torch.bool),
     )
     with torch.no_grad():
-        output = model(
-            torch.zeros(1, 2, 29, 12, 64, 64), torch.zeros(1, 2, 3, 12, 64, 64)
+        output = run_model(
+            model, torch.zeros(1, 2, 29, 12, 64, 64), torch.zeros(1, 2, 3, 12, 64, 64)
         )
     assert output.shape == (1, 2, 29, 12, 64, 64)
     assert torch.isfinite(output).all()
@@ -442,12 +488,12 @@ def test_predicted_nonfinite_ocean_is_rejected_before_sanitization():
         return output
 
     hook = model.backbone.register_forward_hook(contaminate_land)
-    assert torch.isfinite(model(history, torch.zeros_like(history))).all()
+    assert torch.isfinite(run_model(model, history, torch.zeros_like(history))).all()
     hook.remove()
     with torch.no_grad():
         output_convolution(model).bias.fill_(float("nan"))
     with pytest.raises(FloatingPointError):
-        model(history, torch.zeros_like(history))
+        run_model(model, history, torch.zeros_like(history))
 
 
 def test_sst_absolute_infill_gradients_feedback_and_checkpoint():
@@ -490,8 +536,10 @@ def test_sst_absolute_infill_gradients_feedback_and_checkpoint():
     state = history.detach()
     forcing = torch.ones_like(state)
     for _ in range(3):
-        state = model(state, forcing)
-        torch.testing.assert_close(state, restored(history.detach(), forcing))
+        state = run_model(model, state, forcing)
+        torch.testing.assert_close(
+            state, run_model(restored, history.detach(), forcing)
+        )
         history = state
         assert torch.isfinite(state).all()
     keys = model.state_dict()
@@ -530,9 +578,9 @@ def test_sst_linear_passes_match_original_xarray_sequence():
 
 def test_actual_stats_strict_bounds_and_low_precision_policy():
     """Adversarial real scaling satisfies float32 and float64 strict decoders."""
-    # Actual stats-train-1993-2018.npz persisted float32 scaling for SIC and MLD.
-    mean = torch.tensor([0.05289500951766968, 43.130428314208984])
-    std = torch.tensor([0.20912887156009674, 51.219581604003906])
+    # Authoritative supplied_stats.nc SHA660c9b6a... supplied float32 SIC/MLD scaling.
+    mean = torch.tensor([0.0735456570982933, 38.98458480834961])
+    std = torch.tensor([0.23701302707195282, 46.12942123413086])
     mask = torch.ones(2, 12, 8, 8, dtype=torch.bool)
     policy = OceanStatePolicy(["sic", "mlotst"], mean, std, mask)
     torch.manual_seed(47)
@@ -561,8 +609,8 @@ def test_actual_stats_strict_bounds_and_low_precision_policy():
 
 def test_strict_bounds_actual_scaling_native_model_and_gradients():
     """Native residual feedback obeys strict bounds with real scaling."""
-    mean = [0.05289500951766968, 43.130428314208984]
-    std = [0.20912887156009674, 51.219581604003906]
+    mean = [0.0735456570982933, 38.98458480834961]
+    std = [0.23701302707195282, 46.12942123413086]
     mask = torch.ones(2, 12, 8, 8, dtype=torch.bool)
     model = build_model(["sic", "mlotst"], ["z"], mean, std, mask)
     history = torch.zeros(4, 2, 2, 12, 8, 8)
@@ -570,7 +618,7 @@ def test_strict_bounds_actual_scaling_native_model_and_gradients():
     for _ in range(3):
         with torch.no_grad():
             output_convolution(model).bias.normal_(0, 100)
-        output = model(history, torch.zeros(4, 2, 1, 12, 8, 8))
+        output = run_model(model, history, torch.zeros(4, 2, 1, 12, 8, 8))
         physical = (
             output.double() * model.state_policy.std.double()
             + model.state_policy.mean.double()
@@ -632,8 +680,8 @@ def test_module_archive_json_extra_state_and_feedback_parity(tmp_path):
     history = torch.randn(1, 2, 3, 12, 8, 8)
     forcing = torch.randn(1, 2, 1, 12, 8, 8)
     for _ in range(3):
-        expected = model(history, forcing)
-        actual = restored(history, forcing)
+        expected = run_model(model, history, forcing)
+        actual = run_model(restored, history, forcing)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         history = expected.detach()
 
@@ -699,13 +747,14 @@ def test_native_recurrence_resets_and_inputs_preserve_forcing_alignment():
     hook = model.backbone.register_forward_pre_hook(
         lambda module, args: seen.append(args[0])
     )
-    first = model(history, forcing)
+    first = run_model(model, history, forcing)
     hook.remove()
     torch.testing.assert_close(
         seen[0][0], model.state_policy(history).permute(0, 3, 1, 2, 4, 5)
     )
-    torch.testing.assert_close(seen[0][1], forcing.permute(0, 3, 1, 2, 4, 5))
-    torch.testing.assert_close(seen[0][2], model.land_constant[0])
+    assert seen[0][1].shape[3] == 0
+    torch.testing.assert_close(seen[0][3], forcing.reshape(1, 6, 12, 8, 8).unsqueeze(0))
+    torch.testing.assert_close(seen[0][2], native_inputs(model, history, forcing)[2])
     recurrent = [
         layer for layer in model.backbone.modules() if isinstance(layer, ConvGRUBlock)
     ]
@@ -713,12 +762,14 @@ def test_native_recurrence_resets_and_inputs_preserve_forcing_alignment():
     assert all(layer.h.abs().sum() > 0 for layer in recurrent)
     for layer in recurrent:
         layer.h = torch.full_like(layer.h, 1e9)
-    second = model(history, forcing)
+    second = run_model(model, history, forcing)
     torch.testing.assert_close(second, first, rtol=0, atol=0)
 
 
 def test_ocean_interface_rejects_changed_timing_channels_and_mask_grid():
     """Reject incompatible sampling interfaces without validating native architecture."""
+    from hydra.errors import InstantiationException
+
     model, mask = setup_model()
     for key, value in (
         ("presteps", 1),
@@ -732,7 +783,8 @@ def test_ocean_interface_rejects_changed_timing_channels_and_mask_grid():
     ):
         config = copy.deepcopy(model.backbone_config)
         config[key] = value
-        with pytest.raises(ValueError):
+        error = InstantiationException if key == "n_constants" else ValueError
+        with pytest.raises(error):
             GlorysOceanModel(
                 model.channels,
                 model.forcing_channels,
@@ -827,7 +879,9 @@ def test_native_architecture_and_nhwc_options_are_consumed():
     assert model.backbone.reset_cycle == 384
     assert model.backbone.encoder.encoder[0][-1].__class__.__name__ == "BasicConvBlock"
     assert model.backbone_config == config
-    output = model(torch.zeros(1, 2, 3, 12, 8, 8), torch.zeros(1, 2, 3, 12, 8, 8))
+    output = run_model(
+        model, torch.zeros(1, 2, 3, 12, 8, 8), torch.zeros(1, 2, 3, 12, 8, 8)
+    )
     assert output.shape == (1, 2, 3, 12, 8, 8)
     assert torch.isfinite(output).all()
 
@@ -849,3 +903,227 @@ def test_native_padding_and_level_errors_are_delegated():
                 mask,
                 config,
             )
+
+
+def test_native_list_metadata_real_constants_and_compact_datapipe_layout():
+    """Both real native LIST layouts preserve supplied fractional LSM/couplings."""
+    model, _ = setup_model()
+    history = torch.randn(1, 2, 3, 12, 8, 8)
+    forcing = torch.randn_like(history)
+    fixed = native_inputs(model, history, forcing)
+    compact = [fixed[0], fixed[2], fixed[3]]
+    seen = []
+    hook = model.backbone.register_forward_pre_hook(
+        lambda module, args: seen.append(args[0])
+    )
+    expected = model(fixed)
+    actual = model(compact)
+    hook.remove()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.shape == (1, 12, 2, 3, 8, 8)
+    assert seen[0][2] is fixed[2] and seen[1][2] is fixed[2]
+    assert seen[0][3] is fixed[3] and seen[1][3] is fixed[3]
+    assert ((seen[0][2] == 0.2) | (seen[0][2] == 0.8)).all()
+    assert model.decoder_input_channels == 0 and model.coupled_channels == 6
+    for name in (
+        "input_channels",
+        "output_channels",
+        "input_time_dim",
+        "output_time_dim",
+        "n_constants",
+        "presteps",
+        "couplings",
+        "delta_t",
+        "reset_cycle",
+        "couplings_time_first",
+        "integration_steps",
+        "constraints",
+    ):
+        assert getattr(model, name) == getattr(model.backbone, name)
+    model.train_couplers = ["actual-coupler"]
+    assert model.backbone.train_couplers == ["actual-coupler"]
+    with pytest.raises(TypeError):
+        model(history, forcing)
+    for index, bad in (
+        (1, torch.zeros(1, 12, 2, 1, 8, 8)),
+        (2, torch.zeros(12, 2, 8, 8)),
+        (3, torch.zeros(1, 1, 3, 12, 8, 8)),
+    ):
+        invalid = list(fixed)
+        invalid[index] = bad
+        with pytest.raises(ValueError):
+            model(invalid)
+
+
+def test_actual_prepared_coupler_and_native_empty_decoder_known_values():
+    """Existing prepared coupler selects exact two windows without any reaverage."""
+    from types import SimpleNamespace
+
+    import numpy as np
+    import pandas as pd
+    import xarray as xr
+
+    from physicsnemo.datapipes.healpix.couplers import TrailingAverageCoupler
+    from physicsnemo.models.dlwp_healpix.HEALPixRecUNet import HEALPixRecUNet
+    from physicsnemo.models.dlwp_healpix_layers import HEALPixFoldFaces
+
+    values = np.broadcast_to(
+        (100 * np.arange(20)[:, None] + np.arange(3)[None, :])[:, :, None, None, None],
+        (20, 3, 12, 2, 2),
+    ).copy()
+    dataset = xr.Dataset(
+        {"inputs": (("time", "channel_in", "face", "height", "width"), values)},
+        coords={
+            "time": np.arange("1993-01-01", "1993-01-21", dtype="datetime64[D]"),
+            "channel_in": ["z", "wind", "radiation"],
+        },
+    )
+    coupler = TrailingAverageCoupler(
+        dataset,
+        batch_size=1,
+        variables=["z", "wind", "radiation"],
+        presteps=0,
+        input_time_dim=2,
+        output_time_dim=2,
+        averaging_window="96h",
+        input_times=["96h", "192h"],
+        prepared_coupled_data=True,
+    )
+    coupler.compute_coupled_indices(4, pd.Timedelta("24h"))
+    coupled = coupler.construct_integrated_couplings({"time": slice(0, 13)}, 1)
+    assert coupled.shape == (1, 1, 6, 12, 2, 2)
+    np.testing.assert_array_equal(
+        coupled[0, 0, :, 0, 0, 0], [800, 801, 802, 1200, 1201, 1202]
+    )
+    prognostics = torch.zeros(1, 12, 2, 29, 2, 2)
+    prognostics[:, :, 0] = -96
+    constants = torch.full((12, 1, 2, 2), 0.25)
+    empty = torch.empty(1, 12, 2, 0, 2, 2)
+    native = SimpleNamespace(
+        couplings=[{}],
+        channel_dim=2,
+        input_time_dim=2,
+        couplings_time_first=True,
+        fold=HEALPixFoldFaces(),
+    )
+    features = HEALPixRecUNet._reshape_inputs(
+        native, [prognostics, empty, constants, torch.from_numpy(coupled[0])]
+    )
+    assert features.shape == (12, 65, 2, 2)
+    torch.testing.assert_close(features[:, 58], torch.full((12, 2, 2), 0.25))
+    torch.testing.assert_close(
+        features[0, 59:, 0, 0], torch.tensor([800, 801, 802, 1200, 1201, 1202.0])
+    )
+
+
+def test_authoritative_nc_all29_strict_bounds_float32_float64_decode():
+    """Use exact supplied NC values, fit period unknown; never recompute norms."""
+    # NC SHA660c9b6a02ed3b5c79730ee9c083a6cfbafd63ad49980c45adf67e9f1b3cff5b.
+    channels = [
+        "thetao_k0",
+        "thetao_k1",
+        "thetao_k2",
+        "thetao_k3",
+        "thetao_k4",
+        "thetao_k5",
+        "thetao_k6",
+        "thetao_k7",
+        "thetao_k8",
+        "thetao_k9",
+        "thetao_k10",
+        "thetao_k11",
+        "so_k0",
+        "so_k1",
+        "so_k2",
+        "so_k3",
+        "so_k4",
+        "so_k5",
+        "so_k6",
+        "so_k7",
+        "so_k8",
+        "so_k9",
+        "so_k10",
+        "so_k11",
+        "sic",
+        "sithick",
+        "zos",
+        "sst",
+        "mlotst",
+    ]
+    mean = [
+        17.65357780456543,
+        17.400461196899414,
+        16.747940063476562,
+        15.777153968811035,
+        14.864066123962402,
+        13.935174942016602,
+        12.95169734954834,
+        11.680778503417969,
+        10.165316581726074,
+        8.397085189819336,
+        6.56954288482666,
+        4.92886209487915,
+        34.20124816894531,
+        34.48180389404297,
+        34.658897399902344,
+        34.83001708984375,
+        34.947505950927734,
+        34.995849609375,
+        35.020179748535156,
+        34.99577713012695,
+        34.917510986328125,
+        34.803035736083984,
+        34.69807815551758,
+        34.664466857910156,
+        0.0735456570982933,
+        0.918984055519104,
+        -0.007712703198194504,
+        290.66754150390625,
+        38.98458480834961,
+    ]
+    std = [
+        10.425332069396973,
+        10.371052742004395,
+        10.179319381713867,
+        9.726136207580566,
+        9.084220886230469,
+        8.376768112182617,
+        7.5441179275512695,
+        6.43842887878418,
+        5.233626842498779,
+        4.112443923950195,
+        3.2162954807281494,
+        2.514267921447754,
+        2.569411516189575,
+        1.9110301733016968,
+        1.655608892440796,
+        1.420915961265564,
+        1.243853211402893,
+        1.1587263345718384,
+        1.0658341646194458,
+        0.9758275151252747,
+        0.8852865099906921,
+        0.8083427548408508,
+        0.7580327391624451,
+        0.7164247632026672,
+        0.23701302707195282,
+        0.6997730731964111,
+        0.6222794651985168,
+        10.615199089050293,
+        46.12942123413086,
+    ]
+    policy = OceanStatePolicy(
+        channels, mean, std, torch.ones(29, 12, 8, 8, dtype=torch.bool)
+    )
+    torch.manual_seed(134)
+    values = torch.randn(4, 2, 29, 12, 8, 8) * 1e6
+    for dtype in (torch.float32, torch.bfloat16):
+        output = policy(values.to(dtype), strict=True)
+        assert output.dtype == torch.float32
+        for decode_dtype in (torch.float32, torch.float64):
+            physical = output.to(decode_dtype) * policy.std.to(
+                decode_dtype
+            ) + policy.mean.to(decode_dtype)
+            assert torch.isfinite(physical).all()
+            assert (physical[:, :, 24] >= 0).all() and (physical[:, :, 24] <= 1).all()
+            assert (physical[:, :, 28] >= 0).all()

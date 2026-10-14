@@ -294,6 +294,7 @@ class GlorysOceanModel(Module):
     The native model node configures encoder, decoder and recurrent blocks.
     Native residual leads reference corresponding histories. RecUNet resets
     hidden state on every call; presteps=0 uses exactly the supplied histories.
+    The public forward uses the existing native LIST/coupler interface only.
     """
 
     def __init__(
@@ -325,12 +326,6 @@ class GlorysOceanModel(Module):
         self.state_policy = OceanStatePolicy(
             self.channels, mean, std, mask, sst_nlat, sst_nlon
         )
-        self.register_buffer(
-            "land_constant",
-            (~self.state_policy.mask.any(dim=2))
-            .float()
-            .reshape(1, 12, 1, *self.state_policy.mask.shape[-2:]),
-        )
         self.backbone = instantiate(self.backbone_config, _recursive_=False)
         if type(self.backbone) is not HEALPixRecUNet:
             raise ValueError("Ocean backbone must be the existing HEALPixRecUNet")
@@ -350,17 +345,36 @@ class GlorysOceanModel(Module):
             "input_channels": len(self.channels),
             "output_channels": len(self.channels),
             "n_constants": 1,
-            "decoder_input_channels": len(self.forcing_channels),
+            "decoder_input_channels": 0,
+            "coupled_channels": 2 * len(self.forcing_channels),
+            "couplings_time_first": True,
             "input_time_dim": 2,
             "output_time_dim": 2,
             "delta_t": 96,
             "presteps": 0,
             "residual_prediction": True,
-            "couplings": [],
         }
         for name, value in required.items():
             if getattr(self.backbone, name) != value:
                 raise ValueError(f"Ocean backbone requires {name}={value!r}")
+        import pandas as pd
+
+        couplings = self.backbone.couplings
+        if len(couplings) != 1:
+            raise ValueError("Ocean requires one real prepared atmosphere coupler")
+        coupling = couplings[0]
+        params = coupling["params"]
+        if (
+            coupling["coupler"] != "TrailingAverageCoupler"
+            or list(params["variables"]) != list(self.forcing_channels)
+            or not params.get("prepared_coupled_data", False)
+            or [pd.Timedelta(t).total_seconds() for t in params["input_times"]]
+            != [96 * 3600, 192 * 3600]
+            or pd.Timedelta(params["averaging_window"]).total_seconds() != 96 * 3600
+        ):
+            raise ValueError(
+                "Ocean coupling requires both real prepared 96h/192h forcing windows"
+            )
         if self.state_policy.mask.shape[-2:] != (self.backbone.nside[0],) * 2:
             raise ValueError(
                 "Ocean policy mask and native full-resolution nside differ"
@@ -420,27 +434,159 @@ class GlorysOceanModel(Module):
         if state != self.get_extra_state():
             raise ValueError("Checkpoint model configuration differs")
 
-    def forward(self, history, forcing):
-        """Process observations, execute native RecUNet and constrain both leads."""
-        history = self.state_policy(history)
-        batch, steps, count, faces, height, width = history.shape
-        expected = (batch, 2, len(self.forcing_channels), faces, height, width)
-        if steps != 2 or count != len(self.channels) or forcing.shape != expected:
-            raise ValueError("Expected two history states and two forcing windows")
-        forcing = torch.where(torch.isfinite(forcing), forcing, 0.0)
-        native = self.backbone(
-            [
-                history.permute(0, 3, 1, 2, 4, 5),
-                forcing.permute(0, 3, 1, 2, 4, 5),
-                self.land_constant[0],
-            ]
+    @property
+    def input_channels(self):
+        """Expose the actual native input_channels to the existing inferencer."""
+        return self.backbone.input_channels
+
+    @property
+    def output_channels(self):
+        """Expose the actual native output_channels to the existing inferencer."""
+        return self.backbone.output_channels
+
+    @property
+    def input_time_dim(self):
+        """Expose the actual native input_time_dim to the existing inferencer."""
+        return self.backbone.input_time_dim
+
+    @property
+    def output_time_dim(self):
+        """Expose the actual native output_time_dim to the existing inferencer."""
+        return self.backbone.output_time_dim
+
+    @property
+    def n_constants(self):
+        """Expose the actual native n_constants to the existing inferencer."""
+        return self.backbone.n_constants
+
+    @property
+    def decoder_input_channels(self):
+        """Expose the actual native decoder_input_channels to the existing inferencer."""
+        return self.backbone.decoder_input_channels
+
+    @property
+    def coupled_channels(self):
+        """Expose the actual native coupled_channels to the existing inferencer."""
+        return self.backbone.coupled_channels
+
+    @property
+    def presteps(self):
+        """Expose the actual native presteps to the existing inferencer."""
+        return self.backbone.presteps
+
+    @property
+    def couplings(self):
+        """Expose the actual native couplings to the existing inferencer."""
+        return self.backbone.couplings
+
+    @property
+    def delta_t(self):
+        """Expose the actual native delta_t to the existing inferencer."""
+        return self.backbone.delta_t
+
+    @property
+    def reset_cycle(self):
+        """Expose the actual native reset_cycle to the existing inferencer."""
+        return self.backbone.reset_cycle
+
+    @property
+    def couplings_time_first(self):
+        """Expose the actual native couplings_time_first to the existing inferencer."""
+        return self.backbone.couplings_time_first
+
+    @property
+    def integration_steps(self):
+        """Expose the actual native integration_steps to the existing inferencer."""
+        return self.backbone.integration_steps
+
+    @property
+    def is_diagnostic(self):
+        """Expose the actual native is_diagnostic to the existing inferencer."""
+        return self.backbone.is_diagnostic
+
+    @property
+    def channel_dim(self):
+        """Expose the actual native channel_dim to the existing inferencer."""
+        return self.backbone.channel_dim
+
+    @property
+    def enable_nhwc(self):
+        """Expose the actual native enable_nhwc to the existing inferencer."""
+        return self.backbone.enable_nhwc
+
+    @property
+    def hpx_padding_mode(self):
+        """Expose the actual native hpx_padding_mode to the existing inferencer."""
+        return self.backbone.hpx_padding_mode
+
+    @property
+    def compile_padding(self):
+        """Expose the actual native compile_padding to the existing inferencer."""
+        return self.backbone.compile_padding
+
+    @property
+    def nside(self):
+        """Expose the actual native nside to the existing inferencer."""
+        return self.backbone.nside
+
+    @property
+    def constraints(self):
+        """Expose the actual native constraints to the existing inferencer."""
+        return self.backbone.constraints
+
+    @property
+    def train_couplers(self):
+        """Expose the actual native train_couplers to the existing inferencer."""
+        return self.backbone.train_couplers
+
+    @train_couplers.setter
+    def train_couplers(self, value):
+        self.backbone.train_couplers = value
+
+    def reset(self):
+        """Delegate recurrent reset to the existing native model."""
+        self.backbone.reset()
+
+    def forward(self, inputs, **kwargs):
+        """Process real native LIST inputs and return native [B,F,T,C,H,W] states.
+
+        The existing no-insolation data pipe supplies [prognostics, constants,
+        couplings]. The fixed native slots additionally carry a zero-width
+        decoder tensor; it introduces no physical field or dummy insolation.
+        """
+        if not isinstance(inputs, (list, tuple)) or len(inputs) not in (3, 4):
+            raise ValueError("Expected a native prognostics/constants/couplings LIST")
+        native = list(inputs)
+        history = native[0]
+        if history.ndim != 6 or history.shape[1:4] != (12, 2, len(self.channels)):
+            raise ValueError("Expected native two-history [B,12,2,C,H,W] prognostics")
+        history = self.state_policy(history.permute(0, 2, 3, 1, 4, 5)).permute(
+            0, 3, 1, 2, 4, 5
         )
-        states = native.permute(0, 2, 3, 1, 4, 5)
+        native[0] = history
+        batch, faces, steps, count, height, width = history.shape
+        if len(native) == 3:
+            native.insert(1, history.new_empty(batch, faces, steps, 0, height, width))
+        if native[1].shape != (batch, faces, steps, 0, height, width):
+            raise ValueError("Ocean has zero decoder variables; DI slot must be empty")
+        if native[2].shape != (faces, 1, height, width):
+            raise ValueError("Expected the real declared LSM constant [12,1,H,W]")
+        if native[3].shape != (
+            1,
+            batch,
+            2 * len(self.forcing_channels),
+            faces,
+            height,
+            width,
+        ):
+            raise ValueError("Expected actual prepared couplings [1,B,2*K,12,H,W]")
+        states = self.backbone(native, **kwargs)
         if states.shape != history.shape:
             raise ValueError(
                 "Native RecUNet returned an incompatible two-lead state shape"
             )
-        return self.state_policy(states, strict=True)
+        states = self.state_policy(states.permute(0, 2, 3, 1, 4, 5), strict=True)
+        return states.permute(0, 3, 1, 2, 4, 5)
 
 
 def masked_channel_sums(prediction, target, mask):

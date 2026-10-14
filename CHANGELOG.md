@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Ocean models use native LIST inputs and real prepared atmosphere couplings,
+  with actual supplied LSM constants and native inferencer metadata. Coupled
+  HEALPixRecUNet now permits zero decoder variables without dummy insolation.
+
 - Native HEALPix smoothing caches ordinary immutable kernels across inference
   and training, preserving resampling values and checkpoint state keys.
 

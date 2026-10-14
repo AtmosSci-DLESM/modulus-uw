@@ -149,10 +149,6 @@ class HEALPixRecUNet(Module):
                 raise NotImplementedError(
                     "support for coupled models with no constant fields is not available at this time."
                 )
-            if decoder_input_channels == 0:
-                raise NotImplementedError(
-                    "support for coupled models with no decoder inputs (TOA insolation) is not available at this time."
-                )
 
         # add coupled fields to input channels for model initialization
         self.coupled_channels = self._compute_coupled_channels(couplings)
