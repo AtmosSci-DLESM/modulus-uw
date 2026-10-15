@@ -57,6 +57,11 @@ class RankStrideSampler(Sampler):
             // self.num_replicas,
         )
 
+    def set_epoch(self, epoch: int) -> None:
+        """Accept the trainer epoch hook while preserving fixed evaluation order."""
+        # Evaluation has no shuffle or epoch-dependent state.
+        return None
+
 
 class TimeSeriesDataModuleZarr:
     """Module for complete model train, validation, and test data loading. Uses

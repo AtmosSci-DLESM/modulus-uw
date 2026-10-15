@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Fixed-order unpadded validation samplers accept the shared trainer epoch
+  hook, preventing distributed validation from failing after training.
+
 - Ocean state policy v4 enforces nonnegative sea-ice thickness through the
   same safely normalized lower bound as mixed-layer depth, while retaining
   SIC bounds. Older policy checkpoints reject rather than changing science
