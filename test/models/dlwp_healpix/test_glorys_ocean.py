@@ -1256,3 +1256,22 @@ def test_sea_ice_v4_native_zero_residual_archive_and_old_policy_rejection(
     restored.save(str(old_archive))
     with pytest.raises(ValueError, match="policy/channel ordering differs"):
         Module.from_checkpoint(str(old_archive))
+
+
+def test_native_backbone_lookup_after_public_atmosphere_import(monkeypatch):
+    """Public atmosphere class exports must not shadow archived ocean targets."""
+    from importlib import import_module
+
+    package = import_module("physicsnemo.models.dlwp_healpix")
+    module = import_module("physicsnemo.models.dlwp_healpix.HEALPixRecUNet")
+    monkeypatch.setattr(package, "HEALPixRecUNet", module)
+    baseline, _ = setup_model()
+    history = torch.randn(1, 2, 3, 12, 8, 8)
+    forcing = torch.randn_like(history)
+    expected = run_model(baseline, history, forcing)
+    monkeypatch.setattr(package, "HEALPixRecUNet", module.HEALPixRecUNet)
+    restored, _ = setup_model()
+    assert type(restored.backbone) is module.HEALPixRecUNet
+    assert restored.backbone_config == baseline.backbone_config
+    actual = run_model(restored, history, forcing)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

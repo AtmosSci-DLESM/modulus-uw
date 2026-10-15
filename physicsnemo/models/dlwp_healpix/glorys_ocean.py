@@ -326,7 +326,18 @@ class GlorysOceanModel(Module):
         self.state_policy = OceanStatePolicy(
             self.channels, mean, std, mask, sst_nlat, sst_nlon
         )
-        self.backbone = instantiate(self.backbone_config, _recursive_=False)
+        # Resolve the module-qualified target with Python's import mechanism:
+        # the public package also exports a class named HEALPixRecUNet, which
+        # can shadow that submodule during Hydra's attribute-by-attribute lookup.
+        from importlib import import_module
+
+        options = dict(self.backbone_config)
+        module_name, class_name = options["_target_"].rsplit(".", 1)
+        options["_target_"] = getattr(import_module(module_name), class_name)
+        self.backbone = instantiate(
+            OmegaConf.create(options, flags={"allow_objects": True}),
+            _recursive_=False,
+        )
         if type(self.backbone) is not HEALPixRecUNet:
             raise ValueError("Ocean backbone must be the existing HEALPixRecUNet")
         self.backbone.register_buffer(

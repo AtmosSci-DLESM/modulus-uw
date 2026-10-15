@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Live component couplers support source-to-receiver normalization through
+  physical space, retaining the receiving variable order. Optional initial
+  states supply inclusive trailing-average endpoints for GLORYS coupling;
+  prepared dataset forcing remains unchanged.
+
+- GLORYS archive construction resolves its declared native backbone target
+  independently of public class/submodule import order, preserving archived
+  configuration and numerical state.
+
 - Fixed-order unpadded validation samplers accept the shared trainer epoch
   hook, preventing distributed validation from failing after training.
 
