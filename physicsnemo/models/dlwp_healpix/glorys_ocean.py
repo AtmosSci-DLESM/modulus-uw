@@ -418,7 +418,7 @@ class GlorysOceanModel(Module):
         return super().save(file_name=file_name, verbose=verbose)
 
     def get_extra_state(self):
-        """Persist native model config and native corresponding-history residual semantics."""
+        """Persist native model config and native final-input residual semantics."""
         import copy
 
         return {
@@ -426,7 +426,7 @@ class GlorysOceanModel(Module):
             "channels": self.channels,
             "forcing_channels": self.forcing_channels,
             "backbone_config": copy.deepcopy(self.backbone_config),
-            "reference": "native-corresponding-history",
+            "reference": "native-final-input",
         }
 
     def set_extra_state(self, state):

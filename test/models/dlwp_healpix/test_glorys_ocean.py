@@ -187,8 +187,8 @@ def setup_model():
     return model, mask
 
 
-def test_native_corresponding_history_residual_and_constraints():
-    """Native zero increments return matching histories, each advancing 192h."""
+def test_native_final_input_residual_and_constraints():
+    """Both native residual leads use the latest input; constraints stay physical."""
     from physicsnemo.models.dlwp_healpix.HEALPixRecUNet import HEALPixRecUNet
 
     model, mask = setup_model()
@@ -205,18 +205,34 @@ def test_native_corresponding_history_residual_and_constraints():
         convolution.weight.zero_()
         convolution.bias.zero_()
     output = run_model(model, history, torch.zeros_like(history))
-    assert torch.all(output[:, 0, 0][..., mask[0]] == -7)
+    assert torch.all(output[:, 0, 0][..., mask[0]] == 3)
     assert torch.all(output[:, 1, 0][..., mask[0]] == 3)
     with torch.no_grad():
         convolution.bias.copy_(torch.tensor([1, 100, -100, 2, -100, -100.0]))
     output = run_model(model, history, torch.zeros_like(history))
-    assert torch.all(output[:, 0, 0][..., mask[0]] == -6)
+    assert torch.all(output[:, 0, 0][..., mask[0]] == 4)
     assert torch.all(output[:, 1, 0][..., mask[0]] == 5)
     physical = model.state_policy.to_physical(output)
     assert torch.all(physical[:, 0, 1][..., mask[1]] == 1)
     assert torch.all(physical[:, 1, 1][..., mask[1]] == 0)
     assert torch.all(physical[:, :, 2][..., mask[2]] == 0)
     assert torch.all(output[..., ~mask] == 0)
+    feedback = run_model(model, output, torch.zeros_like(history))
+    assert torch.all(feedback[:, 0, 0][..., mask[0]] == 6)
+    assert torch.all(feedback[:, 1, 0][..., mask[0]] == 7)
+    model.backbone.residual_prediction = False
+    absolute = run_model(model, history, torch.zeros_like(history))
+    assert torch.all(absolute[:, 0, 0][..., mask[0]] == 1)
+    assert torch.all(absolute[:, 1, 0][..., mask[0]] == 2)
+
+
+def test_old_corresponding_history_checkpoint_is_rejected():
+    """A checkpoint trained with the old residual reference cannot load silently."""
+    model, _ = setup_model()
+    old = model.state_dict()
+    old["_extra_state"]["reference"] = "native-corresponding-history"
+    with pytest.raises(ValueError, match="Checkpoint model configuration differs"):
+        model.load_state_dict(old)
 
 
 def test_history_feedback_land_invariance_and_checkpoint():

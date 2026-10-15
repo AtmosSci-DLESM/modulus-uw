@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- RecUNet residual predictions now reference the final input state for every
+  output lead, matching the coupled-ocean fix. Ocean checkpoint metadata records
+  the reference and rejects checkpoints trained with the prior one-to-one rule.
+
 - Distributed initialization accepts an optional process-group timeout and
   supports CPU gloo without CUDA device arguments. Console logging retains
   plain output when optional terminal coloring is unavailable.

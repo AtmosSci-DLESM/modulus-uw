@@ -550,7 +550,7 @@ class HEALPixRecUNet(Module):
             prognostics = combined[:, :, :, :self.input_channels]
             orig_input = self._reshape_outputs(input_tensor[:, : self.input_channels * self.input_time_dim])
             if self.residual_prediction:
-                prognostics += orig_input
+                prognostics += orig_input[:, :, -1:, ...]
             diagnostics = combined[:, :, :, self.input_channels:]
             out = th.cat([prognostics, diagnostics], dim=3)
 
