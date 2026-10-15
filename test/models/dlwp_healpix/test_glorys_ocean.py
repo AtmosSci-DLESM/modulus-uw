@@ -1142,4 +1142,117 @@ def test_authoritative_nc_all29_strict_bounds_float32_float64_decode():
             ) + policy.mean.to(decode_dtype)
             assert torch.isfinite(physical).all()
             assert (physical[:, :, 24] >= 0).all() and (physical[:, :, 24] <= 1).all()
+            assert (physical[:, :, 25] >= 0).all()
             assert (physical[:, :, 28] >= 0).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_user_sea_ice_normalization_bounds_missing_domain_and_gradients(dtype):
+    """User scaling changes normalization only; all physical bounds stay strict."""
+    channels = ["sic", "sithick", "mlotst"]
+    mask = torch.ones(3, 12, 8, 8, dtype=torch.bool)
+    mask[0, 0, :2] = False
+    mask[1, 1, :3] = False
+    mask[2, 2, :4] = False
+    policy = OceanStatePolicy(
+        channels, [0, 0, 38.98458480834961], [1, 5, 46.12942123413086], mask
+    )
+    generator = torch.Generator().manual_seed(152)
+    values = (torch.randn(4, 2, 3, 12, 8, 8, generator=generator) * 1e6).to(dtype)
+    values[0, 0] = -1e30
+    values[0, 1] = 1e30
+    values[..., ~mask] = float("nan")
+    values[1, 0, 1, 0, 0, 0] = float("nan")  # Missing observed ocean thickness.
+    values.requires_grad_()
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        output = policy(values)
+    assert output.dtype == torch.float32
+    assert torch.isfinite(output).all()
+    assert (output[..., ~mask] == 0).all()
+    for decoder in (torch.float32, torch.float64):
+        physical = output.to(decoder) * policy.std.to(decoder) + policy.mean.to(decoder)
+        assert (physical[:, :, 0][..., mask[0]] >= 0).all()
+        assert (physical[:, :, 0][..., mask[0]] <= 1).all()
+        assert (physical[:, :, 1][..., mask[1]] >= 0).all()
+        assert (physical[:, :, 2][..., mask[2]] >= 0).all()
+    target = torch.zeros_like(output)
+    target[1, 0, 1, 0, 0, 0] = float("nan")
+    numerator, denominator = masked_channel_sums(output, target, mask)
+    assert (denominator > 0).all()
+    (numerator / denominator).sum().backward()
+    assert torch.isfinite(values.grad).all()
+    assert (values.grad[..., ~mask] == 0).all()
+    assert values.grad[1, 0, 1, 0, 0, 0] == 0
+    with pytest.raises(FloatingPointError, match="Nonfinite valid ocean"):
+        policy(values.detach(), strict=True)
+    clean = torch.where(torch.isfinite(values.detach()), values.detach(), 0)
+    clean[..., ~mask] = float("nan")
+    assert torch.isfinite(policy(clean, strict=True)).all()
+    torch.testing.assert_close(policy(output, strict=True), output, rtol=0, atol=0)
+
+
+def test_sea_ice_v4_native_zero_residual_archive_and_old_policy_rejection(
+    tmp_path, monkeypatch
+):
+    """One shared policy defines native zero-residual persistence and archives."""
+    from physicsnemo import Module
+
+    channels = ["sic", "sithick", "mlotst", "sst"]
+    mask = torch.ones(4, 12, 8, 8, dtype=torch.bool)
+    mask[:, 0, :2, :2] = False
+    model = build_model(
+        channels,
+        ["z"],
+        [0, 0, 38.98458480834961, 290.66754150390625],
+        [1, 5, 46.12942123413086, 10.615199089050293],
+        mask,
+        sst_nlat=33,
+        sst_nlon=64,
+    )
+    with torch.no_grad():
+        output_convolution(model).weight.zero_()
+        output_convolution(model).bias.zero_()
+    history = torch.randn(
+        1, 2, 4, 12, 8, 8, generator=torch.Generator().manual_seed(153)
+    )
+    history[:, 0, 3] = -3
+    history[:, 1, 3] = 2
+    history[..., ~mask] = float("nan")
+    history.requires_grad_()
+    forcing = torch.zeros(1, 2, 1, 12, 8, 8)
+    expected = model.state_policy(history)[:, -1:].expand(-1, 2, -1, -1, -1, -1)
+    output = run_model(model, history, forcing)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    output.sum().backward()
+    assert torch.isfinite(history.grad).all()
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
+    archive = tmp_path / "sea-ice-v4.mdlus"
+    model.save(str(archive))
+    restored = Module.from_checkpoint(str(archive))
+    assert restored.state_policy.get_extra_state()["policy"] == (
+        "sst-triple-interp-other-neutral-safe-sea-ice-bounds-v4"
+    )
+    assert set(restored.state_dict()) == set(model.state_dict())
+    torch.testing.assert_close(
+        run_model(restored, history.detach(), forcing), output.detach(), rtol=0, atol=0
+    )
+    feedback = run_model(restored, output.detach(), forcing)
+    torch.testing.assert_close(feedback, output.detach(), rtol=0, atol=0)
+    old = copy.deepcopy(restored.state_dict())
+    old["state_policy._extra_state"][
+        "policy"
+    ] = "sst-triple-interp-other-neutral-safe-bounds-v3"
+    with pytest.raises(ValueError, match="policy/channel ordering differs"):
+        restored.load_state_dict(old, strict=False)
+    monkeypatch.setattr(
+        restored.state_policy,
+        "get_extra_state",
+        lambda: old["state_policy._extra_state"],
+    )
+    old_archive = tmp_path / "old-policy-v3.mdlus"
+    restored.save(str(old_archive))
+    with pytest.raises(ValueError, match="policy/channel ordering differs"):
+        Module.from_checkpoint(str(old_archive))

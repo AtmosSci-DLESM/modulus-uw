@@ -192,7 +192,7 @@ class OceanStatePolicy(nn.Module):
 
     Invalid non-SST cells become normalized zero before any arithmetic. SST land
     is recomputed by the shared TripleInterpSST from current valid ocean values. Valid sic is
-    clamped in physical units to [0,1], and valid mlotst to [0,infinity).
+    clamped in physical units to [0,1], and valid sithick/mlotst to [0,infinity).
     Scaling, per-channel domains and channel order persist in state_dict.
     Bounds are inward-rounded for both float32 and float64 physical decode.
     strict=True rejects nonfinite valid predictions before processing.
@@ -235,7 +235,7 @@ class OceanStatePolicy(nn.Module):
         """Persist channel order and the shared policy contract."""
         return {
             "channels": self.channels,
-            "policy": "sst-triple-interp-other-neutral-safe-bounds-v3",
+            "policy": "sst-triple-interp-other-neutral-safe-sea-ice-bounds-v4",
             "sst_nlat": self.sst_nlat,
             "sst_nlon": self.sst_nlon,
         }
@@ -260,7 +260,7 @@ class OceanStatePolicy(nn.Module):
         result = []
         for index, name in enumerate(self.channels):
             value = clean[:, :, index : index + 1]
-            if name in ("sic", "mlotst"):
+            if name in ("sic", "sithick", "mlotst"):
                 mean = self.mean[:, :, index : index + 1]
                 std = self.std[:, :, index : index + 1]
                 lower = _safe_normalized_boundary(mean, std, 0.0, lower=True)

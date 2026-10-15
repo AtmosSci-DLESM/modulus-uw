@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Ocean state policy v4 enforces nonnegative sea-ice thickness through the
+  same safely normalized lower bound as mixed-layer depth, while retaining
+  SIC bounds. Older policy checkpoints reject rather than changing science
+  silently. Shared observation, reconstruction and feedback processing agree.
+
 - RecUNet residual predictions now reference the final input state for every
   output lead, matching the coupled-ocean fix. Ocean checkpoint metadata records
   the reference and rejects checkpoints trained with the prior one-to-one rule.
