@@ -202,7 +202,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         # Check if for fsspec if necessary and make sure path exist
         _check_availability(dataset_path)
 
-        self.ds = zarr.open(dataset_path)
+        self.ds = zarr.open(dataset_path, mode="r")
 
         if (
             start_date is None or end_date is None

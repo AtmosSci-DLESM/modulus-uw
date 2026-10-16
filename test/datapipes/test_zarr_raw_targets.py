@@ -21,10 +21,11 @@ import torch
 import xarray as xr
 import zarr
 from omegaconf import OmegaConf
-from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import TimeSeriesDatasetZarr
+
 from physicsnemo.datapipes.healpix.data_modules_zarr import (
     CoupledTimeSeriesDataModuleZarr,
 )
+from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import TimeSeriesDatasetZarr
 
 
 @pytest.fixture
@@ -202,3 +203,107 @@ def test_actual_module_forecast_coupler_datetime_and_next_integration(source):
     ]
     np.testing.assert_allclose(following[2][0, 0, :, 0, 0, 1], expected)
     assert torch.equal(following[1], inputs[1])
+
+
+def _source_tree(path):
+    """Snapshot the tiny temporary store, including metadata and directory names."""
+    if not path.exists():
+        return None
+    return {
+        str(item.relative_to(path)): item.read_bytes() if item.is_file() else None
+        for item in path.rglob("*")
+    }
+
+
+def _readonly_reader(source, kind):
+    """Construct the real base reader or coupled native DataModule on a tiny store."""
+    if kind == "base":
+        return TimeSeriesDatasetZarr(**dataset_kwargs(source), raw_target_mode=True)
+    path, scaling = source
+    return CoupledTimeSeriesDataModuleZarr(
+        dataset_path=str(path),
+        scaling=OmegaConf.create(scaling),
+        input_variables=["sst", "q"],
+        output_variables=["q", "sst"],
+        constant_variables=["land_sea_mask"],
+        input_time_dim=2,
+        output_time_dim=2,
+        data_time_step="24h",
+        time_step="96h",
+        batch_size=1,
+        dataloader_batch_size=None,
+        forecast_init_times=["1993-01-05"],
+        couplings=[
+            dict(
+                coupler="TrailingAverageCoupler",
+                params=dict(
+                    variables=["f1", "f2", "f3"],
+                    batch_size=1,
+                    presteps=0,
+                    input_time_dim=2,
+                    output_time_dim=2,
+                    input_times=["96h", "192h"],
+                    averaging_window="96h",
+                    prepared_coupled_data=True,
+                ),
+            )
+        ],
+        num_workers=0,
+        pin_memory=False,
+        raw_target_mode=True,
+        target_mask_constant="land_sea_mask",
+        preserve_land_channels=["sst"],
+    )
+
+
+@pytest.mark.parametrize("kind", ["base", "coupled_module"])
+@pytest.mark.parametrize("missing", ["store", "empty_metadata", "root_metadata"])
+def test_readonly_source_refuses_creation(source, tmp_path, kind, missing):
+    """Missing stores/root metadata must fail without creating any source files."""
+    path, scaling = source
+    if missing == "store":
+        path = tmp_path / "does-not-exist.zarr"
+    elif missing == "empty_metadata":
+        path = tmp_path / "empty.zarr"
+        path.mkdir()
+        (path / "sentinel").write_bytes(b"preserve me")
+    else:
+        # Fixture-only corruption: preserve chunks, remove the root group/index.
+        (path / ".zgroup").unlink()
+        (path / ".zmetadata").unlink()
+    before = _source_tree(path)
+    with pytest.raises((FileNotFoundError, KeyError, ValueError)):
+        _readonly_reader((path, scaling), kind)
+    assert _source_tree(path) == before
+    if missing == "store":
+        assert not path.exists()
+    else:
+        assert not (path / ".zgroup").exists()
+        assert not (path / ".zmetadata").exists()
+        assert not (path / "zarr.json").exists()
+
+
+@pytest.mark.parametrize("kind", ["base", "coupled_module"])
+def test_readonly_existing_source_preserves_values_and_bytes(source, kind):
+    """Actual base/native coupled reads preserve both values and store bytes."""
+    path, _ = source
+    before = _source_tree(path)
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        reader = _readonly_reader(source, kind)
+        if kind == "base":
+            inputs, target = reader[0]
+            assert np.isnan(target[0, 0, 0, 0, 0, 1])
+            assert target[0, 0, 0, 1, 0, 1] == (1008 - 1) / 2
+            dataset = reader
+        else:
+            loader, _ = reader.test_dataloader()
+            inputs = next(iter(loader))
+            dataset = reader.test_dataset
+            assert inputs[2][0, 0, 0, 0, 0, 1] == (208 - 3) / 4
+        assert dataset.ds.store.read_only is True
+        assert len(inputs) == (2 if kind == "base" else 3)
+        assert _source_tree(path) == before
+    finally:
+        torch.set_num_threads(previous_threads)

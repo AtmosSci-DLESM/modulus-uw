@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Native Zarr datasets open their existing source stores read-only, preventing
+  accidental metadata creation during training or coupled inference setup.
+
 - Fixed-order unpadded validation samplers accept the shared trainer epoch
   hook, preventing distributed validation from failing after training.
 

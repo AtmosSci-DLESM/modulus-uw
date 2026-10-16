@@ -111,7 +111,7 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         # We setup couplers first so superclass can properly initialize
         # and set the scaling
         _check_availability(dataset_path)
-        self.ds = zarr.open(dataset_path)
+        self.ds = zarr.open(dataset_path, mode="r")
         self.couplings = [
             getattr(couplers, c["coupler"])(
                 self.ds,
