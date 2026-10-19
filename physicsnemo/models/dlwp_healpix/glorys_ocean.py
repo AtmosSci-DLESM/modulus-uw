@@ -190,8 +190,11 @@ def _safe_normalized_boundary(mean, std, boundary, lower):
 class OceanStatePolicy(nn.Module):
     """Process observations, reconstructed states and feedback identically.
 
-    Invalid non-SST cells become normalized zero before any arithmetic. SST land
-    is recomputed by the shared TripleInterpSST from current valid ocean values. Valid sic is
+    Legacy archives retain normalized-zero non-SST land and recomputed SST.
+    New training profiles preserve finite ETL-filled observation land; predicted
+    land is optionally triple-interpolated for every field before feedback.
+    Inland exclusions are refilled from the remaining ocean in both modes.
+    In the legacy mode, SST land is recomputed by the shared TripleInterpSST from current valid ocean values. Valid sic is
     clamped in physical units to [0,1], and valid sithick/mlotst to [0,infinity).
     Scaling, per-channel domains and channel order persist in state_dict.
     Bounds are inward-rounded for both float32 and float64 physical decode.
@@ -200,9 +203,28 @@ class OceanStatePolicy(nn.Module):
     must independently exclude missing targets before their sanitization.
     """
 
-    def __init__(self, channels, mean, std, mask, sst_nlat=721, sst_nlon=1440):
+    def __init__(
+        self,
+        channels,
+        mean,
+        std,
+        mask,
+        sst_nlat=721,
+        sst_nlon=1440,
+        legacy_zero_fill_non_sst_land=True,
+        interpolate_predicted_land=True,
+        inland_mask=None,
+    ):
         super().__init__()
         self.channels = _names(channels)
+        if not isinstance(legacy_zero_fill_non_sst_land, bool) or not isinstance(
+            interpolate_predicted_land, bool
+        ):
+            raise ValueError("Land policy flags must be boolean")
+        self.legacy_zero_fill_non_sst_land = legacy_zero_fill_non_sst_land
+        self.interpolate_predicted_land = (
+            True if legacy_zero_fill_non_sst_land else interpolate_predicted_land
+        )
         count = len(self.channels)
         mean = torch.as_tensor(mean, dtype=torch.float32).detach().clone()
         std = torch.as_tensor(std, dtype=torch.float32).detach().clone()
@@ -226,16 +248,42 @@ class OceanStatePolicy(nn.Module):
         self.register_buffer("mask", mask.bool().reshape(1, 1, *mask.shape))
         self.sst_nlat, self.sst_nlon = sst_nlat, sst_nlon
         self.sst_interpolator = None
-        if "sst" in self.channels:
-            sst_mask = mask[self.channels.index("sst")].bool()
-            if not sst_mask.all():
-                self.sst_interpolator = TripleInterpSST(sst_mask, sst_nlat, sst_nlon)
+        if legacy_zero_fill_non_sst_land:
+            if "sst" in self.channels:
+                sst_mask = mask[self.channels.index("sst")].bool()
+                if not sst_mask.all():
+                    self.sst_interpolator = TripleInterpSST(
+                        sst_mask, sst_nlat, sst_nlon
+                    )
+        else:
+            if not torch.equal(mask, mask[:1].expand_as(mask)):
+                raise ValueError(
+                    "ETL land interpolation requires one shared ocean domain"
+                )
+            refill = (
+                torch.zeros_like(mask[0], dtype=torch.bool)
+                if inland_mask is None
+                else torch.as_tensor(inland_mask, dtype=torch.bool).clone()
+            )
+            if refill.shape != mask.shape[1:] or (refill & mask[0].bool()).any():
+                raise ValueError("Inland refill cells must be outside the ocean domain")
+            self.register_buffer("inland_mask", refill)
+            if not mask[0].all() and (interpolate_predicted_land or refill.any()):
+                self.sst_interpolator = TripleInterpSST(
+                    mask[0].bool(), sst_nlat, sst_nlon
+                )
 
     def get_extra_state(self):
         """Persist channel order and the shared policy contract."""
         return {
             "channels": self.channels,
-            "policy": "sst-triple-interp-other-neutral-safe-sea-ice-bounds-v4",
+            "policy": (
+                "sst-triple-interp-other-neutral-safe-sea-ice-bounds-v4"
+                if self.legacy_zero_fill_non_sst_land
+                else "etl-inputs-interpolated-output-land-v5"
+                if self.interpolate_predicted_land
+                else "etl-inputs-free-output-land-v5"
+            ),
             "sst_nlat": self.sst_nlat,
             "sst_nlon": self.sst_nlon,
         }
@@ -255,11 +303,15 @@ class OceanStatePolicy(nn.Module):
         # Autocast/low-precision observations must not quantize safe boundaries.
         if state.dtype in (torch.float16, torch.bfloat16):
             state = state.float()
-        clean = torch.where(self.mask & torch.isfinite(state), state, 0.0)
+        valid = torch.isfinite(state)
+        if self.legacy_zero_fill_non_sst_land:
+            valid = valid & self.mask
+        clean = torch.where(valid, state, 0.0)
         # Linear scaling makes normalized bounds equivalent to physical clamps.
         result = []
         for index, name in enumerate(self.channels):
             value = clean[:, :, index : index + 1]
+            supplied_land = value
             if name in ("sic", "sithick", "mlotst"):
                 mean = self.mean[:, :, index : index + 1]
                 std = self.std[:, :, index : index + 1]
@@ -272,7 +324,11 @@ class OceanStatePolicy(nn.Module):
                             "SIC interval has no representable normalized value"
                         )
                     value = torch.minimum(value, upper)
-            if name == "sst" and self.sst_interpolator is not None:
+            if not self.legacy_zero_fill_non_sst_land:
+                value = torch.where(
+                    self.mask[:, :, index : index + 1], value, supplied_land
+                )
+            elif name == "sst" and self.sst_interpolator is not None:
                 mean = self.mean[:, :, index : index + 1]
                 std = self.std[:, :, index : index + 1]
                 filled = self.sst_interpolator((value * std + mean).squeeze(2))
@@ -281,7 +337,30 @@ class OceanStatePolicy(nn.Module):
             elif name != "sst":
                 value = torch.where(self.mask[:, :, index : index + 1], value, 0.0)
             result.append(value)
-        return torch.cat(result, dim=2)
+        result = torch.cat(result, dim=2)
+        if not self.legacy_zero_fill_non_sst_land and self.sst_interpolator is not None:
+            refill = (
+                ~self.mask
+                if strict and self.interpolate_predicted_land
+                else self.inland_mask
+            )
+            if refill.any():
+                # Reuse the existing ETL operator channel by channel to bound
+                # peak latlon workspace rather than batch all 29 fields at once.
+                filled_channels = []
+                for index in range(len(self.channels)):
+                    value = result[:, :, index : index + 1]
+                    mean = self.mean[:, :, index : index + 1]
+                    std = self.std[:, :, index : index + 1]
+                    filled = self.sst_interpolator((value * std + mean).squeeze(2))
+                    selected = (
+                        refill[:, :, index : index + 1] if refill.ndim == 6 else refill
+                    )
+                    filled_channels.append(
+                        torch.where(selected, (filled.unsqueeze(2) - mean) / std, value)
+                    )
+                result = torch.cat(filled_channels, dim=2)
+        return result
 
     def to_physical(self, state):
         """Denormalize without changing validity; use mask for physical metrics."""
@@ -307,6 +386,9 @@ class GlorysOceanModel(Module):
         backbone_config,
         sst_nlat=721,
         sst_nlon=1440,
+        legacy_zero_fill_non_sst_land=True,
+        interpolate_predicted_land=True,
+        inland_mask=None,
     ):
         from hydra.utils import instantiate
         from omegaconf import OmegaConf
@@ -324,7 +406,15 @@ class GlorysOceanModel(Module):
 
         self.backbone_config = json.loads(json.dumps(backbone_config, allow_nan=False))
         self.state_policy = OceanStatePolicy(
-            self.channels, mean, std, mask, sst_nlat, sst_nlon
+            self.channels,
+            mean,
+            std,
+            mask,
+            sst_nlat,
+            sst_nlon,
+            legacy_zero_fill_non_sst_land,
+            interpolate_predicted_land,
+            inland_mask,
         )
         self.backbone = instantiate(self.backbone_config, _recursive_=False)
         if type(self.backbone) is not HEALPixRecUNet:
@@ -398,6 +488,12 @@ class GlorysOceanModel(Module):
                 "sst_nlon": int(self.state_policy.sst_nlon),
             },
         }
+        if not self.state_policy.legacy_zero_fill_non_sst_land:
+            self._args["__args__"].update(
+                legacy_zero_fill_non_sst_land=False,
+                interpolate_predicted_land=self.state_policy.interpolate_predicted_land,
+                inland_mask=self.state_policy.inland_mask.detach().cpu().tolist(),
+            )
         return self._args
 
     def load_state_dict(self, state_dict, strict=True, assign=False):

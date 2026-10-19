@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- GLORYS supports preserving ETL-filled land inputs and triple-interpolating
+  predicted land for every ocean channel before feedback. Explicit legacy mode
+  preserves v4 archives; predicted-land interpolation can be disabled separately.
+
 - Fixed-order unpadded validation samplers accept the shared trainer epoch
   hook, preventing distributed validation from failing after training.
 
