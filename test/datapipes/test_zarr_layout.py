@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
-np = pytest.importorskip("numpy")
+np =pytest.importorskip("numpy")
 xr = pytest.importorskip("xarray")
 zarr = pytest.importorskip("zarr")
 
@@ -363,6 +365,38 @@ def test_read_sharded_time_slice_matches_array(tmp_path):
     loaded = load_channel_data(zarr.open_group(str(tmp_path / "shard"), mode="r"), sl, ["t2m"])
     assert np.array_equal(loaded[:, 0], ref, equal_nan=True)
     assert np.array_equal(loaded[:, 0], data[sl], equal_nan=True)
+
+
+def test_read_sharded_time_slice_direct_io_flag(tmp_path, monkeypatch):
+    from physicsnemo.datapipes.healpix import zarr_shard_read
+    from physicsnemo.datapipes.healpix.zarr_shard_read import read_sharded_time_slice
+
+    _make_sharded_field(tmp_path / "shard")
+    array = zarr.open_array(f"{tmp_path / 'shard'}/t2m", mode="r")
+    sl = slice(2, 12)
+    ref = np.asarray(array[sl])
+    calls = []
+    real = zarr_shard_read._pread_span_direct
+    monkeypatch.setattr(zarr_shard_read, "_pread_span_direct", lambda *a: calls.append(a) or real(*a))
+    monkeypatch.delenv("PHYSICSNEMO_ZARR_SHARD_READ_DIRECT_IO", raising=False)
+    assert np.array_equal(read_sharded_time_slice(array, sl), ref, equal_nan=True)
+    assert not calls
+    monkeypatch.setenv("PHYSICSNEMO_ZARR_SHARD_READ_DIRECT_IO", "1")
+    assert np.array_equal(read_sharded_time_slice(array, sl), ref, equal_nan=True)
+    assert calls
+
+
+def test_pread_span_direct_unaligned_span(tmp_path):
+    from physicsnemo.datapipes.healpix.zarr_shard_read import _pread_span_direct
+
+    payload = np.random.default_rng(0).integers(0, 256, 20000, dtype=np.uint8).tobytes()
+    f = tmp_path / "blob"
+    f.write_bytes(payload)
+    got = _pread_span_direct(str(f), 4097, 9001)  # neither end on a block boundary; file tail partial block
+    if got is None:
+        pytest.skip("filesystem does not support O_DIRECT")
+    assert got == payload[4097 : 4097 + 9001]
+    assert _pread_span_direct(str(f), 19000, 1000) == payload[19000:]
 
 
 def test_sharded_window_matches_arrays(tmp_path):
