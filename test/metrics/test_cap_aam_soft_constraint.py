@@ -196,6 +196,21 @@ def test_loss_rmse_gradient_and_spec(tmp_path):
         _make(tmp_path, alpha=[1.0, 2.0])
 
 
+def test_normalize_by_boundary_matches_geometric_per_boundary_alphas(tmp_path):
+    alpha = 2.0e4  # N/m
+    a = 6.371e6
+    norm = _make(tmp_path, alpha=alpha, normalize_by_boundary=True)
+    ref = _make(tmp_path, alpha=alpha * 2.0 * np.pi * a ** 2 * np.cos(BND_LAT) ** 2)
+    rng = np.random.default_rng(11)
+    ic = _fields(u=_ring_field(rng.normal(0, 10, NR)), v=_ring_field(rng.normal(0, 5, NR)))
+    pred = _fields(u=_ring_field(rng.normal(0, 10, NR)), v=_ring_field(rng.normal(0, 5, NR)), sp=SP0 + _ring_field(rng.normal(0, 30, NR)), tau=0.01)
+    ic_in = _ic_from(ic)
+    torch.testing.assert_close(norm.constraint_loss(pred, None, input=ic_in), ref.constraint_loss(pred, None, input=ic_in))
+    torch.testing.assert_close(norm.physical_rmse(pred, None, input=ic_in), ref.physical_rmse(pred, None, input=ic_in))
+    with pytest.raises(ValueError):
+        _make(tmp_path, alpha=[1.0] * NB, normalize_by_boundary=True)
+
+
 def test_initial_condition_from_input_diagnostics_matches_prognostic_input(tmp_path):
     prog_small = [n for n in PROG if not n.startswith("v") and n != "sp"]
     mod_diag = _make(tmp_path, prog=prog_small)
