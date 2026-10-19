@@ -1493,6 +1493,14 @@ class CapAxialAngularMomentumSoftConstraint(AxialAngularMomentumSoftConstraint):
     ascending boundary latitude). The loss is the mean over batch, time and boundaries of
     ``phi((R_b / alpha_b)^2)``, so it is a single constraint term whatever the number of boundaries.
 
+    With ``normalize_by_boundary`` a single scalar ``alpha`` in N/m replaces the per-boundary list:
+    ``alpha_b = alpha * 2 pi a^2 cos^2(phi_b)``. ``R_b / (2 pi a^2 cos^2 phi_b)`` is the residual expressed as an error in the
+    column meridional momentum flux ``[int u v dp] / g`` across the boundary (the form of ``F_rel``), so one tolerance applies to
+    every latitude circle. The geometric factor (circumference times lever arm) accounts for most of the latitude dependence of
+    the ERA5 residual: its per-boundary median falls within about a factor 2 of one value equatorward of 70 degrees, while it
+    spans a factor ~80 in N m. Poleward of ~80 degrees the ERA5 residual is smaller than this scaling, so those tiny caps are
+    held more loosely than with per-boundary alphas.
+
     All reductions run in float64: the residuals are ~1e18 N m while the angular momentum itself is ~1e28. Each
     state's column and ring reductions are recomputed in the backward pass (as in ``DerivedSurfacePressure``) so the
     training graph keeps only ``[B, 5, rings]`` tensors per state. Every index is a registered buffer, so the loss and
@@ -1511,6 +1519,7 @@ class CapAxialAngularMomentumSoftConstraint(AxialAngularMomentumSoftConstraint):
         surface_geopotential_name: str,
         alpha=1.0,
         name: str = "cap_aam",
+        normalize_by_boundary: bool = False,
         **kwargs,
     ):
         kwargs.setdefault("mountain_torque_sign", -1.0)
@@ -1574,7 +1583,13 @@ class CapAxialAngularMomentumSoftConstraint(AxialAngularMomentumSoftConstraint):
         self.register_buffer("report_index", torch.tensor(report, dtype=torch.long), persistent=False)
         self.report_names = [f"{'S' if s_ < 0 else 'N'}{int(lat)}" for s_ in (-1.0, 1.0) for lat in self.REPORT_LATITUDES[::(1 if s_ < 0 else -1)]]
 
-        alpha_v = np.broadcast_to(np.asarray([float(a) for a in alpha] if not np.isscalar(alpha) else float(alpha), dtype=np.float64), (n_bnd,))
+        self.normalize_by_boundary = bool(normalize_by_boundary)
+        if self.normalize_by_boundary:
+            if not np.isscalar(alpha):
+                raise ValueError("normalize_by_boundary=True takes one scalar alpha [N/m], not a per-boundary list.")
+            alpha_v = float(alpha) * 2.0 * math.pi * self.a ** 2 * np.cos(bnd_lat) ** 2
+        else:
+            alpha_v = np.broadcast_to(np.asarray([float(a) for a in alpha] if not np.isscalar(alpha) else float(alpha), dtype=np.float64), (n_bnd,))
         self.alpha = torch.as_tensor(np.array(alpha_v), dtype=torch.float64)
 
     def setup(self, trainer) -> None:
