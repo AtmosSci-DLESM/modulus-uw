@@ -11,13 +11,10 @@ Catalogs already written with ``layout=named_arrays_healpix`` still load.
 
 from __future__ import annotations
 
-import logging
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 COORD_KEYS = frozenset({"time", "face", "height", "width", "lat", "lon"})
 
@@ -26,37 +23,85 @@ PER_VARIABLE_LAYOUT_ATTR = "per_variable"
 # Written by earlier converters and the b24 builder.
 _LEGACY_PER_VARIABLE_LAYOUT_ATTR = "named_arrays_healpix"
 
-_zarrs_pipeline_enabled = False
-_zarrs_import_warned = False
+def _per_variable_read_config() -> dict:
+    """zarr config for per-variable field reads.
 
-
-def enable_zarrs_pipeline() -> bool:
-    """Select the zarrs Rust codec pipeline when the optional package is installed.
-
-    zarr.config is per-process. Call from per-variable read helpers so a
-    num_workers=0 load still uses zarrs. Do not call this on stacked reads, and
-    do not enable it in the parent before forking DataLoader workers: fork
-    inherits zarrs state and can deadlock the first batch fetch.
+    zarr's FusedCodecPipeline (opt-in, zarr >= 3.3) decodes synchronously in bulk,
+    and a partial-shard read fetches the window's inner chunks as one coalesced
+    byte range per shard. That matters for time-sharded fields, where a training
+    window is a few dozen inner chunks: per-chunk reads are slow on network
+    filesystems. ``max_workers=1`` keeps decode inline in the thread zarr hands
+    each read to: zarr's module-level decode pool is not reset after ``fork``, so
+    using it before DataLoader workers start can hang them. Concurrency comes from
+    reading every field at once instead (``_read_fields``). Older zarr has no
+    FusedCodecPipeline; reads then use the active pipeline (correct, slower).
     """
-    global _zarrs_pipeline_enabled, _zarrs_import_warned
-    if _zarrs_pipeline_enabled:
-        return True
     try:
-        import zarr
-
-        import zarrs  # noqa: F401
-
-        zarr.config.set({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"})
-        _zarrs_pipeline_enabled = True
-        return True
+        from zarr.core.codec_pipeline import FusedCodecPipeline  # noqa: F401
     except ImportError:
-        if not _zarrs_import_warned:
-            logger.warning(
-                "zarrs is not installed; per-variable Zarr reads use the default "
-                "Python codec pipeline (slower). Install with: pip install zarrs"
-            )
-            _zarrs_import_warned = True
-        return False
+        return {}
+    return {
+        "codec_pipeline.path": "zarr.core.codec_pipeline.FusedCodecPipeline",
+        "codec_pipeline.max_workers": 1,
+    }
+
+
+_READ_CONFIG = _per_variable_read_config()
+_async_arrays: dict[tuple[str, str], Any] = {}
+
+
+def _async_array(group, name: str):
+    """``AsyncArray`` for one field, opened with ``_READ_CONFIG``.
+
+    zarr fixes an array's codec pipeline when the array object is created, so it
+    is created under that config; caching also skips re-reading ``zarr.json`` for
+    every batch.
+    """
+    import zarr
+
+    key = (str(group.store_path), name)
+    array = _async_arrays.get(key)
+    if array is None:
+        with zarr.config.set(_READ_CONFIG):
+            array = group[name].async_array
+        _async_arrays[key] = array
+    return array
+
+
+def _read_fields(ds, names: Sequence[str], selection, on_block=None) -> list[np.ndarray]:
+    """``ds[name][selection]`` for every name, read concurrently.
+
+    For a zarr group each field is one coroutine on zarr's own event loop (the
+    loop every synchronous zarr call runs on; zarr resets it after ``fork``).
+    ``on_block(i, block)`` runs in a worker thread as each field arrives, so
+    scaling and scattering overlap the remaining reads. Other inputs (an xarray
+    Dataset) are read in order.
+    """
+    import zarr
+
+    if not isinstance(ds, zarr.Group):
+        blocks = [np.asarray(ds[n][selection]) for n in names]
+        if on_block is not None:
+            for i, block in enumerate(blocks):
+                on_block(i, block)
+        return blocks
+
+    from zarr.core.sync import sync
+
+    arrays = [_async_array(ds, n) for n in names]
+
+    async def _one(i: int, array) -> np.ndarray:
+        block = np.asarray(await array.getitem(selection))
+        if on_block is not None:
+            await asyncio.to_thread(on_block, i, block)
+        return block
+
+    async def _all() -> list[np.ndarray]:
+        return list(await asyncio.gather(*(_one(i, a) for i, a in enumerate(arrays))))
+
+    # max_workers is read at read time, so the config applies to the reads too.
+    with zarr.config.set(_READ_CONFIG):
+        return sync(_all())
 
 
 def _layout_attr(ds) -> str:
@@ -190,14 +235,6 @@ def _apply_channel_scaling(block: np.ndarray, scaling: Mapping, channel: int) ->
     return block
 
 
-def _run_parallel(fns: list):
-    """Run one callable per field. A single field runs on this thread."""
-    if len(fns) <= 1:
-        return [fn() for fn in fns]
-    with ThreadPoolExecutor(max_workers=len(fns)) as ex:
-        return list(ex.map(lambda fn: fn(), fns))
-
-
 def _require_layout(ds) -> None:
     if is_stacked_layout(ds) or is_per_variable_layout(ds):
         return
@@ -229,20 +266,17 @@ def load_channel_data(
                 _apply_channel_scaling(out[:, i], scaling, i)
         return out
 
-    from .zarr_shard_read import read_field_time
-
     ref = ds[names[0]]
     tlen = _slice_length(ref.shape[0], time_sl)
     spatial = ref.shape[1:]
     out = np.empty((tlen, len(names)) + spatial, dtype=ref.dtype)
 
-    def _fill(i: int, n: str) -> None:
-        block = read_field_time(ds, n, time_sl)
+    def _fill(i: int, block: np.ndarray) -> None:
         if scaling is not None:
             block = _apply_channel_scaling(block, scaling, i)
         out[:, i] = block
 
-    _run_parallel([lambda i=i, n=n: _fill(i, n) for i, n in enumerate(names)])
+    _read_fields(ds, names, time_sl, on_block=_fill)
     return out
 
 
@@ -368,8 +402,6 @@ def load_windowed_channel_data(
         ]
         return inputs, targets, ic_diagnostics
 
-    from .zarr_shard_read import read_field_time
-
     batch_size, t_in = input_time_idx.shape
     ref = ds[input_names[0]]
     spatial = ref.shape[1:]
@@ -427,12 +459,12 @@ def load_windowed_channel_data(
         if name in ic_pos:
             ic_diag_cf[ic_pos[name]] = block[input_time_idx]
 
-    def _fill(name: str, in_c: int | None, out_c: int | None) -> None:
-        block = read_field_time(ds, name, time_sl)
-        _place(block, in_c, out_c, name)
-
-    _run_parallel(
-        [lambda n=n, ic=ic, oc=oc: _fill(n, ic, oc) for n, (ic, oc) in slots.items()]
+    fields = list(slots.items())
+    _read_fields(
+        ds,
+        [name for name, _ in fields],
+        time_sl,
+        on_block=lambda i, block: _place(block, *fields[i][1], fields[i][0]),
     )
     # (C, B, T, ...) -> (B, T, C, ...); view, no copy.
     inputs = np.transpose(inputs_cf, (1, 2, 0, 3, 4, 5))
@@ -444,11 +476,7 @@ def load_windowed_channel_data(
 
 
 def load_constant_fields(ds, field_names: Sequence[str]) -> np.ndarray:
-    """Load constant fields as (C, F, H, W).
-
-    Constants are read once during dataset setup in the parent process; keep the
-    default codec pipeline here so zarrs is not enabled before DataLoader fork.
-    """
+    """Load constant fields as (C, F, H, W)."""
     names = list(field_names)
     if len(names) == 0:
         raise ValueError("empty constant field name list")
@@ -460,5 +488,4 @@ def load_constant_fields(ds, field_names: Sequence[str]) -> np.ndarray:
 
     if not is_per_variable_layout(ds):
         _require_layout(ds)
-    parts = _run_parallel([lambda n=n: np.asarray(ds[n]) for n in names])
-    return np.stack(parts, axis=0)
+    return np.stack(_read_fields(ds, names, slice(None)), axis=0)
