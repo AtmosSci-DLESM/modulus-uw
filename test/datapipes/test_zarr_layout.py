@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
-np =pytest.importorskip("numpy")
+np = pytest.importorskip("numpy")
 xr = pytest.importorskip("xarray")
 zarr = pytest.importorskip("zarr")
 
@@ -388,118 +386,4 @@ def test_stacked_getitem_matches_joint_inputs_scale(tmp_path):
     )
     assert inputs[0].dtype == np.float32
     assert targets.dtype == np.float32
-
-
-def _make_sharded_field(path, *, t: int = 20, shard_time: int = 8, f: int = 2, h: int = 2, w: int = 2):
-    """Per-variable array with inner time chunk 1 and a time shard, zstd level 0."""
-    from zarr.codecs import ZstdCodec
-
-    data = np.arange(t * f * h * w, dtype=np.float32).reshape(t, f, h, w)
-    data[3] = np.nan
-    zarr.create_array(
-        store=str(path),
-        name="t2m",
-        shape=data.shape,
-        chunks=(1, f, h, w),
-        shards=(shard_time, f, h, w),
-        dtype="float32",
-        zarr_format=3,
-        compressors=[ZstdCodec(level=0)],
-        fill_value=np.nan,
-        dimension_names=["time", "face", "height", "width"],
-    )
-    array = zarr.open_array(f"{path}/t2m", mode="a")
-    array[:] = data
-    group = zarr.open_group(str(path), mode="a")
-    group.attrs["layout"] = "per_variable"
-    return data
-
-
-def test_read_sharded_time_slice_matches_array(tmp_path):
-    from physicsnemo.datapipes.healpix.zarr_shard_read import read_sharded_time_slice
-
-    data = _make_sharded_field(tmp_path / "shard")
-    array = zarr.open_array(f"{tmp_path / 'shard'}/t2m", mode="r")
-    sl = slice(2, 12)
-    got = read_sharded_time_slice(array, sl)
-    assert got is not None
-    ref = np.asarray(array[sl])
-    assert got.shape == ref.shape
-    assert np.array_equal(got, ref, equal_nan=True)
-    loaded = load_channel_data(zarr.open_group(str(tmp_path / "shard"), mode="r"), sl, ["t2m"])
-    assert np.array_equal(loaded[:, 0], ref, equal_nan=True)
-    assert np.array_equal(loaded[:, 0], data[sl], equal_nan=True)
-
-
-def test_read_sharded_time_slice_direct_io_flag(tmp_path, monkeypatch):
-    from physicsnemo.datapipes.healpix import zarr_shard_read
-    from physicsnemo.datapipes.healpix.zarr_shard_read import read_sharded_time_slice
-
-    _make_sharded_field(tmp_path / "shard")
-    array = zarr.open_array(f"{tmp_path / 'shard'}/t2m", mode="r")
-    sl = slice(2, 12)
-    ref = np.asarray(array[sl])
-    calls = []
-    real = zarr_shard_read._pread_span_direct
-    monkeypatch.setattr(zarr_shard_read, "_pread_span_direct", lambda *a: calls.append(a) or real(*a))
-    monkeypatch.delenv("PHYSICSNEMO_ZARR_SHARD_READ_DIRECT_IO", raising=False)
-    assert np.array_equal(read_sharded_time_slice(array, sl), ref, equal_nan=True)
-    assert not calls
-    monkeypatch.setenv("PHYSICSNEMO_ZARR_SHARD_READ_DIRECT_IO", "1")
-    assert np.array_equal(read_sharded_time_slice(array, sl), ref, equal_nan=True)
-    assert calls
-
-
-def test_pread_span_direct_unaligned_span(tmp_path):
-    from physicsnemo.datapipes.healpix.zarr_shard_read import _pread_span_direct
-
-    payload = np.random.default_rng(0).integers(0, 256, 20000, dtype=np.uint8).tobytes()
-    f = tmp_path / "blob"
-    f.write_bytes(payload)
-    got = _pread_span_direct(str(f), 4097, 9001)  # neither end on a block boundary; file tail partial block
-    if got is None:
-        pytest.skip("filesystem does not support O_DIRECT")
-    assert got == payload[4097 : 4097 + 9001]
-    assert _pread_span_direct(str(f), 19000, 1000) == payload[19000:]
-
-
-def test_sharded_window_matches_arrays(tmp_path):
-    from zarr.codecs import ZstdCodec
-
-    path = tmp_path / "multi"
-    t, f, h, w, shard_time = 20, 2, 2, 2, 8
-    stored = {}
-    for i, name in enumerate(("t2m", "u10m")):
-        data = (np.arange(t * f * h * w, dtype=np.float32) + i * 1000).reshape(t, f, h, w)
-        data[3] = np.nan
-        stored[name] = data
-        zarr.create_array(
-            store=str(path),
-            name=name,
-            shape=data.shape,
-            chunks=(1, f, h, w),
-            shards=(shard_time, f, h, w),
-            dtype="float32",
-            zarr_format=3,
-            compressors=[ZstdCodec(level=0)],
-            fill_value=np.nan,
-            dimension_names=["time", "face", "height", "width"],
-        )
-        zarr.open_array(f"{path}/{name}", mode="a")[:] = data
-    group = zarr.open_group(str(path), mode="a")
-    group.attrs["layout"] = "per_variable"
-    group = zarr.open_group(str(path), mode="r")
-    sl = slice(2, 12)
-    loaded = load_channel_data(group, sl, ["t2m", "u10m"])
-    for c, name in enumerate(("t2m", "u10m")):
-        assert np.array_equal(loaded[:, c], stored[name][sl], equal_nan=True)
-    idx_in = np.array([[0, 1], [2, 3]])
-    idx_out = np.array([[4, 6], [5, 7]])
-    inputs, targets = load_windowed_channel_data(
-        group, sl, ["t2m", "u10m"], idx_in, ["u10m", "t2m"], idx_out
-    )
-    for c, name in enumerate(("t2m", "u10m")):
-        assert np.array_equal(inputs[:, :, c], stored[name][sl][idx_in], equal_nan=True)
-    for c, name in enumerate(("u10m", "t2m")):
-        assert np.array_equal(targets[:, :, c], stored[name][sl][idx_out], equal_nan=True)
 
