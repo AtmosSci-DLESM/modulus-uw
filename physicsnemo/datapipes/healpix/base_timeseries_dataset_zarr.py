@@ -24,11 +24,12 @@ from typing import List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 import xarray as xr
-import zarr
 from physicsnemo.datapipes.datapipe import Datapipe
 from physicsnemo.datapipes.meta import DatapipeMetaData
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import Dataset
+
+from .zarr_layout import open_healpix_zarr
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +201,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         # Check if for fsspec if necessary and make sure path exist
         _check_availability(dataset_path)
 
-        self.ds = zarr.open(dataset_path)
+        self.ds = open_healpix_zarr(dataset_path)
 
         if (
             start_date is None or end_date is None
