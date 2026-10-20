@@ -129,11 +129,11 @@ def _read_fields(ds, names: Sequence[str], selection, on_block=None) -> list[np.
     loop every synchronous zarr call runs on; zarr resets it after ``fork``).
     ``on_block(i, block)`` runs in a worker thread as each field arrives, so
     scaling and scattering overlap the remaining reads. Other inputs (an xarray
-    Dataset) are read in order.
+    Dataset, or any group under zarr 2, which has no async API) are read in order.
     """
     import zarr
 
-    if not isinstance(ds, zarr.Group):
+    if LocalStore is None or not isinstance(ds, zarr.Group):
         blocks = [np.asarray(ds[n][selection]) for n in names]
         if on_block is not None:
             for i, block in enumerate(blocks):
