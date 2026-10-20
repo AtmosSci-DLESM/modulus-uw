@@ -12,9 +12,17 @@ Catalogs already written with ``layout=named_arrays_healpix`` still load.
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+
+try:  # zarr >= 3
+    from zarr.abc.store import RangeByteRequest
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.storage import LocalStore
+except ImportError:
+    LocalStore = None
 
 COORD_KEYS = frozenset({"time", "face", "height", "width", "lat", "lon"})
 
@@ -22,6 +30,52 @@ COORD_KEYS = frozenset({"time", "face", "height", "width", "lat", "lon"})
 PER_VARIABLE_LAYOUT_ATTR = "per_variable"
 # Written by earlier converters and the b24 builder.
 _LEGACY_PER_VARIABLE_LAYOUT_ATTR = "named_arrays_healpix"
+
+
+if LocalStore is not None:
+
+    class _PositionalReadLocalStore(LocalStore):
+        """``LocalStore`` whose byte-range reads are one ``os.pread``.
+
+        zarr's ``LocalStore`` opens the file and seeks to its end before every
+        ranged read to learn the size. On Lustre that size lookup is a remote
+        call per read; it cost about 9% of v2-18 training throughput on
+        Perlmutter. A positional read needs no size. Shard-index (suffix) and
+        whole-key reads keep the base implementation.
+        """
+
+        def get_sync(self, key, *, prototype=None, byte_range=None):
+            if not isinstance(byte_range, RangeByteRequest):
+                return super().get_sync(key, prototype=prototype, byte_range=byte_range)
+            try:
+                fd = os.open(self.root / key, os.O_RDONLY)
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                return None
+            try:
+                length = byte_range.end - byte_range.start
+                data = os.pread(fd, length, byte_range.start)
+            finally:
+                os.close(fd)
+            if len(data) != length:  # past EOF: let zarr's own read decide
+                return super().get_sync(key, prototype=prototype, byte_range=byte_range)
+            return (prototype or default_buffer_prototype()).buffer.from_bytes(data)
+
+        async def get(self, key, prototype=None, byte_range=None):
+            if not isinstance(byte_range, RangeByteRequest):
+                return await super().get(key, prototype, byte_range)
+            return await asyncio.to_thread(
+                self.get_sync, key, prototype=prototype, byte_range=byte_range
+            )
+
+
+def open_healpix_zarr(path):
+    """``zarr.open(path)``; a local directory store reads through ``_PositionalReadLocalStore``."""
+    import zarr
+
+    if LocalStore is not None and isinstance(path, (str, os.PathLike)) and os.path.isdir(path):
+        return zarr.open(_PositionalReadLocalStore(path))
+    return zarr.open(path)
+
 
 def _per_variable_read_config() -> dict:
     """zarr config for per-variable field reads.
