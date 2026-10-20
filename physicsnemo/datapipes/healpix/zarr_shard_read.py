@@ -7,6 +7,8 @@ layouts fall back to the zarr codec path. Stacked ``inputs`` reads never come he
 
 from __future__ import annotations
 
+import errno
+import mmap
 import os
 import threading
 
@@ -108,10 +110,64 @@ def _read_index_tail(path: str, index_nbytes: int) -> bytes:
         os.close(fd)
 
 
+_DIRECT_ALIGN = 4096
+
+
+def _direct_io_enabled() -> bool:
+    """True when ``PHYSICSNEMO_ZARR_SHARD_READ_DIRECT_IO=1``.
+
+    Read per call (not at import) so DataLoader workers see the launcher's env.
+    """
+    return os.environ.get("PHYSICSNEMO_ZARR_SHARD_READ_DIRECT_IO", "0") == "1"
+
+
+def _pread_span_direct(path: str, offset: int, length: int) -> bytes | None:
+    """Read the span with ``O_DIRECT`` (no page cache); None if the filesystem refuses it.
+
+    ``O_DIRECT`` needs block-aligned offset, length and buffer, so the aligned
+    superset is read into a page-aligned anonymous mapping and the span sliced out.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    except OSError:
+        return None
+    start = offset - offset % _DIRECT_ALIGN
+    stop = -(-(offset + length) // _DIRECT_ALIGN) * _DIRECT_ALIGN
+    buf = mmap.mmap(-1, stop - start)
+    try:
+        got = 0
+        while got < offset + length - start:
+            n = os.preadv(fd, [memoryview(buf)[got:]], start + got)
+            if n == 0:
+                raise OSError(f"short shard read at offset {offset}")
+            got += n
+        return bytes(memoryview(buf)[offset - start : offset - start + length])
+    except OSError as exc:
+        if exc.errno == errno.EINVAL:  # filesystem accepted the flag at open but not the read
+            return None
+        raise
+    finally:
+        buf.close()
+        os.close(fd)
+
+
 def _pread_span(path: str, offset: int, length: int) -> bytes:
-    """One buffered read of ``length`` bytes at ``offset``."""
+    """One read of ``length`` bytes at ``offset``.
+
+    Buffered by default. A training epoch that reads far more shard data than the
+    job's memory limit (a Slurm cgroup counts page cache against that limit)
+    never re-reads a page while it is still cached, so the cache only fills the
+    limit and every rank's reads then stall in direct reclaim; a stall on one
+    rank holds up the gradient sync of all ranks. With the env flag above the
+    read bypasses the page cache instead. Leave it unset when the working set
+    fits in memory, where the cache is what makes later epochs fast.
+    """
     if length <= 0:
         return b""
+    if _direct_io_enabled():
+        data = _pread_span_direct(path, offset, length)
+        if data is not None:
+            return data
     fd = os.open(path, os.O_RDONLY)
     try:
         return _pread_exact(fd, length, offset)
