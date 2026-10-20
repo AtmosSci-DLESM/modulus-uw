@@ -253,6 +253,18 @@ def test_sharded_per_variable_windows_match_arrays(tmp_path):
         assert np.array_equal(targets[:, :, c], stored[name][sl][idx_out], equal_nan=True)
 
 
+def test_open_healpix_zarr_positional_reads_match(tmp_path):
+    from physicsnemo.datapipes.healpix.zarr_layout import open_healpix_zarr
+
+    _, stored = _make_sharded_store(tmp_path / "sharded")
+    group = open_healpix_zarr(str(tmp_path / "sharded"))
+    assert type(group.store).__name__ == "_PositionalReadLocalStore"
+    for sl in (slice(1, 6), slice(2, 12), slice(14, 20)):
+        loaded = load_channel_data(group, sl, ["t2m", "u10m"])
+        for c, name in enumerate(("t2m", "u10m")):
+            assert np.array_equal(loaded[:, c], stored[name][sl], equal_nan=True)
+
+
 def _read_in_child(queue, path):
     group = zarr.open_group(path, mode="r")
     queue.put(float(np.nansum(load_channel_data(group, slice(8, 16), ["t2m", "u10m"]))))

@@ -21,7 +21,6 @@ from typing import List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 import torch
-import zarr
 from omegaconf import DictConfig, OmegaConf
 
 from physicsnemo.datapipes.meta import DatapipeMetaData
@@ -30,6 +29,7 @@ from physicsnemo.utils.insolation import insolation
 from . import couplers
 from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
 from .base_timeseries_dataset_zarr import _check_availability
+from .zarr_layout import open_healpix_zarr
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +107,7 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         # We setup couplers first so superclass can properly initialize
         # and set the scaling
         _check_availability(dataset_path)
-        self.ds = zarr.open(dataset_path)
+        self.ds = open_healpix_zarr(dataset_path)
         self.couplings = [
             getattr(couplers, c["coupler"])(
                 self.ds,
