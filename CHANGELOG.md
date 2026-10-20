@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- HEALPix isolatitude padding avoids a redundant output copy. ConvGRU resets
+  release previous hidden tensors before the next forecast, allowing CUDA graph
+  replay without reading overwritten graph outputs; recurrence within each
+  forecast and checkpoint state keys are preserved. Smoothing kernels are
+  nonpersistent constants with local dtype/device casts, retaining inference-to-
+  training gradients without caching graph-produced tensors. SST interpolation
+  runs eagerly because its backward synchronizes with the host. GLORYS SST
+  regridding stays eager under compilation because its backward synchronizes
+  with the host.
+
 - GLORYS supports preserving ETL-filled land inputs and triple-interpolating
   predicted land for every ocean channel before feedback. Explicit legacy mode
   preserves v4 archives; predicted-land interpolation can be disabled separately.

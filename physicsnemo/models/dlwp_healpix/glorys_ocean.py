@@ -148,6 +148,8 @@ class TripleInterpSST(nn.Module):
         if state != self.get_extra_state():
             raise ValueError("Checkpoint SST interpolation configuration differs")
 
+    # Regridding has a host-synchronizing masked-scatter backward.
+    @torch.compiler.disable
     def forward(self, ocean):
         if ocean.shape[-3:] != self.mask.shape:
             raise ValueError("SST field and interpolation mask must match")
