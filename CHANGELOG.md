@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- HEALPix Zarr loaders select required state and forcing channels before
+  materialization and limit raw-target state and target reads to consumed windows.
+  Prepared coupling buffers use float32 without changing returned values,
+  target validity, sample order, or checkpoint state.
+
 - HEALPix isolatitude padding avoids a redundant output copy. ConvGRU resets
   release previous hidden tensors before the next forecast, allowing CUDA graph
   replay without reading overwritten graph outputs; recurrence within each
