@@ -35,6 +35,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GLORYS archive construction resolves its declared native backbone target
   independently of public class/submodule import order, preserving archived
   configuration and numerical state.
+- HEALPix Zarr loaders select required state and forcing channels before
+  materialization and limit raw-target state and target reads to consumed windows.
+  Prepared coupling buffers use float32 without changing returned values,
+  target validity, sample order, or checkpoint state.
+
+- HEALPix isolatitude padding avoids a redundant output copy. ConvGRU resets
+  release previous hidden tensors before the next forecast, allowing CUDA graph
+  replay without reading overwritten graph outputs; recurrence within each
+  forecast and checkpoint state keys are preserved. Smoothing kernels are
+  nonpersistent constants with local dtype/device casts, retaining inference-to-
+  training gradients without caching graph-produced tensors. SST interpolation
+  runs eagerly because its backward synchronizes with the host. GLORYS SST
+  regridding stays eager under compilation because its backward synchronizes
+  with the host.
+
+- GLORYS supports preserving ETL-filled land inputs and triple-interpolating
+  predicted land for every ocean channel before feedback. Explicit legacy mode
+  preserves v4 archives; predicted-land interpolation can be disabled separately.
 
 - Fixed-order unpadded validation samplers accept the shared trainer epoch
   hook, preventing distributed validation from failing after training.

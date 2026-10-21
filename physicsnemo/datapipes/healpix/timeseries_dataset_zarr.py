@@ -165,10 +165,16 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         time_index, this_batch = self._get_time_index(item)
 
         torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_staging_data")
-        # data from the input and target arrays overlap, to avoid 2 seperate loads
-        # we load both and then slice it later
-        staging_ds = self.ds["inputs"][slice(*time_index)]
-        staging_ds = staging_ds[:, self.all_variable_indices]
+        # Raw targets live separately, so their future horizon is not an input.
+        input_time_slice = slice(*time_index)
+        if self.raw_target_mode:
+            input_time_slice = slice(
+                time_index[0],
+                time_index[0] + self._input_indices[this_batch - 1][-1] + 1,
+            )
+        staging_ds = self.ds["inputs"].oindex[
+            input_time_slice, self.all_variable_indices, :, :, :
+        ]
         torch.cuda.nvtx.range_pop()
 
         # we scale this dataset to avoid doing twice the work when we scale as both
@@ -198,10 +204,20 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
 
         if not self.forecast_mode:
             torch.cuda.nvtx.range_push("TimeSeriesDataset:__getitem__:load_target")
+            output_indices = self._output_indices
             if self.raw_target_mode:
+                target_offset = max(0, min(output_indices[0], default=0))
+                output_indices = [
+                    [index - target_offset for index in indices]
+                    for indices in output_indices
+                ]
                 target_array = np.asarray(
                     self.ds["targets"].oindex[
-                        slice(*time_index), self.raw_target_variable_indices, :, :, :
+                        slice(time_index[0] + target_offset, time_index[1]),
+                        self.raw_target_variable_indices,
+                        :,
+                        :,
+                        :,
                     ],
                     dtype=np.float32,
                 )
@@ -249,7 +265,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         for sample in range(this_batch):
             inputs[sample] = input_array[self._input_indices[sample]]
             if not self.forecast_mode:
-                targets[sample] = target_array[self._output_indices[sample]]
+                targets[sample] = target_array[output_indices[sample]]
             if self.add_insolation:
                 decoder_inputs[sample] = (
                     sol

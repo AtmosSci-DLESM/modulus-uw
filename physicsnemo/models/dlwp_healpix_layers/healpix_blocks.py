@@ -125,7 +125,7 @@ class ConvGRUBlock(th.nn.Module):
         Sequence
             Result of the forward pass
         """
-        if inputs.shape != self.h.shape:
+        if self.h is None or inputs.shape != self.h.shape:
             self.h = th.zeros_like(inputs)
         combined = th.cat([inputs, self.h], dim=1)
         combined_conv = self.conv_gates(combined)
@@ -145,7 +145,7 @@ class ConvGRUBlock(th.nn.Module):
 
     def reset(self):
         """Reset the update gates"""
-        self.h = th.zeros_like(self.h)
+        self.h = None
 
 #
 # CONV BLOCKS
@@ -1561,29 +1561,31 @@ class SmoothedInterpolate(th.nn.Module):
         # Four point smoother specific to HPX grid. This smooths out the specific
         # type of aliasing that nearest neighbor and bilinear upsampling introduce
         # into zonally uniform signals
-        self.smoother_kernel = torch.tensor(
-            [[0.,1.,0.],
-             [1.,0.,1.],
-             [0.,1.,0.]]
-        )
-        # Normalize the kernel to sum to 1
-        self.smoother_kernel = self.smoother_kernel / self.smoother_kernel.sum()
-        self.smoother_kernel = self.smoother_kernel.unsqueeze(0).unsqueeze(0)  # shape (1,1,3,3)
-        self.smoother_kernel = self.smoother_kernel.repeat((in_channels,1,1,1))
+        with torch.inference_mode(False):
+            smoother_kernel = torch.tensor(
+                [[0.,1.,0.],
+                 [1.,0.,1.],
+                 [0.,1.,0.]]
+            )
+            # Normalize the kernel to sum to 1
+            smoother_kernel = smoother_kernel / smoother_kernel.sum()
+            smoother_kernel = smoother_kernel.unsqueeze(0).unsqueeze(0)  # shape (1,1,3,3)
+            smoother_kernel = smoother_kernel.repeat((in_channels,1,1,1))
+            self.register_buffer("smoother_kernel", smoother_kernel, persistent=False)
 
     def forward(self, x: th.Tensor) -> th.Tensor:
         # Cached constants must remain usable by autograd after inference.
         with torch.inference_mode(False):
-            self.smoother_kernel = self.smoother_kernel.to(device=x.device, dtype=x.dtype)
-            if torch.is_inference(self.smoother_kernel):
-                self.smoother_kernel = self.smoother_kernel.clone()
+            kernel = self.smoother_kernel.to(device=x.device, dtype=x.dtype)
+            if torch.is_inference(kernel):
+                kernel = kernel.clone()
 
         # Interpolate, smooth, trim in order
         x = self.interp(x, scale_factor=self.scale_factor, mode=self.mode)
 
         x = torch.nn.functional.conv2d(
             x,
-            self.smoother_kernel,
+            kernel,
             padding=0,
             groups=self.in_channels
         )

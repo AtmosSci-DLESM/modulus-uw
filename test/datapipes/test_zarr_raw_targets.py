@@ -21,10 +21,8 @@ import torch
 import xarray as xr
 import zarr
 from omegaconf import OmegaConf
+
 from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import TimeSeriesDatasetZarr
-from physicsnemo.datapipes.healpix.data_modules_zarr import (
-    CoupledTimeSeriesDataModuleZarr,
-)
 
 
 @pytest.fixture
@@ -202,3 +200,178 @@ def test_actual_module_forecast_coupler_datetime_and_next_integration(source):
     ]
     np.testing.assert_allclose(following[2][0, 0, :, 0, 0, 1], expected)
     assert torch.equal(following[1], inputs[1])
+
+
+class _InputReadProbe:
+    """Observe selected reads while delegating all data access to real Zarr."""
+
+    def __init__(self, group):
+        self.group = group
+        self.reads = []
+
+    def __getitem__(self, key):
+        if key != "inputs":
+            return self.group[key]
+        parent = self
+
+        class InputArray:
+            @property
+            def oindex(self):
+                return self
+
+            def __getitem__(self, selection):
+                parent.reads.append(selection)
+                return parent.group["inputs"].oindex[selection]
+
+        return InputArray()
+
+
+@pytest.mark.parametrize(
+    "mode", ["raw-full", "raw-partial", "raw-forecast", "ordinary", "forecast"]
+)
+def test_only_selected_input_channels_and_required_raw_horizon(source, mode):
+    """Raw targets must not extend state reads beyond consumed histories."""
+    kwargs = dataset_kwargs(source)
+    kwargs.update(batch_size=4, input_variables=["q", "sst"])
+    raw = mode.startswith("raw-")
+    if mode.endswith("forecast"):
+        kwargs.update(
+            start_date=None, end_date=None, forecast_init_times=["1993-01-05"]
+        )
+    dataset = TimeSeriesDatasetZarr(**kwargs, raw_target_mode=raw)
+    item = len(dataset) - 1 if mode == "raw-partial" else 0
+    time_index, batch = dataset._get_time_index(item)
+    probe = _InputReadProbe(dataset.ds)
+    dataset.ds = probe
+    result = dataset[item]
+    inputs = result if dataset.forecast_mode else result[0]
+    (selection,) = probe.reads
+    assert selection[1] == dataset.all_variable_indices
+    expected_stop = time_index[0] + batch + 4 if raw else time_index[1]
+    assert selection[0] == slice(time_index[0], expected_stop)
+    assert inputs[0].shape[0] == batch
+    assert inputs[0][0, 0, 0, 0, 0, 0] == (time_index[0] + 100 - 1) / 2
+    assert inputs[0][0, 0, 0, 1, 0, 0] == (time_index[0] - 1) / 2
+
+
+@pytest.mark.parametrize("time_first", [False, True])
+def test_selected_coupling_channel_order_and_float32_staging(source, time_first):
+    """Prepared forcing retains order and rounding without FP64 staging."""
+    from physicsnemo.datapipes.healpix.couplers import TrailingAverageCoupler
+
+    path, _ = source
+    group = zarr.open_group(path, mode="r")
+    coupler = TrailingAverageCoupler(
+        group,
+        batch_size=3,
+        variables=["f3", "f1"],
+        input_times=["24h", "48h"],
+        averaging_window="24h",
+    )
+    coupler.time_first = time_first
+    coupler.compute_coupled_indices(1, np.timedelta64(24, "h"))
+    coupler.set_scaling(
+        xr.Dataset(
+            {
+                "mean": ("index", np.array([3, 3], dtype="f4")),
+                "std": ("index", np.array([4, 4], dtype="f4")),
+            },
+            coords={"index": ["f3", "f1"]},
+        )
+    )
+    probe = _InputReadProbe(group)
+    coupler.ds = probe
+    actual = coupler.construct_integrated_couplings({"time": slice(0, 10)}, bsize=2)
+    expected = np.empty((2, 1, 4, 12, 2, 2), dtype="f4")
+    for sample in range(2):
+        values = np.array(
+            [402 + sample, 202 + sample, 403 + sample, 203 + sample], dtype="f4"
+        )
+        values -= np.float32(3)
+        values /= np.float32(4)
+        expected[sample, 0] = values[:, None, None, None]
+    if time_first:
+        expected = expected.transpose(1, 0, 2, 3, 4, 5)
+    np.testing.assert_array_equal(actual, expected)
+    assert actual.dtype == coupler.integrated_couplings.dtype == np.float32
+    (selection,) = probe.reads
+    assert selection[0] == slice(0, 6)
+    assert selection[1] == [4, 2]
+
+
+class _TargetReadProbe:
+    """Record raw-target reads without substituting any values."""
+
+    def __init__(self, group):
+        self.group = group
+        self.reads = []
+
+    def __getitem__(self, key):
+        if key != "targets":
+            return self.group[key]
+        parent = self
+
+        class TargetArray:
+            @property
+            def oindex(self):
+                return self
+
+            def __getitem__(self, selection):
+                parent.reads.append(selection)
+                return parent.group["targets"].oindex[selection]
+
+        return TargetArray()
+
+
+@pytest.mark.parametrize(
+    "gap,input_dim", [("96h", 2), ("0h", 2), ("-120h", 2), ("96h", 4)]
+)
+@pytest.mark.parametrize("last", [False, True])
+def test_raw_target_leading_window_exact_bytes(source, gap, input_dim, last):
+    """Rebased raw copies preserve NaNs, gap offsets and partial batches."""
+    kwargs = dataset_kwargs(source)
+    kwargs.update(batch_size=4, gap=gap, input_time_dim=input_dim)
+    if gap == "-120h":
+        kwargs["output_time_dim"] = 3
+    dataset = TimeSeriesDatasetZarr(**kwargs, raw_target_mode=True)
+    item = len(dataset) - 1 if last else 0
+    time_index, batch = dataset._get_time_index(item)
+    original = np.asarray(
+        dataset.ds["targets"].oindex[
+            slice(*time_index), dataset.raw_target_variable_indices, :, :, :
+        ],
+        dtype=np.float32,
+    )
+    if dataset.target_scaling is not None:
+        original -= dataset.target_scaling["mean"]
+        original /= dataset.target_scaling["std"]
+    expected = np.stack([original[dataset._output_indices[n]] for n in range(batch)])
+    expected = expected.transpose(0, 3, 1, 2, 4, 5)
+    probe = _TargetReadProbe(dataset.ds)
+    dataset.ds = probe
+    _, actual = dataset[item]
+    assert actual.shape == expected.shape
+    assert actual.dtype == expected.dtype
+    assert actual.strides == expected.strides
+    assert actual.tobytes() == expected.tobytes()
+    (selection,) = probe.reads
+    offset = max(0, min(dataset._output_indices[0], default=0))
+    assert selection[0] == slice(time_index[0] + offset, time_index[1])
+    assert selection[1] == dataset.raw_target_variable_indices
+
+
+@pytest.mark.parametrize("raw,forecast", [(False, False), (False, True), (True, True)])
+def test_target_trim_does_not_read_forecast_or_legacy_raw_targets(
+    source, raw, forecast
+):
+    """Forecasts and ordinary input-backed targets never read raw target data."""
+    kwargs = dataset_kwargs(source)
+    if forecast:
+        kwargs.update(
+            start_date=None, end_date=None, forecast_init_times=["1993-01-05"]
+        )
+    dataset = TimeSeriesDatasetZarr(**kwargs, raw_target_mode=raw)
+    probe = _TargetReadProbe(dataset.ds)
+    dataset.ds = probe
+    dataset[0]
+    assert probe.reads == []

@@ -332,7 +332,8 @@ class BaseCoupler(ABC):
         """
         # reset integrated couplings
         self.integrated_couplings = np.empty(
-            (bsize, self.coupled_integration_dim, self.timevar_dim) + self.spatial_dims
+            (bsize, self.coupled_integration_dim, self.timevar_dim) + self.spatial_dims,
+            dtype=np.float32,
         )
 
         index_range = slice(
@@ -342,10 +343,9 @@ class BaseCoupler(ABC):
 
         # extract coupled variables
         if self.use_zarr:
-            # Loading the contiguous time slice into memory and then pulling out the semi-random
-            # variable indices is quicker than trying to do this all at once.
-            ds_index_range = self.ds["inputs"][index_range]
-            ds_index_range = ds_index_range[:, self.ds_variable_indices]
+            ds_index_range = self.ds["inputs"].oindex[
+                index_range, self.ds_variable_indices, :, :, :
+            ]
         else:
             ds_index_range = (
                 self.ds["inputs"]
