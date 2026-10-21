@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- GLORYS supports 24/48/96-hour steps with two histories and one or two outputs.
+  One-output RecUNet residuals reshape histories on the input time axis.
+
 - Live component couplers support source-to-receiver normalization through
   physical space, retaining the receiving variable order. Optional initial
   states supply inclusive trailing-average endpoints for GLORYS coupling;

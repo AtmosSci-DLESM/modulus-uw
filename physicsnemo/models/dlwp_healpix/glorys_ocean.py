@@ -449,14 +449,19 @@ class GlorysOceanModel(Module):
             "output_channels": len(self.channels),
             "n_constants": 1,
             "decoder_input_channels": 0,
-            "coupled_channels": 2 * len(self.forcing_channels),
+            "coupled_channels": self.backbone.output_time_dim
+            * len(self.forcing_channels),
             "couplings_time_first": True,
             "input_time_dim": 2,
-            "output_time_dim": 2,
-            "delta_t": 96,
             "presteps": 0,
             "residual_prediction": True,
         }
+        if self.backbone.output_time_dim not in (1, 2) or self.backbone.delta_t not in (
+            24,
+            48,
+            96,
+        ):
+            raise ValueError("Ocean requires 24/48/96h steps and one or two outputs")
         for name, value in required.items():
             if getattr(self.backbone, name) != value:
                 raise ValueError(f"Ocean backbone requires {name}={value!r}")
@@ -472,11 +477,15 @@ class GlorysOceanModel(Module):
             or list(params["variables"]) != list(self.forcing_channels)
             or not params.get("prepared_coupled_data", False)
             or [pd.Timedelta(t).total_seconds() for t in params["input_times"]]
-            != [96 * 3600, 192 * 3600]
-            or pd.Timedelta(params["averaging_window"]).total_seconds() != 96 * 3600
+            != [
+                self.backbone.delta_t * i * 3600
+                for i in range(1, self.backbone.output_time_dim + 1)
+            ]
+            or pd.Timedelta(params["averaging_window"]).total_seconds()
+            != self.backbone.delta_t * 3600
         ):
             raise ValueError(
-                "Ocean coupling requires both real prepared 96h/192h forcing windows"
+                "Ocean coupling requires real prepared forcing at every output valid time"
             )
         if self.state_policy.mask.shape[-2:] != (self.backbone.nside[0],) * 2:
             raise ValueError(
@@ -683,16 +692,18 @@ class GlorysOceanModel(Module):
         if native[3].shape != (
             1,
             batch,
-            2 * len(self.forcing_channels),
+            self.output_time_dim * len(self.forcing_channels),
             faces,
             height,
             width,
         ):
-            raise ValueError("Expected actual prepared couplings [1,B,2*K,12,H,W]")
-        states = self.backbone(native, **kwargs)
-        if states.shape != history.shape:
             raise ValueError(
-                "Native RecUNet returned an incompatible two-lead state shape"
+                "Expected actual prepared couplings [1,B,output_times*K,12,H,W]"
+            )
+        states = self.backbone(native, **kwargs)
+        if states.shape != (batch, faces, self.output_time_dim, count, height, width):
+            raise ValueError(
+                "Native RecUNet returned an incompatible output state shape"
             )
         states = self.state_policy(states.permute(0, 2, 3, 1, 4, 5), strict=True)
         return states.permute(0, 3, 1, 2, 4, 5)
