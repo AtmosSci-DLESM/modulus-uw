@@ -118,7 +118,7 @@ class HEALPixRecUNet(Module):
         couplings_time_first: bool, optional
             Whether coupled data is in [T, B, C, F, H, W] rather than [B, F, T, C, H, W] format
         constraints: list[DictConfig], optional
-            List of hydra instantiable DictConfigs specifying constraints 
+            List of hydra instantiable DictConfigs specifying constraints
             (e.g., nonnegativity) to be applied to the model outputs
         hpx_padding_mode: str, optional
             Padding strategy: ``earth2grid``, ``karlbauer``, or ``isolatitude``.
@@ -135,7 +135,9 @@ class HEALPixRecUNet(Module):
             and ``True`` to ``earth2grid`` (legacy configs). Prefer ``hpx_padding_mode``.
         """
         super().__init__()
-        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(
+            enable_healpixpad, hpx_padding_mode
+        )
         self.channel_dim = 2  # Now 2 with [B, F, T*C, H, W]. Was 1 in old data format with [B, T*C, F, H, W]
 
         self.input_channels = input_channels
@@ -160,7 +162,7 @@ class HEALPixRecUNet(Module):
         self.input_time_dim = input_time_dim
         self.output_time_dim = output_time_dim
         self.delta_t = int(pd.Timedelta(delta_time).total_seconds() // 3600)
-        if reset_cycle == float('inf'):
+        if reset_cycle == float("inf"):
             self.reset_cycle = reset_cycle
         else:
             self.reset_cycle = int(pd.Timedelta(reset_cycle).total_seconds() // 3600)
@@ -279,7 +281,9 @@ class HEALPixRecUNet(Module):
                 inputs[2].expand(
                     *tuple([inputs[0].shape[0]] + len(inputs[2].shape) * [-1])
                 ),  # constants
-                inputs[3].permute(0, 2, 1, 3, 4) if self.couplings_time_first else inputs[3],  # coupled inputs
+                inputs[3].permute(0, 2, 1, 3, 4)
+                if self.couplings_time_first
+                else inputs[3],  # coupled inputs
             ]
             res = th.cat(result, dim=self.channel_dim)
 
@@ -388,10 +392,16 @@ class HEALPixRecUNet(Module):
             List of hydra instantiable DictConfigs specifying constraints
         """
         if constraints is not None:
-            self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
+            self.constraints = [
+                instantiate(constraints[constraint]) for constraint in constraints
+            ]
 
     def _initialize_hidden(
-        self, inputs: Sequence, outputs: Sequence, step: int, conditions_cln: Sequence = None
+        self,
+        inputs: Sequence,
+        outputs: Sequence,
+        step: int,
+        conditions_cln: Sequence = None,
     ) -> None:
         """Initialize the hidden layers
 
@@ -439,19 +449,26 @@ class HEALPixRecUNet(Module):
                 s = step - self.presteps + prestep
                 if len(self.couplings) > 0:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[s - 1][:, :, :, :self.input_channels]]
+                        inputs=[outputs[s - 1][:, :, :, : self.input_channels]]
                         + list(inputs[1:3])
                         + [inputs[3][step - (prestep - self.presteps)]],
                         step=s + 1,
                     )
                 else:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[s - 1][:, :, :, :self.input_channels]] + list(inputs[1:]), step=s + 1
+                        inputs=[outputs[s - 1][:, :, :, : self.input_channels]]
+                        + list(inputs[1:]),
+                        step=s + 1,
                     )
             # Forward the data through the model to initialize hidden states
-            self.decoder(self.encoder(input_tensor, conditions_cln=conditions_cln), conditions_cln=conditions_cln)
+            self.decoder(
+                self.encoder(input_tensor, conditions_cln=conditions_cln),
+                conditions_cln=conditions_cln,
+            )
 
-    def forward(self, inputs: Sequence, output_only_last=False, conditions_cln=None) -> th.Tensor:
+    def forward(
+        self, inputs: Sequence, output_only_last=False, conditions_cln=None
+    ) -> th.Tensor:
         """
         Forward pass of the HEALPixUnet
 
@@ -461,15 +478,15 @@ class HEALPixRecUNet(Module):
             Inputs to the model, of the form [prognostics|TISR|constants|coupled inputs].
             [B*Cond, F, T, C, H, W] is the format for prognostics and TISR. Cond is the number of (optional) conditional inputs.
                 Note the time dimension in prognostics is for initialization and hidden state priming (input_time_dim*2) while
-                the T dimension in TISR is for initialization and hidden state priming as well as roll-out. There are 2 additional 
-                time steps provided to TISR that are apparently not used. 
+                the T dimension in TISR is for initialization and hidden state priming as well as roll-out. There are 2 additional
+                time steps provided to TISR that are apparently not used.
             [F, C, H, W] is the format for constants
             [T, B*Cond, C, F, H, W] is the format for coupled inputs. Here time is for initialization and roll-out (one per model step).
         output_only_last: bool, optional
             If only the last dimension of the outputs should be returned
         conditions_cln: Sequence, optional
-            If the model is using conditional normalization, this is a sequence of tensors that will be used to condition the 
-            normalization layers. The shape of the tensors should be [Cond*B, N], where N is the size of the conditions, Cond is the 
+            If the model is using conditional normalization, this is a sequence of tensors that will be used to condition the
+            normalization layers. The shape of the tensors should be [Cond*B, N], where N is the size of the conditions, Cond is the
             number of conditions, and B is the batch size. It is expected that the inputs have a leading dimension of Cond*B (e.g., data
             for different ensmble members/conditions has been duplicated along this dimension). The sequence should have length equal to
             the model's `n_integration_steps` attribute.
@@ -485,7 +502,12 @@ class HEALPixRecUNet(Module):
             # (Re-)initialize recurrent hidden states
             if (step * (self.delta_t * self.input_time_dim)) % self.reset_cycle == 0:
                 if conditions_cln is not None:
-                    self._initialize_hidden(inputs=inputs, outputs=outputs, step=step, conditions_cln=conditions_cln[step])
+                    self._initialize_hidden(
+                        inputs=inputs,
+                        outputs=outputs,
+                        step=step,
+                        conditions_cln=conditions_cln[step],
+                    )
                 else:
                     self._initialize_hidden(inputs=inputs, outputs=outputs, step=step)
 
@@ -520,14 +542,15 @@ class HEALPixRecUNet(Module):
             else:
                 if len(self.couplings) > 0:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[-1][:, :, :, :self.input_channels]]
+                        inputs=[outputs[-1][:, :, :, : self.input_channels]]
                         + list(inputs[1:3])
                         + [inputs[3][self.presteps + step]],
                         step=step + self.presteps,
                     )
                 else:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[-1][:, :, :, :self.input_channels]] + list(inputs[1:]),
+                        inputs=[outputs[-1][:, :, :, : self.input_channels]]
+                        + list(inputs[1:]),
                         step=step + self.presteps,
                     )
             # th.cuda.nvtx.range_pop()
@@ -547,11 +570,14 @@ class HEALPixRecUNet(Module):
 
             # Residual prediction
             combined = self._reshape_outputs(decodings)
-            prognostics = combined[:, :, :, :self.input_channels]
-            orig_input = self._reshape_outputs(input_tensor[:, : self.input_channels * self.input_time_dim])
+            prognostics = combined[:, :, :, : self.input_channels]
+            # Input histories retain their own time axis even for one output.
+            orig_input = self.unfold(
+                input_tensor[:, : self.input_channels * self.input_time_dim]
+            ).unflatten(2, (self.input_time_dim, self.input_channels))
             if self.residual_prediction:
                 prognostics += orig_input[:, :, -1:, ...]
-            diagnostics = combined[:, :, :, self.input_channels:]
+            diagnostics = combined[:, :, :, self.input_channels :]
             out = th.cat([prognostics, diagnostics], dim=3)
 
             # Apply constraints
