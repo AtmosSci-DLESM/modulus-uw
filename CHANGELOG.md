@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Cast isolatitude gather indices to int64 for compatibility with older PyTorch
+  releases (backport of PR #86).
+
 - GLORYS supports 24/48/96-hour steps with two histories and one or two outputs.
   One-output RecUNet residuals reshape histories on the input time axis.
 
