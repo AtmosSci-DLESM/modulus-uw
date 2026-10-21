@@ -39,9 +39,9 @@ if LocalStore is not None:
 
         zarr's ``LocalStore`` opens the file and seeks to its end before every
         ranged read to learn the size. On Lustre that size lookup is a remote
-        call per read; it cost about 9% of v2-18 training throughput on
-        Perlmutter. A positional read needs no size. Shard-index (suffix) and
-        whole-key reads keep the base implementation.
+        call per read; it cost about 7% of training throughput on Perlmutter.
+        A positional read needs no size. Shard-index (suffix) and whole-key
+        reads keep the base implementation.
         """
 
         def get_sync(self, key, *, prototype=None, byte_range=None):
