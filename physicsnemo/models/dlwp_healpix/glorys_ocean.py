@@ -641,9 +641,10 @@ class GlorysOceanModel(Module):
     def forward(self, inputs, **kwargs):
         """Chain native blocks for training; one forcing block remains inference.
 
-        The native coupler supplies [blocks,B,2*K,F,H,W] forcing windows.
+        The native coupler supplies [blocks,B,output_steps*K,F,H,W] forcing windows.
         Only the initial observed history enters the rollout. Each subsequent
-        call consumes the full constrained predicted pair without detachment.
+        call consumes the latest two states, sliding in constrained predictions
+        without detachment (one or two new states per native call).
         Architecture, parameter names and single-block archives are unchanged.
         """
         if not isinstance(inputs, (list, tuple)) or len(inputs) not in (3, 4):
@@ -657,8 +658,11 @@ class GlorysOceanModel(Module):
         outputs = []
         for step in range(forcing.shape[0]):
             native = [history, *inputs[1:-1], forcing[step : step + 1]]
-            history = self._forward_block(native, **kwargs)
-            outputs.append(history)
+            prediction = self._forward_block(native, **kwargs)
+            outputs.append(prediction)
+            history = torch.cat((history, prediction), dim=2)[
+                :, :, -self.input_time_dim :
+            ]
         return torch.cat(outputs, dim=2)
 
     def _forward_block(self, inputs, **kwargs):

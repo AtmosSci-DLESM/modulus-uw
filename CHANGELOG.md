@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- GLORYS autoregressive training supports one-output sliding histories and
+  forcing strides independent of the two-history input window.
+
 - Remove GLORYS inland-water refill constructor options and model buffers.
 
 - Cast isolatitude gather indices to int64 for compatibility with older PyTorch

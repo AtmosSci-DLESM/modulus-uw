@@ -454,6 +454,7 @@ class TrailingAverageCoupler(BaseCoupler):
         averaging_window: str = "24h",
         input_times: Sequence = [pd.Timedelta("24h"), pd.Timedelta("48h")],
         prepared_coupled_data=True,
+        integration_time_dim=None,
     ):
         """
         Parameters
@@ -478,12 +479,24 @@ class TrailingAverageCoupler(BaseCoupler):
         input_times: Sequence, optional
             sequence of pandas Timedelta objects that indicate which times are to be coupled,
             default [pd.Timedelta("24h"), pd.Timedelta("48h")]
+        integration_time_dim: int, optional
+            Predicted time steps per native model call, used for forcing stride
+            and number of integration blocks. Defaults to input_time_dim.
         prepared_coupled_data: boolean, optional
             If True assumes data in dataset has been prepared appropriately for training:
             averages have already been calculated so that each time step denotes
             the right side of a averaging_window window.
             This is highly recommended for training, default True
         """
+        self.integration_time_dim = (
+            input_time_dim if integration_time_dim is None else integration_time_dim
+        )
+        if (
+            isinstance(self.integration_time_dim, bool)
+            or not isinstance(self.integration_time_dim, int)
+            or self.integration_time_dim < 1
+        ):
+            raise ValueError("integration_time_dim must be a positive integer")
         super().__init__(
             dataset=dataset,
             batch_size=batch_size,
@@ -517,6 +530,10 @@ class TrailingAverageCoupler(BaseCoupler):
             self.time_da = self.ds["time"].values
         self._set_time_increments()
 
+    def _compute_coupled_integration_dim(self):
+        """Count native calls using their output stride rather than history size."""
+        return self.presteps + max(self.output_time_dim // self.integration_time_dim, 1)
+
     def compute_coupled_indices(self, interval, data_time_step):
         """
         Called by CoupledDataset to compute static indices for training
@@ -537,7 +554,7 @@ class TrailingAverageCoupler(BaseCoupler):
             for i in range(self.coupled_integration_dim):
                 self._coupled_offsets[b, i, :] = (
                     b
-                    + (self.input_time_dim * i + 1) * interval
+                    + (self.integration_time_dim * i + 1) * interval
                     + np.array([ts / data_time_step for ts in self.input_times])
                 )
 
@@ -571,8 +588,8 @@ class TrailingAverageCoupler(BaseCoupler):
             for i, r in enumerate(averaging_window_max_indices):
                 averaging_slices[j].append(
                     slice(
-                        self.input_time_dim * j * di + i * di,
-                        self.input_time_dim * j * di + r,
+                        self.integration_time_dim * j * di + i * di,
+                        self.integration_time_dim * j * di + r,
                     )
                 )
         self.averaging_slices = averaging_slices
