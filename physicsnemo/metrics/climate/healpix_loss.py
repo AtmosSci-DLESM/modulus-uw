@@ -21,7 +21,6 @@ import torch as th
 import xarray as xr
 
 import earth2grid
-from cuhpx import SHTCUDA, iSHTCUDA
 from earth2grid.healpix import HEALPIX_PAD_XY, PixelOrder
 from physicsnemo.models.dlwp_healpix_layers.healpix_paddings import make_hpx_padding_layer
 """
@@ -641,6 +640,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
         self.lmax = lmax
         self.mmax = mmax
         self.nside = nside
+        from cuhpx import SHTCUDA, iSHTCUDA
+
         self.sht = SHTCUDA(nside=nside, lmax=lmax, mmax=mmax, quad_weights='ring')
         src_grid = earth2grid.healpix.Grid(level=int(np.log2(nside)), pixel_order=HEALPIX_PAD_XY)
         tar_grid = earth2grid.healpix.Grid(level=int(np.log2(nside)), pixel_order=PixelOrder.RING)
@@ -1117,8 +1118,8 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         """
         if self.patch_weights is None:
             return th.linalg.vector_norm(diff_vec, dim=-1)
-        weighted_sq = diff_vec ** 2 * self.patch_weights
-        return th.sqrt((weighted_sq).sum(dim=-1).clamp(min=0.0))
+        # vector_norm defines a finite zero subgradient for identical members.
+        return th.linalg.vector_norm(diff_vec * self.patch_weights.sqrt(), dim=-1)
 
     def _extract_patches_prediction(self, prediction: th.Tensor) -> th.Tensor:
         """
@@ -1180,6 +1181,63 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         patches = patches.reshape(b, t, f, c, d, h, w)
         patches = patches.permute(0, 2, 1, 3, 5, 6, 4)  # [B, F, T, C, H, W, D]
         return patches
+
+    def masked_channel_sums(self, prediction, target, ocean_mask):
+        """Return ocean PES numerators and valid-patch counts per channel.
+
+        Keep the unmasked AS PES coefficients and HEALPix patch geometry. As
+        in ocean afPES, exclude invalid components inside each vector, rescale
+        partial patches to full-patch support, and drop fully invalid patches.
+        Nonfinite targets are excluded *before* subtraction. Predictions over
+        valid targets must remain finite. No channel weights are applied here.
+
+        ``ocean_mask`` broadcasts to native target [B,F,T,C,H,W]. Padding uses
+        normalized valid data so isolatitude interpolation cannot mix masked
+        filler into valid coastal patch components. Its interpolated validity
+        supplies fractional component weights across HEALPix face boundaries.
+        """
+        b, f, t, c, h, w = target.shape
+        prediction = prediction.reshape(self.n_members, b, f, t, c, h, w).float()
+        target = target.float()
+        mask = th.broadcast_to(ocean_mask.to(target), target.shape)
+        if not th.isfinite(mask).all() or (mask < 0).any() or (mask > 1).any():
+            raise ValueError("Ocean mask must be finite weights in [0,1]")
+        valid = (mask > 0) & th.isfinite(target)
+        if (valid.unsqueeze(0) & ~th.isfinite(prediction)).any():
+            raise FloatingPointError("Nonfinite prediction over valid ocean target")
+        support = th.where(valid, mask, 0)
+        safe_target = th.where(valid, target, 0) * support
+        safe_prediction = th.where(valid.unsqueeze(0), prediction, 0) * support
+        components = self._extract_patches_target(support).clamp(0, 1)
+        component_denominator = components.clamp_min(th.finfo(th.float32).tiny)
+        pred = self._extract_patches_prediction(safe_prediction) / component_denominator
+        truth = self._extract_patches_target(safe_target) / component_denominator
+        # _weighted_patch_norm applies optional AS Gaussian weights itself.
+        weights = (
+            self.patch_weights
+            if self.patch_weights is not None
+            else th.ones(self.patch_size**2, device=target.device)
+        )
+        available = (components * weights).sum(dim=-1)
+        valid_patch = available > 0
+        scale = weights.sum() / th.where(valid_patch, available, 1)
+        component_scale = th.sqrt(components * scale.unsqueeze(-1))
+        skill = self._weighted_patch_norm((pred - truth.unsqueeze(0)) * component_scale)
+        if self.n_members == 2:
+            spread = self._weighted_patch_norm((pred[0] - pred[1]) * component_scale)
+            score = self.averaging_coeff * (skill.sum(0) - self.coeff_eps * spread)
+        else:
+            spread = sum(
+                self._weighted_patch_norm((pred[i] - pred[j]) * component_scale)
+                for i in range(self.n_members)
+                for j in range(i + 1, self.n_members)
+            )
+            score = self.averaging_coeff * (
+                2 * (self.n_members - 1) * skill.sum(0) - 2 * self.coeff_eps * spread
+            )
+        score = th.where(valid_patch, score, 0)
+        reduce = (0, 1, 2, 4, 5)
+        return score.sum(dim=reduce), valid_patch.sum(dim=reduce)
 
     def forward(self, prediction, target, average_channels: bool = True):
         """

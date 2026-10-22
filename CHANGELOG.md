@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- AS patched energy score exposes ocean-masked per-channel sums and patch counts,
+  excluding missing targets before arithmetic and normalizing coastal patches.
+  Spectral-only cuhpx imports are deferred until the spectral loss is constructed.
+
 - The GLORYS training branch also supports prescribed and live coupled inference,
   preserving physical coupling normalization, model target resolution and
   alpha training strides.
