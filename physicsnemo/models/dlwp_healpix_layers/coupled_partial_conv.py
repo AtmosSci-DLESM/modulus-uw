@@ -114,8 +114,8 @@ def load_spatial_mask(
     """
     ds = _open_mask_dataset(dataset_path)
     try:
-        # Named-array stores keep each constant as its own variable. That resolver
-        # ships with the per-variable loader; monolithic constants/channel_c masks
+        # Per-variable stores keep each constant as its own variable. That resolver
+        # ships with the per-variable loader; stacked constants/channel_c masks
         # still load when the resolver is not installed yet.
         try:
             from physicsnemo.datapipes.healpix.zarr_layout import resolve_mask_field
