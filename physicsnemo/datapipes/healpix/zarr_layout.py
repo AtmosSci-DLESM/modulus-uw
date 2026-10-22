@@ -12,6 +12,7 @@ Catalogs already written with ``layout=named_arrays_healpix`` still load.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from typing import Any, Mapping, Sequence
 
@@ -30,6 +31,29 @@ COORD_KEYS = frozenset({"time", "face", "height", "width", "lat", "lon"})
 PER_VARIABLE_LAYOUT_ATTR = "per_variable"
 # Written by earlier converters and the b24 builder.
 _LEGACY_PER_VARIABLE_LAYOUT_ATTR = "named_arrays_healpix"
+
+# A one-off bulk read (a rollout's multi-year truth, read once per run) brings
+# hundreds of GB through the page cache that nothing reads again. Under a job
+# memory limit those pages fill the cgroup, and every process in the job then
+# stalls in reclaim. See ``dropping_read_pages``.
+_DROP_READ_PAGES = False
+
+
+@contextlib.contextmanager
+def dropping_read_pages():
+    """Within this block, local byte-range reads leave their pages out of the page cache.
+
+    Readahead is switched off for each read, so only the requested range enters
+    the cache, and that range is dropped right after it is read. The flag is
+    process-wide: use it around a bulk read that no other thread of the process
+    overlaps with reads that should stay cached.
+    """
+    global _DROP_READ_PAGES
+    previous, _DROP_READ_PAGES = _DROP_READ_PAGES, True
+    try:
+        yield
+    finally:
+        _DROP_READ_PAGES = previous
 
 
 if LocalStore is not None:
@@ -53,7 +77,12 @@ if LocalStore is not None:
                 return None
             try:
                 length = byte_range.end - byte_range.start
+                drop = _DROP_READ_PAGES
+                if drop:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)  # no readahead
                 data = os.pread(fd, length, byte_range.start)
+                if drop:
+                    os.posix_fadvise(fd, byte_range.start, length, os.POSIX_FADV_DONTNEED)
             finally:
                 os.close(fd)
             if len(data) != length:  # past EOF: let zarr's own read decide
