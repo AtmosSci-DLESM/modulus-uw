@@ -45,7 +45,7 @@ def _make_stacked_store(path, *, t: int = 4, c: int = 3, f: int = 12, h: int = 4
 
 
 def _make_per_variable_store(
-    path, *, t: int = 4, f: int = 12, h: int = 4, w: int = 4, layout: str = "per_variable"
+    path, *, t: int = 4, f: int = 12, h: int = 4, w: int = 4, attrs: dict | None = None
 ):
     dynamic = ["t2m", "u10m", "v10m"]
     constants = ["lsm", "z"]
@@ -63,26 +63,27 @@ def _make_per_variable_store(
     ds = xr.Dataset(
         data_vars,
         coords={"time": np.arange(t), **_spatial_coords(f=f, h=h, w=w)},
-        attrs={"layout": layout},
+        attrs=attrs or {},
     )
     ds.to_zarr(path, mode="w")
     return zarr.open_group(str(path), mode="r")
 
 
 def test_layout_detection(tmp_path):
+    """The layout comes from the store's arrays; root attributes are ignored."""
     stacked = _make_stacked_store(tmp_path / "stacked")
     per_var = _make_per_variable_store(tmp_path / "per_var")
-    legacy = _make_per_variable_store(
-        tmp_path / "legacy", layout="named_arrays_healpix"
+    # Catalogs carry assorted attributes, including an unrelated ``layout``.
+    tagged = _make_per_variable_store(
+        tmp_path / "tagged", attrs={"layout": "named_arrays_healpix", "source": "x"}
     )
     assert is_stacked_layout(stacked) is True
     assert is_per_variable_layout(stacked) is False
     assert constants_are_stacked(stacked) is True
-    assert is_per_variable_layout(per_var) is True
-    assert is_stacked_layout(per_var) is False
-    assert constants_are_stacked(per_var) is False
-    assert is_per_variable_layout(legacy) is True
-    assert constants_are_stacked(legacy) is False
+    for ds in (per_var, tagged):
+        assert is_per_variable_layout(ds) is True
+        assert is_stacked_layout(ds) is False
+        assert constants_are_stacked(ds) is False
 
 
 def test_available_field_names_per_variable_store(tmp_path):
@@ -91,7 +92,7 @@ def test_available_field_names_per_variable_store(tmp_path):
 
 
 def test_load_channel_data_stacked_by_name(tmp_path):
-    ds = _make_stacked_store(tmp_path / "mono")
+    ds = _make_stacked_store(tmp_path / "stacked")
     time_sl = slice(0, 2)
     expected = np.asarray(ds["inputs"][time_sl, [0, 2]])
     loaded = load_channel_data(ds, time_sl, ["t2m", "v10m"])
@@ -181,7 +182,6 @@ def test_load_windowed_channel_data_stacked_matches_per_variable(tmp_path):
     per_var_xr = xr.Dataset(
         data_vars,
         coords={"time": np.arange(t), **_spatial_coords(f=f, h=h, w=w)},
-        attrs={"layout": "per_variable"},
     )
     per_var_path = tmp_path / "per_variable"
     per_var_xr.to_zarr(per_var_path, mode="w")
@@ -230,7 +230,6 @@ def _make_sharded_store(path, names=("t2m", "u10m"), *, t=20, shard_time=8, f=2,
             dimension_names=["time", "face", "height", "width"],
         )
         zarr.open_array(f"{path}/{name}", mode="a")[:] = data
-    zarr.open_group(str(path), mode="a").attrs["layout"] = "per_variable"
     return zarr.open_group(str(path), mode="r"), stored
 
 
@@ -331,11 +330,10 @@ def test_per_variable_reads_work_after_fork(tmp_path):
     assert queue.get(timeout=5) == expected
 
 
-def test_resolve_mask_field_per_variable_legacy_layout_attr(tmp_path):
+def test_resolve_mask_field_per_variable_store(tmp_path):
     """``channel_c`` selects a top-level array on a per-variable store.
 
-    The legacy ``named_arrays_healpix`` attribute is what catalogs already
-    on disk declare. The coupled stem calls this helper when it is installed.
+    The coupled stem calls this helper when it is installed.
     """
     f, h, w = 12, 4, 4
     land = np.zeros((f, h, w), dtype=np.float32)
@@ -343,7 +341,6 @@ def test_resolve_mask_field_per_variable_legacy_layout_attr(tmp_path):
     ds = xr.Dataset(
         {"lsm": (("face", "height", "width"), land)},
         coords=_spatial_coords(f=f, h=h, w=w),
-        attrs={"layout": "named_arrays_healpix"},
     )
     path = tmp_path / "mask_per_variable.zarr"
     ds.to_zarr(path, mode="w")
@@ -354,12 +351,34 @@ def test_resolve_mask_field_per_variable_legacy_layout_attr(tmp_path):
     opened.close()
 
 
-def test_missing_layout_attr_is_not_per_variable(tmp_path):
-    bare = _make_per_variable_store(tmp_path / "bare", layout="")
-    assert is_stacked_layout(bare) is False
-    assert is_per_variable_layout(bare) is False
-    with pytest.raises(ValueError, match="Unrecognized healpix Zarr layout"):
-        load_channel_data(bare, slice(0, 1), ["t2m"])
+def test_per_variable_detected_without_layout_attr(tmp_path):
+    bare = _make_per_variable_store(tmp_path / "bare")
+    assert dict(bare.attrs) == {}
+    assert is_per_variable_layout(bare) is True
+    np.testing.assert_array_equal(
+        load_channel_data(bare, slice(0, 2), ["u10m"]), np.full((2, 1, 12, 4, 4), 2.0)
+    )
+
+
+def test_warns_once_when_fused_pipeline_is_missing(tmp_path, monkeypatch):
+    """Per-variable reads without FusedCodecPipeline (zarr < 3.3) warn once per process."""
+    import warnings
+
+    from physicsnemo.datapipes.healpix import zarr_layout
+
+    def slow_read_warnings() -> list:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            load_channel_data(ds, slice(0, 2), ["t2m"])
+        return [w for w in caught if "zarr >= 3.3" in str(w.message)]
+
+    ds = _make_per_variable_store(tmp_path / "per_var")
+    monkeypatch.setattr(zarr_layout, "_warned_slow_reads", False)
+    assert slow_read_warnings() == []  # FusedCodecPipeline available
+
+    monkeypatch.setattr(zarr_layout, "_READ_CONFIG", {})
+    assert len(slow_read_warnings()) == 1
+    assert slow_read_warnings() == []  # once per process
 
 
 def test_stacked_getitem_matches_joint_inputs_scale(tmp_path):

@@ -81,7 +81,7 @@ class BaseCoupler(ABC):
         # extract important meta data from ds
         self.ds = dataset
         self.batch_size = batch_size
-        # Spatial size from coords when present (works for per-variable and mono stores).
+        # Spatial size from coords when present (works for per-variable and stacked stores).
         if "face" in self.ds and "height" in self.ds and "width" in self.ds:
             self.spatial_dims = (
                 int(self.ds["face"].shape[0]),
@@ -115,12 +115,6 @@ class BaseCoupler(ABC):
             self.use_zarr = True
             from .zarr_layout import available_field_names, is_stacked_layout
 
-            available = available_field_names(self.ds)
-            missing_variables = set(self.variables) - available
-            if missing_variables:
-                raise ValueError(
-                    f"Missing variables in dataset for coupling: {missing_variables}"
-                )
             if is_stacked_layout(self.ds):
                 # Iterate over self.variables in the outer loop so selected indices
                 # follow the order of self.variables (matching the xarray path's
@@ -133,6 +127,15 @@ class BaseCoupler(ABC):
                 self.ds_variable_indices = [
                     i for v in self.variables for i, ic in enumerate(channel_in) if ic == v
                 ]
+                available = set(channel_in)
+            else:
+                available = available_field_names(self.ds)
+            # Check if any of the requested variables are not in the dataset
+            missing_variables = set(self.variables) - available
+            if len(missing_variables) > 0:
+                raise ValueError(
+                    f"Missing variables in dataset for coupling: {missing_variables}"
+                )
         else:
             raise TypeError(
                 f"Coupler only supports xarray Datasets or zarr Groups, got {type(self.ds)}"
@@ -259,7 +262,7 @@ class BaseCoupler(ABC):
         if self.use_zarr:
             from .zarr_layout import load_channel_data
 
-            # Monolithic or per-variable (same helper as TimeSeriesDatasetZarr).
+            # Stacked or per-variable (same helper as TimeSeriesDatasetZarr).
             ds_index_range = load_channel_data(
                 self.ds,
                 index_range,
@@ -502,8 +505,8 @@ class TrailingAverageCoupler(BaseCoupler):
         self.averaging_window = pd.Timedelta(averaging_window)
 
         if self.use_zarr:
-            # Per-variable catalogs store datetime64 directly; stacked stores
-            # encode hours since start via CF units/calendar.
+            # Either layout may store time as datetime64 or as CF-encoded
+            # numbers (units/calendar attributes); decode the latter.
             time_arr = np.asarray(self.ds["time"][:])
             if np.issubdtype(time_arr.dtype, np.datetime64):
                 self.time_da = time_arr.astype("datetime64[ns]")
