@@ -28,6 +28,13 @@ from .healpix_blocks import (
     TransposedConvUpsample,
     SmoothedInterpolateConv,
 )
+from .reflection_steerable_blocks import (
+    ReflectionSteerableBasicConvBlock,
+    ReflectionSteerableConvGRUBlock,
+    ReflectionSteerableMulti_SymmetricConvNeXtBlock,
+    ReflectionSteerableSmoothedInterpolateConv,
+    ReflectionSteerableSymmetricConvNeXtBlock,
+)
 from .healpix_decoder import UNetDecoder
 from .healpix_encoder import UNetEncoder
 from .healpix_layers import HEALPixLayer
