@@ -215,7 +215,6 @@ class OceanStatePolicy(nn.Module):
         sst_nlon=1440,
         legacy_zero_fill_non_sst_land=True,
         interpolate_predicted_land=True,
-        inland_mask=None,
     ):
         super().__init__()
         self.channels = _names(channels)
@@ -262,15 +261,7 @@ class OceanStatePolicy(nn.Module):
                 raise ValueError(
                     "ETL land interpolation requires one shared ocean domain"
                 )
-            refill = (
-                torch.zeros_like(mask[0], dtype=torch.bool)
-                if inland_mask is None
-                else torch.as_tensor(inland_mask, dtype=torch.bool).clone()
-            )
-            if refill.shape != mask.shape[1:] or (refill & mask[0].bool()).any():
-                raise ValueError("Inland refill cells must be outside the ocean domain")
-            self.register_buffer("inland_mask", refill)
-            if not mask[0].all() and (interpolate_predicted_land or refill.any()):
+            if not mask[0].all() and interpolate_predicted_land:
                 self.sst_interpolator = TripleInterpSST(
                     mask[0].bool(), sst_nlat, sst_nlon
                 )
@@ -341,11 +332,7 @@ class OceanStatePolicy(nn.Module):
             result.append(value)
         result = torch.cat(result, dim=2)
         if not self.legacy_zero_fill_non_sst_land and self.sst_interpolator is not None:
-            refill = (
-                ~self.mask
-                if strict and self.interpolate_predicted_land
-                else self.inland_mask
-            )
+            refill = ~self.mask if strict else torch.zeros_like(self.mask)
             if refill.any():
                 # Reuse the existing ETL operator channel by channel to bound
                 # peak latlon workspace rather than batch all 29 fields at once.
@@ -390,7 +377,6 @@ class GlorysOceanModel(Module):
         sst_nlon=1440,
         legacy_zero_fill_non_sst_land=True,
         interpolate_predicted_land=True,
-        inland_mask=None,
     ):
         from hydra.utils import instantiate
         from omegaconf import OmegaConf
@@ -416,7 +402,6 @@ class GlorysOceanModel(Module):
             sst_nlon,
             legacy_zero_fill_non_sst_land,
             interpolate_predicted_land,
-            inland_mask,
         )
         self.backbone = instantiate(self.backbone_config, _recursive_=False)
         if type(self.backbone) is not HEALPixRecUNet:
@@ -503,7 +488,6 @@ class GlorysOceanModel(Module):
             self._args["__args__"].update(
                 legacy_zero_fill_non_sst_land=False,
                 interpolate_predicted_land=self.state_policy.interpolate_predicted_land,
-                inland_mask=self.state_policy.inland_mask.detach().cpu().tolist(),
             )
         return self._args
 
@@ -655,6 +639,29 @@ class GlorysOceanModel(Module):
         self.backbone.reset()
 
     def forward(self, inputs, **kwargs):
+        """Chain native blocks for training; one forcing block remains inference.
+
+        The native coupler supplies [blocks,B,2*K,F,H,W] forcing windows.
+        Only the initial observed history enters the rollout. Each subsequent
+        call consumes the full constrained predicted pair without detachment.
+        Architecture, parameter names and single-block archives are unchanged.
+        """
+        if not isinstance(inputs, (list, tuple)) or len(inputs) not in (3, 4):
+            raise ValueError("Expected a native prognostics/constants/couplings LIST")
+        forcing = inputs[-1]
+        if forcing.ndim != 6 or forcing.shape[0] < 1:
+            raise ValueError("Expected one or more native forcing blocks")
+        if forcing.shape[0] == 1:
+            return self._forward_block(inputs, **kwargs)
+        history = inputs[0]
+        outputs = []
+        for step in range(forcing.shape[0]):
+            native = [history, *inputs[1:-1], forcing[step : step + 1]]
+            history = self._forward_block(native, **kwargs)
+            outputs.append(history)
+        return torch.cat(outputs, dim=2)
+
+    def _forward_block(self, inputs, **kwargs):
         """Process real native LIST inputs and return native [B,F,T,C,H,W] states.
 
         The existing no-insolation data pipe supplies [prognostics, constants,

@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- GLORYS differentiable autoregressive training chains native two-output calls
+  using integrated forcing windows and full predicted-pair feedback, retaining
+  the existing single-block inference and archive interfaces.
+
 - GLORYS models support standard PhysicsNeMo Module archives with JSON-ready
   construction metadata and strict scientific state loading, preserving v3
   ocean state policy and interpolation precision.
@@ -26,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added Multi-Storage Client to allow checkpointing to/from Object Storage
 
 ### Changed
+
+- Remove GLORYS inland-water refill constructor options and model buffers.
 
 - Cast isolatitude gather indices to int64 for compatibility with older PyTorch
   releases (backport of PR #86).
