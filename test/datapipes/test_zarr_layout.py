@@ -265,6 +265,48 @@ def test_open_healpix_zarr_positional_reads_match(tmp_path):
             assert np.array_equal(loaded[:, c], stored[name][sl], equal_nan=True)
 
 
+def test_dropping_read_pages_drops_only_inside_the_block(tmp_path, monkeypatch):
+    import os
+
+    from physicsnemo.datapipes.healpix import zarr_layout
+
+    _, stored = _make_sharded_store(tmp_path / "sharded")
+    group = zarr_layout.open_healpix_zarr(str(tmp_path / "sharded"))
+    advice = []
+    real = os.posix_fadvise
+    monkeypatch.setattr(
+        zarr_layout.os,
+        "posix_fadvise",
+        lambda fd, offset, length, flag: (advice.append(flag), real(fd, offset, length, flag)),
+    )
+    load_channel_data(group, slice(2, 12), ["t2m"])
+    assert advice == []
+    with zarr_layout.dropping_read_pages():
+        loaded = load_channel_data(group, slice(2, 12), ["t2m"])
+    assert np.array_equal(loaded[:, 0], stored["t2m"][2:12], equal_nan=True)
+    assert advice and set(advice) == {os.POSIX_FADV_RANDOM, os.POSIX_FADV_DONTNEED}
+    n = len(advice)
+    load_channel_data(group, slice(2, 12), ["t2m"])
+    assert len(advice) == n  # back to cached reads after the block
+
+
+def test_per_variable_arrays_use_fused_pipeline(tmp_path):
+    """Per-variable arrays decode through FusedCodecPipeline on zarr >= 3.3.
+
+    Without it reads fall back to the active pipeline, which is correct but
+    slower; this fails if a zarr release renames or drops the pipeline.
+    """
+    from packaging.version import Version
+
+    from physicsnemo.datapipes.healpix.zarr_layout import _async_array
+
+    if Version(zarr.__version__) < Version("3.3"):
+        pytest.skip("FusedCodecPipeline needs zarr >= 3.3")
+    group, _ = _make_sharded_store(tmp_path / "sharded")
+    pipeline = type(_async_array(group, "t2m").codec_pipeline).__name__
+    assert pipeline == "FusedCodecPipeline", f"per-variable reads use {pipeline}"
+
+
 def _read_in_child(queue, path):
     group = zarr.open_group(path, mode="r")
     queue.put(float(np.nansum(load_channel_data(group, slice(8, 16), ["t2m", "u10m"]))))
