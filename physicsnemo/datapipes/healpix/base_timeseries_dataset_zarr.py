@@ -199,21 +199,27 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                 "Either start and end date or forecast_init_times must be provided"
             )
 
-        # Validate requested fields exist in the store.
-        from .zarr_layout import available_field_names
+        # Validate requested fields exist in the store: a stacked store lists them
+        # in ``channel_in`` / ``channel_c``, a per-variable store as top-level arrays.
+        from .zarr_layout import available_field_names, is_stacked_layout
 
-        available = available_field_names(self.ds)
+        stacked = is_stacked_layout(self.ds)
+        available = (
+            set(self.ds["channel_in"][:]) if stacked else available_field_names(self.ds)
+        )
         missing_channels = set(self.staging_variables) - available
-        if missing_channels:
+        if len(missing_channels) > 0:
             raise KeyError(
-                f"Requested input or output variables not found in dataset: {missing_channels}"
+                f"Requested Input, coupled, or output variables not found in dataset: {missing_channels}"
             )
 
         self._get_time_da(self.dataset_path, start_date, end_date)
 
         if constant_variables:
+            if stacked:
+                available = set(self.ds["channel_c"][:])
             missing_constants = set(constant_variables) - available
-            if missing_constants:
+            if len(missing_constants) > 0:
                 raise KeyError(
                     f"Requested constants not found in dataset: {missing_constants}"
                 )
@@ -537,6 +543,14 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             batch_size = self.batch_size - (window_max_index - self.total_samples)
         else:
             batch_size = self.batch_size
+        if batch_size < 0:
+            # Fail loudly: slicing the sample indices with a negative batch size
+            # would silently return mis-sized batches.
+            raise ValueError(
+                f"Index {item} gives a batch of {batch_size} samples (time window "
+                f"[{window_start_index}, {window_max_index}), "
+                f"total_samples={self.total_samples})."
+            )
         return (window_start_index, window_max_index), batch_size
 
     def _get_forecast_sol_times(self, item: int) -> np.ndarray:

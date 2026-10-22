@@ -149,7 +149,7 @@ def test_TimeSeriesDataset_missing_time(tmp_path):
         )
 
 
-def _make_minimal_healpix_zarr(path, channel_in, n_time=8):
+def _make_minimal_healpix_zarr(path, channel_in, n_time=8, channel_c=()):
     """Write a tiny stacked HEALPix zarr suitable for TimeSeriesDatasetZarr."""
     face, height, width = 1, 2, 2
     times = pd.date_range("1979-01-01", periods=n_time, freq="6h")
@@ -176,6 +176,12 @@ def _make_minimal_healpix_zarr(path, channel_in, n_time=8):
             "width": np.arange(width),
         },
     )
+    if channel_c:
+        ds["constants"] = (
+            ("channel_c", "face", "height", "width"),
+            np.zeros((len(channel_c), face, height, width), dtype="float32"),
+        )
+        ds = ds.assign_coords(channel_c=list(channel_c))
     ds.to_zarr(path)
     return times
 
@@ -229,6 +235,96 @@ def test_TimeSeriesDataset_forecast_skips_missing_diagnostic_channels(tmp_path):
     sample = forecast_ds[0]
     assert isinstance(sample, list)
     assert sample[0].shape[3] == len(input_variables)
+
+
+def test_TimeSeriesDataset_stacked_names_checked_against_channels(tmp_path):
+    """On a stacked store, inputs come from ``channel_in`` and constants from ``channel_c``."""
+    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
+        TimeSeriesDatasetZarr,
+    )
+
+    dataset_path = tmp_path / "stacked.zarr"
+    _make_minimal_healpix_zarr(dataset_path, channel_in=["z500"], channel_c=["lsm"])
+    kwargs = dict(
+        dataset_path=str(dataset_path),
+        data_time_step="6h",
+        time_step="6h",
+        scaling=omegaconf.DictConfig(
+            {"z500": {"mean": 0.0, "std": 1.0}, "lsm": {"mean": 0.0, "std": 1.0}}
+        ),
+        start_date="1979-01-01",
+        end_date="1979-01-02",
+        batch_size=1,
+    )
+    with pytest.raises(KeyError, match="Requested Input, coupled, or output variables"):
+        TimeSeriesDatasetZarr(input_variables=["z500", "lsm"], **kwargs)
+    with pytest.raises(KeyError, match="Requested constants not found"):
+        TimeSeriesDatasetZarr(
+            input_variables=["z500"], constant_variables=["z500"], **kwargs
+        )
+    TimeSeriesDatasetZarr(
+        input_variables=["z500"], constant_variables=["lsm"], **kwargs
+    )
+
+
+def test_TimeSeriesDataset_negative_batch_size_raises(tmp_path):
+    """A window that gives a negative batch size raises instead of returning a mis-sized batch."""
+    from physicsnemo.datapipes.healpix.timeseries_dataset_zarr import (
+        TimeSeriesDatasetZarr,
+    )
+
+    dataset_path = tmp_path / "stacked.zarr"
+    times = _make_minimal_healpix_zarr(dataset_path, channel_in=["z500"], n_time=16)
+    dataset = TimeSeriesDatasetZarr(
+        dataset_path=str(dataset_path),
+        data_time_step="6h",
+        time_step="6h",
+        scaling=omegaconf.DictConfig({"z500": {"mean": 0.0, "std": 1.0}}),
+        input_variables=["z500"],
+        start_date=str(times[8]),
+        end_date=str(times[15]),
+        batch_size=2,
+        drop_last=False,
+    )
+    with pytest.raises(ValueError, match="gives a batch of"):
+        dataset[len(dataset) - 1]
+
+
+def _set_up_data_module(queue, dataset_path, init_times):
+    import zarr.core.sync
+
+    from physicsnemo.datapipes.healpix.data_modules_zarr import (
+        TimeSeriesDataModuleZarr,
+    )
+
+    data_module = TimeSeriesDataModuleZarr(
+        dataset_path=dataset_path,
+        input_variables=["z500"],
+        batch_size=1,
+        scaling=omegaconf.DictConfig({"z500": {"mean": 0.0, "std": 1.0}}),
+        forecast_init_times=init_times,
+        max_threads_per_worker=2,
+    )
+    data_module.setup()
+    data_module.test_dataset[0]
+    queue.put(zarr.core.sync._executor._max_workers)
+
+
+def test_TimeSeriesDataModule_max_threads_per_worker(tmp_path):
+    """``max_threads_per_worker`` sizes the pool zarr reads with in a process that sets up the module."""
+    import multiprocessing as mp
+
+    dataset_path = tmp_path / "stacked.zarr"
+    times = _make_minimal_healpix_zarr(dataset_path, channel_in=["z500"])
+    ctx = mp.get_context("fork")  # zarr starts a fresh pool after fork, as in a DataLoader worker
+    queue = ctx.Queue()
+    child = ctx.Process(
+        target=_set_up_data_module, args=(queue, str(dataset_path), times[:2])
+    )
+    child.start()
+    child.join(120)
+    assert child.exitcode == 0
+    assert queue.get(timeout=5) == 2
 
 
 @import_or_fail("omegaconf")
