@@ -107,17 +107,30 @@ def open_healpix_zarr(path):
 
 
 def _per_variable_read_config() -> dict:
-    """zarr config for per-variable field reads.
+    """zarr config for per-variable field reads: FusedCodecPipeline, one worker.
 
-    zarr's FusedCodecPipeline (opt-in, zarr >= 3.3) decodes synchronously in bulk,
-    and a partial-shard read fetches the window's inner chunks as one coalesced
-    byte range per shard. That matters for time-sharded fields, where a training
-    window is a few dozen inner chunks: per-chunk reads are slow on network
-    filesystems. ``max_workers=1`` keeps decode inline in the thread zarr hands
-    each read to: zarr's module-level decode pool is not reset after ``fork``, so
-    using it before DataLoader workers start can hang them. Concurrency comes from
-    reading every field at once instead (``_read_fields``). Older zarr has no
-    FusedCodecPipeline; reads then use the active pipeline (correct, slower).
+    Byte-range coalescing does not depend on this config: from zarr 3.3 every
+    codec pipeline reads the inner chunks a window needs from a shard as
+    coalesced byte ranges (one read per shard for a training window).
+    FusedCodecPipeline (opt-in and experimental, zarr >= 3.3; see
+    https://zarr.readthedocs.io/en/stable/user-guide/experimental/) changes how
+    those chunks are decoded. The default pipeline gives each inner chunk its
+    own coroutine and ``asyncio.to_thread`` hop; Fused runs a whole read, IO and
+    decode, in one hop. Time-sharded fields hold one time step per inner chunk,
+    so a training window is a few dozen inner chunks per field, and on a local
+    store that per-chunk scheduling costs more than the decode itself.
+
+    ``max_workers=1`` keeps that decode in the read's own thread. Fused's pool
+    runs one task per shard of a read and decodes a shard's inner chunks in
+    order; a window touches one shard per field (two at a shard boundary), so
+    the pool has nothing to parallelize. A pool sized to the CPU count in every
+    DataLoader worker would also oversubscribe the node; reads are concurrent
+    across fields instead (``_read_fields``). Through zarr 3.4.1 the pool is also
+    not reset after ``fork`` (fixed upstream in zarr-python#4483), so using it
+    before DataLoader workers start can hang them.
+
+    Older zarr has no FusedCodecPipeline; reads then use the active pipeline
+    (correct, slower).
     """
     try:
         from zarr.core.codec_pipeline import FusedCodecPipeline  # noqa: F401
