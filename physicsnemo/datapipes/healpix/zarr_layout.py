@@ -3,10 +3,12 @@
 - **stacked** — prognostic fields packed on a channel axis in ``inputs`` /
   ``constants``, with names in ``channel_in`` / ``channel_c``.
   Detection: ``is_stacked_layout``.
-- **per-variable** — one Zarr array per field, root attribute
-  ``layout=per_variable``. Detection: ``is_per_variable_layout``.
+- **per-variable** — one top-level Zarr array per field: any store without an
+  ``inputs`` array. Detection: ``is_per_variable_layout``.
 
-Catalogs already written with ``layout=named_arrays_healpix`` still load.
+The layout is read from the store's arrays, not from root attributes: catalogs
+carry different attributes, and forecast output stores use ``layout`` for
+something else.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import warnings
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -26,11 +29,10 @@ except ImportError:
     LocalStore = None
 
 COORD_KEYS = frozenset({"time", "face", "height", "width", "lat", "lon"})
-
-# Root attribute written by current converters.
-PER_VARIABLE_LAYOUT_ATTR = "per_variable"
-# Written by earlier converters and the b24 builder.
-_LEGACY_PER_VARIABLE_LAYOUT_ATTR = "named_arrays_healpix"
+# Arrays that belong to the stacked layout, never fields of a per-variable store.
+_STACKED_KEYS = frozenset(
+    {"inputs", "targets", "constants", "channel_in", "channel_out", "channel_c"}
+)
 
 # A one-off bulk read (a rollout's multi-year truth, read once per run) brings
 # hundreds of GB through the page cache that nothing reads again. Under a job
@@ -144,6 +146,30 @@ def _per_variable_read_config() -> dict:
 
 _READ_CONFIG = _per_variable_read_config()
 _async_arrays: dict[tuple[str, str], Any] = {}
+# Set once the slow-reader warning has been shown; forked DataLoader workers
+# inherit it, so the warning appears once per job, not once per worker.
+_warned_slow_reads = False
+
+
+def _warn_slow_per_variable_reads() -> None:
+    """Warn once per process when per-variable reads cannot use FusedCodecPipeline.
+
+    Without it (zarr < 3.3, or a zarr that renamed it), per-variable reads fall
+    back to the active pipeline; zarr < 3.3 also fetches every inner chunk of a
+    shard with its own store read. Both make reads much slower.
+    """
+    global _warned_slow_reads
+    if _READ_CONFIG or _warned_slow_reads:
+        return
+    _warned_slow_reads = True
+    import zarr
+
+    warnings.warn(
+        f"Per-variable Zarr reads need zarr >= 3.3 to be fast. zarr {zarr.__version__} "
+        "has no FusedCodecPipeline (and before 3.3 reads every inner chunk of a "
+        "shard separately), so these reads are much slower. Install zarr >= 3.3.",
+        stacklevel=3,
+    )
 
 
 def _async_array(group, name: str):
@@ -175,6 +201,7 @@ def _read_fields(ds, names: Sequence[str], selection, on_block=None) -> list[np.
     """
     import zarr
 
+    _warn_slow_per_variable_reads()
     if LocalStore is None or not isinstance(ds, zarr.Group):
         blocks = [np.asarray(ds[n][selection]) for n in names]
         if on_block is not None:
@@ -200,51 +227,23 @@ def _read_fields(ds, names: Sequence[str], selection, on_block=None) -> list[np.
         return sync(_all())
 
 
-def _layout_attr(ds) -> str:
-    attrs = getattr(ds, "attrs", None) or {}
-    if not hasattr(attrs, "get"):
-        return ""
-    return str(attrs.get("layout", "") or "")
-
-
-def _has_per_variable_layout_attr(ds) -> bool:
-    layout = _layout_attr(ds)
-    return (
-        layout == PER_VARIABLE_LAYOUT_ATTR
-        or layout == _LEGACY_PER_VARIABLE_LAYOUT_ATTR
-        or layout.startswith("per_variable")
-    )
-
-
 def is_stacked_layout(ds) -> bool:
     """True when prognostic fields are packed on a channel axis in ``inputs``."""
     return "inputs" in ds
 
 
 def is_per_variable_layout(ds) -> bool:
-    """True when the root ``layout`` attribute marks one array per field.
-
-    A store without ``inputs`` is not per-variable unless it declares
-    ``layout=per_variable`` (or the legacy ``named_arrays_healpix`` value).
-    """
-    if is_stacked_layout(ds):
-        return False
-    return _has_per_variable_layout_attr(ds)
+    """True when each field is its own top-level array (no ``inputs`` array)."""
+    return not is_stacked_layout(ds)
 
 
 def constants_are_stacked(ds) -> bool:
     """True when constants are a ``constants`` array indexed by ``channel_c``.
 
-    Per-variable catalogs (``layout=per_variable`` or the older
-    ``named_arrays_healpix``) store each constant as a top-level array.
-    A store that still has a ``constants`` array and does not declare a
-    per-variable layout keeps the stacked read.
+    That holds for every stacked store and for a constants-only stacked store;
+    per-variable stores keep each constant as a top-level array.
     """
-    if is_stacked_layout(ds):
-        return True
-    if _has_per_variable_layout_attr(ds):
-        return False
-    return "constants" in ds
+    return is_stacked_layout(ds) or ("constants" in ds and "channel_c" in ds)
 
 
 def resolve_mask_field(
@@ -293,13 +292,11 @@ def available_field_names(ds) -> set[str]:
         if "channel_c" in ds:
             names.update(str(x) for x in np.asarray(ds["channel_c"][:]))
         return names
-    if not is_per_variable_layout(ds):
-        return set()
-    # A leading underscore marks loader metadata, not a prognostic field.
+    # A leading underscore marks loader metadata (e.g. ``_shard_index``), not a field.
     return {
         str(k)
         for k in ds.keys()
-        if k not in COORD_KEYS and k != "constants" and not str(k).startswith("_")
+        if k not in COORD_KEYS and k not in _STACKED_KEYS and not str(k).startswith("_")
     }
 
 
@@ -331,15 +328,6 @@ def _apply_channel_scaling(block: np.ndarray, scaling: Mapping, channel: int) ->
     return block
 
 
-def _require_layout(ds) -> None:
-    if is_stacked_layout(ds) or is_per_variable_layout(ds):
-        return
-    raise ValueError(
-        "Unrecognized healpix Zarr layout. Stacked stores have an 'inputs' "
-        "array; per-variable stores set the root attribute layout='per_variable'."
-    )
-
-
 def load_channel_data(
     ds,
     time_sl,
@@ -348,7 +336,6 @@ def load_channel_data(
 ) -> np.ndarray:
     """Load selected prognostic fields for a time window as (T, C, F, H, W)."""
     names = list(field_names)
-    _require_layout(ds)
     if len(names) == 0:
         if is_per_variable_layout(ds):
             raise ValueError("empty field name list")
@@ -356,7 +343,8 @@ def load_channel_data(
 
     if is_stacked_layout(ds):
         indices = _stacked_channel_indices(ds, names)
-        out = np.array(np.asarray(ds["inputs"][time_sl, indices]))
+        # zarr returns a new array; copy only if it is read-only (scaled in place).
+        out = np.require(ds["inputs"][time_sl, indices], requirements="W")
         if scaling is not None:
             for i in range(len(names)):
                 _apply_channel_scaling(out[:, i], scaling, i)
@@ -451,7 +439,6 @@ def load_windowed_channel_data(
     """
     input_names = list(input_names)
     ic_diag_names = list(ic_diagnostic_names or [])
-    _require_layout(ds)
     if len(input_names) == 0:
         raise ValueError("empty input field name list")
     if input_time_idx.ndim != 2:
@@ -466,7 +453,7 @@ def load_windowed_channel_data(
         names = list(dict.fromkeys(
             list(input_names) + list(output_names or []) + ic_diag_names
         ))
-        staging = np.array(load_channel_data(ds, time_sl, names, scaling=None))
+        staging = load_channel_data(ds, time_sl, names, scaling=None)
         _scale_stacked_staging(
             staging,
             names,
@@ -582,6 +569,4 @@ def load_constant_fields(ds, field_names: Sequence[str]) -> np.ndarray:
         indices = [cc.index(n) for n in names]
         return np.asarray(ds["constants"][indices])
 
-    if not is_per_variable_layout(ds):
-        _require_layout(ds)
     return np.stack(_read_fields(ds, names, slice(None)), axis=0)
