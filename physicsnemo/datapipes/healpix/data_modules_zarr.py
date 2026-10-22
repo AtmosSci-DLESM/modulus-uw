@@ -31,6 +31,7 @@ from torch.utils.data.distributed import DistributedSampler
 from physicsnemo.distributed import DistributedManager
 
 from .coupledtimeseries_dataset_zarr import CoupledTimeSeriesDatasetZarr
+from .multi_store_dataset import MultiStoreDataset
 from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ class TimeSeriesDataModuleZarr:
 
     def __init__(
         self,
-        dataset_path: str,
+        dataset_path: Union[str, Sequence[str]],
         batch_size: int = 32,
         dataloader_batch_size: Optional[int] = None,
         drop_last: bool = True,
@@ -75,8 +76,10 @@ class TimeSeriesDataModuleZarr:
         """
         Parameters
         ----------
-        dataset_path: str, optional
-            The path to the dataset, default "."
+        dataset_path: str or sequence of str
+            The path to the dataset. A sequence of paths trains on several stores
+            with the same layout: each split concatenates one dataset per store,
+            built with the same split dates.
         batch_size: int, optional
             The number of sequential samples to load from the dataset to load, default 32
         dataloader_batch_size: int, optional
@@ -146,7 +149,15 @@ class TimeSeriesDataModuleZarr:
             default applies: min(32, CPU count + 4).
         """
         super().__init__()
-        self.dataset_path = Path(dataset_path)
+        # A str (or Path) is one store; any other sequence (list, Hydra
+        # ListConfig) is several stores. dataset_path stays the first store so
+        # code that builds a single dataset from these kwargs keeps working.
+        if isinstance(dataset_path, (str, Path)):
+            dataset_path = [dataset_path]
+        self.dataset_paths = [Path(p) for p in dataset_path]
+        if not self.dataset_paths:
+            raise ValueError("dataset_path is empty")
+        self.dataset_path = self.dataset_paths[0]
         self.dataset_batch_size = batch_size
         self.dataloader_batch_size = dataloader_batch_size
         self.drop_last = drop_last
@@ -219,8 +230,11 @@ class TimeSeriesDataModuleZarr:
 
     def _validate_setup_requirements(self) -> None:
         """Validate that required setup conditions are met"""
-        if not self.dataset_path.exists():
-            raise FileNotFoundError(f"Dataset path not found: {self.dataset_path}")
+        for path in self.dataset_paths:
+            if not path.exists():
+                raise FileNotFoundError(f"Dataset path not found: {path}")
+        if self.forecast_init_times is not None and len(self.dataset_paths) > 1:
+            raise ValueError("forecast_init_times supports a single dataset_path")
 
         if self.splits is None and self.forecast_init_times is None:
             raise ValueError("Either splits or forecast_init_times must be provided")
@@ -278,27 +292,52 @@ class TimeSeriesDataModuleZarr:
             )
         # splits are provided, use them to split the dataset
         else:
-            self.train_dataset = dataset_class(
+            self.train_dataset = self._per_store(
+                common_kwargs,
+                dataset_class,
                 start_date=self.splits["train_date_start"],
                 end_date=self.splits["train_date_end"],
                 drop_last=self.drop_last,
                 add_train_noise=self.add_train_noise,
                 train_noise_params=self.train_noise_params,
-                train_noise_seed=self.train_noise_seed + int(dist.rank),
-                **common_kwargs,
+                # Store 0 keeps the single-store seed; other stores draw distinct noise.
+                train_noise_seed=lambda i: self.train_noise_seed + int(dist.rank) + 10000 * i,
             )
-            self.val_dataset = dataset_class(
+            self.val_dataset = self._per_store(
+                common_kwargs,
+                dataset_class,
                 start_date=self.splits["val_date_start"],
                 end_date=self.splits["val_date_end"],
                 drop_last=self.drop_last,
-                **common_kwargs,
             )
-            self.test_dataset = dataset_class(
+            self.test_dataset = self._per_store(
+                common_kwargs,
+                dataset_class,
                 start_date=self.splits["test_date_start"],
                 end_date=self.splits["test_date_end"],
                 drop_last=False,
-                **common_kwargs,
             )
+            if len(self.dataset_paths) > 1 and self.constant_variables:
+                consts = [ds.get_constants() for ds in self.train_dataset.datasets]
+                if not all(np.allclose(consts[0], c, equal_nan=True) for c in consts[1:]):
+                    warnings.warn(
+                        "Constants differ between stores; each batch uses its own "
+                        "store's constants and get_constants() returns store 0's"
+                    )
+
+    def _per_store(self, common_kwargs: dict, dataset_class, **split_kwargs):
+        """One dataset per store with the same split; concatenated when several.
+
+        A callable split kwarg is called with the store index.
+        """
+        datasets = [
+            dataset_class(
+                **{**common_kwargs, "dataset_path": path},
+                **{k: (v(i) if callable(v) else v) for k, v in split_kwargs.items()},
+            )
+            for i, path in enumerate(self.dataset_paths)
+        ]
+        return datasets[0] if len(datasets) == 1 else MultiStoreDataset(datasets)
 
     def setup(self) -> None:
         """Setup the datasets used for this DataModule"""
@@ -451,7 +490,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
 
     def __init__(
         self,
-        dataset_path: str,
+        dataset_path: Union[str, Sequence[str]],
         batch_size: int = 32,
         dataloader_batch_size: Optional[int] = None,
         drop_last: bool = True,
@@ -484,8 +523,10 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         """
         Parameters
         ----------
-        dataset_path: str, optional
-            The path to the dataset, default "."
+        dataset_path: str or sequence of str
+            The path to the dataset. A sequence of paths trains on several stores
+            with the same layout: each split concatenates one dataset per store,
+            built with the same split dates.
         batch_size: int, optional
             The number of sequential samples to load from the dataset to load, default 32
         dataloader_batch_size: int, optional
