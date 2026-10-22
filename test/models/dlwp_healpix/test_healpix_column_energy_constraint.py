@@ -240,3 +240,30 @@ def test_nside64_is_fast():
         mod(pred, orig, aux=aux)
         elapsed = time.perf_counter() - started
     assert elapsed < 1.0, elapsed
+
+
+def test_frozen_precipitation_optional():
+    """Without a frozen channel the budget matches a zero frozen channel."""
+    rng = torch.Generator().manual_seed(0)
+    pred = torch.zeros(1, 12, 1, len(OUT_CH), 4, 4)
+    orig = torch.zeros(1, 12, 1, len(IN_CH), 4, 4)
+    pred[:, :, :, 0] = orig[:, :, :, 0] = 98500.0
+    pred[:, :, :, 1 : 1 + N] = 270.0 + torch.rand(1, 12, 1, N, 4, 4, generator=rng)
+    orig[:, :, :, 1 : 1 + N] = 270.0
+    pred[:, :, :, 1 + N : 1 + 2 * N] = orig[:, :, :, 1 + N : 1 + 2 * N] = 0.002
+    pred[:, :, :, 1 + 2 * N :] = 100.0 * torch.rand(1, 12, 1, len(FLUX), 4, 4, generator=rng)
+    pred[:, :, :, -1] = 0.0
+    aux = {
+        "insolation": torch.full((1, 12, 1, 1, 4, 4), 0.5),
+        "constants": torch.zeros(1, 12, 1, 3, 4, 4),
+    }
+    no_frozen = _make(
+        out_channels=OUT_CH[:-1],
+        frozen_precipitation=None,
+        scaling={k: v for k, v in SCALING.items() if k != FLUX[-1]},
+    )
+    with torch.no_grad():
+        out = _make()(pred, orig, aux=aux)
+        out_nf = no_frozen(pred[:, :, :, :-1], orig, aux=aux)
+    assert torch.allclose(out[:, :, :, :-1], out_nf)
+    assert not torch.allclose(out_nf[:, :, :, 1 : 1 + N], pred[:, :, :, 1 : 1 + N])

@@ -23,6 +23,8 @@ net atmospheric energy flux times the step. Height is hydrostatic. The model
 does not carry ERA5 ``DSWRFtoa``; ``aux['insolation']`` is the decoder's
 geometric factor and is scaled by ``solar_constant``. ``HGTsfc`` is read from
 ``aux['constants']`` and denormalized with its scaling.
+``frozen_precipitation=None`` drops the latent heat of freezing term for data
+without a frozen precipitation field (e.g. E3SM).
 """
 
 from __future__ import annotations
@@ -130,7 +132,7 @@ class ColumnEnergyConstraint(torch.nn.Module):
         surface_up_sw: str = "USWRFsfc",
         toa_up_lw: str = "ULWRFtoa",
         toa_up_sw: str = "USWRFtoa",
-        frozen_precipitation: str = "total_frozen_precipitation_rate",
+        frozen_precipitation: str | None = "total_frozen_precipitation_rate",
         method: str = "constant_temperature",
         timestep_seconds: float = 21600.0,
         solar_constant: float = SOLAR_CONSTANT,
@@ -171,8 +173,7 @@ class ColumnEnergyConstraint(torch.nn.Module):
             surface_up_sw,
             toa_up_lw,
             toa_up_sw,
-            frozen_precipitation,
-        )
+        ) + ((frozen_precipitation,) if frozen_precipitation is not None else ())
         for name in (surface_pressure, *self.temp_names, *self.water_names):
             if name not in self.in_names:
                 raise ValueError(f"{name!r} is missing from in_channels")
@@ -305,8 +306,10 @@ class ColumnEnergyConstraint(torch.nn.Module):
             insolation = self._align_time(aux["insolation"].float(), n_time)
             toa_down_sw = insolation[:, :, :, :1] * self.solar_constant
             fluxes = self._denorm_levels(prediction, self._flux, self.flux_mean, self.flux_std)
-            lhf, shf, dlw, ulw, dsw, usw, ulw_toa, usw_toa, frozen = fluxes.split(1, dim=3)
-            surface = (dsw - usw + dlw - ulw) - lhf - shf - frozen * LATENT_HEAT_OF_FREEZING
+            lhf, shf, dlw, ulw, dsw, usw, ulw_toa, usw_toa, *frozen = fluxes.split(1, dim=3)
+            surface = (dsw - usw + dlw - ulw) - lhf - shf
+            if frozen:
+                surface = surface - frozen[0] * LATENT_HEAT_OF_FREEZING
             into_atmosphere = (toa_down_sw - usw_toa - ulw_toa) - surface
             energy = self._column_energy(temperature, q, ps, height)
             energy0 = self._column_energy(temperature0, q0, ps0, height)
