@@ -16,17 +16,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import threading
 import warnings
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-try:  # zarr >= 3
+try:  # zarr >= 3; zarr 2 has no async API (see _read_fields)
     from zarr.abc.store import RangeByteRequest
     from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
     from zarr.storage import LocalStore
 except ImportError:
-    LocalStore = None
+    LocalStore = sync = None
 
 COORD_KEYS = frozenset({"time", "face", "height", "width", "lat", "lon"})
 # Arrays that belong to the stacked layout, never fields of a per-variable store.
@@ -149,6 +151,37 @@ _async_arrays: dict[tuple[str, str], Any] = {}
 # Set once the slow-reader warning has been shown; forked DataLoader workers
 # inherit it, so the warning appears once per job, not once per worker.
 _warned_slow_reads = False
+# Reads that run at the same time share one zarr.config.set(_READ_CONFIG); see
+# _read_config.
+_read_config_lock = threading.Lock()
+_read_config_users = 0
+_read_config_stack = contextlib.ExitStack()
+
+
+@contextlib.contextmanager
+def _read_config():
+    """``zarr.config.set(_READ_CONFIG)``, shared by reads that run at the same time.
+
+    zarr's config is global to the process, and Fused reads
+    ``codec_pipeline.max_workers`` when each read starts. If every read entered
+    and left its own ``zarr.config.set``, a read finishing in one thread could
+    restore zarr's defaults while a read in another thread still runs. Here the
+    first read sets the config and the last one to finish restores it.
+    """
+    global _read_config_users
+    import zarr
+
+    with _read_config_lock:
+        if _read_config_users == 0:
+            _read_config_stack.enter_context(zarr.config.set(_READ_CONFIG))
+        _read_config_users += 1
+    try:
+        yield
+    finally:
+        with _read_config_lock:
+            _read_config_users -= 1
+            if _read_config_users == 0:
+                _read_config_stack.close()
 
 
 def _warn_slow_per_variable_reads() -> None:
@@ -179,12 +212,10 @@ def _async_array(group, name: str):
     is created under that config; caching also skips re-reading ``zarr.json`` for
     every batch.
     """
-    import zarr
-
     key = (str(group.store_path), name)
     array = _async_arrays.get(key)
     if array is None:
-        with zarr.config.set(_READ_CONFIG):
+        with _read_config():
             array = group[name].async_array
         _async_arrays[key] = array
     return array
@@ -202,14 +233,12 @@ def _read_fields(ds, names: Sequence[str], selection, on_block=None) -> list[np.
     import zarr
 
     _warn_slow_per_variable_reads()
-    if LocalStore is None or not isinstance(ds, zarr.Group):
+    if sync is None or not isinstance(ds, zarr.Group):
         blocks = [np.asarray(ds[n][selection]) for n in names]
         if on_block is not None:
             for i, block in enumerate(blocks):
                 on_block(i, block)
         return blocks
-
-    from zarr.core.sync import sync
 
     arrays = [_async_array(ds, n) for n in names]
 
@@ -223,7 +252,7 @@ def _read_fields(ds, names: Sequence[str], selection, on_block=None) -> list[np.
         return list(await asyncio.gather(*(_one(i, a) for i, a in enumerate(arrays))))
 
     # max_workers is read at read time, so the config applies to the reads too.
-    with zarr.config.set(_READ_CONFIG):
+    with _read_config():
         return sync(_all())
 
 
