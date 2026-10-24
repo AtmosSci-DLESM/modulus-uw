@@ -69,6 +69,7 @@ class TimeSeriesDataModuleZarr:
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
+        max_threads_per_worker: Optional[int] = None,
     ):
         """
         Parameters
@@ -137,6 +138,11 @@ class TimeSeriesDataModuleZarr:
         in_order: bool, optional
             Passed to torch.utils.data.DataLoader when set (requires PyTorch with ``in_order`` support).
             If None, DataLoader default applies.
+        max_threads_per_worker: int, optional
+            Upper bound on the threads zarr uses to read and decode data in each
+            DataLoader worker (and in the main process), set through zarr's
+            ``threading.max_workers`` when the datasets are set up. If None, zarr's
+            default applies: min(32, CPU count + 4).
         """
         super().__init__()
         self.dataset_path = Path(dataset_path)
@@ -165,6 +171,7 @@ class TimeSeriesDataModuleZarr:
         self.train_noise_params = train_noise_params
         self.train_noise_seed = train_noise_seed
         self.in_order = in_order
+        self.max_threads_per_worker = max_threads_per_worker
 
         self.train_dataset = None
         self.val_dataset = None
@@ -294,6 +301,14 @@ class TimeSeriesDataModuleZarr:
         """Setup the datasets used for this DataModule"""
         self._validate_setup_requirements()
         dist = self._initialize_distributed_manager()
+
+        if self.max_threads_per_worker is not None:
+            # zarr sizes its thread pool on a process's first read, so set this
+            # before the datasets read anything. Forked DataLoader workers inherit
+            # the config and build their own pool of this size.
+            import zarr
+
+            zarr.config.set({"threading.max_workers": self.max_threads_per_worker})
 
         common_kwargs = self._get_common_dataset_kwargs()
         dataset_class = self._get_dataset_class()
@@ -460,6 +475,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
+        max_threads_per_worker: Optional[int] = None,
     ):
         """
         Parameters
@@ -530,6 +546,9 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             Seed for the random number generator for adding noise to the training data, default 42
         in_order: bool, optional
             Passed to torch.utils.data.DataLoader when set. If None, DataLoader default applies.
+        max_threads_per_worker: int, optional
+            Upper bound on the threads zarr uses to read and decode data in each
+            DataLoader worker; see TimeSeriesDataModuleZarr. If None, zarr's default applies.
         """
         self.couplings = couplings
 
@@ -560,6 +579,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             train_noise_params,
             train_noise_seed,
             in_order,
+            max_threads_per_worker,
         )
 
     def _get_coupled_vars(self):
