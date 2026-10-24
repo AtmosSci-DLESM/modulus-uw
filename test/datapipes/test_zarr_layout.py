@@ -289,6 +289,22 @@ def test_dropping_read_pages_drops_only_inside_the_block(tmp_path, monkeypatch):
     assert len(advice) == n  # back to cached reads after the block
 
 
+def test_concurrent_reads_leave_zarr_config_as_found(tmp_path):
+    """Reads from several threads share the read config; the last one restores zarr's."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    group, stored = _make_sharded_store(tmp_path / "sharded")
+    keys = ("codec_pipeline.path", "codec_pipeline.max_workers")
+    before = {k: zarr.config.get(k, None) for k in keys}
+    windows = [slice(i % 12, i % 12 + 8) for i in range(64)]
+    with ThreadPoolExecutor(8) as pool:
+        loaded = list(pool.map(lambda sl: load_channel_data(group, sl, ["t2m", "u10m"]), windows))
+    for sl, block in zip(windows, loaded):
+        for c, name in enumerate(("t2m", "u10m")):
+            assert np.array_equal(block[:, c], stored[name][sl], equal_nan=True)
+    assert {k: zarr.config.get(k, None) for k in keys} == before
+
+
 def test_per_variable_arrays_use_fused_pipeline(tmp_path):
     """Per-variable arrays decode through FusedCodecPipeline on zarr >= 3.3.
 
