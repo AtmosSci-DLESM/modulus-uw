@@ -264,29 +264,20 @@ def test_open_healpix_zarr_positional_reads_match(tmp_path):
             assert np.array_equal(loaded[:, c], stored[name][sl], equal_nan=True)
 
 
-def test_dropping_read_pages_drops_only_inside_the_block(tmp_path, monkeypatch):
-    import os
+def test_concurrent_reads_leave_zarr_config_as_found(tmp_path):
+    """Reads from several threads share the read config; the last one restores zarr's."""
+    from concurrent.futures import ThreadPoolExecutor
 
-    from physicsnemo.datapipes.healpix import zarr_layout
-
-    _, stored = _make_sharded_store(tmp_path / "sharded")
-    group = zarr_layout.open_healpix_zarr(str(tmp_path / "sharded"))
-    advice = []
-    real = os.posix_fadvise
-    monkeypatch.setattr(
-        zarr_layout.os,
-        "posix_fadvise",
-        lambda fd, offset, length, flag: (advice.append(flag), real(fd, offset, length, flag)),
-    )
-    load_channel_data(group, slice(2, 12), ["t2m"])
-    assert advice == []
-    with zarr_layout.dropping_read_pages():
-        loaded = load_channel_data(group, slice(2, 12), ["t2m"])
-    assert np.array_equal(loaded[:, 0], stored["t2m"][2:12], equal_nan=True)
-    assert advice and set(advice) == {os.POSIX_FADV_RANDOM, os.POSIX_FADV_DONTNEED}
-    n = len(advice)
-    load_channel_data(group, slice(2, 12), ["t2m"])
-    assert len(advice) == n  # back to cached reads after the block
+    group, stored = _make_sharded_store(tmp_path / "sharded")
+    keys = ("codec_pipeline.path", "codec_pipeline.max_workers")
+    before = {k: zarr.config.get(k, None) for k in keys}
+    windows = [slice(i % 12, i % 12 + 8) for i in range(64)]
+    with ThreadPoolExecutor(8) as pool:
+        loaded = list(pool.map(lambda sl: load_channel_data(group, sl, ["t2m", "u10m"]), windows))
+    for sl, block in zip(windows, loaded):
+        for c, name in enumerate(("t2m", "u10m")):
+            assert np.array_equal(block[:, c], stored[name][sl], equal_nan=True)
+    assert {k: zarr.config.get(k, None) for k in keys} == before
 
 
 def test_per_variable_arrays_use_fused_pipeline(tmp_path):
