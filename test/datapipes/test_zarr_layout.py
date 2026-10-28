@@ -94,7 +94,9 @@ def test_available_field_names_per_variable_store(tmp_path):
 def test_load_channel_data_stacked_by_name(tmp_path):
     ds = _make_stacked_store(tmp_path / "stacked")
     time_sl = slice(0, 2)
-    expected = np.asarray(ds["inputs"][time_sl, [0, 2]])
+    # Basic time slice, then numpy channel pick: also runs on zarr 2, which has
+    # no orthogonal ``[slice, list]`` selection through ``__getitem__``.
+    expected = np.asarray(ds["inputs"][time_sl])[:, [0, 2]]
     loaded = load_channel_data(ds, time_sl, ["t2m", "v10m"])
     np.testing.assert_array_equal(loaded, expected)
 
