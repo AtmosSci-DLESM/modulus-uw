@@ -372,8 +372,12 @@ def load_channel_data(
 
     if is_stacked_layout(ds):
         indices = _stacked_channel_indices(ds, names)
-        # zarr returns a new array; copy only if it is read-only (scaled in place).
-        out = np.require(ds["inputs"][time_sl, indices], requirements="W")
+        # Read the time window for every channel, then select channels in numpy.
+        # A channel list inside the zarr selection fails on zarr 2 (orthogonal
+        # selection needs one entry per axis) and its ``oindex`` is ~4x slower,
+        # so this keeps stacked reads identical in data and speed on zarr 2 and 3.
+        # Fancy indexing returns a new writable array (scaled in place below).
+        out = np.asarray(ds["inputs"][time_sl])[:, indices]
         if scaling is not None:
             for i in range(len(names)):
                 _apply_channel_scaling(out[:, i], scaling, i)
