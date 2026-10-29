@@ -5,13 +5,15 @@ a cap, a random level). These modules need no state across windows. At rollout s
 fed-back state ``x_k`` is compared with the truth of the previous step, ``e = x_k - truth_{k-1}`` (normalized units, detached),
 and the noise is a re-arranged copy of that very error:
 
-* ``WindowSpectralNoise`` (``alpha`` is the only parameter): analyse ``e`` into spherical-harmonic coefficients ``e_lm`` for
+* ``WindowSpectralNoise`` (``alpha``, or ``alpha_range``): analyse ``e`` into spherical-harmonic coefficients ``e_lm`` for
   every channel, multiply every coefficient by one random unit phase ``exp(i theta_lm)`` that is the same for all channels
   of a sample (for ``m = 0`` a random sign, so the field stays real), drop degree 0, and synthesise ``alpha`` times the result.
   Per channel the power at every ``(l, m)`` equals ``alpha**2`` times the error's, so the zonal-mean (polar-cap) content is
   kept; one common rotation per ``(l, m)`` also keeps the cross-spectra between channels (relative phases) exactly. The
   pattern is decorrelated from the sample's own error. ``alpha = 1`` is the natural choice: the noise has the energy of
-  the error the model really made, doubling the input error variance.
+  the error the model really made, doubling the input error variance. ``alpha_range = (lo, hi)`` instead draws the level
+  of each sample from ``U(lo, hi)`` at every noisy step, so training sees fed-back states from clean to heavily noised
+  (``(0, 2)``: mean level 1, mean power 4/3 of the error's).
 * ``WindowErrorSwap`` (``alpha``): the previous-step error of another sample of the batch, global mean removed.
 
 Both add to the state and clamp channels with a physical lower bound (specific humidity), return the noisy state, run
@@ -88,7 +90,10 @@ class WindowErrorSwap(_WindowNoiseBase):
 
 
 class WindowSpectralNoise(_WindowNoiseBase):
-    """Noise = ``alpha`` times the previous-step error with one common random phase rotation per ``(l, m)`` (see module doc)."""
+    """Noise = ``alpha`` times the previous-step error with one common random phase rotation per ``(l, m)`` (see module doc).
+
+    ``alpha_range = (lo, hi)`` replaces the fixed ``alpha`` with a fresh ``U(lo, hi)`` draw per sample at every call.
+    """
 
     def __init__(
         self,
@@ -98,9 +103,16 @@ class WindowSpectralNoise(_WindowNoiseBase):
         nside: int = 64,
         lmax: int | None = None,
         lower_bounds: Mapping[str, float] | None = None,
+        alpha_range: Sequence[float] | None = None,
         **_,
     ):
         super().__init__(in_channels, scaling, alpha, lower_bounds)
+        self.alpha_range = None
+        if alpha_range is not None:
+            lo, hi = (float(v) for v in alpha_range)
+            if not 0.0 <= lo <= hi:
+                raise ValueError(f"alpha_range must satisfy 0 <= lo <= hi, got {alpha_range}")
+            self.alpha_range = (lo, hi)
         self.nside = int(nside)
         self.lmax = int(lmax) if lmax is not None else 3 * self.nside - 1
         L = self.lmax
@@ -148,6 +160,13 @@ class WindowSpectralNoise(_WindowNoiseBase):
         im = torch.where(self._m0, torch.zeros_like(theta), theta.sin())
         return torch.complex(re, im)
 
+    def _level(self, device):
+        """Noise level of one sample: the fixed ``alpha``, or a fresh ``U(alpha_range)`` draw (in-graph, like the rotation)."""
+        if self.alpha_range is None:
+            return self.alpha
+        lo, hi = self.alpha_range
+        return lo + (hi - lo) * torch.rand((), device=device)
+
     def _noise(self, err):
         B, F, T, C, H, W = err.shape
         e = err.reshape(B, F, C, H, W).permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
@@ -155,8 +174,9 @@ class WindowSpectralNoise(_WindowNoiseBase):
         if variant == "all":  # all fields at once: one transform call, larger temporaries
             ring = self._to_ring(e.reshape(B * C, -1).contiguous()).contiguous()
             alm = self._sht(ring).reshape(B, C, self.lmax, self.lmax)
-            rot = torch.stack([self._rotation(err.device) for _ in range(B)])  # one rotation per sample, shared by its channels
-            alm = alm * (self.alpha * rot)[:, None]
+            # One rotation and one level per sample, shared by its channels.
+            rot = torch.stack([self._level(err.device) * self._rotation(err.device) for _ in range(B)])
+            alm = alm * rot[:, None]
             alm[:, :, 0, :] = 0
             field = self._from_ring(self._isht(alm.reshape(B * C, self.lmax, self.lmax)).float().contiguous())
             noise = field.reshape(B, C, F, H, W)
@@ -164,13 +184,13 @@ class WindowSpectralNoise(_WindowNoiseBase):
             nchunk = 2 if variant == "half" else 1
             out = []
             for b in range(B):  # one sample at a time keeps the transform temporaries small (the graph holds their peak)
-                rot = self._rotation(err.device)
+                rot = self._level(err.device) * self._rotation(err.device)
                 parts = []
                 for c0 in range(0, C, -(-C // nchunk)):  # channel chunks (the rotation is shared across them)
                     ec = e[b, c0:c0 + -(-C // nchunk)]
                     ring = self._to_ring(ec.reshape(ec.shape[0], -1).contiguous()).contiguous()
                     alm = self._sht(ring)  # [c, L, L] complex
-                    alm = alm * (self.alpha * rot)[None]
+                    alm = alm * rot[None]
                     alm[:, 0, :] = 0  # degree 0 (the global mean) stays out, as in SpectralInputNoise
                     parts.append(self._from_ring(self._isht(alm).float().contiguous()).reshape(-1, F, H, W))
                 out.append(torch.cat(parts) if len(parts) > 1 else parts[0])

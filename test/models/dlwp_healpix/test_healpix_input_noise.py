@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from physicsnemo.models.dlwp_healpix import HEALPixRecUNet
+from physicsnemo.models.dlwp_healpix_layers.healpix_window_noise import WindowSpectralNoise
 from physicsnemo.models.dlwp_healpix_layers.healpix_input_noise import (
     SpectralInputNoise,
     degree_variance,
@@ -550,3 +551,48 @@ def test_recunet_builds_noise_from_config_and_adds_no_state(spectrum_path):
     assert isinstance(model.input_noise, SpectralInputNoise)
     assert model.input_noise.scale_hi == 2.0
     assert len(model.state_dict()) == len(_recunet().state_dict())
+
+
+def _band_limited_error(module, batch, ell_max=100, seed=0):
+    """``[B, 12, 1, C, H, W]`` error field with power only at 1 <= l <= ell_max, where the transform round trip is exact."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    L = module.lmax
+    ell = torch.arange(L, device="cuda")[:, None].expand(L, L)
+    m = torch.arange(L, device="cuda")[None, :].expand(L, L)
+    mask = ((m <= ell) & (ell >= 1) & (ell <= ell_max)).float()
+    n = batch * len(CHANNELS)
+    re = torch.randn(n, L, L, device="cuda", generator=gen) * mask
+    im = torch.randn(n, L, L, device="cuda", generator=gen) * mask * (m > 0).float()
+    field = module._from_ring(module._isht(torch.complex(re, im)).float().contiguous())
+    return field.reshape(batch, len(CHANNELS), 12, NSIDE, NSIDE).permute(0, 2, 1, 3, 4).unsqueeze(2)
+
+
+def _window_power_ratio(module, err, seed=0):
+    """Noise power over error power per sample and channel, ``[B, C]`` (alpha**2 per sample)."""
+    torch.manual_seed(seed)
+    noise = module(torch.zeros_like(err), err)
+    return noise.square().mean(dim=(1, 2, 4, 5)) / err.square().mean(dim=(1, 2, 4, 5))
+
+
+@requires_sht
+@pytest.mark.parametrize("alpha_range", [None, (1.0, 1.0), (0.0, 2.0)])
+def test_window_noise_level(alpha_range):
+    module = WindowSpectralNoise(CHANNELS, SCALING, alpha=1.0, nside=NSIDE, alpha_range=alpha_range)
+    batch = 8 if alpha_range in (None, (1.0, 1.0)) else 256
+    ratio = _window_power_ratio(module, _band_limited_error(module, batch))
+    # One level per sample, shared by all its channels.
+    assert torch.allclose(ratio, ratio[:, :1].expand_as(ratio), rtol=2e-3)
+    level = ratio[:, 0].sqrt().cpu()
+    if alpha_range in (None, (1.0, 1.0)):
+        assert level.numpy() == pytest.approx(1.0, rel=2e-3)
+    else:  # U(0, 2): every level inside the range, spread over it, mean 1, mean power 4/3
+        assert level.min().item() >= 0.0 and level.max().item() <= 2.0 * (1 + 2e-3)
+        assert level.min().item() < 0.2 and level.max().item() > 1.8
+        assert level.mean().item() == pytest.approx(1.0, abs=0.15)
+        assert level.square().mean().item() == pytest.approx(4.0 / 3.0, abs=0.25)
+
+
+@pytest.mark.parametrize("bad", [(1.0, 0.5), (-0.1, 1.0), (0.0, 1.0, 2.0)])
+def test_window_noise_alpha_range_rejects_bad_ranges(bad):
+    with pytest.raises(ValueError):
+        WindowSpectralNoise(CHANNELS, SCALING, nside=NSIDE, alpha_range=bad)
