@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import warnings
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -103,8 +104,14 @@ class HEALPixRecUNet(Module):
         delta_time: str, optional
             hours between two consecutive data points
         reset_cycle: str, optional
-            hours after which the recurrent states are reset to zero and re-initialized. Set np.infty
-            to never reset the hidden states.
+            Hours after which recurrent states are reset to zero and re-initialized.
+            Set ``float("inf")`` (or ``np.infty``) to never reset during ``forward()``:
+            hidden state then persists across successive ``forward()`` calls (for
+            example coupled-inference coupler windows). Call ``reset()`` between
+            independent forecasts or initial conditions so state does not leak from
+            one initialization to the next. ``inf`` during training keeps state
+            across batches until ``reset()``; a warning is emitted on the first
+            training ``forward()`` so that is not accidental.
         presteps: int, optional
             number of model steps to initialize recurrent states.
         enable_nhwc: bool, optional
@@ -168,6 +175,8 @@ class HEALPixRecUNet(Module):
             self.reset_cycle = reset_cycle
         else:
             self.reset_cycle = int(pd.Timedelta(reset_cycle).total_seconds() // 3600)
+        self._recurrent_hidden_primed = False
+        self._reset_cycle_inf_train_warned = False
         self.presteps = presteps
         self.enable_nhwc = enable_nhwc
         self.residual_prediction = residual_prediction
@@ -482,16 +491,40 @@ class HEALPixRecUNet(Module):
         -------
         th.Tensor: Predicted outputs
         """
-        self.reset()
+        # Do not call self.reset() at the top of every forward. Finite reset_cycle
+        # still re-zeros via _initialize_hidden when hours % reset_cycle == 0
+        # (always true at step 0). With reset_cycle=inf, wiping here would discard
+        # GRU state between coupled-inference forward() calls (one per coupler window).
+        if self.reset_cycle == float("inf") and self.training and not self._reset_cycle_inf_train_warned:
+            warnings.warn(
+                "reset_cycle=inf during training keeps GRU hidden state across "
+                "forward() calls until reset() is invoked. Finite reset_cycle is "
+                "the usual training setting; call reset() between independent "
+                "samples if this persistence is intended.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self._reset_cycle_inf_train_warned = True
         outputs = []
         for step in range(self.integration_steps):
             # th.cuda.nvtx.range_push(f"Integration step: {step}")
             # (Re-)initialize recurrent hidden states
-            if (step * (self.delta_t * self.input_time_dim)) % self.reset_cycle == 0:
+            hours = step * (self.delta_t * self.input_time_dim)
+            if self.reset_cycle == float("inf"):
+                # 0 % inf == 0, so the finite-cycle modulo would re-prime every
+                # forward at step 0. Honor "never reset" after the first prime so
+                # hidden state carries across coupler windows when inference sets
+                # reset_cycle=inf (disable_*_recurrent_reset).
+                need_init = not self._recurrent_hidden_primed
+            else:
+                need_init = (hours % self.reset_cycle) == 0
+            if need_init:
                 if conditions_cln is not None:
                     self._initialize_hidden(inputs=inputs, outputs=outputs, step=step, conditions_cln=conditions_cln[step])
                 else:
                     self._initialize_hidden(inputs=inputs, outputs=outputs, step=step)
+                if self.reset_cycle == float("inf"):
+                    self._recurrent_hidden_primed = True
 
             # Construct concatenated input: [prognostics|TISR|constants]
             if step == 0:
@@ -572,6 +605,13 @@ class HEALPixRecUNet(Module):
         return th.cat(outputs, dim=self.channel_dim)
 
     def reset(self):
-        """Resets the state of the network"""
+        """Reset encoder/decoder recurrent state.
+
+        When ``reset_cycle`` is infinite, also clears the primed flag so the next
+        ``forward()`` re-initializes hidden state. Call this between independent
+        forecasts so GRU state does not carry from one initial condition to the next.
+        """
         self.encoder.reset()
         self.decoder.reset()
+        # Allow a later forward to re-prime when reset_cycle is inf.
+        self._recurrent_hidden_primed = False
