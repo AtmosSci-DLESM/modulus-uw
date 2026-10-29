@@ -577,7 +577,7 @@ def _window_power_ratio(module, err, seed=0):
 @requires_sht
 @pytest.mark.parametrize("alpha_range", [None, (1.0, 1.0), (0.0, 2.0)])
 def test_window_noise_level(alpha_range):
-    module = WindowSpectralNoise(CHANNELS, SCALING, alpha=1.0, nside=NSIDE, alpha_range=alpha_range)
+    module = WindowSpectralNoise(CHANNELS, SCALING, alpha=1.0, nside=NSIDE, alpha_range=alpha_range).to("cuda")
     batch = 8 if alpha_range in (None, (1.0, 1.0)) else 256
     ratio = _window_power_ratio(module, _band_limited_error(module, batch))
     # One level per sample, shared by all its channels.
