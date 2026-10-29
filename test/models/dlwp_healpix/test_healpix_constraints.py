@@ -369,6 +369,45 @@ def test_nonnegative_keep_grad_through_clamp_passes_gradient():
     torch.testing.assert_close(x_ste.grad, torch.ones_like(raw))
 
 
+def test_constraint_configs_list_matches_mapping_order():
+    from hydra.utils import instantiate
+    from omegaconf import OmegaConf
+
+    from physicsnemo.models.dlwp_healpix_layers.healpix_constraints import (
+        constraint_configs,
+    )
+
+    scaling = {
+        "q": {"mean": 0.0, "std": 1.0},
+        "sp": {"mean": 0.0, "std": 1.0},
+    }
+    channels = ["q", "sp"]
+
+    def _spec(variable):
+        return {
+            "_target_": (
+                "physicsnemo.models.dlwp_healpix_layers.healpix_constraints."
+                "NonnegativeConstraint"
+            ),
+            "variables": [variable],
+            "in_channels": channels,
+            "out_channels": channels,
+            "scaling": scaling,
+        }
+
+    spec_q = _spec("q")
+    spec_sp = _spec("sp")
+    mapping = OmegaConf.create({"bounded": spec_q, "other": spec_sp})
+    sequence = OmegaConf.create([spec_q, spec_sp])
+
+    def _names(configs):
+        return [instantiate(cfg).variables for cfg in constraint_configs(configs)]
+
+    assert _names(mapping) == [["q"], ["sp"]]
+    assert _names(sequence) == [["q"], ["sp"]]
+    assert constraint_configs(None) is None
+
+
 def test_replace_value_keep_gradient_identity_backward():
     from physicsnemo.models.dlwp_healpix_layers.healpix_constraints import (
         replace_value_keep_gradient,
