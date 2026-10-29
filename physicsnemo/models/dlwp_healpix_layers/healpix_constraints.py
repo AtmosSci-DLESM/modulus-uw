@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+
 import numpy as np
 import torch
 import xarray as xr
@@ -22,17 +24,51 @@ an input argument for consistency.
 '''
 
 
-def replace_value_keep_gradient(
-    x: torch.Tensor, new_value: torch.Tensor
-) -> torch.Tensor:
-    """
-    Use ``new_value`` in the forward pass but keep ``x``'s gradient in the backward pass.
+def constraint_configs(constraints):
+    """Instantiable hard-constraint configs, in application order.
 
-    Straight-through estimator for hard corrections (e.g. nonnegative clamps): the
-    forward value is the projected ``new_value``, while backward treats the op as
-    identity so saturated cells still receive a learning signal.
+    ``constraints`` is a sequence of Hydra configs, or a name-keyed mapping
+    whose keys are unused labels. ``None`` means the model has no constraints.
     """
-    return x + (new_value - x).detach()
+    if constraints is None:
+        return None
+    if isinstance(constraints, Mapping):
+        return list(constraints.values())
+    return list(constraints)
+
+
+class ClampInteriorSTE(torch.autograd.Function):
+    """Hard clamp in forward. Backward is identity inside the interval.
+
+    Outside, pass ``grad_output`` only when it points into the feasible set:
+    increase when below the lower bound, decrease when above the upper bound.
+    Outward gradients are dropped so the pre-clamp latent does not drift
+    further out of bounds while the forward value stays at the bound.
+    """
+
+    @staticmethod
+    def forward(ctx, x, lower, upper):
+        ctx.save_for_backward(x, lower, upper)
+        return torch.minimum(torch.maximum(x, lower), upper)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, lower, upper = ctx.saved_tensors
+        below = x < lower
+        above = x > upper
+        inside = ~(below | above)
+        zeros = torch.zeros_like(grad_output)
+        grad = torch.where(inside, grad_output, zeros)
+        grad = torch.where(below & (grad_output < 0), grad_output, grad)
+        grad = torch.where(above & (grad_output > 0), grad_output, grad)
+        return grad, None, None
+
+
+def clamp_keep_interior_grad(
+    x: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor
+) -> torch.Tensor:
+    """Hard clamp ``x`` to ``[lower, upper]`` with interior-only STE backward."""
+    return ClampInteriorSTE.apply(x, lower, upper)
 
 
 class NonnegativeConstraint(torch.nn.Module):
@@ -56,10 +92,11 @@ class NonnegativeConstraint(torch.nn.Module):
         scaling: dict[str, dict[str, float]]
             Dictionary containing the mean and std for each variable.
         keep_grad_through_clamp: bool, optional
-            If True, apply the nonnegative clamp with a straight-through
-            estimator: forward values are still clamped to physical zero, but
-            gradients flow as if the clamp were identity so below-threshold
-            predictions still get a learning signal. Default False.
+            If True, forward is still the hard clamp to physical zero, but
+            backward passes ``∂L/∂y`` on saturated cells only when it points
+            into the feasible set (increase when below the lower bound).
+            Default False uses the true clamp Jacobian (zeros on
+            saturated cells).
         """
         super().__init__()
         self.variables = variables
@@ -91,16 +128,24 @@ class NonnegativeConstraint(torch.nn.Module):
             1, 1, 1, -1, 1, 1
         )
         self.register_buffer("thresholds", thresholds, persistent=False)
+        self.register_buffer(
+            "unconstrained_upper",
+            torch.tensor(float("inf")),
+            persistent=False,
+        )
 
     def forward(self, prediction, input):
         '''
         Tensors are expected to be in the shape [B, F, T, C, H, W]
         '''
         thresholds = self.thresholds.to(dtype=prediction.dtype)
-        clamped = torch.maximum(prediction, thresholds)
         if self.keep_grad_through_clamp:
-            return replace_value_keep_gradient(prediction, clamped)
-        return clamped
+            return clamp_keep_interior_grad(
+                prediction,
+                thresholds,
+                self.unconstrained_upper.to(dtype=prediction.dtype),
+            )
+        return torch.maximum(prediction, thresholds)
 
 class DryAirMassConstraint(torch.nn.Module):
     def __init__(
