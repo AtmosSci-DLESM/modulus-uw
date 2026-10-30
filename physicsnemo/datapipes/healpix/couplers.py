@@ -419,12 +419,10 @@ class ConstantCoupler(BaseCoupler):
     """
     coupler used to interface two component of earth system
 
-    The latest supplied source time is held across the complete receiving
+    The final supplied source time is held across the complete receiving
     integration. Earlier source times remain available to the source model;
     they are not replayed within the receiving integration.
     """
-
-    snapshot_policy = "latest"
 
     def __init__(
         self,
@@ -512,7 +510,7 @@ class ConstantCoupler(BaseCoupler):
             format is [B, F, T, C, H, W]
         """
 
-        def _broadcast_latest_time(fields: th.Tensor) -> th.Tensor:
+        def _broadcast(fields: th.Tensor) -> th.Tensor:
             # Clone so later mutations of coupled_fields cannot alter presets.
             return (
                 fields[:, :, -1:]
@@ -520,7 +518,7 @@ class ConstantCoupler(BaseCoupler):
                 .clone()
             )
 
-        self._store_preset_coupled_fields(coupled_fields, _broadcast_latest_time)
+        self._store_preset_coupled_fields(coupled_fields, _broadcast)
 
 
 class TrailingAverageCoupler(BaseCoupler):

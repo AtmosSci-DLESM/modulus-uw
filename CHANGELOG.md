@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- ConstantCoupler holds the latest supplied ocean time across each receiving
+- ConstantCoupler holds the final supplied ocean state across each receiving
   atmosphere integration, preserving channel order, physical scaling and gradients.
 
 - GLORYS autoregressive training supports one-output sliding histories and

@@ -27,7 +27,7 @@ from physicsnemo.datapipes.healpix.couplers import ConstantCoupler
 @pytest.mark.parametrize("batch_size", [1, 3])
 @pytest.mark.parametrize("times", [1, 2, 4])
 @pytest.mark.parametrize("scaled", [False, True])
-def test_latest_time_preserves_channels_scaling_feedback_and_gradients(
+def test_final_state_preserves_channels_scaling_feedback_and_gradients(
     batch_size, times, scaled
 ):
     """Only the final source time reaches every recipient slot and its gradient."""
