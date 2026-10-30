@@ -384,7 +384,7 @@ def test_constant_without_scaling_unchanged():
     out = bare.construct_integrated_couplings()
 
     expected = (
-        znorm[:, :, :1]
+        znorm[:, :, -1:]
         .permute(2, 0, 3, 1, 4, 5)
         .expand(bare.coupled_integration_dim, -1, -1, -1, -1, -1)
     )
@@ -487,7 +487,7 @@ def test_constant_coupler_affine_transform_across_integration():
 
     means_o, stds_o = _stats(TRAILING_48H_VARS)
     # Expected: renorm_o(phys_t0) = (phys_t0 - μ_o) / σ_o
-    phys_t0 = physical[:, :, :1].to(torch.float64)
+    phys_t0 = physical[:, :, -1:].to(torch.float64)
     expected_bf = (phys_t0 - means_o.view(1, 1, 1, -1, 1, 1)) / stds_o.view(
         1, 1, 1, -1, 1, 1
     )
@@ -499,7 +499,7 @@ def test_constant_coupler_affine_transform_across_integration():
 
     assert out.shape[0] == coupler.coupled_integration_dim
     assert _max_abs_err(out, expected) < 1e-4
-    # All integration steps identical (broadcast of time 0).
+    # All integration steps identical (broadcast of the latest time).
     assert torch.allclose(out[0], out[1], rtol=0, atol=0)
     assert torch.allclose(out[0], out[-1], rtol=0, atol=0)
 

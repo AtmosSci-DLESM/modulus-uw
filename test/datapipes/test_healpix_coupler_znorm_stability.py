@@ -372,7 +372,7 @@ def test_trailing_average_ocean_forcing_config_znorm_roundtrip():
     ],
 )
 def test_constant_coupler_preserves_znorm_values(variables):
-    """ConstantCoupler must not corrupt z-norm fields when broadcasting time 0."""
+    """ConstantCoupler must not corrupt z-norm fields when broadcasting the latest time."""
     generator = torch.Generator().manual_seed(_SEED + 2)
     timedim = 4
     physical = _sample_physical(variables, timedim, generator)
@@ -392,7 +392,7 @@ def test_constant_coupler_preserves_znorm_values(variables):
     out = coupler.construct_integrated_couplings()
 
     # time_first layout: [integration, B, C, F, H, W]
-    expected = znorm[:, :, :1, :, :, :].permute(2, 0, 3, 1, 4, 5)
+    expected = znorm[:, :, -1:, :, :, :].permute(2, 0, 3, 1, 4, 5)
     expected = expected.expand(coupler.coupled_integration_dim, -1, -1, -1, -1, -1)
 
     assert out.shape[0] == coupler.coupled_integration_dim

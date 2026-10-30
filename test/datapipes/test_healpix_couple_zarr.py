@@ -257,9 +257,9 @@ def test_ConstantCoupler(dataset_path, scaling_dict, pytestconfig):
     assert coupler.coupled_mode
     assert list(coupler.construct_integrated_couplings().shape) == expected_shape
 
-    # broadcast the first time step of every channel across the integration dim
+    # broadcast the latest time step of every channel across the integration dim
     expected = coupled_fields[:, :, :, coupler.coupled_channel_indices, :, :]
-    expected = expected[:, :, :1, :, :, :]
+    expected = expected[:, :, -1:, :, :, :]
     expected = expected.permute(2, 0, 3, 1, 4, 5)
     assert th.equal(expected, coupler.construct_integrated_couplings())
 
@@ -1373,10 +1373,10 @@ def test_CoupledTimeSeriesDatasetZarr_next_integration(
         spatial_dims[2],
     )
 
-    # mirrors set_coupled_fields: broadcast the first time step across the
+    # mirrors set_coupled_fields: broadcast the latest time step across the
     # integration dim and permute to [integration_dim, batch, timevar, face, height, width]
     expected_coupling = coupled_fields[:, :, :, coupled_channel_indices, :, :]
-    expected_coupling = expected_coupling[:, :, :1, :, :, :]
+    expected_coupling = expected_coupling[:, :, -1:, :, :, :]
     expected_coupling = expected_coupling.permute(2, 0, 3, 1, 4, 5)
 
     # need to grab at least 1 sample to properly intialize everything

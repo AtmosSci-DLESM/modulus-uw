@@ -419,9 +419,12 @@ class ConstantCoupler(BaseCoupler):
     """
     coupler used to interface two component of earth system
 
-    constant coupler will take the the coupled field at integration time and
-    force the model with this field consistently
+    The latest supplied source time is held across the complete receiving
+    integration. Earlier source times remain available to the source model;
+    they are not replayed within the receiving integration.
     """
+
+    snapshot_policy = "latest"
 
     def __init__(
         self,
@@ -509,15 +512,15 @@ class ConstantCoupler(BaseCoupler):
             format is [B, F, T, C, H, W]
         """
 
-        def _broadcast_first_time(fields: th.Tensor) -> th.Tensor:
+        def _broadcast_latest_time(fields: th.Tensor) -> th.Tensor:
             # Clone so later mutations of coupled_fields cannot alter presets.
             return (
-                fields[:, :, :1]
+                fields[:, :, -1:]
                 .expand(-1, -1, self.coupled_integration_dim, -1, -1, -1)
                 .clone()
             )
 
-        self._store_preset_coupled_fields(coupled_fields, _broadcast_first_time)
+        self._store_preset_coupled_fields(coupled_fields, _broadcast_latest_time)
 
 
 class TrailingAverageCoupler(BaseCoupler):
