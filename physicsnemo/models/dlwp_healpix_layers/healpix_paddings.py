@@ -115,6 +115,7 @@ def make_hpx_padding_layer(
     hpx_padding_mode: str,
     enable_nhwc: bool,
     nside: int | None = None,
+    isolatitude_split_bwd: bool = True,
 ) -> th.nn.Module:
     """
     Construct the HEALPix padding submodule for a given mode.
@@ -130,6 +131,9 @@ def make_hpx_padding_layer(
     nside : int or None, optional
         Native face height/width. Required when ``hpx_padding_mode=="isolatitude"``;
         ignored otherwise.
+    isolatitude_split_bwd : bool, optional
+        Forwarded as ``split_bwd`` to :class:`HEALPixPaddingIsolatitude` (split
+        gather-plus-border-scatter backward). Ignored for other modes.
 
     Returns
     -------
@@ -162,6 +166,7 @@ def make_hpx_padding_layer(
             padding=padding,
             nside=nside,
             enable_nhwc=enable_nhwc,
+            split_bwd=isolatitude_split_bwd,
         )
     raise ValueError(
         f"Unsupported hpx_padding_mode={hpx_padding_mode!r}; "
@@ -674,6 +679,71 @@ class HEALPixPadding(th.nn.Module):
         return ret
 
 
+def _build_backward_split(
+    p: int, H: int, index0: th.Tensor, pos_v1: th.Tensor
+) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+    """Index tables the split backward needs to avoid scattering over the whole output.
+
+    The padded output's interior is an exact identity bijection onto the input
+    and holds none of the two-source pixels, so the gradient is
+
+        grad_in = <grad_out at the interior positions>      79-94% of it
+                + scatter-add of the border ring only        6-21%
+
+    which replaces a full scatter-add (atomic, over every output pixel) with a
+    gather plus a small scatter. Returns the interior positions, the border
+    positions, the input each border position feeds, and its weight (0.5 where
+    the pixel averages two sources).
+    """
+    Hp = H + 2 * p
+    K = 12 * Hp * Hp
+    k = th.arange(K)
+    i = (k // Hp) % Hp
+    j = k % Hp
+    interior = (i >= p) & (i < p + H) & (j >= p) & (j < p + H)
+    interior_k = interior.nonzero(as_tuple=False).squeeze(1)
+    border_k = (~interior).nonzero(as_tuple=False).squeeze(1)
+    w = th.ones(K)
+    w[pos_v1.cpu().long()] = 0.5
+    return (
+        interior_k,
+        border_k,
+        index0.cpu().long()[border_k].contiguous(),
+        w[border_k].contiguous(),
+    )
+
+
+class _IsolatitudeRowGather(th.autograd.Function):
+    """Row-gather pad whose backward is a gather plus a border-only scatter."""
+
+    @staticmethod
+    def forward(ctx, src, i0, pos, i1p, ik, bk, bsrc, bw):
+        out = src.index_select(1, i0)
+        if pos.numel() > 0:
+            g1 = src.index_select(1, i1p)
+            g0 = out.index_select(1, pos)
+            out.index_add_(1, pos, (g1 - g0) * 0.5)
+        ctx.save_for_backward(pos, i1p, ik, bk, bsrc, bw)
+        ctx.n_in = src.shape[1]
+        return out
+
+    @staticmethod
+    def backward(ctx, go):
+        pos, i1p, ik, bk, bsrc, bw = ctx.saved_tensors
+        # index_select and reshape fall off a cliff on a non-contiguous input,
+        # and `go` arrives permuted from the caller.
+        go = go.contiguous()
+        # Interior, as a gather. Algebraically this is the contiguous interior
+        # block of `go`, but taking it as a strided slice instead makes
+        # Inductor generate a kernel 2.7x slower than the whole backward at
+        # nside 32; index_select compiles cleanly.
+        grad = go.index_select(1, ik)
+        grad.index_add_(1, bsrc, go.index_select(1, bk) * bw.to(go.dtype)[None, :, None])
+        if pos.numel() > 0:
+            grad.index_add_(1, i1p, go.index_select(1, pos) * 0.5)
+        return grad, None, None, None, None, None, None, None
+
+
 class HEALPixPaddingIsolatitude(th.nn.Module):
     """
     Isolatitude HEALPix padding via **precomputed gather** indices.
@@ -687,6 +757,7 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
         padding: int,
         nside: int,
         enable_nhwc: bool = False,
+        split_bwd: bool = True,
     ):
         """
         Parameters
@@ -698,10 +769,18 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             this size at init; ``forward`` rejects other ``H``.
         enable_nhwc : bool, optional
             Channels-last output when True.
+        split_bwd : bool, optional
+            Only affects channels-last input. When True (default) the backward is
+            computed as a gather over the output interior plus a scatter over the
+            border ring only. When False, autograd's generic gradient for
+            ``index_select`` (a scatter-add over every output pixel) is used. The
+            forward output is identical either way; the gradient differs only by
+            floating-point summation order.
         """
         super().__init__()
         self.p = padding
         self.enable_nhwc = enable_nhwc
+        self.split_bwd = bool(split_bwd)
         if not isinstance(nside, int) or nside < 1:
             raise ValueError(
                 f"nside must be a positive int, got {nside!r}"
@@ -712,8 +791,9 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
                 f"invalid value for 'padding', expected int > 0 but got {padding}"
             )
         idx, valid = build_isolatitude_gather_index(padding, nside)
-        self.register_buffer("_index0", idx[0], persistent=False) # always 1
-        self.register_buffer("_index1", idx[1].clamp_min(0), persistent=False)
+        # Stored as int64 once so forward needs no per-call dtype/device conversion.
+        self.register_buffer("_index0", idx[0].long(), persistent=False)  # always 1
+        self.register_buffer("_index1", idx[1].clamp_min(0).long(), persistent=False)
 
         # Boolean mask for the second gather source
         v1_bool = valid[1]
@@ -728,9 +808,31 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             persistent=False,
         )
 
+        if self.split_bwd:
+            ik, bk, bsrc, bw = _build_backward_split(
+                padding, nside, self._index0, self._pos_v1
+            )
+            self.register_buffer("_interior_k", ik, persistent=False)
+            self.register_buffer("_border_k", bk, persistent=False)
+            self.register_buffer("_border_src", bsrc, persistent=False)
+            self.register_buffer("_border_w", bw, persistent=False)
+
     def forward(self, data: th.Tensor) -> th.Tensor:
         """
         Gather-based isolatitude pad on folded input.
+
+        Two layouts are handled separately. When ``data`` is channels-last its
+        physical element order is ``(b, f, i, j, c)``, so the channel axis is
+        innermost and the pad becomes a gather of whole ``C``-long *rows*:
+        ``permute(0, 2, 3, 1).reshape(B, F*H*W, C)`` is a free view, the index
+        is consulted once per pixel instead of once per element, each gathered
+        row is contiguous, and the result is already channels-last so neither
+        side needs a layout conversion.
+
+        Otherwise the pad runs in ``[B, C, F*H*W]``. Both paths use
+        ``index_select`` with the 1-D index rather than ``gather`` with the
+        index broadcast over ``B`` and ``C``, and both patch the handful of
+        two-source pixels in place rather than cloning the whole output.
 
         Parameters
         ----------
@@ -747,6 +849,8 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
         BF, C, H, W = data.shape
         F = 12
         B = BF // F
+        p = self.p
+        Hp = Wp = H + 2 * p
 
         if H != W:
             raise ValueError("HEALPix faces must be square (H == W)")
@@ -756,40 +860,56 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
                 f"(from init), but input has H={H}. Make sure that nside was set correctly "
                 f"in the model config."
             )
-        
-        x = data.reshape(B, F, C, H, W)
-        flat = x.permute(0, 2, 1, 3, 4).reshape(B, C, F * H * W)
-
-        # Gather-based isolatitude pad.
-        # valid[0] is always 1, so output is:
-        #   out = g0                   (where valid1==0)
-        #   out = 0.5 * (g0 + g1)      (where valid1==1)
-        # and valid1==1 positions are extremely sparse.
-        i0 = self._index0.view(1, 1, -1).expand(B, C, -1)
-        g0 = flat.gather(dim=2, index=i0.to(device=data.device).long())
 
         pos_v1 = self._pos_v1
-        if pos_v1.numel() > 0:
-            Nv1 = int(pos_v1.numel())
-            g0_sub = g0.index_select(dim=2, index=pos_v1.to(device=data.device).long())
+        row_major = data.is_contiguous(memory_format=th.channels_last)
 
-            i1_sub = self._index1_pos_v1.view(1, 1, Nv1).expand(B, C, Nv1)
-            g1_sub = flat.gather(dim=2, index=i1_sub.to(device=data.device).long())
-
-            # out[pos_v1] = 0.5 * (g0_sub + g1_sub)
-            #             = g0_sub + 0.5 * (g1_sub - g0_sub)
-            delta = (g1_sub - g0_sub) * 0.5
-            out_flat = g0.clone()
-            out_flat.index_add_(dim=2, index=pos_v1.to(device=data.device), source=delta)
+        if row_major:
+            # Channel axis innermost: gather rows, not elements.
+            src = data.permute(0, 2, 3, 1).reshape(B, F * H * W, C)
+            axis = 1
         else:
-            out_flat = g0
+            # Channel axis outermost: gather elements, not rows.
+            src = (
+                data.reshape(B, F, C, H, W)
+                .permute(0, 2, 1, 3, 4)
+                .reshape(B, C, F * H * W)
+            )
+            axis = 2
 
-        Hp, Wp = H + 2 * self.p, W + 2 * self.p
-        out = out_flat.reshape(B, C, F, Hp, Wp).permute(0, 2, 1, 3, 4).reshape(
-            BF, C, Hp, Wp
-        )
-        if self.enable_nhwc:
-            out = out.to(memory_format=th.channels_last)
+        if row_major and self.split_bwd:
+            out = _IsolatitudeRowGather.apply(
+                src, self._index0, pos_v1, self._index1_pos_v1,
+                self._interior_k, self._border_k, self._border_src, self._border_w,
+            )
+        else:
+            out = src.index_select(axis, self._index0)
+
+            if pos_v1.numel() > 0:
+                # valid[0] is always set, so out == g0 everywhere and the two-source
+                # pixels need out = g0 + 0.5 * (g1 - g0). There are only a handful of
+                # them, so patch those entries in place; `out` is freshly allocated by
+                # index_select and aliased by nothing else.
+                g1 = src.index_select(axis, self._index1_pos_v1)
+                g0 = out.index_select(axis, pos_v1)
+                out.index_add_(axis, pos_v1, (g1 - g0) * 0.5)
+
+        if row_major:
+            out = (
+                out.reshape(B, F, Hp, Wp, C)
+                .permute(0, 1, 4, 2, 3)
+                .reshape(BF, C, Hp, Wp)
+            )
+            if not self.enable_nhwc:
+                out = out.contiguous()
+        else:
+            out = (
+                out.reshape(B, C, F, Hp, Wp)
+                .permute(0, 2, 1, 3, 4)
+                .reshape(BF, C, Hp, Wp)
+            )
+            if self.enable_nhwc:
+                out = out.to(memory_format=th.channels_last)
 
         return out
 
