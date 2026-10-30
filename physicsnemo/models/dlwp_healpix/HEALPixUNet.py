@@ -439,9 +439,13 @@ class HEALPixUNet(Module):
                 input_tensor[:, : self.input_channels * self.input_time_dim]
             )
             if self.residual_prediction:
+                # this is a view of combined which already holds [prognostics|diagnostics]
                 prognostics += orig_input
             diagnostics = combined[:, :, :, self.input_channels :]
-            out = th.cat([prognostics, diagnostics], dim=3)
+            # `out` is exactly cat([prognostics, diagnostics], dim=3),
+            # so rebuilding it with th.cat only allocates and copies the whole output again.
+            # out = th.cat([prognostics, diagnostics], dim=3)
+            out = combined
 
             # Apply constraints
             if self.constraints is not None:
