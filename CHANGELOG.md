@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GLORYS supports 24/48/96-hour steps with two histories and one or two outputs.
   One-output RecUNet residuals reshape histories on the input time axis.
 
+- Live component couplers support source-to-receiver normalization through
+  physical space, retaining the receiving variable order. Optional initial
+  states supply inclusive trailing-average endpoints for GLORYS coupling;
+  prepared dataset forcing remains unchanged.
+
+- GLORYS archive construction resolves its declared native backbone target
+  independently of public class/submodule import order, preserving archived
+  configuration and numerical state.
 - HEALPix Zarr loaders select required state and forcing channels before
   materialization and limit raw-target state and target reads to consumed windows.
   Prepared coupling buffers use float32 without changing returned values,
