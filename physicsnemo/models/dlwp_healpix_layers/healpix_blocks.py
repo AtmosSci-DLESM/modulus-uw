@@ -1050,7 +1050,7 @@ class SymmetricConvNeXtBlock(th.nn.Module):
             else:
                 x = self.entry_norm(x)
             if emit_nvtx:
-                torch.cuda.nvtx.range_push() # SymmetricConvNextBlock:forward:norm
+                torch.cuda.nvtx.range_pop() # SymmetricConvNextBlock:forward:norm
 
         for layer in self.convblock:
             if emit_nvtx:
