@@ -78,6 +78,8 @@ def test_hydrostasy_coupled_level_matches_predicted_level(tmp_path):
     ref = _hydro(tmp_path, full)
     mod = _hydro(tmp_path, model, coupled)
     assert not ref.needs_coupled_input and mod.needs_coupled_input
+    # Only the z/t/q levels are copied (not sp), with the coupled level last.
+    assert mod.with_coupled(pred_m, slots).shape[3] == 3 * len(LEVELS)
     torch.testing.assert_close(
         mod.constraint_loss(pred_m, None, average_channels=False, coupled_input=slots),
         ref.constraint_loss(pred, None, average_channels=False),
