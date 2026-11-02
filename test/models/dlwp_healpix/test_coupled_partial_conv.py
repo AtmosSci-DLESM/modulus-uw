@@ -460,6 +460,34 @@ def test_odd_channel_bias_stays_zero_through_adam():
     th.testing.assert_close(w, apply_R_kernel(w), atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.skipif(not th.cuda.is_available(), reason="needs CUDA")
+def test_odd_bias_grad_hook_captures_in_cuda_graph():
+    """The odd-channel bias gradient is zeroed inside a captured backward pass."""
+    pconv = PartialHEALPixConv2d(
+        channels=2,
+        kernel_size=3,
+        hpx_padding_mode="karlbauer",
+        nside=NSIDE,
+        bias=True,
+        channel_is_odd=[False, True],
+    ).cuda()
+    x = th.randn(N_FACES, 2, NSIDE, NSIDE, device="cuda")
+    mask = th.ones_like(x)
+    stream = th.cuda.Stream()
+    stream.wait_stream(th.cuda.current_stream())
+    with th.cuda.stream(stream):  # warm up outside the graph
+        pconv(x, mask).pow(2).mean().backward()
+    th.cuda.current_stream().wait_stream(stream)
+    pconv.zero_grad(set_to_none=False)
+    graph = th.cuda.CUDAGraph()
+    with th.cuda.graph(graph):
+        pconv(x, mask).pow(2).mean().backward()
+    graph.replay()
+    th.cuda.synchronize()
+    assert float(pconv.bias.grad[1]) == 0.0
+    assert float(pconv.bias.grad[0]) != 0.0
+
+
 def test_stem_intertwines_mixed_even_odd_channels():
     """Ones mask + mixed parity: stem(ρx) ≈ ρ stem(x) with odd-channel sign flip."""
     channels = 2
