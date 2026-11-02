@@ -247,12 +247,12 @@ class PartialHEALPixConv2d(nn.Module):
             if bool(self.channel_is_odd.any()):
                 with th.no_grad():
                     self.bias[self.channel_is_odd] = 0
-                odd_mask = self.channel_is_odd
 
-                def _odd_bias_hook(grad, odd_mask=odd_mask):
-                    g = grad.clone()
-                    g[odd_mask] = 0
-                    return g
+                # Read the buffer at call time so the mask follows the module to
+                # the GPU, and use masked_fill: boolean-index assignment is not
+                # allowed while a CUDA graph captures the backward pass.
+                def _odd_bias_hook(grad):
+                    return grad.masked_fill(self.channel_is_odd, 0)
 
                 self.bias.register_hook(_odd_bias_hook)
         else:
