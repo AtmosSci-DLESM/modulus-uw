@@ -183,6 +183,8 @@ class AdaptiveLossWeights(torch.nn.Module):
         self.needs_input_diagnostics = bool(
             getattr(inner, "needs_input_diagnostics", False)
         )
+        # Set when a soft constraint reads a coupled (prescribed) channel.
+        self.needs_coupled_input = bool(getattr(inner, "needs_coupled_input", False))
 
         # Views into ``_log_values``, bound in ``_build`` / ``setup``. Forward
         # only ``copy_``s into that storage. CUDA-graph replay does not re-run
@@ -489,12 +491,15 @@ class AdaptiveLossWeights(torch.nn.Module):
         target: torch.Tensor,
         input: Optional[torch.Tensor],
         input_diagnostics: Optional[torch.Tensor],
+        coupled_input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         kwargs = {"average_channels": False}
         if self.needs_input:
             kwargs["input"] = input
         if self.needs_input_diagnostics:
             kwargs["input_diagnostics"] = input_diagnostics
+        if self.needs_coupled_input:
+            kwargs["coupled_input"] = coupled_input
         terms = self.inner(prediction, target, **kwargs)
         if terms.dim() == 0:
             terms = terms.unsqueeze(0)
@@ -550,6 +555,7 @@ class AdaptiveLossWeights(torch.nn.Module):
         average_channels: bool = True,
         input: Optional[torch.Tensor] = None,
         input_diagnostics: Optional[torch.Tensor] = None,
+        coupled_input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not self._built:
             raise RuntimeError(
@@ -567,8 +573,14 @@ class AdaptiveLossWeights(torch.nn.Module):
                 "inner criterion has needs_input_diagnostics=True."
             )
 
+        if self.needs_coupled_input and coupled_input is None:
+            raise ValueError(
+                "AdaptiveLossWeights requires coupled_input because the inner "
+                "criterion has needs_coupled_input=True."
+            )
+
         unweighted = self._call_inner(
-            prediction, target, input, input_diagnostics
+            prediction, target, input, input_diagnostics, coupled_input
         )
         # Detach for the post-backward EMA path; keep a graph on weighted terms.
         # ``copy_`` so train and eval graph replays write the same buffer the
