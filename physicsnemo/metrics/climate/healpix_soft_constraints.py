@@ -111,14 +111,69 @@ class SoftConstraint(torch.nn.Module):
 
     ``physical_rmse`` returns the physical residual RMSE used by validation
     metrics (no alpha, no tolerant map, no loss weight).
+
+    ``needs_coupled_input`` marks a constraint that reads a field the model
+    receives only as a coupled (prescribed) input, such as a pressure level
+    fed by the coupler instead of predicted. Such a constraint takes
+    ``coupled_input=`` (the batch's coupled tensor, ``inputs[3]``) and calls
+    :meth:`with_coupled` before indexing by channel name.
     """
 
     needs_input: bool = False
     needs_input_diagnostics: bool = False
+    needs_coupled_input: bool = False
 
     def setup(self, trainer) -> None:
         """Move buffers to trainer device. Override as needed."""
         pass
+
+    def with_coupled(
+        self,
+        prediction: torch.Tensor,
+        coupled_input: torch.Tensor,
+        input: Optional[torch.Tensor] = None,
+    ):
+        """Append the coupled channels to ``prediction`` (and ``input``).
+
+        The constraint resolves names in ``channels + coupled_channels``, so the
+        coupled block must sit right after the ``len(channels)`` model channels.
+
+        ``coupled_input`` is ``[T_slots, B, C, F, H, W]``. Slot ``presteps + k``
+        is the field the model received for output step ``k``, so the last
+        ``T`` slots line up with the ``T`` predicted steps. With a coupler
+        ``refresh_period`` that field is constant within each period: using it
+        for the predicted state assumes the prescribed field changes little
+        within one period. The first of those slots (the field at the initial
+        time) is appended to every time of ``input``, whose last time is the
+        initial condition.
+        """
+        if coupled_input is None:
+            raise ValueError(
+                f"{type(self).__name__} reads coupled channels; pass coupled_input=inputs[3]."
+            )
+        n_steps = prediction.shape[2]
+        if coupled_input.shape[0] < n_steps:
+            raise ValueError(
+                f"{type(self).__name__}: coupled_input has {coupled_input.shape[0]} "
+                f"time slots but the prediction has {n_steps} steps."
+            )
+        if prediction.shape[3] != self._n_model_channels:
+            raise ValueError(
+                f"{type(self).__name__}: prediction has {prediction.shape[3]} channels "
+                f"but channels names {self._n_model_channels}; with coupled_channels, "
+                "channels must list every prediction channel in order."
+            )
+        coupled = coupled_input[-n_steps:].permute(1, 3, 0, 2, 4, 5).to(prediction.dtype)
+        prediction = torch.cat([prediction, coupled], dim=3)
+        if input is None:
+            return prediction
+        if input.shape[3] != self._n_model_input_channels:
+            raise ValueError(
+                f"{type(self).__name__}: input has {input.shape[3]} channels but "
+                f"input_channels names {self._n_model_input_channels}."
+            )
+        ic = coupled[:, :, :1].to(input.dtype).expand(-1, -1, input.shape[2], -1, -1, -1)
+        return prediction, torch.cat([input, ic], dim=3)
 
     def constraint_loss(
         self,
@@ -194,6 +249,7 @@ class HydrostasySoftConstraint(SoftConstraint):
         topography_masking: bool = True,
         name: str = "hydro",
         relative_loss_scale=None,
+        coupled_channels: Sequence[str] = (),
     ):
         super().__init__()
         self.name = _constraint_name(name)
@@ -203,6 +259,12 @@ class HydrostasySoftConstraint(SoftConstraint):
         self.topography_masking = topography_masking
         self.loss_weights = torch.tensor(weights, dtype=torch.float32)
 
+        # Levels the model does not predict (e.g. a coupled top level) are
+        # looked up in ``coupled_channels``, appended after the prediction
+        # channels by ``with_coupled``. ``channels`` must then list every
+        # prediction channel so the appended block lands at len(channels).
+        self._n_model_channels = len(channels)
+        channels = list(channels) + list(coupled_channels)
         self.pressure_levels = sorted(hPa_levels)
         self.z_pressure_levels = {
             channels.index(f"z{int(pl)}"): pl for pl in self.pressure_levels
@@ -221,6 +283,12 @@ class HydrostasySoftConstraint(SoftConstraint):
                 break
         else:
             raise ValueError("No humidity (q) channels found for hydrostasy soft constraint")
+
+        self.needs_coupled_input = any(
+            idx >= self._n_model_channels
+            for mapping in (self.z_pressure_levels, self.T_pressure_levels, self.q_pressure_levels)
+            for idx in mapping
+        )
 
         self.z_constraint_pressure_levels = {
             i: pl for i, pl in enumerate(self.pressure_levels)
@@ -349,11 +417,14 @@ class HydrostasySoftConstraint(SoftConstraint):
         target: torch.Tensor,
         *,
         average_channels: bool = True,
+        coupled_input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         with torch.amp.autocast("cuda", enabled=False):
             prediction = prediction.float()
             if prediction.ndim != 6:
                 raise AssertionError("Expected predictions to have 6 dimensions")
+            if self.needs_coupled_input:
+                prediction = self.with_coupled(prediction, coupled_input)
 
             x = self.scale(prediction)
             Tv_avg, Tv_model_avg = self.constraint(x)
@@ -379,11 +450,14 @@ class HydrostasySoftConstraint(SoftConstraint):
         Underground columns are masked when ``topography_masking`` is True.
         No alpha, tolerant map, or loss weight is applied.
         """
+        coupled_input = kwargs.get("coupled_input")
         del target, kwargs
         with torch.amp.autocast("cuda", enabled=False):
             prediction = prediction.float()
             if prediction.ndim != 6:
                 raise AssertionError("Expected predictions to have 6 dimensions")
+            if self.needs_coupled_input:
+                prediction = self.with_coupled(prediction, coupled_input)
             x = self.scale(prediction)
             Tv_avg, Tv_model_avg = self.constraint(x)
             Tv_error = Tv_avg - Tv_model_avg
@@ -836,6 +910,7 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         mountain_torque_anomaly: bool = False,
         reference_temperature: float = 288.0,
         reference_pressure: float = 101325.0,
+        coupled_channels: Sequence[str] = (),
     ):
         super().__init__()
         self.name = _constraint_name(name)
@@ -851,10 +926,19 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         self.mountain_torque_anomaly = bool(mountain_torque_anomaly)
         self._ref_temperature = float(reference_temperature)
         self._ref_pressure = float(reference_pressure)
-        self.channels = list(channels)
-        self.input_channels = (
+        # Levels the model does not predict (e.g. a coupled top level) are
+        # looked up in ``coupled_channels``, which ``with_coupled`` appends
+        # after the prediction channels and after the input channels (as the
+        # initial-time field). ``channels`` / ``input_channels`` must then list
+        # every prediction / input channel in order.
+        self.coupled_channels = list(coupled_channels)
+        model_input_channels = (
             list(input_channels) if input_channels is not None else list(channels)
         )
+        self._n_model_channels = len(channels)
+        self._n_model_input_channels = len(model_input_channels)
+        self.channels = list(channels) + self.coupled_channels
+        self.input_channels = model_input_channels + self.coupled_channels
         self.weight = float(weight)
         self.g0 = float(g0)
         self.a = float(a)
@@ -925,6 +1009,10 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
                     f"{name!r} in input_channels or diagnostic_channels."
                 )
             self._ic_diag_index[name] = self.diagnostic_channels.index(name)
+        self.needs_coupled_input = any(i >= self._n_model_channels for i in u_idxs) or any(
+            i is not None and i >= self._n_model_input_channels
+            for i in self._ic_input_index.values()
+        )
 
         def _stat(name: str, key: str) -> float:
             if name not in scaling:
@@ -1275,6 +1363,7 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         input: torch.Tensor,
         input_diagnostics: Optional[torch.Tensor] = None,
         average_channels: bool = True,
+        coupled_input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         del target
         if input is None:
@@ -1292,6 +1381,8 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
                 input_diagnostics = input_diagnostics.float()
             if prediction.ndim != 6:
                 raise AssertionError("Expected predictions to have 6 dimensions")
+            if self.needs_coupled_input:
+                prediction, input = self.with_coupled(prediction, coupled_input, input)
             residual = self._budget_residuals(prediction, input, input_diagnostics)
             error = (residual / self.alpha) ** 2
             loss = self.weight * _error_tolerant(error).mean()
@@ -1306,6 +1397,7 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         *,
         input: torch.Tensor,
         input_diagnostics: Optional[torch.Tensor] = None,
+        coupled_input: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """RMSE of the global AAM budget residual in N·m.
@@ -1328,6 +1420,8 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
             input = input.float()
             if input_diagnostics is not None:
                 input_diagnostics = input_diagnostics.float()
+            if self.needs_coupled_input:
+                prediction, input = self.with_coupled(prediction, coupled_input, input)
             residual = self._budget_residuals(prediction, input, input_diagnostics)
             # A realistic budget residual is ~1e19 N·m. Squaring that in fp32
             # overflows to inf (3e19**2 > 3.4e38), so the RMSE is accumulated
@@ -1451,6 +1545,11 @@ class CapAxialAngularMomentumSoftConstraint(AxialAngularMomentumSoftConstraint):
                 if vname not in self.diagnostic_channels:
                     raise ValueError(f"Cap AAM requires IC field {vname!r} in input_channels or diagnostic_channels.")
                 self._ic_diag_index[vname] = self.diagnostic_channels.index(vname)
+        self.needs_coupled_input = (
+            self.needs_coupled_input
+            or any(i >= self._n_model_channels for i in v_idxs)
+            or any(i is not None and i >= self._n_model_input_channels for i in self._ic_input_index.values())
+        )
         v_stats = [(float(scaling[f"v{int(p)}"]["mean"]), float(scaling[f"v{int(p)}"]["std"])) for p in self.pressure_levels]
         self.register_buffer("v_mean", torch.tensor([m for m, _ in v_stats], dtype=torch.float32).view(1, 1, 1, -1, 1, 1), persistent=False)
         self.register_buffer("v_std", torch.tensor([s_ for _, s_ in v_stats], dtype=torch.float32).view(1, 1, 1, -1, 1, 1), persistent=False)
@@ -1596,7 +1695,7 @@ class CapAxialAngularMomentumSoftConstraint(AxialAngularMomentumSoftConstraint):
     def term_names(self) -> list[str]:
         return [self.name]
 
-    def constraint_loss(self, prediction, target, *, input, input_diagnostics=None, average_channels: bool = True) -> torch.Tensor:
+    def constraint_loss(self, prediction, target, *, input, input_diagnostics=None, average_channels: bool = True, coupled_input=None) -> torch.Tensor:
         del target
         if input is None:
             raise ValueError("CapAxialAngularMomentumSoftConstraint requires prognostic input.")
@@ -1605,11 +1704,14 @@ class CapAxialAngularMomentumSoftConstraint(AxialAngularMomentumSoftConstraint):
         with torch.amp.autocast("cuda", enabled=False):
             if prediction.ndim != 6:
                 raise AssertionError("Expected predictions to have 6 dimensions")
-            r = self._boundary_residuals(prediction.float(), input.float(), None if input_diagnostics is None else input_diagnostics.float())
+            prediction, input = prediction.float(), input.float()
+            if self.needs_coupled_input:
+                prediction, input = self.with_coupled(prediction, coupled_input, input)
+            r = self._boundary_residuals(prediction, input, None if input_diagnostics is None else input_diagnostics.float())
             loss = self.weight * _error_tolerant((r / self.alpha) ** 2).mean()
             return loss.float() if average_channels else loss.float().reshape(())
 
-    def physical_rmse(self, prediction, target=None, *, input, input_diagnostics=None, average_channels: bool = True, **kwargs) -> torch.Tensor:
+    def physical_rmse(self, prediction, target=None, *, input, input_diagnostics=None, average_channels: bool = True, coupled_input=None, **kwargs) -> torch.Tensor:
         """RMS of the cap residual [N m] (all boundaries); per reported latitude when ``average_channels=False``.
 
         Same transitions as the loss; no alpha, tolerant map or weight. ``report_names`` labels the per-term values.
@@ -1618,7 +1720,10 @@ class CapAxialAngularMomentumSoftConstraint(AxialAngularMomentumSoftConstraint):
         if input is None:
             raise ValueError("CapAxialAngularMomentumSoftConstraint.physical_rmse requires input.")
         with torch.amp.autocast("cuda", enabled=False):
-            r = self._boundary_residuals(prediction.float(), input.float(), None if input_diagnostics is None else input_diagnostics.float())
+            prediction, input = prediction.float(), input.float()
+            if self.needs_coupled_input:
+                prediction, input = self.with_coupled(prediction, coupled_input, input)
+            r = self._boundary_residuals(prediction, input, None if input_diagnostics is None else input_diagnostics.float())
             ms = (r * r).mean(dim=(0, 1))
             if average_channels:
                 return torch.sqrt(ms.mean()).float()
@@ -1638,7 +1743,8 @@ class LossWithSoftConstraints(torch.nn.Module):
 
     ``needs_input`` is True iff any child soft constraint requires prognostic
     input. ``needs_input_diagnostics`` is True iff any child needs IC diagnostic
-    channels. Trainers should gate passing tensors on those flags.
+    channels. ``needs_coupled_input`` is True iff any child reads a coupled
+    channel. Trainers should gate passing tensors on those flags.
     """
 
     def __init__(
@@ -1658,8 +1764,11 @@ class LossWithSoftConstraints(torch.nn.Module):
         self.needs_input_diagnostics = any(
             getattr(c, "needs_input_diagnostics", False) for c in self.constraints
         )
+        self.needs_coupled_input = any(
+            getattr(c, "needs_coupled_input", False) for c in self.constraints
+        )
         # Bind a forward whose signature matches the needs_* flags.
-        if self.needs_input or self.needs_input_diagnostics:
+        if self.needs_input or self.needs_input_diagnostics or self.needs_coupled_input:
             self.forward = self._forward_with_input
         else:
             self.forward = self._forward_without_input
@@ -1711,6 +1820,7 @@ class LossWithSoftConstraints(torch.nn.Module):
         average_channels: bool,
         input: Optional[torch.Tensor],
         input_diagnostics: Optional[torch.Tensor],
+        coupled_input: Optional[torch.Tensor] = None,
     ) -> list[torch.Tensor]:
         parts = []
         for constraint in self.constraints:
@@ -1719,6 +1829,8 @@ class LossWithSoftConstraints(torch.nn.Module):
                 kwargs["input"] = input
             if getattr(constraint, "needs_input_diagnostics", False):
                 kwargs["input_diagnostics"] = input_diagnostics
+            if getattr(constraint, "needs_coupled_input", False):
+                kwargs["coupled_input"] = coupled_input
             parts.append(
                 constraint.constraint_loss(prediction, target, **kwargs)
             )
@@ -1772,7 +1884,13 @@ class LossWithSoftConstraints(torch.nn.Module):
         average_channels: bool = True,
         input: Optional[torch.Tensor] = None,
         input_diagnostics: Optional[torch.Tensor] = None,
+        coupled_input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.needs_coupled_input and coupled_input is None:
+            raise ValueError(
+                "LossWithSoftConstraints requires coupled_input because a soft "
+                "constraint reads a coupled channel (pass coupled_input=inputs[3])."
+            )
         if self.needs_input and input is None:
             raise ValueError(
                 "LossWithSoftConstraints requires prognostic input because a "
@@ -1795,5 +1913,6 @@ class LossWithSoftConstraints(torch.nn.Module):
             average_channels=False,
             input=input,
             input_diagnostics=input_diagnostics,
+            coupled_input=coupled_input,
         )
         return self._combine(data, parts, average_channels)
