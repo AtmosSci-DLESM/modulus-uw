@@ -502,6 +502,132 @@ def test_DealiasedDownsample_filter_len1_matches_strided_slice_all_power2_stride
 
 @import_or_fail("hydra")
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+@pytest.mark.parametrize("stride", [2, 4])
+def test_DealiasedDownsample_reflection_equivariant_intertwines(
+    device, test_data, pytestconfig, stride
+):
+    """Local Z₂ Reynolds wrap: down(ρx) ≈ ρ down(x) for triangle-3 stride-2 stacks."""
+    from physicsnemo.models.dlwp_healpix_layers import DealiasedDownsample
+    from physicsnemo.models.dlwp_healpix_layers.reflection_ops import hpx_spatial_reflect
+
+    channels = 2
+    nside = 16
+    block = DealiasedDownsample(
+        in_channels=channels,
+        resample_filter=(1.0, 2.0, 1.0),
+        stride=stride,
+        hpx_padding_mode="isolatitude",
+        compile_padding=False,
+        nside=nside,
+        reflection_equivariant=True,
+    ).to(device)
+    x = test_data(channels=channels, img_size=nside, device=device)
+    with torch.no_grad():
+        y = block(x)
+        y_from_rx = block(hpx_spatial_reflect(x))
+        ry = hpx_spatial_reflect(y)
+    assert torch.allclose(y_from_rx, ry, atol=1e-5, rtol=1e-4)
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_DealiasedDownsample_strided_does_not_intertwine_on_even_nside(
+    device, test_data, pytestconfig
+):
+    """Control: bare stride-2 BlurPool breaks R-intertwining on even faces."""
+    from physicsnemo.models.dlwp_healpix_layers import DealiasedDownsample
+    from physicsnemo.models.dlwp_healpix_layers.reflection_ops import hpx_spatial_reflect
+
+    channels = 2
+    nside = 16
+    block = DealiasedDownsample(
+        in_channels=channels,
+        resample_filter=(1.0, 2.0, 1.0),
+        stride=2,
+        hpx_padding_mode="isolatitude",
+        compile_padding=False,
+        nside=nside,
+        reflection_equivariant=False,
+    ).to(device)
+    # Non-symmetric input so the sublattice mismatch is visible.
+    x = torch.randn(12, channels, nside, nside, device=device)
+    with torch.no_grad():
+        err = (block(hpx_spatial_reflect(x)) - hpx_spatial_reflect(block(x))).abs().max()
+    assert err.item() > 1e-3
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_DealiasedDownsample_reflection_equivariant_zonally_uniform_stays_even(
+    device, pytestconfig
+):
+    """Soft zonal check: zonally uniform even field stays ρ-symmetric after Π(down).
+
+    HEALPix face CNNs are not zonally equivariant in general, so we do not require
+    zero ring spread after strided blur — only that a zonally uniform cos(lat)
+    input (even under ρ) remains even under ρ at the coarser grid.
+    """
+    from earth2grid.healpix import coordinates as hpx_coordinates
+    from physicsnemo.models.dlwp_healpix_layers import DealiasedDownsample
+    from physicsnemo.models.dlwp_healpix_layers.reflection_ops import hpx_spatial_reflect
+
+    channels = 1
+    nside = 16
+    x_coords = (torch.arange(nside, dtype=torch.float32) + 0.5) / nside
+    xx, yy = torch.meshgrid(x_coords, x_coords, indexing="ij")
+    faces = []
+    for f in range(12):
+        ff = torch.full_like(xx, f, dtype=torch.long)
+        xs, ys = hpx_coordinates.face_to_global(xx, yy, ff)
+        _lon, lat_deg = hpx_coordinates.global_to_angular(xs, ys)
+        faces.append(torch.cos(torch.deg2rad(lat_deg)))
+    field = torch.stack(faces, dim=0).unsqueeze(1).to(device)
+    # Input is zonally uniform and even under ρ.
+    assert torch.allclose(field, hpx_spatial_reflect(field), atol=1e-5, rtol=1e-4)
+
+    block = DealiasedDownsample(
+        in_channels=channels,
+        resample_filter=(1.0, 2.0, 1.0),
+        stride=2,
+        hpx_padding_mode="isolatitude",
+        compile_padding=False,
+        nside=nside,
+        reflection_equivariant=True,
+    ).to(device)
+    with torch.no_grad():
+        y = block(field)
+    assert torch.allclose(y, hpx_spatial_reflect(y), atol=1e-5, rtol=1e-4)
+
+
+@import_or_fail("hydra")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_DealiasedDownsample_reflection_equivariant_cuda_graph_capture(pytestconfig):
+    """Reflection-equivariant downsample must not allocate during CUDA graph capture."""
+    from physicsnemo.models.dlwp_healpix_layers import DealiasedDownsample
+
+    device = torch.device("cuda:0")
+    channels = 2
+    nside = 16
+    block = DealiasedDownsample(
+        in_channels=channels,
+        resample_filter=(1.0, 2.0, 1.0),
+        stride=2,
+        hpx_padding_mode="isolatitude",
+        compile_padding=False,
+        nside=nside,
+        reflection_equivariant=True,
+    ).to(device)
+    x = torch.randn(12, channels, nside, nside, device=device)
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        with torch.cuda.graph(graph):
+            y = block(x)
+    assert y.shape == (12, channels, nside // 2, nside // 2)
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 def test_TransposedConvUpsample_initialization(device, pytestconfig):
     from physicsnemo.models.dlwp_healpix_layers import (
         TransposedConvUpsample,  #

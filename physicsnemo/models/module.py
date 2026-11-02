@@ -383,6 +383,10 @@ class Module(torch.nn.Module):
 
             # Merge model_args (adding new keys and updating existing ones)
             if model_args is not None:
+                args_to_remove = ["_target_", "_recursive_"]
+                for k in args_to_remove:
+                    if k in model_args:
+                        del model_args[k]
                 args["__args__"].update(model_args)
 
             model = cls.instantiate(args)
