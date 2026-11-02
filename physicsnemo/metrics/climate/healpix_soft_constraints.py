@@ -127,16 +127,56 @@ class SoftConstraint(torch.nn.Module):
         """Move buffers to trainer device. Override as needed."""
         pass
 
+    def _resolve_coupled(self, side, channels, coupled_channels, needed=None):
+        """Channel names this constraint indexes on one side (``"model"`` or ``"input"``).
+
+        Without a needed field in ``coupled_channels`` this is ``channels``
+        unchanged. Otherwise it is the needed ``channels`` (all of them when
+        ``needed`` is None) followed by the needed coupled channels, which is
+        the layout :meth:`with_coupled` builds. Keeping only the needed
+        channels avoids copying the whole prediction for a few coupled ones.
+        Returns ``(names, reads_coupled)``.
+        """
+        channels, coupled = list(channels), list(coupled_channels)
+        setattr(self, f"_n_{side}_channels", len(channels))
+        want = (lambda n: True) if needed is None else (lambda n: n in needed)
+        from_coupler = [n for n in dict.fromkeys(coupled) if want(n) and n not in channels]
+        if not from_coupler:
+            setattr(self, f"_{side}_keep", None)
+            return channels, False
+        keep = [i for i, n in enumerate(channels) if want(n)]
+        setattr(self, f"_{side}_keep", torch.tensor(keep, dtype=torch.long))
+        setattr(self, f"_{side}_coupled_keep", torch.tensor([coupled.index(n) for n in from_coupler], dtype=torch.long))
+        return [channels[i] for i in keep] + from_coupler, True
+
+    def _compact(self, side, x, coupled):
+        """``x`` reduced to the channels named by ``_resolve_coupled`` for ``side``, in float32."""
+        keep = getattr(self, f"_{side}_keep")
+        if keep is None:
+            return x
+        n_model = getattr(self, f"_n_{side}_channels")
+        if x.shape[3] != n_model:
+            raise ValueError(
+                f"{type(self).__name__}: {side} tensor has {x.shape[3]} channels but "
+                f"{n_model} are named; with coupled_channels the {side} channel list "
+                "must name every channel of that tensor in order."
+            )
+        ckeep = getattr(self, f"_{side}_coupled_keep").to(coupled.device)
+        return torch.cat(
+            [x.index_select(3, keep.to(x.device)).float(), coupled.index_select(3, ckeep).float()],
+            dim=3,
+        )
+
     def with_coupled(
         self,
         prediction: torch.Tensor,
         coupled_input: torch.Tensor,
         input: Optional[torch.Tensor] = None,
     ):
-        """Append the coupled channels to ``prediction`` (and ``input``).
+        """Prediction (and input) in the channel layout this constraint indexes.
 
-        The constraint resolves names in ``channels + coupled_channels``, so the
-        coupled block must sit right after the ``len(channels)`` model channels.
+        That layout is the needed model channels followed by the needed
+        coupled channels (see ``_resolve_coupled``); the result is float32.
 
         ``coupled_input`` is ``[T_slots, B, C, F, H, W]``. Slot ``presteps + k``
         is the field the model received for output step ``k``, so the last
@@ -144,8 +184,8 @@ class SoftConstraint(torch.nn.Module):
         ``refresh_period`` that field is constant within each period: using it
         for the predicted state assumes the prescribed field changes little
         within one period. The first of those slots (the field at the initial
-        time) is appended to every time of ``input``, whose last time is the
-        initial condition.
+        time) stands for the coupled field at every time of ``input``, whose
+        last time is the initial condition.
         """
         if coupled_input is None:
             raise ValueError(
@@ -157,23 +197,12 @@ class SoftConstraint(torch.nn.Module):
                 f"{type(self).__name__}: coupled_input has {coupled_input.shape[0]} "
                 f"time slots but the prediction has {n_steps} steps."
             )
-        if prediction.shape[3] != self._n_model_channels:
-            raise ValueError(
-                f"{type(self).__name__}: prediction has {prediction.shape[3]} channels "
-                f"but channels names {self._n_model_channels}; with coupled_channels, "
-                "channels must list every prediction channel in order."
-            )
-        coupled = coupled_input[-n_steps:].permute(1, 3, 0, 2, 4, 5).to(prediction.dtype)
-        prediction = torch.cat([prediction, coupled], dim=3)
+        coupled = coupled_input[-n_steps:].permute(1, 3, 0, 2, 4, 5)
+        prediction = self._compact("model", prediction, coupled)
         if input is None:
             return prediction
-        if input.shape[3] != self._n_model_input_channels:
-            raise ValueError(
-                f"{type(self).__name__}: input has {input.shape[3]} channels but "
-                f"input_channels names {self._n_model_input_channels}."
-            )
-        ic = coupled[:, :, :1].to(input.dtype).expand(-1, -1, input.shape[2], -1, -1, -1)
-        return prediction, torch.cat([input, ic], dim=3)
+        ic = coupled[:, :, :1].expand(-1, -1, input.shape[2], -1, -1, -1)
+        return prediction, self._compact("input", input, ic)
 
     def constraint_loss(
         self,
@@ -260,11 +289,12 @@ class HydrostasySoftConstraint(SoftConstraint):
         self.loss_weights = torch.tensor(weights, dtype=torch.float32)
 
         # Levels the model does not predict (e.g. a coupled top level) are
-        # looked up in ``coupled_channels``, appended after the prediction
-        # channels by ``with_coupled``. ``channels`` must then list every
-        # prediction channel so the appended block lands at len(channels).
-        self._n_model_channels = len(channels)
-        channels = list(channels) + list(coupled_channels)
+        # looked up in ``coupled_channels``; ``channels`` must then name every
+        # prediction channel in order (see ``with_coupled``).
+        level_names = {f"{v}{int(p)}" for v in "ztq" for p in hPa_levels}
+        channels, self.needs_coupled_input = self._resolve_coupled(
+            "model", channels, coupled_channels, level_names
+        )
         self.pressure_levels = sorted(hPa_levels)
         self.z_pressure_levels = {
             channels.index(f"z{int(pl)}"): pl for pl in self.pressure_levels
@@ -283,12 +313,6 @@ class HydrostasySoftConstraint(SoftConstraint):
                 break
         else:
             raise ValueError("No humidity (q) channels found for hydrostasy soft constraint")
-
-        self.needs_coupled_input = any(
-            idx >= self._n_model_channels
-            for mapping in (self.z_pressure_levels, self.T_pressure_levels, self.q_pressure_levels)
-            for idx in mapping
-        )
 
         self.z_constraint_pressure_levels = {
             i: pl for i, pl in enumerate(self.pressure_levels)
@@ -882,6 +906,8 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
 
     needs_input = True
     _STRESS_NAMES = ("avg_iews-6h", "avg_iegwss-6h")
+    # Pressure-level fields read at every level (prediction and initial condition).
+    _LEVEL_VARS = ("u",)
     _REQUIRED_IC_FIELDS_BASE = ("sp",)
 
     def __init__(
@@ -927,18 +953,25 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
         self._ref_temperature = float(reference_temperature)
         self._ref_pressure = float(reference_pressure)
         # Levels the model does not predict (e.g. a coupled top level) are
-        # looked up in ``coupled_channels``, which ``with_coupled`` appends
-        # after the prediction channels and after the input channels (as the
-        # initial-time field). ``channels`` / ``input_channels`` must then list
-        # every prediction / input channel in order.
-        self.coupled_channels = list(coupled_channels)
+        # looked up in ``coupled_channels``; ``channels`` / ``input_channels``
+        # must then name every prediction / input channel in order (see
+        # ``with_coupled``). The derived-surface-pressure path reads its own
+        # channels, so it keeps every model channel.
         model_input_channels = (
             list(input_channels) if input_channels is not None else list(channels)
         )
-        self._n_model_channels = len(channels)
-        self._n_model_input_channels = len(model_input_channels)
-        self.channels = list(channels) + self.coupled_channels
-        self.input_channels = model_input_channels + self.coupled_channels
+        self._model_channel_names = list(channels)
+        level_names = {f"{v}{int(p)}" for v in self._LEVEL_VARS for p in hPa_levels}
+        derived = derived_surface_pressure is not None
+        self.channels, pred_coupled = self._resolve_coupled(
+            "model", channels, coupled_channels,
+            None if derived else level_names | {"sp", *self._STRESS_NAMES},
+        )
+        self.input_channels, input_coupled = self._resolve_coupled(
+            "input", model_input_channels, coupled_channels,
+            None if derived else level_names | {"sp"},
+        )
+        self.needs_coupled_input = pred_coupled or input_coupled
         self.weight = float(weight)
         self.g0 = float(g0)
         self.a = float(a)
@@ -998,7 +1031,7 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
             self.diagnostic_channels = list(diagnostic_channels)
         elif self.needs_input_diagnostics:
             input_set = set(self.input_channels)
-            self.diagnostic_channels = [c for c in self.channels if c not in input_set]
+            self.diagnostic_channels = [c for c in self._model_channel_names if c not in input_set]
         else:
             self.diagnostic_channels = []
         self._ic_diag_index: Dict[str, int] = {}
@@ -1009,10 +1042,6 @@ class AxialAngularMomentumSoftConstraint(SoftConstraint):
                     f"{name!r} in input_channels or diagnostic_channels."
                 )
             self._ic_diag_index[name] = self.diagnostic_channels.index(name)
-        self.needs_coupled_input = any(i >= self._n_model_channels for i in u_idxs) or any(
-            i is not None and i >= self._n_model_input_channels
-            for i in self._ic_input_index.values()
-        )
 
         def _stat(name: str, key: str) -> float:
             if name not in scaling:
@@ -1492,6 +1521,7 @@ class CapAxialAngularMomentumSoftConstraint(AxialAngularMomentumSoftConstraint):
 
     # Latitudes [deg] whose boundary RMS is reported as per-term values (N and S), for TensorBoard.
     REPORT_LATITUDES = (65.0, 50.0, 35.0, 20.0)
+    _LEVEL_VARS = ("u", "v")
 
     def __init__(
         self,
@@ -1541,15 +1571,10 @@ class CapAxialAngularMomentumSoftConstraint(AxialAngularMomentumSoftConstraint):
                 if not self.needs_input_diagnostics:
                     self.needs_input_diagnostics = True
                     input_set = set(self.input_channels)
-                    self.diagnostic_channels = [c for c in self.channels if c not in input_set]
+                    self.diagnostic_channels = [c for c in self._model_channel_names if c not in input_set]
                 if vname not in self.diagnostic_channels:
                     raise ValueError(f"Cap AAM requires IC field {vname!r} in input_channels or diagnostic_channels.")
                 self._ic_diag_index[vname] = self.diagnostic_channels.index(vname)
-        self.needs_coupled_input = (
-            self.needs_coupled_input
-            or any(i >= self._n_model_channels for i in v_idxs)
-            or any(i is not None and i >= self._n_model_input_channels for i in self._ic_input_index.values())
-        )
         v_stats = [(float(scaling[f"v{int(p)}"]["mean"]), float(scaling[f"v{int(p)}"]["std"])) for p in self.pressure_levels]
         self.register_buffer("v_mean", torch.tensor([m for m, _ in v_stats], dtype=torch.float32).view(1, 1, 1, -1, 1, 1), persistent=False)
         self.register_buffer("v_std", torch.tensor([s_ for _, s_ in v_stats], dtype=torch.float32).view(1, 1, 1, -1, 1, 1), persistent=False)
