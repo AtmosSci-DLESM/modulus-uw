@@ -502,11 +502,19 @@ def build_coupled_partial_conv_stem(
     if not channel_names:
         raise ValueError("coupled_partial_conv requires at least one coupled variable")
 
-    missing = sorted({n for n in channel_names if n not in masks_cfg})
-    if missing:
+    # A coupled variable without a mask entry is valid everywhere (all-ones
+    # mask): e.g. a prescribed atmospheric level next to masked ocean fields.
+    # The shape comes from a loaded mask, so at least one entry is required.
+    defaulted = [n for n in channel_names if n not in masks_cfg]
+    if len(defaulted) == len(channel_names):
         raise ValueError(
-            "coupled_partial_conv.masks is missing entries for coupled variables: "
-            + ", ".join(missing)
+            "coupled_partial_conv.masks has no entry for any coupled variable; "
+            "set coupled_partial_conv to null to disable the stem."
+        )
+    if defaulted:
+        logger.info(
+            "coupled_partial_conv: no mask for %s; using an all-ones mask.",
+            ", ".join(defaulted),
         )
 
     odd_set = {str(v) for v in (odd_coupled_variables or [])}
@@ -520,6 +528,9 @@ def build_coupled_partial_conv_stem(
 
     per_channel = []
     for name in channel_names:
+        if name in defaulted:
+            per_channel.append(None)
+            continue
         mcfg = _as_plain_dict(masks_cfg[name])
         if "dataset_path" not in mcfg:
             raise ValueError(f"coupled_partial_conv.masks.{name} requires dataset_path")
@@ -533,6 +544,8 @@ def build_coupled_partial_conv_stem(
             )
         )
 
+    shape_ref = next(m for m in per_channel if m is not None)
+    per_channel = [th.ones_like(shape_ref) if m is None else m for m in per_channel]
     channel_masks = th.stack(per_channel, dim=0)  # [C, F, H, W]
     stem_cfg = _resolve_stem_config(cfg)
     return instantiate(

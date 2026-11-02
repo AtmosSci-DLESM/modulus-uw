@@ -164,7 +164,7 @@ def test_build_stem_none_config_returns_none():
     assert build_coupled_partial_conv_stem(None, _toy_couplings()) is None
 
 
-def test_build_stem_requires_all_variables(tmp_path, ocean_frac):
+def test_build_stem_missing_mask_is_all_ones(tmp_path, ocean_frac):
     zpath = tmp_path / "mask.zarr"
     _write_lsm_zarr(zpath, ocean_frac)
     cfg = {
@@ -179,8 +179,13 @@ def test_build_stem_requires_all_variables(tmp_path, ocean_frac):
             }
         },
     }
-    with pytest.raises(ValueError, match="missing entries"):
-        build_coupled_partial_conv_stem(cfg, _toy_couplings())
+    stem = build_coupled_partial_conv_stem(cfg, _toy_couplings())
+    masks = stem.channel_masks
+    assert th.allclose(masks[0], th.from_numpy(ocean_frac).to(masks.dtype))
+    assert th.all(masks[1] == 1.0)
+
+    with pytest.raises(ValueError, match="no entry for any coupled variable"):
+        build_coupled_partial_conv_stem(cfg, _toy_couplings(variables=("u50", "v50")))
 
 
 @pytest.mark.parametrize("hpx_padding_mode", ["karlbauer", "earth2grid"])
