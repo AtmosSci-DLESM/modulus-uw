@@ -15,6 +15,7 @@
 # limitations under the License.
 
 # System modules
+import copy
 import logging
 import warnings
 from pathlib import Path
@@ -24,7 +25,7 @@ from typing import Optional, Sequence, Union
 import numpy as np
 
 # External modules
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -55,6 +56,7 @@ class TimeSeriesDataModuleZarr:
         presteps: int = 0,
         input_time_dim: int = 1,
         output_time_dim: int = 1,
+        train_output_time_dim: Optional[int] = None,
         data_time_step: Union[int, str] = "3h",
         time_step: Union[int, str] = "6h",
         gap: Union[int, str, None] = None,
@@ -99,6 +101,10 @@ class TimeSeriesDataModuleZarr:
             Number of time steps in the input array, default 1
         output_time_dim: int, optional
             Number of time steps in the target/ground truth array, default 1
+        train_output_time_dim: int, optional
+            Output steps per training sample, for training that rolls further than
+            it scores (push-forward). Validation and test keep output_time_dim.
+            Default None uses output_time_dim.
         data_time_step: Union[int, str], optional
             Either integer hours or a str interpretable by pandas: time between steps in the
             original data time series, default "3h"
@@ -151,6 +157,8 @@ class TimeSeriesDataModuleZarr:
         self.splits = splits
         self.input_time_dim = input_time_dim + (presteps * input_time_dim)
         self.output_time_dim = output_time_dim
+        # Training samples may cover a longer window (push-forward); val/test keep output_time_dim.
+        self.train_output_time_dim = train_output_time_dim or output_time_dim
         self.data_time_step = data_time_step
         self.time_step = time_step
         self.gap = gap
@@ -257,6 +265,27 @@ class TimeSeriesDataModuleZarr:
         """Get the dataset class to use for creating datasets"""
         return TimeSeriesDatasetZarr
 
+    def _train_kwargs(self, common_kwargs: dict) -> dict:
+        """Dataset kwargs for the train split: ``train_output_time_dim`` steps per sample."""
+        if self.train_output_time_dim == self.output_time_dim:
+            return common_kwargs
+        return {**common_kwargs, "output_time_dim": self.train_output_time_dim}
+
+    def _with_train_window(self, dataset_class):
+        """Wrap ``dataset_class`` so the train split is built with ``_train_kwargs``.
+
+        Only the train split passes ``add_train_noise``, so that keyword marks it.
+        Wrapping the class leaves the split calls in ``_create_datasets`` as they
+        are, and every train dataset they build (one per store) gets the window.
+        """
+
+        def build(**kwargs):
+            if "add_train_noise" in kwargs:
+                kwargs = self._train_kwargs(kwargs)
+            return dataset_class(**kwargs)
+
+        return build
+
     def _create_datasets(self, common_kwargs: dict, dataset_class, dist) -> None:
         """Create train, validation, and test datasets based on configuration"""
         # forecast_init_times are provided just create the test dataset
@@ -297,6 +326,8 @@ class TimeSeriesDataModuleZarr:
 
         common_kwargs = self._get_common_dataset_kwargs()
         dataset_class = self._get_dataset_class()
+        if self.train_output_time_dim != self.output_time_dim:
+            dataset_class = self._with_train_window(dataset_class)
 
         self._create_datasets(common_kwargs, dataset_class, dist)
 
@@ -445,6 +476,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         presteps: int = 0,
         input_time_dim: int = 1,
         output_time_dim: int = 1,
+        train_output_time_dim: Optional[int] = None,
         data_time_step: Union[int, str] = "3h",
         time_step: Union[int, str] = "6h",
         gap: Union[int, str, None] = None,
@@ -490,6 +522,8 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             Number of time steps in the input array, default 1
         output_time_dim: int, optional
             Number of time steps in the target/ground truth array, default 1
+        train_output_time_dim: int, optional
+            Output steps per training sample; see TimeSeriesDataModuleZarr.
         data_time_step: Union[int, str], optional
             Either integer hours or a str interpretable by pandas: time between steps in the
             original data time series, default "3h"
@@ -546,6 +580,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             presteps,
             input_time_dim,
             output_time_dim,
+            train_output_time_dim,
             data_time_step,
             time_step,
             gap,
@@ -578,6 +613,19 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             }
         )
         return base_kwargs
+
+    def _train_kwargs(self, common_kwargs: dict) -> dict:
+        """Train-split kwargs; the couplers also get the longer window."""
+        kwargs = super()._train_kwargs(common_kwargs)
+        if kwargs is common_kwargs:
+            return kwargs
+        couplings = []
+        for c in self.couplings:
+            # Plain, resolved copies: the configs interpolate ${data.output_time_dim}.
+            c = OmegaConf.to_container(c, resolve=True) if OmegaConf.is_config(c) else copy.deepcopy(c)
+            c["params"]["output_time_dim"] = self.train_output_time_dim
+            couplings.append(c)
+        return {**kwargs, "couplings": couplings}
 
     def _get_dataset_class(self):
         """Get the dataset class to use for creating datasets"""

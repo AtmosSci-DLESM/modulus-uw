@@ -442,10 +442,13 @@ class HEALPixRecUNet(Module):
             else:
                 s = step - self.presteps + prestep
                 if len(self.couplings) > 0:
+                    # outputs[s - 1] is the state at the input time of step s, whose
+                    # coupling slot is presteps + s = step + prestep. With a refresh
+                    # period this keeps the re-primed prestep in the previous period.
                     input_tensor = self._reshape_inputs(
                         inputs=[outputs[s - 1][:, :, :, :self.input_channels]]
                         + list(inputs[1:3])
-                        + [inputs[3][step - (prestep - self.presteps)]],
+                        + [inputs[3][step + prestep]],
                         step=s + 1,
                     )
                 else:

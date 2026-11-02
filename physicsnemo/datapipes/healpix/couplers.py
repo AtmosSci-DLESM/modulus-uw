@@ -16,7 +16,7 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Sequence
+from typing import Optional, Sequence
 
 import cftime
 import numpy as np
@@ -237,10 +237,17 @@ class BaseCoupler(ABC):
             (bsize, self.coupled_integration_dim, self.timevar_dim) + self.spatial_dims
         )
 
-        index_range = slice(
-            batch["time"].start,
-            batch["time"].start + self._coupled_offsets[-1, -1, -1] + 1,
-        )
+        # Offsets may be negative (a refresh period puts the prestep slot in the
+        # previous period), so the read starts at the smallest offset and the
+        # stored offsets are shifted by it when indexing.
+        self._offset_min = int(self._coupled_offsets.min())
+        start = batch["time"].start + self._offset_min
+        if start < 0:
+            raise ValueError(
+                f"Coupled data needed from time index {start}, before the start of "
+                "the dataset; start the split at least one refresh period later."
+            )
+        index_range = slice(start, batch["time"].start + int(self._coupled_offsets.max()) + 1)
 
         # extract coupled variables
         if self.use_zarr:
@@ -297,14 +304,11 @@ class BaseCoupler(ABC):
             # use static offsets to create integrated coupling array
             for b in range(bsize):
                 for i in range(self.coupled_integration_dim):
+                    offsets = self._coupled_offsets[b, i, :] - self._offset_min
                     if self.use_zarr:
-                        coupling_temp = ds_index_range[
-                            self._coupled_offsets[b, i, :], :
-                        ]
+                        coupling_temp = ds_index_range[offsets, :]
                     else:
-                        coupling_temp = ds_index_range.isel(
-                            time=self._coupled_offsets[b, i, :]
-                        ).to_numpy()
+                        coupling_temp = ds_index_range.isel(time=offsets).to_numpy()
                     self.integrated_couplings[b, i, :, :, :] = coupling_temp.reshape(
                         (self.timevar_dim,) + coupling_temp.shape[2:]
                     )
@@ -334,6 +338,7 @@ class ConstantCoupler(BaseCoupler):
         output_time_dim: int = 2,
         input_times: Sequence = [pd.Timedelta("24h"), pd.Timedelta("48h")],
         prepared_coupled_data=True,
+        refresh_period: Optional[str] = None,
     ):
         """
         Parameters
@@ -361,7 +366,23 @@ class ConstantCoupler(BaseCoupler):
             averages have already been calculated so that each time step denotes
             the right side of a averaging_window window.
             This is highly recommended for training, default True
+        refresh_period: str, optional
+            How often the coupled field is renewed, as in a sequentially coupled
+            model (e.g. "24h"). The window is cut into periods of this length
+            starting at the initial time t0, and a model step uses the field at the
+            start of the period that holds its input time: the prestep (input time
+            before t0) sees the previous period's field, steps with input times in
+            [0, refresh_period) see the field at t0, the next period the field at
+            t0 + refresh_period, and so on. Must be a multiple of the model step.
+            Default None keeps one field (the window's first input time) for the
+            whole window.
         """
+        self.refresh_period = (
+            pd.Timedelta(refresh_period) if refresh_period is not None else None
+        )
+        self._slot_periods = None
+        self._previous_fields = None
+        self._period0_source = None
         super().__init__(
             dataset=dataset,
             batch_size=batch_size,
@@ -389,13 +410,46 @@ class ConstantCoupler(BaseCoupler):
         self._coupled_offsets = np.empty(
             [self.batch_size, self.coupled_integration_dim, len(self.input_times)]
         )
+        shifts = np.array([ts / data_time_step for ts in self.input_times])
+        if self.refresh_period is None:
+            slot_base = np.zeros(self.coupled_integration_dim)
+        else:
+            # Offsets count data steps from each sample's first frame, which is the
+            # first prestep input; t0 (the last input time of step 0) lies
+            # ``interval * (input_time_dim * (1 + presteps) - 1)`` steps later.
+            step = self.input_time_dim * interval
+            refresh = self.refresh_period / pd.Timedelta(data_time_step)
+            if refresh <= 0 or refresh % step != 0:
+                raise ValueError(
+                    f"refresh_period {self.refresh_period} must be a positive "
+                    f"multiple of the model step ({step} data steps)"
+                )
+            refresh = int(refresh)
+            t0 = interval * (self.input_time_dim * (1 + self.presteps) - 1)
+            # Slot i feeds model step i - presteps, whose input time is
+            # (i - presteps) * step; floor division puts the presteps in period -1.
+            self._slot_periods = np.array(
+                [((i - self.presteps) * step) // refresh for i in range(self.coupled_integration_dim)]
+            )
+            slot_base = t0 + self._slot_periods * refresh
         for b in range(self.batch_size):
             for i in range(self.coupled_integration_dim):
-                self._coupled_offsets[b, i, :] = b + np.array(
-                    [ts / data_time_step for ts in self.input_times]
-                )
+                self._coupled_offsets[b, i, :] = b + slot_base[i] + shifts
 
         self._coupled_offsets = self._coupled_offsets.astype(int)
+
+    def construct_integrated_couplings(self, batch=None, bsize=None):
+        out = super().construct_integrated_couplings(batch, bsize)
+        if self.refresh_period is not None and not self.coupled_mode:
+            # Keep a reference to this window's first-period field (no copy): when
+            # inference then switches to set_coupled_fields it is the previous field.
+            self._period0_source = self.integrated_couplings
+        return out
+
+    def reset_coupler(self):
+        super().reset_coupler()
+        self._previous_fields = None
+        self._period0_source = None
 
     def set_coupled_fields(self, coupled_fields: th.tensor):
         """
@@ -421,6 +475,19 @@ class ConstantCoupler(BaseCoupler):
 
         # broadcast the first time step to the entire coupled integration dimension
         self.preset_coupled_fields[:, :, :, :, :, :] = coupled_fields[:, :, :1, :, :, :]
+        if self.refresh_period is not None:
+            # Slots of the previous period (the prestep) keep the field the last
+            # window used; later periods cannot be known yet and repeat this one.
+            if self._previous_fields is None and self._period0_source is not None:
+                src = th.from_numpy(self._period0_source[:, self.presteps])  # [B, C, F, H, W]
+                # cast: the dataset buffer may be float64 while the preset buffer is float32
+                self._previous_fields = src.permute(0, 2, 1, 3, 4)[:, :, None].to(
+                    self.preset_coupled_fields.dtype
+                )
+            if self._previous_fields is not None:
+                prev = np.flatnonzero(self._slot_periods < 0)
+                self.preset_coupled_fields[:, :, th.as_tensor(prev)] = self._previous_fields
+            self._previous_fields = coupled_fields[:, :, :1].clone()
         if self.time_first:
             self.preset_coupled_fields = self.preset_coupled_fields.permute(2, 0, 3, 1, 4, 5)
         # flag for construct integrated coupling method to use this array
