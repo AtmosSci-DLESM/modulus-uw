@@ -180,9 +180,9 @@ def test_build_stem_missing_mask_is_all_ones(tmp_path, ocean_frac):
         },
     }
     stem = build_coupled_partial_conv_stem(cfg, _toy_couplings())
-    masks = stem.channel_masks
-    assert th.allclose(masks[0], th.from_numpy(ocean_frac).to(masks.dtype))
-    assert th.all(masks[1] == 1.0)
+    masks = stem.channel_masks  # [F, C, H, W]
+    assert th.allclose(masks[:, 0], th.from_numpy(ocean_frac).to(masks.dtype))
+    assert th.all(masks[:, 1] == 1.0)
 
     with pytest.raises(ValueError, match="no entry for any coupled variable"):
         build_coupled_partial_conv_stem(cfg, _toy_couplings(variables=("u50", "v50")))
