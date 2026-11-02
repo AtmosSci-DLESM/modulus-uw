@@ -440,3 +440,28 @@ def test_eval_graph_capture_does_not_orphan_train_log_buffers():
     assert float(wrap.weights[0]) != pytest.approx(1.0)
     # Eval replay must not be required for the training logs to move.
     assert eval_loss is not None
+
+
+class _CoupledTerms(_FixedTerms):
+    """Inner criterion that reads coupled inputs; returns their sum as the last term."""
+
+    needs_coupled_input = True
+
+    def forward(self, prediction, target, average_channels=True, coupled_input=None):
+        terms = super().forward(prediction, target, average_channels=False)
+        return torch.cat([terms[:-1], coupled_input.sum().reshape(1)])
+
+
+def test_coupled_input_is_forwarded_to_inner():
+    inner = _CoupledTerms(torch.tensor([2.0, 8.0]))
+    wrap = AdaptiveLossWeights(
+        inner=inner, n_data_variables=2, warmup_epochs=1, ema_window_epochs=1,
+        steps_per_epoch=1, variable_names=["a", "b"],
+    )
+    wrap.setup(_DummyTrainer(device=torch.device("cpu"), output_variables=["a", "b"], dataloader_train=[0]))
+    assert wrap.needs_coupled_input
+    pred = torch.zeros(1, 1, 1, 2, 1, 1)
+    out = wrap(pred, pred, average_channels=False, coupled_input=torch.full((3,), 2.0))
+    assert out.tolist() == [2.0, 6.0]
+    with pytest.raises(ValueError, match="coupled_input"):
+        wrap(pred, pred)
