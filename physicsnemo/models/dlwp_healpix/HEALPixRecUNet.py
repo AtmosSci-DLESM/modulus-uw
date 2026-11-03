@@ -585,6 +585,13 @@ class HEALPixRecUNet(Module):
                     n_constants=self.n_constants,
                     num_faces=self.unfold.num_faces,
                 )
+                if len(self.couplings) > 0:
+                    # The step's raw coupled input as [B, F, 1, C, H, W], for
+                    # constraints that read a level prescribed through the coupler.
+                    coupled = inputs[3][self.presteps + step]
+                    if self.couplings_time_first:
+                        coupled = coupled.permute(0, 2, 1, 3, 4)
+                    aux["coupled"] = coupled.unsqueeze(2)
                 for constraint in self.constraints:
                     if accepts_forcing(constraint):
                         out = constraint(out, orig_input, aux=aux)
