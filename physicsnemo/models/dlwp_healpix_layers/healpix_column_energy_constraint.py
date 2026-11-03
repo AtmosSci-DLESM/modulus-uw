@@ -247,6 +247,11 @@ class ColumnEnergyConstraint(torch.nn.Module):
                 raise ValueError(f"{prefix} scaling std must be nonzero")
             self.register_buffer(f"{prefix}_mean", mean, persistent=False)
             self.register_buffer(f"{prefix}_std", std, persistent=False)
+            # Predicted levels' scaling, gathered here: list indexing of a CUDA tensor in forward
+            # copies the index to the device, which a CUDA graph capture does not allow.
+            model_levels = self._t_model if prefix == "t" else self._q_model
+            self.register_buffer(f"{prefix}_mean_model", mean[model_levels].clone(), persistent=False)
+            self.register_buffer(f"{prefix}_std_model", std[model_levels].clone(), persistent=False)
         flux_mean = torch.tensor(
             [_mean_std(scaling, n)[0] for n in self.flux_names], dtype=torch.float32
         )
@@ -270,11 +275,11 @@ class ColumnEnergyConstraint(torch.nn.Module):
         stacked = self._stack(tensor, indices)
         return stacked * std.view(1, 1, 1, -1, 1, 1) + mean.view(1, 1, 1, -1, 1, 1)
 
-    def _column(self, tensor, indices, model_levels, coupled_map, coupled, mean, std):
+    def _column(self, tensor, indices, model_levels, coupled_map, coupled, mean, std, mean_model, std_model):
         """All levels denormalized, model levels from ``tensor``, prescribed from ``coupled``."""
         if not coupled_map:
             return self._denorm_levels(tensor, indices, mean, std)
-        model = self._denorm_levels(tensor, indices, mean[model_levels], std[model_levels])
+        model = self._denorm_levels(tensor, indices, mean_model, std_model)
         levels = []
         for k in range(mean.shape[0]):
             if k in coupled_map:
@@ -350,8 +355,8 @@ class ColumnEnergyConstraint(torch.nn.Module):
                     )
                 coupled = aux["coupled"].float()
                 coupled = coupled.expand(-1, -1, n_time, -1, -1, -1)
-            t_args = (self._t_model, self._t_cpl, coupled, self.t_mean, self.t_std)
-            q_args = (self._q_model, self._q_cpl, coupled, self.q_mean, self.q_std)
+            t_args = (self._t_model, self._t_cpl, coupled, self.t_mean, self.t_std, self.t_mean_model, self.t_std_model)
+            q_args = (self._q_model, self._q_cpl, coupled, self.q_mean, self.q_std, self.q_mean_model, self.q_std_model)
             temperature = self._column(prediction, self._t_out, *t_args)
             temperature0 = self._column(orig, self._t_in, *t_args)
             q = self._column(prediction, self._q_out, *q_args)
