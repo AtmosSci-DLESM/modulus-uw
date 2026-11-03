@@ -28,6 +28,12 @@ ACE ``MoistureBudgetCorrection`` with ``advection_and_precipitation``:
 Column water is the hybrid-sigma mass integral ``Σ q Δp / g``. ``Δp`` uses the
 same ERA5 8-layer ``ak``/``bk`` as the dry-air constraint. Equal-area means are
 over faces, H, and W.
+
+A water level the model receives only through the coupler (named in
+``coupled_channels``, absent from the prognostics) is left out of the column.
+Its prescribed field is the same in the input and the prediction, and a level
+with Δb_k = 0 has a thickness Δa_k that does not depend on p_s, so its water
+cancels in each column's tendency: dropping it gives the same budget.
 """
 
 from __future__ import annotations
@@ -85,6 +91,7 @@ class MoistureBudgetConstraint(torch.nn.Module):
         timestep_seconds: float = 21600.0,
         ak: list[float] | tuple[float, ...] | None = None,
         bk: list[float] | tuple[float, ...] | None = None,
+        coupled_channels: list[str] | tuple[str, ...] = (),
     ):
         super().__init__()
         if terms_to_modify != "advection_and_precipitation":
@@ -110,7 +117,18 @@ class MoistureBudgetConstraint(torch.nn.Module):
                 f"ak/bk must have n_layers+1={n_layers + 1} interfaces, "
                 f"got ak={len(ak)} bk={len(bk)}"
             )
-        water_names = [f"{water_prefix}{k}" for k in range(n_layers)]
+        levels = []
+        for k in range(n_layers):
+            name = f"{water_prefix}{k}"
+            if name in coupled_channels and name not in self.in_names and name not in self.out_names:
+                if bk[k + 1] != bk[k]:
+                    raise ValueError(
+                        f"coupled level {name!r} has Δb != 0: its water term depends on p_s "
+                        "and does not cancel"
+                    )
+                continue
+            levels.append(k)
+        water_names = [f"{water_prefix}{k}" for k in levels]
         required_out = (
             surface_pressure,
             *water_names,
@@ -165,8 +183,8 @@ class MoistureBudgetConstraint(torch.nn.Module):
             raise ValueError("water scaling std must be nonzero")
         self.register_buffer("q_mean", q_mean, persistent=False)
         self.register_buffer("q_std", q_std, persistent=False)
-        self.register_buffer("dak", torch.tensor(ak, dtype=torch.float32).diff(), persistent=False)
-        self.register_buffer("dbk", torch.tensor(bk, dtype=torch.float32).diff(), persistent=False)
+        self.register_buffer("dak", torch.tensor(ak, dtype=torch.float32).diff()[levels], persistent=False)
+        self.register_buffer("dbk", torch.tensor(bk, dtype=torch.float32).diff()[levels], persistent=False)
 
     def _stack(self, tensor: torch.Tensor, indices: tuple[int, ...]) -> torch.Tensor:
         return torch.cat([tensor[:, :, :, i : i + 1] for i in indices], dim=3)

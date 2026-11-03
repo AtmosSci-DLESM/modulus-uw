@@ -127,3 +127,31 @@ def test_nside64_is_fast():
         mod(pred, orig)
         elapsed = time.perf_counter() - started
     assert elapsed < 1.0, elapsed
+
+
+def test_coupled_top_level_matches_prognostic_with_same_value():
+    # Layer 0 prescribed through the coupler is the same in the input and the
+    # prediction, so dropping it gives the 8-layer result with q0_pred == q0_in.
+    rng = np.random.default_rng(3)
+    ps0 = 98000.0 + 500.0 * rng.standard_normal((2, 12, 1, 1, 4, 4))
+    q0 = np.clip(0.004 + 0.001 * rng.standard_normal((2, 12, 1, N_LAYERS, 4, 4)), 1e-4, 0.02)
+    q = np.clip(q0 + 0.0003 * rng.standard_normal(q0.shape), 1e-4, 0.02)
+    q[:, :, :, 0] = q0[:, :, :, 0]
+    diag = np.stack(
+        [80.0 + 20.0 * rng.standard_normal(ps0.shape[:3] + (4, 4)),
+         2.0e-5 + 1.0e-6 * rng.standard_normal(ps0.shape[:3] + (4, 4)),
+         np.zeros(ps0.shape[:3] + (4, 4)),
+         1.0e-6 * np.ones(ps0.shape[:3] + (4, 4))],
+        axis=3,
+    )
+    pred = torch.from_numpy(np.concatenate([ps0 + 100.0, q, diag], axis=3)).float()
+    orig = torch.from_numpy(np.concatenate([ps0, q0], axis=3)).float()
+    keep_out = [i for i in range(len(OUT_CH)) if i != 1]
+    with torch.no_grad():
+        full = _make()(pred, orig)
+        cpl = _make(
+            in_channels=[n for n in IN_CH if n != WATER[0]],
+            out_channels=[n for n in OUT_CH if n != WATER[0]],
+            coupled_channels=[WATER[0]],
+        )(pred[:, :, :, keep_out], orig[:, :, :, [0, *range(2, 1 + N_LAYERS)]])
+    np.testing.assert_allclose(cpl.numpy(), full[:, :, :, keep_out].numpy(), rtol=1e-5, atol=1e-9)
