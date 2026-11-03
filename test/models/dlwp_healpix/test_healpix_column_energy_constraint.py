@@ -355,3 +355,72 @@ def test_coupled_top_level_captures_in_cuda_graph():
             captured = mod(pred, orig, aux=aux)
         graph.replay()
     torch.testing.assert_close(captured, eager)
+
+
+class _AuxSpy(torch.nn.Module):
+    """Constraint that records the ``aux`` RecUNet passes it and returns the prediction unchanged."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen = []
+
+    def forward(self, prediction, input, aux=None):
+        self.seen.append({k: v.clone() for k, v in aux.items()})
+        return prediction
+
+
+def _small_coupled_recunet(presteps=1, steps=3):
+    from omegaconf import OmegaConf
+
+    from physicsnemo.models.dlwp_healpix import HEALPixRecUNet
+
+    conv = {
+        "_target_": "physicsnemo.models.dlwp_healpix_layers.ConvNeXtBlock",
+        "activation": {"_target_": "physicsnemo.models.layers.activations.CappedGELU", "cap_value": 10},
+        "kernel_size": 3, "dilation": 1, "upscale_factor": 2, "_recursive_": True,
+    }
+    gru = {"_target_": "physicsnemo.models.dlwp_healpix_layers.ConvGRUBlock", "kernel_size": 1, "_recursive_": False}
+    encoder = OmegaConf.create({
+        "_target_": "physicsnemo.models.dlwp_healpix_layers.UNetEncoder", "conv_block": conv,
+        "down_sampling_block": {"_target_": "physicsnemo.models.dlwp_healpix_layers.AvgPool", "pooling": 2},
+        "recurrent_block": gru, "_recursive_": False, "n_channels": [8, 8], "dilations": [1, 1],
+    })
+    decoder = OmegaConf.create({
+        "_target_": "physicsnemo.models.dlwp_healpix_layers.UNetDecoder", "conv_block": conv,
+        "up_sampling_block": {"_target_": "physicsnemo.models.dlwp_healpix_layers.TransposedConvUpsample",
+                              "activation": conv["activation"], "upsampling": 2},
+        "recurrent_block": gru,
+        "output_layer": {"_target_": "physicsnemo.models.dlwp_healpix_layers.BasicConvBlock", "kernel_size": 1, "n_layers": 1},
+        "_recursive_": False, "n_channels": [8, 8], "dilations": [1, 1],
+    })
+    couplings = [{"coupler": "ConstantCoupler", "params": {"variables": ["sst", "sic"], "input_times": ["0h"]}}]
+    torch.manual_seed(0)
+    model = HEALPixRecUNet(
+        encoder=encoder, decoder=decoder, input_channels=3, output_channels=4, n_constants=2,
+        decoder_input_channels=1, input_time_dim=1, output_time_dim=steps, delta_time="6h",
+        reset_cycle="24h", presteps=presteps, couplings=couplings, nside=[8, 4],
+    ).eval()
+    g = torch.Generator().manual_seed(1)
+    B, F, S = 2, 12, 8
+    inputs = [
+        torch.randn(B, F, 1 + presteps, 3, S, S, generator=g),
+        torch.randn(B, F, presteps + steps, 1, S, S, generator=g),
+        torch.randn(F, 2, S, S, generator=g),
+        torch.randn(presteps + steps, B, 2, F, S, S, generator=g),
+    ]
+    return model, inputs
+
+
+def test_recunet_passes_each_steps_insolation_constants_and_couplings_in_aux():
+    model, inputs = _small_coupled_recunet()
+    spy = _AuxSpy()
+    model.constraints = [spy]
+    with torch.no_grad():
+        model(inputs)
+    assert len(spy.seen) == 3
+    presteps = model.presteps
+    for step, aux in enumerate(spy.seen):
+        i = step + presteps
+        assert torch.equal(aux["insolation"], inputs[1][:, :, i : i + 1])
+        assert torch.equal(aux["constants"], inputs[2].unsqueeze(0).unsqueeze(2).expand(2, -1, -1, -1, -1, -1))
+        assert torch.equal(aux["coupled"], inputs[3][i].permute(0, 2, 1, 3, 4).unsqueeze(2))
