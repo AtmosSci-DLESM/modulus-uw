@@ -114,15 +114,21 @@ def test_zarr_store_matches_xarray_in_requested_variable_order(tmp_path):
     np.testing.assert_allclose(from_zarr, from_xr[:, :, ::-1], rtol=1e-6)
 
 
-def test_means_are_normalized_with_the_coupled_scaling_and_float32():
-    # The base class's normalization applies before averaging (identical to after,
-    # with the same mean/std, since it is linear).
-    c = _coupler(batch_size=1)
-    scaling = xr.Dataset(
-        {"mean": ("index", [5.0, 7.0]), "std": ("index", [2.0, 4.0])},
-        coords={"index": ["u1", "t1"]},
+def test_means_are_normalized_with_the_coupled_scaling_and_float32(tmp_path):
+    # Zarr reads (as in training) are normalized before averaging, which equals
+    # normalizing the mean since the scaling is linear.
+    path = tmp_path / "coupled.zarr"
+    _dataset().to_zarr(path)
+    c = WindowMeanCoupler(
+        dataset=zarr.open(str(path)), batch_size=1, variables=["u1", "t1"], presteps=1,
+        input_time_dim=1, output_time_dim=4, input_times=["24h"],
     )
-    c.set_scaling(scaling)
+    c.compute_coupled_indices(interval=4, data_time_step=pd.Timedelta("6h"))
+    # set_scaling's input format differs between data-module versions; both build these arrays.
+    c.coupled_scaling = {
+        "mean": np.array([5.0, 7.0]).reshape(1, 2, 1, 1, 1),
+        "std": np.array([2.0, 4.0]).reshape(1, 2, 1, 1, 1),
+    }
     out = c.construct_integrated_couplings(batch={"time": slice(10, 31)}, bsize=1)
     assert out.dtype == np.float32
     for i in range(5):
