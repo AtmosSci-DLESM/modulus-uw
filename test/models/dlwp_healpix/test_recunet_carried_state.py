@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_reflection_recunet import _legacy_encoder_decoder, _structural_encoder_decoder  # noqa: E402
 
 from physicsnemo.models.dlwp_healpix import HEALPixRecUNet  # noqa: E402
+from physicsnemo.models.dlwp_healpix_layers.healpix_blocks import set_static_hidden_state  # noqa: E402
 
 _STEPS, _NSIDE = 4, 8
 
@@ -82,3 +83,68 @@ def test_carried_single_steps_equal_one_multi_step_forward(kind):
         carried = _carried(model, *_inputs())
     assert multi.shape == carried.shape == (1, 12, _STEPS, 3, _NSIDE, _NSIDE)
     assert th.equal(multi, carried)
+
+
+@pytest.mark.parametrize("kind", ["structural", "legacy"])
+def test_static_hidden_state_keeps_eager_results(kind):
+    model = _model(kind)
+    with th.no_grad():
+        multi = _multi_step(model, *_inputs())
+        set_static_hidden_state(model)
+        carried = _carried(model, *_inputs())
+    assert th.equal(multi, carried)
+
+
+@pytest.mark.skipif(not th.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("kind", ["structural", "legacy"])
+def test_prime_and_carry_cuda_graphs_replay_the_carried_steps(kind):
+    # Coupled inference with a carried state: one graph primes the GRU (first window),
+    # another continues from the state the previous replay left (later windows).
+    model = _model(kind).cuda()
+    prog, insol, constants = _inputs("cuda")
+    with th.no_grad():
+        eager = _carried(model, prog, insol, constants)
+        set_static_hidden_state(model)
+        static = [prog.clone(), insol[:, :, :1].clone(), constants.clone()]
+        stream = th.cuda.Stream()
+        stream.wait_stream(th.cuda.current_stream())
+        with th.cuda.stream(stream):  # warm-up allocates the hidden-state buffers
+            model.reset()
+            model(static)
+            model(static)
+        th.cuda.current_stream().wait_stream(stream)
+        model.reset()
+        hidden = [m.h.data_ptr() for m in model.modules() if hasattr(m, "static_hidden_state")]
+        prime, carry = th.cuda.CUDAGraph(), th.cuda.CUDAGraph()
+        with th.cuda.graph(prime):
+            out_prime = model(static)
+        with th.cuda.graph(carry, pool=prime.pool()):
+            out_carry = model(static)
+        # Both graphs read and write the hidden-state buffers allocated in the warm-up.
+        assert [m.h.data_ptr() for m in model.modules() if hasattr(m, "static_hidden_state")] == hidden
+        outs, state = [], prog
+        for k in range(_STEPS):
+            static[0].copy_(state)
+            static[1].copy_(insol[:, :, k : k + 1])
+            (prime if k == 0 else carry).replay()
+            out = (out_prime if k == 0 else out_carry).clone()
+            outs.append(out)
+            state = out[:, :, -1:]
+        replayed = th.cat(outs, dim=2)
+    th.testing.assert_close(replayed, eager, rtol=1e-5, atol=1e-6)
+
+
+def test_static_hidden_state_guards():
+    model = _model("structural")
+    set_static_hidden_state(model)
+    with th.no_grad():
+        model([*_inputs()[:1], _inputs()[1][:, :, :_STEPS], _inputs()[2]])
+    gru = next(m for m in model.modules() if hasattr(m, "static_hidden_state"))
+    with pytest.raises(RuntimeError, match="cannot take inputs"):
+        gru(th.zeros(2, *gru.h.shape[1:]))
+    with pytest.raises(RuntimeError, match="disable grad"):
+        gru(th.zeros_like(gru.h))
+    averaged = _model("structural")
+    averaged.enforce_reflectional_equivariance = True
+    with pytest.raises(ValueError, match="averaged"):
+        set_static_hidden_state(averaged)

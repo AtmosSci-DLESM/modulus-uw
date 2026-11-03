@@ -85,11 +85,57 @@ class _LayerNormOverChannels(th.nn.Module):
 # RECURRENT BLOCKS
 #
 
+def set_static_hidden_state(module: th.nn.Module, enabled: bool = True) -> None:
+    """Switch every ConvGRU block in ``module`` to in-place hidden-state updates (see
+    ``ConvGRUBlock.static_hidden_state``), e.g. before capturing CUDA graphs of a model whose
+    state carries across forward calls."""
+    if enabled and getattr(module, "enforce_reflectional_equivariance", False):
+        # The averaged reflection mode sets and averages the blocks' hidden states itself.
+        raise ValueError("static hidden state does not support the averaged reflection-equivariance mode")
+    for m in module.modules():
+        if hasattr(m, "static_hidden_state"):
+            m.static_hidden_state = enabled
+
+
+def _prepare_hidden(block: th.nn.Module, inputs: th.Tensor) -> None:
+    """Give ``block.h`` the inputs' shape: a fresh zero state, except that a static state
+    (see ``ConvGRUBlock.static_hidden_state``) is allocated once and then never replaced."""
+    if inputs.shape == block.h.shape:
+        return
+    if block.static_hidden_state and block.h.numel() > 1:
+        raise RuntimeError(
+            f"static hidden state of shape {tuple(block.h.shape)} cannot take inputs of shape "
+            f"{tuple(inputs.shape)}; reset the model's hidden state (static off) to resize it"
+        )
+    block.h = th.zeros_like(inputs)
+
+
+def _store_hidden(block: th.nn.Module, h_next: th.Tensor) -> None:
+    if not block.static_hidden_state:
+        block.h = h_next
+        return
+    if th.is_grad_enabled():
+        raise RuntimeError("static hidden state is for inference; disable grad (it updates the state in place)")
+    block.h.copy_(h_next)
+
+
+def _zero_hidden(block: th.nn.Module) -> None:
+    if block.static_hidden_state:
+        block.h.zero_()
+    else:
+        block.h = th.zeros_like(block.h)
+
+
 class ConvGRUBlock(th.nn.Module):
     """Class that implements a Convolutional GRU
     Code modified from
     https://github.com/happyjin/ConvGRU-pytorch/blob/master/convGRU.py
     """
+
+    # Inference only: update the hidden state in place, so a captured CUDA graph reads
+    # and writes the same buffer on every replay and the state can carry across forward
+    # calls (one per coupler window). Not differentiable through the state.
+    static_hidden_state = False
 
     def __init__(
         self,
@@ -164,8 +210,7 @@ class ConvGRUBlock(th.nn.Module):
         Sequence
             Result of the forward pass
         """
-        if inputs.shape != self.h.shape:
-            self.h = th.zeros_like(inputs)
+        _prepare_hidden(self, inputs)
         combined = th.cat([inputs, self.h], dim=1)
         combined_conv = self.conv_gates(combined)
 
@@ -178,13 +223,13 @@ class ConvGRUBlock(th.nn.Module):
         cnm = th.tanh(cc_cnm)
 
         h_next = (1 - update_gate) * self.h + update_gate * cnm
-        self.h = h_next
+        _store_hidden(self, h_next)
 
         return inputs + h_next
 
     def reset(self):
         """Reset the update gates"""
-        self.h = th.zeros_like(self.h)
+        _zero_hidden(self)
 
 #
 # CONV BLOCKS
