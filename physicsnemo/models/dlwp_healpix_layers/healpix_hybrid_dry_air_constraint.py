@@ -25,6 +25,13 @@ ACE AtmosphereCorrector (``_adjust_gen_dry_air_to_target``):
 ``orig_input`` (previous step / IC). Equal-area mean is over faces, H, W.
 This pins the monopole only; it does not flatten a planetary dipole.
 
+A water level the model receives only through the coupler (named in
+``coupled_channels``, absent from the prognostics) is left out of both sums.
+Its prescribed field is the same in ``orig_input`` and the prediction, and a
+level with Δb_k = 0 has a thickness Δa_k that does not depend on p_s, so its
+q_k Δa_k cancels in ``error`` and returns unchanged through the inversion:
+dropping it gives the same p_s as summing the coupled value.
+
 Default ``ak``/``bk`` are the ERA5 8-layer interfaces from
 ``/global/cfs/projectdirs/e3sm/yikwill/datasets/2026-03-19-era5-1deg-8layer-1940-2025.zarr``
 (``ak_0``…``ak_8``, ``bk_0``…``bk_8``). Those are also baked into the HPX ACE
@@ -77,6 +84,7 @@ class HybridSigmaDryAirMassConstraint(torch.nn.Module):
         n_layers: int = 8,
         ak: list[float] | tuple[float, ...] | None = None,
         bk: list[float] | tuple[float, ...] | None = None,
+        coupled_channels: list[str] | tuple[str, ...] = (),
     ):
         super().__init__()
         if scaling is None:
@@ -95,7 +103,18 @@ class HybridSigmaDryAirMassConstraint(torch.nn.Module):
                 f"ak/bk must have n_layers+1={n_layers + 1} interfaces, "
                 f"got ak={len(ak)} bk={len(bk)}"
             )
-        water_names = [f"{water_prefix}{k}" for k in range(n_layers)]
+        levels = []
+        for k in range(n_layers):
+            name = f"{water_prefix}{k}"
+            if name in coupled_channels and name not in self.in_names and name not in self.out_names:
+                if bk[k + 1] != bk[k]:
+                    raise ValueError(
+                        f"coupled level {name!r} has Δb != 0: its water term depends on p_s "
+                        "and does not cancel"
+                    )
+                continue
+            levels.append(k)
+        water_names = [f"{water_prefix}{k}" for k in levels]
         for name in (surface_pressure, *water_names):
             if name not in self.out_names:
                 raise ValueError(f"{name!r} is not in out_channels {self.out_names}")
@@ -125,8 +144,8 @@ class HybridSigmaDryAirMassConstraint(torch.nn.Module):
             raise ValueError("water scaling std must be nonzero")
         self.register_buffer("q_mean", q_mean, persistent=False)
         self.register_buffer("q_std", q_std, persistent=False)
-        dak = torch.tensor(ak, dtype=torch.float32).diff()
-        dbk = torch.tensor(bk, dtype=torch.float32).diff()
+        dak = torch.tensor(ak, dtype=torch.float32).diff()[levels]
+        dbk = torch.tensor(bk, dtype=torch.float32).diff()[levels]
         self.register_buffer("dak", dak, persistent=False)
         self.register_buffer("dbk", dbk, persistent=False)
 
