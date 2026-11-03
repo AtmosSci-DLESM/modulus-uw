@@ -269,9 +269,9 @@ def test_frozen_precipitation_optional():
     assert not torch.allclose(out_nf[:, :, :, 1 : 1 + N], pred[:, :, :, 1 : 1 + N])
 
 
-def test_coupled_top_level_closes_full_column_budget():
-    # Layer 0 comes from the coupler: it is not written, and the predicted
-    # layers' offset closes the budget of the full column, layer 0 included.
+
+def _coupled_top_case():
+    """Layer 0 prescribed: (module, pred, orig, aux, physical arrays)."""
     rng = np.random.default_rng(5)
     spatial = (2, 12, 1, 1, 4, 4)
     levels = (2, 12, 1, N, 4, 4)
@@ -290,8 +290,6 @@ def test_coupled_top_level_closes_full_column_budget():
         axis=3,
     )
     top = [TEMP[0], WATER[0]]
-    in_ch = [n for n in IN_CH if n not in top]
-    out_ch = [n for n in OUT_CH if n not in top]
     model_t = list(range(1, N))
     pred = torch.from_numpy(np.concatenate([ps, t[:, :, :, model_t], q[:, :, :, model_t], flux], axis=3)).float()
     orig = torch.from_numpy(np.concatenate([ps0, t0[:, :, :, model_t], q0[:, :, :, model_t]], axis=3)).float()
@@ -304,25 +302,56 @@ def test_coupled_top_level_closes_full_column_budget():
         "coupled": torch.from_numpy(coupled).float(),
     }
     mod = _make(
-        in_channels=in_ch,
-        out_channels=out_ch,
+        in_channels=[n for n in IN_CH if n not in top],
+        out_channels=[n for n in OUT_CH if n not in top],
         coupled_channels=["sea_surface_temperature", *top],
     )
+    arrays = dict(ps0=ps0, ps=ps, t0=t0, t=t, q0=q0, q=q, height=height, insol=insol, flux=flux, model_t=model_t)
+    return mod, pred, orig, aux, arrays
+
+
+def test_coupled_top_level_closes_full_column_budget():
+    # Layer 0 comes from the coupler: it is not written, and the predicted
+    # layers' offset closes the budget of the full column, layer 0 included.
+    mod, pred, orig, aux, a = _coupled_top_case()
     with pytest.raises(ValueError, match="coupled"):
         mod(pred, orig, aux={k: v for k, v in aux.items() if k != "coupled"})
     with torch.no_grad():
         out = mod(pred, orig, aux=aux).numpy()
+    t, model_t = a["t"], a["model_t"]
     t_new = t.copy()
     t_new[:, :, :, model_t] = out[:, :, :, 1:N]
     delta = t_new[:, :, :, model_t] - t[:, :, :, model_t]
     assert np.max(np.abs(delta - delta[:, :1, :, :1])) < 1e-4
     np.testing.assert_array_equal(out[:, :, :, N:], pred[:, :, :, N:].numpy())
-    column0, _ = _energy_and_factor(ps0, t0, q0, height)
-    column_new, _ = _energy_and_factor(ps, t_new, q, height)
-    lhf, shf, dlw, ulw, dsw, usw, ulw_toa, usw_toa, frozen = np.moveaxis(flux, 3, 0)
-    into = (np.squeeze(insol, axis=3) * SOLAR_CONSTANT - usw_toa - ulw_toa) - (
+    column0, _ = _energy_and_factor(a["ps0"], a["t0"], a["q0"], a["height"])
+    column_new, _ = _energy_and_factor(a["ps"], t_new, a["q"], a["height"])
+    lhf, shf, dlw, ulw, dsw, usw, ulw_toa, usw_toa, frozen = np.moveaxis(a["flux"], 3, 0)
+    into = (np.squeeze(a["insol"], axis=3) * SOLAR_CONSTANT - usw_toa - ulw_toa) - (
         (dsw - usw + dlw - ulw) - lhf - shf - frozen * LATENT_HEAT_OF_FREEZING
     )
     gm = lambda x: x.mean(axis=(1, 3, 4))
     desired = gm(column0) + gm(into) * DT
     assert np.max(np.abs(gm(column_new) - desired)) < 1.0e-6 * np.max(np.abs(gm(column_new)))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_coupled_top_level_captures_in_cuda_graph():
+    # Training and rollouts capture the model, constraints included, in CUDA graphs.
+    mod, pred, orig, aux, _ = _coupled_top_case()
+    dev = torch.device("cuda")
+    mod = mod.to(dev)
+    pred, orig = pred.to(dev), orig.to(dev)
+    aux = {k: v.to(dev) for k, v in aux.items()}
+    with torch.no_grad():
+        eager = mod(pred, orig, aux=aux)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            mod(pred, orig, aux=aux)  # warm-up on a side stream, as before a capture
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = mod(pred, orig, aux=aux)
+        graph.replay()
+    torch.testing.assert_close(captured, eager)
