@@ -267,3 +267,62 @@ def test_frozen_precipitation_optional():
         out_nf = no_frozen(pred[:, :, :, :-1], orig, aux=aux)
     assert torch.allclose(out[:, :, :, :-1], out_nf)
     assert not torch.allclose(out_nf[:, :, :, 1 : 1 + N], pred[:, :, :, 1 : 1 + N])
+
+
+def test_coupled_top_level_closes_full_column_budget():
+    # Layer 0 comes from the coupler: it is not written, and the predicted
+    # layers' offset closes the budget of the full column, layer 0 included.
+    rng = np.random.default_rng(5)
+    spatial = (2, 12, 1, 1, 4, 4)
+    levels = (2, 12, 1, N, 4, 4)
+    ps0 = 98000.0 + 200.0 * rng.standard_normal(spatial)
+    ps = ps0 + 50.0 * rng.standard_normal(spatial)
+    t0 = 260.0 + np.linspace(0, 30, N).reshape(1, 1, 1, N, 1, 1) + rng.standard_normal(levels)
+    t = t0 + 0.4 * rng.standard_normal(levels)
+    q0 = np.clip(0.003 + 0.0005 * rng.standard_normal(levels), 1e-4, 0.02)
+    q = np.clip(q0 + 0.0001 * rng.standard_normal(levels), 1e-4, 0.02)
+    t[:, :, :, 0], q[:, :, :, 0] = t0[:, :, :, 0], q0[:, :, :, 0]
+    height = 200.0 + 50.0 * rng.standard_normal(spatial)
+    insol = 0.4 + 0.2 * rng.random(spatial)
+    flux = np.concatenate(
+        [m + s * rng.standard_normal(spatial) for m, s in
+         ((80, 5), (20, 2), (300, 5), (350, 5), (200, 5), (40, 2), (220, 5), (80, 2), (0, 0))],
+        axis=3,
+    )
+    top = [TEMP[0], WATER[0]]
+    in_ch = [n for n in IN_CH if n not in top]
+    out_ch = [n for n in OUT_CH if n not in top]
+    model_t = list(range(1, N))
+    pred = torch.from_numpy(np.concatenate([ps, t[:, :, :, model_t], q[:, :, :, model_t], flux], axis=3)).float()
+    orig = torch.from_numpy(np.concatenate([ps0, t0[:, :, :, model_t], q0[:, :, :, model_t]], axis=3)).float()
+    constants = torch.zeros(2, 12, 1, 3, 4, 4)
+    constants[:, :, :, 1:2] = torch.from_numpy(height).float()
+    coupled = np.concatenate([np.zeros(spatial), t0[:, :, :, :1], q0[:, :, :, :1]], axis=3)
+    aux = {
+        "insolation": torch.from_numpy(insol).float(),
+        "constants": constants,
+        "coupled": torch.from_numpy(coupled).float(),
+    }
+    mod = _make(
+        in_channels=in_ch,
+        out_channels=out_ch,
+        coupled_channels=["sea_surface_temperature", *top],
+    )
+    with pytest.raises(ValueError, match="coupled"):
+        mod(pred, orig, aux={k: v for k, v in aux.items() if k != "coupled"})
+    with torch.no_grad():
+        out = mod(pred, orig, aux=aux).numpy()
+    t_new = t.copy()
+    t_new[:, :, :, model_t] = out[:, :, :, 1:N]
+    delta = t_new[:, :, :, model_t] - t[:, :, :, model_t]
+    assert np.max(np.abs(delta - delta[:, :1, :, :1])) < 1e-4
+    np.testing.assert_array_equal(out[:, :, :, N:], pred[:, :, :, N:].numpy())
+    column0, _ = _energy_and_factor(ps0, t0, q0, height)
+    column_new, _ = _energy_and_factor(ps, t_new, q, height)
+    lhf, shf, dlw, ulw, dsw, usw, ulw_toa, usw_toa, frozen = np.moveaxis(flux, 3, 0)
+    into = (np.squeeze(insol, axis=3) * SOLAR_CONSTANT - usw_toa - ulw_toa) - (
+        (dsw - usw + dlw - ulw) - lhf - shf - frozen * LATENT_HEAT_OF_FREEZING
+    )
+    gm = lambda x: x.mean(axis=(1, 3, 4))
+    desired = gm(column0) + gm(into) * DT
+    assert np.max(np.abs(gm(column_new) - desired)) < 1.0e-6 * np.max(np.abs(gm(column_new)))

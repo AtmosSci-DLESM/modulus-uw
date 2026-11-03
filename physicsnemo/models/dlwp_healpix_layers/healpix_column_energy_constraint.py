@@ -25,6 +25,13 @@ geometric factor and is scaled by ``solar_constant``. ``HGTsfc`` is read from
 ``aux['constants']`` and denormalized with its scaling.
 ``frozen_precipitation=None`` drops the latent heat of freezing term for data
 without a frozen precipitation field (e.g. E3SM).
+
+A level the model receives only through the coupler (its temperature or water
+named in ``coupled_channels`` and absent from the prognostics) is read from
+``aux['coupled']``, the step's coupled input, for both the input and the
+predicted column. It still counts in the column energy: its height sits on the
+predicted layers below. The offset moves only the predicted temperatures, and
+the correction factor counts only their response.
 """
 
 from __future__ import annotations
@@ -112,6 +119,7 @@ def forcing_from_folded_input(
     return {"insolation": insolation, "constants": constants}
 
 
+
 class ColumnEnergyConstraint(torch.nn.Module):
     def __init__(
         self,
@@ -138,6 +146,7 @@ class ColumnEnergyConstraint(torch.nn.Module):
         solar_constant: float = SOLAR_CONSTANT,
         ak: list[float] | tuple[float, ...] | None = None,
         bk: list[float] | tuple[float, ...] | None = None,
+        coupled_channels: list[str] | tuple[str, ...] = (),
     ):
         super().__init__()
         if method != "constant_temperature":
@@ -164,6 +173,23 @@ class ColumnEnergyConstraint(torch.nn.Module):
             )
         self.temp_names = [f"{temperature_prefix}{k}" for k in range(n_layers)]
         self.water_names = [f"{water_prefix}{k}" for k in range(n_layers)]
+        coupled_names = list(coupled_channels)
+        self._t_cpl = {
+            k: coupled_names.index(n)
+            for k, n in enumerate(self.temp_names)
+            if n in coupled_names and n not in self.in_names and n not in self.out_names
+        }
+        self._q_cpl = {
+            k: coupled_names.index(n)
+            for k, n in enumerate(self.water_names)
+            if n in coupled_names and n not in self.in_names and n not in self.out_names
+        }
+        self.needs_coupled = bool(self._t_cpl or self._q_cpl)
+        self._t_model = [k for k in range(n_layers) if k not in self._t_cpl]
+        self._q_model = [k for k in range(n_layers) if k not in self._q_cpl]
+        model_names = [self.temp_names[k] for k in self._t_model] + [
+            self.water_names[k] for k in self._q_model
+        ]
         self.flux_names = (
             latent_heat_flux,
             sensible_heat_flux,
@@ -174,27 +200,29 @@ class ColumnEnergyConstraint(torch.nn.Module):
             toa_up_lw,
             toa_up_sw,
         ) + ((frozen_precipitation,) if frozen_precipitation is not None else ())
-        for name in (surface_pressure, *self.temp_names, *self.water_names):
+        for name in (surface_pressure, *model_names):
             if name not in self.in_names:
                 raise ValueError(f"{name!r} is missing from in_channels")
-        for name in (
-            surface_pressure,
-            *self.temp_names,
-            *self.water_names,
-            *self.flux_names,
-        ):
+        for name in (surface_pressure, *model_names, *self.flux_names):
             if name not in self.out_names:
                 raise ValueError(f"{name!r} is not in out_channels")
+            if name not in scaling:
+                raise ValueError(f"scaling is missing {name!r}")
+        for name in (*self.temp_names, *self.water_names):
             if name not in scaling:
                 raise ValueError(f"scaling is missing {name!r}")
         if surface_height not in scaling:
             raise ValueError(f"scaling is missing {surface_height!r}")
         self._ps_out = self.out_names.index(surface_pressure)
         self._ps_in = self.in_names.index(surface_pressure)
-        self._t_out = tuple(self.out_names.index(n) for n in self.temp_names)
-        self._t_in = tuple(self.in_names.index(n) for n in self.temp_names)
-        self._q_out = tuple(self.out_names.index(n) for n in self.water_names)
-        self._q_in = tuple(self.in_names.index(n) for n in self.water_names)
+        self._t_out = tuple(self.out_names.index(self.temp_names[k]) for k in self._t_model)
+        self._t_in = tuple(self.in_names.index(self.temp_names[k]) for k in self._t_model)
+        self._q_out = tuple(self.out_names.index(self.water_names[k]) for k in self._q_model)
+        self._q_in = tuple(self.in_names.index(self.water_names[k]) for k in self._q_model)
+        # 1 where the offset moves the level's temperature, 0 where it is prescribed.
+        t_pred = torch.zeros(n_layers, dtype=torch.float32)
+        t_pred[self._t_model] = 1.0
+        self.register_buffer("t_pred", t_pred, persistent=False)
         self._flux = tuple(self.out_names.index(n) for n in self.flux_names)
 
         def _pair(name: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -242,6 +270,21 @@ class ColumnEnergyConstraint(torch.nn.Module):
         stacked = self._stack(tensor, indices)
         return stacked * std.view(1, 1, 1, -1, 1, 1) + mean.view(1, 1, 1, -1, 1, 1)
 
+    def _column(self, tensor, indices, model_levels, coupled_map, coupled, mean, std):
+        """All levels denormalized, model levels from ``tensor``, prescribed from ``coupled``."""
+        if not coupled_map:
+            return self._denorm_levels(tensor, indices, mean, std)
+        model = self._denorm_levels(tensor, indices, mean[model_levels], std[model_levels])
+        levels = []
+        for k in range(mean.shape[0]):
+            if k in coupled_map:
+                c = coupled_map[k]
+                levels.append(coupled[:, :, :, c : c + 1] * std[k] + mean[k])
+            else:
+                i = model_levels.index(k)
+                levels.append(model[:, :, :, i : i + 1])
+        return torch.cat(levels, dim=3)
+
     def _write(self, tensor, idx, values):
         return torch.cat([tensor[:, :, :, :idx], values, tensor[:, :, :, idx + 1 :]], dim=3)
 
@@ -276,9 +319,13 @@ class ColumnEnergyConstraint(torch.nn.Module):
 
     def _correction_factor(self, temperature, q, ps):
         dz = self._layer_thickness(ps, temperature, q)
-        q_times_dlogp = dz * GRAVITY / temperature
+        # Only predicted levels take the offset: a prescribed level adds no c_v
+        # term and keeps its own thickness, but still rises with the predicted
+        # layers below.
+        m = self.t_pred.view(1, 1, 1, -1, 1, 1)
+        q_times_dlogp = dz * GRAVITY / temperature * m
         cumulative = torch.cumsum(q_times_dlogp.flip(3), dim=3).flip(3)
-        integrand = CV - 0.5 * q_times_dlogp + cumulative
+        integrand = CV * m - 0.5 * q_times_dlogp + cumulative
         return self._column_integral(integrand, ps)
 
     def _global_mean(self, field):
@@ -295,10 +342,20 @@ class ColumnEnergyConstraint(torch.nn.Module):
             orig = self._align_time(orig, n_time)
             ps = self._denorm_one(prediction, self._ps_out, self.ps_mean, self.ps_std)
             ps0 = self._denorm_one(orig, self._ps_in, self.ps_mean, self.ps_std)
-            temperature = self._denorm_levels(prediction, self._t_out, self.t_mean, self.t_std)
-            temperature0 = self._denorm_levels(orig, self._t_in, self.t_mean, self.t_std)
-            q = self._denorm_levels(prediction, self._q_out, self.q_mean, self.q_std)
-            q0 = self._denorm_levels(orig, self._q_in, self.q_mean, self.q_std)
+            coupled = None
+            if self.needs_coupled:
+                if "coupled" not in aux:
+                    raise ValueError(
+                        "column energy constraint with coupled levels requires aux['coupled']"
+                    )
+                coupled = aux["coupled"].float()
+                coupled = coupled.expand(-1, -1, n_time, -1, -1, -1)
+            t_args = (self._t_model, self._t_cpl, coupled, self.t_mean, self.t_std)
+            q_args = (self._q_model, self._q_cpl, coupled, self.q_mean, self.q_std)
+            temperature = self._column(prediction, self._t_out, *t_args)
+            temperature0 = self._column(orig, self._t_in, *t_args)
+            q = self._column(prediction, self._q_out, *q_args)
+            q0 = self._column(orig, self._q_in, *q_args)
             constants = aux["constants"].float()
             if constants.shape[2] != 1 and constants.shape[2] != n_time:
                 constants = self._align_time(constants, n_time)
@@ -321,6 +378,6 @@ class ColumnEnergyConstraint(torch.nn.Module):
                 1, 1, 1, -1, 1, 1
             )
             out = prediction
-            for k, idx in enumerate(self._t_out):
+            for k, idx in zip(self._t_model, self._t_out):
                 out = self._write(out, idx, norm[:, :, :, k : k + 1])
         return out.to(dtype=orig_dtype)
