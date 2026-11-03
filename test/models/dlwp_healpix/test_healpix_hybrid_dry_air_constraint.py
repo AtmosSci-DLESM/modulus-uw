@@ -177,3 +177,29 @@ def test_uses_last_input_time():
         rtol=0.0,
         atol=1e-2,
     )
+
+
+def test_coupled_top_level_matches_prognostic_with_same_value():
+    # Layer 0 prescribed through the coupler is the same in the input and the
+    # prediction, so dropping it gives the 8-layer result with q0_pred == q0_in.
+    rng = np.random.default_rng(4)
+    ps0 = 98500.0 + 1500.0 * rng.standard_normal((2, 12, 1, 1, 4, 4))
+    q0 = np.clip(0.003 + 0.001 * rng.standard_normal((2, 12, 1, N_LAYERS, 4, 4)), 0.0, 0.02)
+    q = np.clip(q0 + 0.0005 * rng.standard_normal(q0.shape), 0.0, 0.02)
+    q[:, :, :, 0] = q0[:, :, :, 0]
+    orig = torch.from_numpy(np.concatenate([ps0, q0], axis=3)).float()
+    pred = torch.from_numpy(np.concatenate([ps0 + 800.0, q], axis=3)).float()
+    with torch.no_grad():
+        full = _make_mod(out_channels=IN_CH)(pred, orig)
+        cpl = _make_mod(
+            in_channels=IN_CH[:1] + IN_CH[2:],
+            out_channels=IN_CH[:1] + IN_CH[2:],
+            coupled_channels=["sea_surface_temperature", WATER[0]],
+        )(pred[:, :, :, [0, *range(2, 1 + N_LAYERS)]], orig[:, :, :, [0, *range(2, 1 + N_LAYERS)]])
+    np.testing.assert_allclose(cpl[:, :, :, 0].numpy(), full[:, :, :, 0].numpy(), rtol=0.0, atol=5e-2)
+
+
+def test_rejects_coupled_level_with_pressure_dependent_thickness():
+    keep = [n for n in IN_CH if n != WATER[7]]
+    with pytest.raises(ValueError, match="cancel"):
+        _make_mod(in_channels=keep, out_channels=keep, coupled_channels=[WATER[7]])
