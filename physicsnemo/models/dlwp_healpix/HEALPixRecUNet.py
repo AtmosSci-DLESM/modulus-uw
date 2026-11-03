@@ -567,25 +567,23 @@ class HEALPixRecUNet(Module):
             diagnostics = combined[:, :, :, self.input_channels:]
             out = th.cat([prognostics, diagnostics], dim=3)
 
-            # Apply constraints. Insolation and constants are taken from the
-            # pre-reorder folded input so a structural channel permutation
-            # does not move them. Only constraints that accept ``aux`` see it.
+            # Apply constraints. Only constraints that accept ``aux`` see it: the
+            # step's insolation [B, F, T, D, H, W] and constants [B, F, 1, K, H, W],
+            # read from the inputs, which no channel reordering of the encoder input
+            # touches.
             if self.constraints is not None:
                 from physicsnemo.models.dlwp_healpix_layers.healpix_column_energy_constraint import (
                     accepts_forcing,
-                    forcing_from_folded_input,
                 )
 
-                residual_src = locals().get("input_for_residual", input_tensor)
-                aux = forcing_from_folded_input(
-                    residual_src,
-                    input_channels=self.input_channels,
-                    input_time_dim=self.input_time_dim,
-                    decoder_input_channels=self.decoder_input_channels,
-                    n_constants=self.n_constants,
-                    num_faces=self.unfold.num_faces,
-                )
-                if len(self.couplings) > 0:
+                aux = None
+                if any(accepts_forcing(c) for c in self.constraints):
+                    i = (step + self.presteps) * self.input_time_dim
+                    aux = {
+                        "insolation": inputs[1][:, :, i : i + self.input_time_dim],
+                        "constants": inputs[2].unsqueeze(0).unsqueeze(2).expand(inputs[0].shape[0], -1, -1, -1, -1, -1),
+                    }
+                if aux is not None and len(self.couplings) > 0:
                     # The step's raw coupled input as [B, F, 1, C, H, W], for
                     # constraints that read a level prescribed through the coupler.
                     coupled = inputs[3][self.presteps + step]

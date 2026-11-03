@@ -35,7 +35,6 @@ from physicsnemo.models.dlwp_healpix_layers.healpix_column_energy_constraint imp
     SOLAR_CONSTANT,
     ColumnEnergyConstraint,
     accepts_forcing,
-    forcing_from_folded_input,
 )
 
 N = 8
@@ -76,20 +75,7 @@ class _TwoArg(torch.nn.Module):
         return prediction
 
 
-def test_forcing_slice_and_signature():
-    folded = torch.arange(2 * 12 * 8 * 2 * 2, dtype=torch.float32).reshape(24, 8, 2, 2)
-    aux = forcing_from_folded_input(
-        folded,
-        input_channels=3,
-        input_time_dim=1,
-        decoder_input_channels=1,
-        n_constants=2,
-        num_faces=12,
-    )
-    assert aux["insolation"].shape == (2, 12, 1, 1, 2, 2)
-    assert aux["constants"].shape == (2, 12, 1, 2, 2, 2)
-    assert torch.equal(aux["insolation"][:, :, 0, 0], folded[:, 3].reshape(2, 12, 2, 2))
-    assert torch.equal(aux["constants"][:, :, 0, 1], folded[:, 5].reshape(2, 12, 2, 2))
+def test_accepts_forcing_signature():
     assert accepts_forcing(_make())
     assert not accepts_forcing(_TwoArg())
 
@@ -424,3 +410,23 @@ def test_recunet_passes_each_steps_insolation_constants_and_couplings_in_aux():
         assert torch.equal(aux["insolation"], inputs[1][:, :, i : i + 1])
         assert torch.equal(aux["constants"], inputs[2].unsqueeze(0).unsqueeze(2).expand(2, -1, -1, -1, -1, -1))
         assert torch.equal(aux["coupled"], inputs[3][i].permute(0, 2, 1, 3, 4).unsqueeze(2))
+
+
+class _AuxReader(torch.nn.Module):
+    """Constraint that reads every ``aux`` field (pure tensor ops) and leaves the prediction's values unchanged."""
+
+    def forward(self, prediction, input, aux=None):
+        touch = sum(v.sum() for v in aux.values())
+        return prediction + 0.0 * touch
+
+
+def test_recunet_with_aux_constraint_compiles_without_graph_breaks():
+    # A graph break inside the step loop makes dynamo compile every padding and
+    # block call as its own frame, recompiling it for each shape until shapes go
+    # dynamic, which the fused padding cannot trace.
+    model, inputs = _small_coupled_recunet()
+    model.constraints = [_AuxReader()]
+    torch._dynamo.reset()
+    with torch.no_grad():
+        explanation = torch._dynamo.explain(model)(inputs)
+    assert explanation.graph_break_count == 0, explanation.break_reasons
