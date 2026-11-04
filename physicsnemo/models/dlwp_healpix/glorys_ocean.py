@@ -377,6 +377,7 @@ class GlorysOceanModel(Module):
         sst_nlon=1440,
         legacy_zero_fill_non_sst_land=True,
         interpolate_predicted_land=True,
+        resample_conditions_per_block=False,
     ):
         from hydra.utils import instantiate
         from omegaconf import OmegaConf
@@ -387,6 +388,9 @@ class GlorysOceanModel(Module):
         self.register_buffer("device_buffer", self.device_buffer, persistent=False)
         self.channels = _names(channels)
         self.forcing_channels = _names(forcing_channels)
+        if not isinstance(resample_conditions_per_block, bool):
+            raise ValueError("resample_conditions_per_block must be boolean")
+        self.resample_conditions_per_block = resample_conditions_per_block
         if OmegaConf.is_config(backbone_config):
             backbone_config = OmegaConf.to_container(backbone_config, resolve=True)
         # An archive must carry the full plain model node, not a live module.
@@ -433,7 +437,6 @@ class GlorysOceanModel(Module):
             "input_channels": len(self.channels),
             "output_channels": len(self.channels),
             "n_constants": 1,
-            "decoder_input_channels": 0,
             "coupled_channels": self.backbone.output_time_dim
             * len(self.forcing_channels),
             "couplings_time_first": True,
@@ -441,6 +444,8 @@ class GlorysOceanModel(Module):
             "presteps": 0,
             "residual_prediction": True,
         }
+        if self.backbone.decoder_input_channels not in (0, 1):
+            raise ValueError("Ocean supports zero or one insolation decoder channel")
         if self.backbone.output_time_dim not in (1, 2) or self.backbone.delta_t not in (
             24,
             48,
@@ -500,6 +505,8 @@ class GlorysOceanModel(Module):
                 legacy_zero_fill_non_sst_land=False,
                 interpolate_predicted_land=self.state_policy.interpolate_predicted_land,
             )
+        if self.resample_conditions_per_block:
+            self._args["__args__"]["resample_conditions_per_block"] = True
         return self._args
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
@@ -523,13 +530,16 @@ class GlorysOceanModel(Module):
         """Persist native model config and native final-input residual semantics."""
         import copy
 
-        return {
+        state = {
             "architecture": "existing-healpix-recunet-ocean-v1",
             "channels": self.channels,
             "forcing_channels": self.forcing_channels,
             "backbone_config": copy.deepcopy(self.backbone_config),
             "reference": "native-final-input",
         }
+        if self.resample_conditions_per_block:
+            state["resample_conditions_per_block"] = True
+        return state
 
     def set_extra_state(self, state):
         """Reject architecture or temporal drift, including old CNN checkpoints."""
@@ -649,13 +659,19 @@ class GlorysOceanModel(Module):
         """Delegate recurrent reset to the existing native model."""
         self.backbone.reset()
 
+    def conditioning_steps(self, inputs):
+        """Number of independent latent draws for the supplied native rollout."""
+        blocks = inputs[-1].shape[0] if self.resample_conditions_per_block else 1
+        return blocks * self.integration_steps
+
     def forward(self, inputs, **kwargs):
         """Chain native blocks for training; one forcing block remains inference.
 
         The native coupler supplies [blocks,B,output_steps*K,F,H,W] forcing windows.
         Only the initial observed history enters the rollout. Each subsequent
         call consumes the latest two states, sliding in constrained predictions
-        without detachment (one or two new states per native call).
+        without detachment (one or two new states per native call). Insolation
+        advances with each block; new profiles use distinct conditions per block.
         Architecture, parameter names and single-block archives are unchanged.
         """
         if not isinstance(inputs, (list, tuple)) or len(inputs) not in (3, 4):
@@ -667,9 +683,20 @@ class GlorysOceanModel(Module):
             return self._forward_block(inputs, **kwargs)
         history = inputs[0]
         outputs = []
+        conditions = kwargs.get("conditions_cln")
+        if conditions is not None and self.resample_conditions_per_block:
+            if len(conditions) != self.conditioning_steps(inputs):
+                raise ValueError("Expected one condition per ocean integration step")
         for step in range(forcing.shape[0]):
             native = [history, *inputs[1:-1], forcing[step : step + 1]]
-            prediction = self._forward_block(native, **kwargs)
+            if self.decoder_input_channels:
+                start = step * self.output_time_dim
+                native[1] = inputs[1][:, :, start : start + self.input_time_dim + self.output_time_dim]
+            block_kwargs = dict(kwargs)
+            if conditions is not None and self.resample_conditions_per_block:
+                start = step * self.integration_steps
+                block_kwargs["conditions_cln"] = conditions[start : start + self.integration_steps]
+            prediction = self._forward_block(native, **block_kwargs)
             outputs.append(prediction)
             history = torch.cat((history, prediction), dim=2)[
                 :, :, -self.input_time_dim :
@@ -679,9 +706,8 @@ class GlorysOceanModel(Module):
     def _forward_block(self, inputs, **kwargs):
         """Process real native LIST inputs and return native [B,F,T,C,H,W] states.
 
-        The existing no-insolation data pipe supplies [prognostics, constants,
-        couplings]. The fixed native slots additionally carry a zero-width
-        decoder tensor; it introduces no physical field or dummy insolation.
+        Insolation-enabled data supplies [prognostics, insolation, constants,
+        couplings]. Legacy no-insolation archives retain the empty decoder slot.
         """
         if not isinstance(inputs, (list, tuple)) or len(inputs) not in (3, 4):
             raise ValueError("Expected a native prognostics/constants/couplings LIST")
@@ -695,9 +721,12 @@ class GlorysOceanModel(Module):
         native[0] = history
         batch, faces, steps, count, height, width = history.shape
         if len(native) == 3:
+            if self.decoder_input_channels:
+                raise ValueError("Ocean insolation input is required")
             native.insert(1, history.new_empty(batch, faces, steps, 0, height, width))
-        if native[1].shape != (batch, faces, steps, 0, height, width):
-            raise ValueError("Ocean has zero decoder variables; DI slot must be empty")
+        decoder_steps = steps + self.output_time_dim if self.decoder_input_channels else steps
+        if native[1].shape != (batch, faces, decoder_steps, self.decoder_input_channels, height, width):
+            raise ValueError("Ocean decoder input must match its dated insolation window")
         if native[2].shape != (faces, 1, height, width):
             raise ValueError("Expected the real declared LSM constant [12,1,H,W]")
         if native[3].shape != (
