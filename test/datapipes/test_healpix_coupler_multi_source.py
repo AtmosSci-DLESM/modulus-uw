@@ -84,3 +84,27 @@ def test_missing_sender_or_variable_raises():
     with pytest.raises(ValueError, match="does not output"):
         c.setup_coupling_sources({"ocean": ["sst", "sic"], "strat": ["t0"]},
                                  {"sst": "ocean", "sic": "ocean", "t0": "strat", "u0": "strat"})
+
+
+def test_input_kind_must_match_the_setup_and_senders_may_differ_in_device_and_dtype():
+    c = _coupler()
+    c.construct_integrated_couplings(batch={"time": slice(10, 16)}, bsize=1)
+    with pytest.raises(ValueError, match="after setup_coupling_sources"):
+        c.set_coupled_fields({"ocean": _field([1.0, 2.0])})  # no multi-source setup
+    c.setup_coupling_sources({"ocean": ["sst", "sic"], "strat": ["t0", "u0"]},
+                             {"sst": "ocean", "sic": "ocean", "t0": "strat", "u0": "strat"})
+    with pytest.raises(ValueError, match="tensor after setup_coupling"):
+        c.set_coupled_fields(_field([1.0, 2.0, 3.0, 4.0]))  # plain tensor after multi-source setup
+    c.set_coupled_fields({"ocean": _field([1.0, 2.0]).double(), "strat": _field([3.0, 4.0])})
+    out = c.construct_integrated_couplings()
+    assert out.dtype == torch.float32 and torch.equal(out[1:, 0, :, 0, 0, 0], torch.tensor([[1.0, 2.0, 3.0, 4.0]] * 4))
+    # a plain setup_coupling afterwards returns to tensor input
+    c.setup_coupling(SimpleNamespace(output_variables=list(_VARS)))
+    c.set_coupled_fields(_field([5.0, 6.0, 7.0, 8.0]))
+
+
+def test_unknown_sender_name_raises_value_error():
+    c = _coupler()
+    with pytest.raises(ValueError, match="not among"):
+        c.setup_coupling_sources({"strat": ["t0", "u0"], "ocean": ["sst", "sic"]},
+                                 {"sst": "ocean", "sic": "ocean", "t0": "stratosphere", "u0": "strat"})

@@ -207,37 +207,7 @@ class BaseCoupler(ABC):
             missing_channels = set(self.variables) - set(found_channels)
             raise ValueError(f"Missing variables in coupled module: {missing_channels}")
         self.coupled_channel_indices = channel_indices
-
-    def setup_coupling_sources(self, output_variables: Mapping, source_of: Mapping):
-        """
-        Couple against several sender components; set_coupled_fields then takes a mapping
-        of their outputs and gathers the coupled fields in ``self.variables`` order.
-
-        Parameters
-        ----------
-        output_variables: Mapping
-            Output variable names of each sender, by sender name.
-        source_of: Mapping
-            Sender name of each coupled variable (as named in ``self.variables``; a
-            trailing ``-<suffix>`` is matched to the sender's variable without it).
-        """
-        self._source_channels = []
-        for v in self.variables:
-            if v not in source_of:
-                raise ValueError(f"No sender given for coupled variable {v!r}")
-            name = v if "-" not in v else "-".join(v.split("-")[:-1])
-            outputs = list(output_variables[source_of[v]])
-            if name not in outputs:
-                raise ValueError(f"Sender {source_of[v]!r} does not output {name!r}")
-            self._source_channels.append((source_of[v], outputs.index(name)))
-        self.coupled_channel_indices = list(range(len(self.variables)))
-
-    def gather_sources(self, fields: Mapping) -> th.Tensor:
-        """
-        Coupled fields from several senders' outputs (see setup_coupling_sources), in
-        ``self.variables`` order: [B, F, T, C, H, W] from {sender name: [B, F, T, C_sender, H, W]}.
-        """
-        return th.cat([fields[src][:, :, :, i : i + 1] for src, i in self._source_channels], dim=3)
+        self._source_channels = None
 
     def reset_coupler(self):
         self.coupled_mode = False
@@ -414,6 +384,7 @@ class ConstantCoupler(BaseCoupler):
         self._slot_periods = None
         self._previous_fields = None
         self._period0_source = None
+        self._source_channels = None
         super().__init__(
             dataset=dataset,
             batch_size=batch_size,
@@ -482,6 +453,42 @@ class ConstantCoupler(BaseCoupler):
         self._previous_fields = None
         self._period0_source = None
 
+    def setup_coupling_sources(self, output_variables: Mapping, source_of: Mapping):
+        """
+        Couple against several sender components; set_coupled_fields then takes a mapping
+        of their outputs and gathers the coupled fields in ``self.variables`` order.
+
+        Parameters
+        ----------
+        output_variables: Mapping
+            Output variable names of each sender, by sender name.
+        source_of: Mapping
+            Sender name of each coupled variable (as named in ``self.variables``; a
+            trailing ``-<suffix>`` is matched to the sender's variable without it).
+        """
+        self._source_channels = []
+        for v in self.variables:
+            if source_of.get(v) is not None and source_of[v] not in output_variables:
+                raise ValueError(f"Sender {source_of[v]!r} of {v!r} is not among {sorted(output_variables)}")
+            if v not in source_of:
+                raise ValueError(f"No sender given for coupled variable {v!r}")
+            name = v if "-" not in v else "-".join(v.split("-")[:-1])
+            outputs = list(output_variables[source_of[v]])
+            if name not in outputs:
+                raise ValueError(f"Sender {source_of[v]!r} does not output {name!r}")
+            self._source_channels.append((source_of[v], outputs.index(name)))
+        self.coupled_channel_indices = list(range(len(self.variables)))
+
+    def gather_sources(self, fields: Mapping) -> th.Tensor:
+        """
+        Coupled fields from several senders' outputs (see setup_coupling_sources), in
+        ``self.variables`` order: [B, F, T, C, H, W] from {sender name: [B, F, T, C_sender, H, W]},
+        as CPU float32 (the coupler's buffer type) whatever device and dtype each sender uses.
+        """
+        return th.cat(
+            [fields[src][:, :, :, i : i + 1].to("cpu", th.float32) for src, i in self._source_channels], dim=3
+        )
+
     def set_coupled_fields(self, coupled_fields: th.tensor):
         """
         Set the data for the coupled field for the next iteration of the dataloader.
@@ -495,8 +502,12 @@ class ConstantCoupler(BaseCoupler):
             format is [B, F, T, C, H, W], or {sender name: sender outputs} after
             setup_coupling_sources
         """
+        if isinstance(coupled_fields, Mapping) != (self._source_channels is not None):
+            raise ValueError(
+                "set_coupled_fields takes {sender: outputs} after setup_coupling_sources and a tensor after setup_coupling"
+            )
         if isinstance(coupled_fields, Mapping):
-            # Several senders (setup_coupling_sources); only their first time is used.
+            # Several senders; only their first time is used.
             coupled_fields = self.gather_sources({k: v[:, :, :1] for k, v in coupled_fields.items()})
         # create buffer for coupling
         coupled_fields = coupled_fields[
