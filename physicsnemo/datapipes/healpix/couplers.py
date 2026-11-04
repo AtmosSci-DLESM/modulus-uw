@@ -451,7 +451,9 @@ class ConstantCoupler(BaseCoupler):
     def reset_coupler(self):
         super().reset_coupler()
         self._previous_fields = None
-        self._period0_source = None
+        # _period0_source is kept: it is the dataset's field for the initial condition, which a
+        # reset between rollouts from that IC (e.g. ensemble batches) does not change. Reading
+        # the next initial condition replaces it.
 
     def setup_coupling_sources(self, output_variables: Mapping, source_of: Mapping):
         """
