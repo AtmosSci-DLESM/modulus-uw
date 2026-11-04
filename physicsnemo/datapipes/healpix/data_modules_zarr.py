@@ -96,6 +96,7 @@ class TimeSeriesDataModuleZarr:
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
+        clamp_salinity_targets: bool = False,
         raw_target_mode: bool = False,
         target_mask_constant: Optional[str] = None,
         target_mask_threshold: float = 0.5,
@@ -196,6 +197,9 @@ class TimeSeriesDataModuleZarr:
         self.train_noise_params = train_noise_params
         self.train_noise_seed = train_noise_seed
         self.in_order = in_order
+        if not isinstance(clamp_salinity_targets, bool):
+            raise ValueError("clamp_salinity_targets must be boolean")
+        self.clamp_salinity_targets = clamp_salinity_targets
         self.raw_target_mode = raw_target_mode
         self.target_mask_constant = target_mask_constant
         self.target_mask_threshold = target_mask_threshold
@@ -240,6 +244,7 @@ class TimeSeriesDataModuleZarr:
             "time_step": self.time_step,
             "gap": self.gap,
             "scaling": self.scaling,
+            "clamp_salinity_targets": self.clamp_salinity_targets,
             "raw_target_mode": self.raw_target_mode,
             "target_mask_constant": self.target_mask_constant,
             "target_mask_threshold": self.target_mask_threshold,
@@ -509,6 +514,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
+        clamp_salinity_targets: bool = False,
         raw_target_mode: bool = False,
         target_mask_constant: Optional[str] = None,
         target_mask_threshold: float = 0.5,
@@ -613,6 +619,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             train_noise_params,
             train_noise_seed,
             in_order,
+            clamp_salinity_targets=clamp_salinity_targets,
             raw_target_mode=raw_target_mode,
             target_mask_constant=target_mask_constant,
             target_mask_threshold=target_mask_threshold,

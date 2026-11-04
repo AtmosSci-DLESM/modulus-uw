@@ -215,6 +215,7 @@ class OceanStatePolicy(nn.Module):
         sst_nlon=1440,
         legacy_zero_fill_non_sst_land=True,
         interpolate_predicted_land=True,
+        nonnegative_salinity=False,
     ):
         super().__init__()
         self.channels = _names(channels)
@@ -222,6 +223,9 @@ class OceanStatePolicy(nn.Module):
             interpolate_predicted_land, bool
         ):
             raise ValueError("Land policy flags must be boolean")
+        if not isinstance(nonnegative_salinity, bool):
+            raise ValueError("nonnegative_salinity must be boolean")
+        self.nonnegative_salinity = nonnegative_salinity
         self.legacy_zero_fill_non_sst_land = legacy_zero_fill_non_sst_land
         self.interpolate_predicted_land = (
             True if legacy_zero_fill_non_sst_land else interpolate_predicted_land
@@ -268,7 +272,7 @@ class OceanStatePolicy(nn.Module):
 
     def get_extra_state(self):
         """Persist channel order and the shared policy contract."""
-        return {
+        state = {
             "channels": self.channels,
             "policy": (
                 "sst-triple-interp-other-neutral-safe-sea-ice-bounds-v4"
@@ -280,6 +284,10 @@ class OceanStatePolicy(nn.Module):
             "sst_nlat": self.sst_nlat,
             "sst_nlon": self.sst_nlon,
         }
+
+        if self.nonnegative_salinity:
+            state["nonnegative_salinity"] = True
+        return state
 
     def set_extra_state(self, state):
         """Reject checkpoints with incompatible channel order or policy."""
@@ -305,7 +313,9 @@ class OceanStatePolicy(nn.Module):
         for index, name in enumerate(self.channels):
             value = clean[:, :, index : index + 1]
             supplied_land = value
-            if name in ("sic", "sithick", "mlotst"):
+            if name in ("sic", "sithick", "mlotst") or (
+                self.nonnegative_salinity and name.startswith("so_k")
+            ):
                 mean = self.mean[:, :, index : index + 1]
                 std = self.std[:, :, index : index + 1]
                 lower = _safe_normalized_boundary(mean, std, 0.0, lower=True)
@@ -319,7 +329,9 @@ class OceanStatePolicy(nn.Module):
                     value = torch.minimum(value, upper)
             if not self.legacy_zero_fill_non_sst_land:
                 value = torch.where(
-                    self.mask[:, :, index : index + 1], value, supplied_land
+                    self.mask[:, :, index : index + 1] | (
+                        self.nonnegative_salinity and name.startswith("so_k")
+                    ), value, supplied_land
                 )
             elif name == "sst" and self.sst_interpolator is not None:
                 mean = self.mean[:, :, index : index + 1]
@@ -377,6 +389,7 @@ class GlorysOceanModel(Module):
         sst_nlon=1440,
         legacy_zero_fill_non_sst_land=True,
         interpolate_predicted_land=True,
+        nonnegative_salinity=False,
         resample_conditions_per_block=False,
     ):
         from hydra.utils import instantiate
@@ -406,6 +419,7 @@ class GlorysOceanModel(Module):
             sst_nlon,
             legacy_zero_fill_non_sst_land,
             interpolate_predicted_land,
+            nonnegative_salinity,
         )
         # Resolve the module-qualified target with Python's import mechanism:
         # the public package also exports a class named HEALPixRecUNet, which
@@ -505,6 +519,8 @@ class GlorysOceanModel(Module):
                 legacy_zero_fill_non_sst_land=False,
                 interpolate_predicted_land=self.state_policy.interpolate_predicted_land,
             )
+        if self.state_policy.nonnegative_salinity:
+            self._args["__args__"]["nonnegative_salinity"] = True
         if self.resample_conditions_per_block:
             self._args["__args__"]["resample_conditions_per_block"] = True
         return self._args

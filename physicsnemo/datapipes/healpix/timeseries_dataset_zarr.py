@@ -72,6 +72,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
         meta: DatapipeMetaData = MetaData(),
+        clamp_salinity_targets: bool = False,
         raw_target_mode: bool = False,
         target_mask_constant: Optional[str] = None,
         target_mask_threshold: float = 0.5,
@@ -103,6 +104,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
             train_noise_params=train_noise_params,
             train_noise_seed=train_noise_seed,
             meta=meta,
+            clamp_salinity_targets=clamp_salinity_targets,
             raw_target_mode=raw_target_mode,
             target_mask_constant=target_mask_constant,
             target_mask_threshold=target_mask_threshold,
@@ -221,6 +223,7 @@ class TimeSeriesDatasetZarr(BaseTimeSeriesDatasetZarr):
                     ],
                     dtype=np.float32,
                 )
+                target_array = self.process_physical_targets(target_array)
                 if self.target_scaling is not None:
                     target_array -= self.target_scaling["mean"]
                     target_array /= self.target_scaling["std"]

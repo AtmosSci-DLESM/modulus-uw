@@ -105,6 +105,7 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         train_noise_params: DictConfig = None,
         train_noise_seed: int = 42,
         meta: DatapipeMetaData = None,
+        clamp_salinity_targets: bool = False,
         raw_target_mode: bool = False,
         target_mask_constant: Optional[str] = None,
         target_mask_threshold: float = 0.5,
@@ -161,6 +162,9 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         """
         Datapipe.__init__(self, meta=meta)
 
+        if not isinstance(clamp_salinity_targets, bool):
+            raise ValueError("clamp_salinity_targets must be boolean")
+        self.clamp_salinity_targets = clamp_salinity_targets
         self.raw_target_mode = raw_target_mode
         self.target_mask_constant = target_mask_constant
         self.target_mask_threshold = target_mask_threshold
@@ -564,6 +568,16 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
 
         self.constants = np.transpose(const, axes=(1, 0, 2, 3))
         return self.constants
+
+    def process_physical_targets(self, values):
+        """Clamp finite negative salinity in physical units; retain missingness."""
+        if self.clamp_salinity_targets:
+            for index, name in enumerate(self.output_variables):
+                if name.startswith("so_k"):
+                    channel = values[:, index]
+                    selected = np.isfinite(channel) & (channel < 0)
+                    channel[selected] = 0.0
+        return values
 
     def _get_time_index(self, item: int) -> Tuple[Tuple[int, int], int]:
         """Get time indices for specified sample.
