@@ -268,8 +268,19 @@ class UNetDecoder(th.nn.Module):
             th.cuda.nvtx.range_pop()
         return self.output_layer(x)
 
-    def reset(self):
-        """Resets the state of the decoder layers"""
+    def reset(self, reset_mode: str = None):
+        """
+        Resets the state of the decoder layers
+
+        Parameters
+        ----------
+        reset_mode: str, optional
+            The mode to use for the reset. If not provided, the default mode is used.
+            Valid modes depend on the type of recurrent block used in the model.
+        """
         for layer in self.decoder:
             if layer["recurrent"] is not None:
-                layer["recurrent"].reset()
+                if reset_mode is not None:
+                    layer["recurrent"].reset(reset_mode)
+                else:
+                    layer["recurrent"].reset()

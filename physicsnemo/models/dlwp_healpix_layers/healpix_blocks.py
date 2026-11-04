@@ -163,20 +163,30 @@ class ConvGRUBlock(th.nn.Module):
 
         return inputs + h_next
 
-    def reset(self):
+    def reset(self, mode: str = "zero_in_place"):
         """Reset the update gates"""
-        #self.h = th.zeros_like(self.h)
-        #self.h = self.h.detach()
-        #with torch.no_grad():
-        #    self.h.zero_()
-        # _h0 remains alive for the lifetime of this module/CUDA Graph.
-        with torch.no_grad():
-            self._h0.zero_()
+        
+        # mode can be "zero_new", "zero", "detach"
+        # h and _h0 are the same tensor, _h0 is the original tensor
+        # zero: create a new zero tensor, original behavior
+        # zero_in_place: set the current h tensor to zero
+        # detach: detach the current h tensor, keep the original tensor
+        if mode == "zero":
+            # create a new zero tensor, original behavior
+            self.h = self._h0 = th.zeros_like(self.h)
+        elif mode == "zero_in_place":
+            # set the current h tensor to zero
+            self.h = self.h.zero_()
+        elif mode == "detach":
+            # _h0 remains alive for the lifetime of this module/CUDA Graph.
+            with torch.no_grad():
+                self._h0.zero_()
 
-        # Severs history between top-level forwards, while retaining
-        # recurrence gradients within one forward.
-        self.h = self._h0
-
+            # Severs history between top-level forwards, while retaining
+            # recurrence gradients within one forward.
+            self.h = self._h0
+        else:
+            raise ValueError(f"Invalid reset mode: {mode}; expected one of {self.RESET_MODES}")
 
 #
 # CONV BLOCKS

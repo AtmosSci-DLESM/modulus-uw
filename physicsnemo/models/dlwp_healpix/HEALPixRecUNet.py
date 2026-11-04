@@ -575,7 +575,20 @@ class HEALPixRecUNet(Module):
 
         return th.cat(outputs, dim=self.channel_dim)
 
-    def reset(self):
-        """Resets the state of the network"""
-        self.encoder.reset()
-        self.decoder.reset()
+    def reset(self, reset_mode: str = None):
+        """
+        Resets the state of the network
+
+        Parameters
+        ----------
+        reset_mode: str, optional
+            The mode to use for the reset. If not provided, the default mode is used.
+            Valid modes depend on the type of recurrent block used in the model.
+        """
+
+        if reset_mode is not None:
+            self.encoder.reset(reset_mode)
+            self.decoder.reset(reset_mode)
+        else:
+            self.encoder.reset()
+            self.decoder.reset()
