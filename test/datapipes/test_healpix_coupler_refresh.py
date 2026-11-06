@@ -100,7 +100,26 @@ def test_coupled_mode_prestep_keeps_the_previous_window_field():
     assert torch.all(out[0] == 100.0)
     assert torch.all(out[1:] == 200.0)
     c.reset_coupler()
-    assert c._previous_fields is None and c._period0_source is None
+    assert c._previous_fields is None
+
+
+def test_reset_after_reading_the_initial_condition_keeps_its_prestep_field():
+    # The inference driver reads the IC, then resets the couplers before each rollout from it:
+    # window 1's prestep slot must still be the IC window's period field.
+    c = _coupler(output_time_dim=4, refresh_period="24h", batch_size=1)
+    start = 10
+    c.construct_integrated_couplings(batch={"time": slice(start, start + 6)}, bsize=1)
+    for value in (100.0, 300.0):  # two rollouts from the same IC
+        c.reset_coupler()
+        c.set_coupled_fields(torch.full((1, _FACE, 1, 2, _HEIGHT, _WIDTH), value))
+        out = c.preset_coupled_fields
+        assert torch.all(out[0] == start + 1)
+        assert torch.all(out[1:] == value)
+    # reading the next IC replaces it
+    c.reset_coupler()
+    c.construct_integrated_couplings(batch={"time": slice(start + 8, start + 14)}, bsize=1)
+    c.set_coupled_fields(torch.full((1, _FACE, 1, 2, _HEIGHT, _WIDTH), 500.0))
+    assert torch.all(c.preset_coupled_fields[0] == start + 9)
 
 
 def test_train_split_gets_longer_window_couplings():
