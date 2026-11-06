@@ -17,7 +17,7 @@ from typing import Optional, Sequence
 import torch as th
 import torch.nn as nn
 
-from .healpix_blocks import HEALPixLayer, SmoothedInterpolate
+from .healpix_blocks import HEALPixLayer, SmoothedInterpolate, _prepare_hidden, _store_hidden, _zero_hidden
 from .healpix_paddings import make_hpx_padding_layer, warn_deprecated_enable_healpixpad
 from .normalization import ConditionalLayerNorm
 from .reflection_ops import bank_sizes, merge_banks, split_banks
@@ -344,6 +344,10 @@ class ReflectionSteerableConvGRUBlock(nn.Module):
     """ConvGRU with typed even|odd hidden state and ReflectionSteerable candidate."""
 
     reflection_steerable = True
+    # Inference only: update the hidden state in place, so a captured CUDA graph reads
+    # and writes the same buffer on every replay and the state can carry across forward
+    # calls (one per coupler window). Not differentiable through the state.
+    static_hidden_state = False
 
     def __init__(
         self,
@@ -376,8 +380,7 @@ class ReflectionSteerableConvGRUBlock(nn.Module):
         self.h = th.zeros(1, 1, 1, 1)
 
     def forward(self, inputs: th.Tensor, sin_lat_gate: Optional[th.Tensor] = None) -> th.Tensor:
-        if inputs.shape != self.h.shape:
-            self.h = th.zeros_like(inputs)
+        _prepare_hidden(self, inputs)
 
         xe, xo = split_banks(inputs, self.n_even)
         he, ho = split_banks(self.h, self.n_even)
@@ -399,11 +402,11 @@ class ReflectionSteerableConvGRUBlock(nn.Module):
 
         update_gate = merge_banks(update_e, update_o)
         h_next = (1 - update_gate) * self.h + update_gate * cnm
-        self.h = h_next
+        _store_hidden(self, h_next)
         return inputs + h_next
 
     def reset(self):
-        self.h = th.zeros_like(self.h)
+        _zero_hidden(self)
 
 
 class ReflectionSteerableBasicConvBlock(nn.Module):
