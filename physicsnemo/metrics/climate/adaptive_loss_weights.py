@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import torch
@@ -96,10 +97,10 @@ class AdaptiveLossWeights(torch.nn.Module):
         scale, or a mapping whose keys do not match the term names, raises.
         Passing ``constraint_groups`` together with specs also raises.
 
-        Variable terms have implicit relative loss scale 1. During warmup, applied
-        weights are 1 on variables and ``s_k`` on constraints. After warmup,
-        ``w_i = T / m_i`` and ``w_k = s_k * T / m_k`` with ``T = mean(m)`` over
-        the data-variable EMA.
+        Variable terms have relative loss scale 1 unless ``variable_loss_scales``
+        sets one. During warmup, applied weights are ``s_i`` on variables and
+        ``s_k`` on constraints. After warmup, ``w_i = s_i * T / m_i`` and
+        ``w_k = s_k * T / m_k`` with ``T = mean(m)`` over the data-variable EMA.
     variable_names:
         Optional names for data terms (logging). Defaults to
         ``var_0 … var_{C-1}``, or ``trainer.output_variables`` in ``setup``.
@@ -115,6 +116,14 @@ class AdaptiveLossWeights(torch.nn.Module):
         in ``setup``.
     eps:
         Floor for EMA magnitudes when forming ``T / m``.
+    variable_loss_scales:
+        Optional ``{output variable name: s_i}``. A data variable with scale
+        ``s_i`` keeps ``s_i`` times the equalized share ``T`` of the loss, so
+        ``s_i = 2`` weighs it twice as much as an unlisted variable (scale 1).
+        A fixed weight inside the inner criterion cannot do this, because the
+        EMA ``m_i`` would absorb it. Names are matched against
+        ``trainer.output_variables`` in ``setup``; an unknown name raises.
+        The scales live in the checkpointed ``relative_loss_scale`` buffer.
 
     Trainer contract
     ----------------
@@ -139,6 +148,7 @@ class AdaptiveLossWeights(torch.nn.Module):
         ema_window_epochs: float = 5.0,
         steps_per_epoch: Optional[int] = None,
         eps: float = 1e-12,
+        variable_loss_scales: Optional[Mapping[str, float]] = None,
     ):
         super().__init__()
         if n_data_variables is not None and int(n_data_variables) < 1:
@@ -165,6 +175,14 @@ class AdaptiveLossWeights(torch.nn.Module):
         self.warmup_epochs = int(warmup_epochs)
         self.ema_window_epochs = float(ema_window_epochs)
         self.eps = float(eps)
+        self._variable_loss_scales: Dict[str, float] = {}
+        for name, scale in (variable_loss_scales or {}).items():
+            scale = float(scale)
+            if not math.isfinite(scale) or scale <= 0.0:
+                raise ValueError(
+                    f"variable_loss_scales[{name!r}] must be finite and > 0, got {scale}"
+                )
+            self._variable_loss_scales[str(name)] = scale
         self.steps_per_epoch = (
             int(steps_per_epoch) if steps_per_epoch is not None else None
         )
@@ -461,9 +479,25 @@ class AdaptiveLossWeights(torch.nn.Module):
         # Rebind after the device move and any variable-name rewrite so the
         # dict views the storage forward will ``copy_`` into.
         self._bind_log_buffers()
-        # Warmup weights: 1 on variables, s_k on constraints.
+        self._apply_variable_loss_scales()
+        # Warmup weights: s_i on variables (1 unless variable_loss_scales sets
+        # one), s_k on constraints.
         self.weights.copy_(self.relative_loss_scale)
         self._sync_ema_ready_flag()
+
+    def _apply_variable_loss_scales(self) -> None:
+        """Write ``variable_loss_scales`` into the data-variable slots of ``relative_loss_scale``."""
+        if not self._variable_loss_scales:
+            return
+        index = {name: i for i, name in enumerate(self.variable_names)}
+        unknown = [name for name in self._variable_loss_scales if name not in index]
+        if unknown:
+            raise ValueError(
+                f"variable_loss_scales names {unknown} are not data variables "
+                f"{self.variable_names}"
+            )
+        for name, scale in self._variable_loss_scales.items():
+            self.relative_loss_scale[index[name]] = scale
 
     def _sync_ema_ready_flag(self) -> None:
         """Read ema_initialized once. Resume calls this from load_state_dict."""

@@ -465,3 +465,51 @@ def test_coupled_input_is_forwarded_to_inner():
     assert out.tolist() == [2.0, 6.0]
     with pytest.raises(ValueError, match="coupled_input"):
         wrap(pred, pred)
+
+
+def _scaled_wrap(terms, names, scales, warmup_epochs):
+    wrap = AdaptiveLossWeights(
+        inner=_FixedTerms(torch.tensor(terms)),
+        warmup_epochs=warmup_epochs,
+        ema_window_epochs=5,
+        steps_per_epoch=4,
+        variable_loss_scales=scales,
+    )
+    wrap.setup(
+        _DummyTrainer(
+            device=torch.device("cpu"),
+            output_variables=list(names),
+            dataloader_train=[0] * 4,
+        )
+    )
+    return wrap
+
+
+def test_variable_loss_scale_multiplies_equalized_share():
+    """After warmup a variable with scale s keeps s * T of the loss, the others T."""
+    wrap = _scaled_wrap([1.0, 4.0, 9.0], ["a", "b", "c"], {"b": 2.0}, warmup_epochs=0)
+    pred = torch.zeros(1, 1, 1, 1, 1, 1)
+    _ = wrap(pred, pred)
+    wrap.post_backward_update(epoch=0)
+    T = (1.0 + 4.0 + 9.0) / 3
+    assert torch.allclose(wrap.weights, torch.tensor([T / 1.0, 2.0 * T / 4.0, T / 9.0]))
+    weighted = wrap(pred, pred, average_channels=False)
+    assert torch.allclose(weighted, torch.tensor([T, 2.0 * T, T]))
+    assert torch.allclose(wrap.log_buffers["loss_weight/b"], torch.tensor(2.0 * T / 4.0))
+
+
+def test_variable_loss_scale_is_the_warmup_weight():
+    wrap = _scaled_wrap([1.0, 4.0, 9.0], ["a", "b", "c"], {"c": 2.0}, warmup_epochs=1)
+    assert torch.equal(wrap.weights, torch.tensor([1.0, 1.0, 2.0]))
+    pred = torch.zeros(1, 1, 1, 1, 1, 1)
+    _ = wrap(pred, pred)
+    wrap.post_backward_update(epoch=0)
+    assert torch.equal(wrap.weights, torch.tensor([1.0, 1.0, 2.0]))
+    assert "relative_loss_scale" in wrap.state_dict()
+
+
+def test_variable_loss_scales_reject_bad_input():
+    with pytest.raises(ValueError, match="not data variables"):
+        _scaled_wrap([1.0, 2.0], ["a", "b"], {"z": 2.0}, warmup_epochs=0)
+    with pytest.raises(ValueError, match="finite and > 0"):
+        _scaled_wrap([1.0, 2.0], ["a", "b"], {"a": 0.0}, warmup_epochs=0)
