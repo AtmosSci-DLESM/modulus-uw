@@ -90,34 +90,6 @@ def accepts_forcing(constraint) -> bool:
     return "aux" in params
 
 
-def forcing_from_folded_input(
-    folded: torch.Tensor,
-    *,
-    input_channels: int,
-    input_time_dim: int,
-    decoder_input_channels: int,
-    n_constants: int,
-    num_faces: int = 12,
-) -> dict[str, torch.Tensor]:
-    """Insolation and constants from the pre-reorder folded encoder input.
-
-    Channel order, before any structural permutation, is prognostics
-    (``input_time_dim * input_channels``), decoder inputs
-    (``input_time_dim * decoder_input_channels``), then constants.
-    ``folded`` is ``[B * F, C, H, W]``.
-    """
-    n_prog = int(input_channels) * int(input_time_dim)
-    n_di = int(decoder_input_channels) * int(input_time_dim)
-    insol_flat = folded[:, n_prog : n_prog + n_di]
-    const_flat = folded[:, n_prog + n_di : n_prog + n_di + int(n_constants)]
-    bf, _, h, w = folded.shape
-    batch = bf // int(num_faces)
-    insolation = insol_flat.reshape(
-        batch, int(num_faces), int(input_time_dim), int(decoder_input_channels), h, w
-    )
-    constants = const_flat.reshape(batch, int(num_faces), 1, int(n_constants), h, w)
-    return {"insolation": insolation, "constants": constants}
-
 
 
 class ColumnEnergyConstraint(torch.nn.Module):
