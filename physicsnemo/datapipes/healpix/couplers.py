@@ -16,7 +16,7 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 import cftime
 import numpy as np
@@ -222,6 +222,7 @@ class BaseCoupler(ABC):
             missing_channels = set(self.variables) - set(found_channels)
             raise ValueError(f"Missing variables in coupled module: {missing_channels}")
         self.coupled_channel_indices = channel_indices
+        self._source_channels = None
 
     def reset_coupler(self):
         self.coupled_mode = False
@@ -397,6 +398,7 @@ class ConstantCoupler(BaseCoupler):
         self._slot_periods = None
         self._previous_fields = None
         self._period0_source = None
+        self._source_channels = None
         super().__init__(
             dataset=dataset,
             batch_size=batch_size,
@@ -467,6 +469,42 @@ class ConstantCoupler(BaseCoupler):
         # reset between rollouts from that IC (e.g. ensemble batches) does not change. Reading
         # the next initial condition replaces it.
 
+    def setup_coupling_sources(self, output_variables: Mapping, source_of: Mapping):
+        """
+        Couple against several sender components; set_coupled_fields then takes a mapping
+        of their outputs and gathers the coupled fields in ``self.variables`` order.
+
+        Parameters
+        ----------
+        output_variables: Mapping
+            Output variable names of each sender, by sender name.
+        source_of: Mapping
+            Sender name of each coupled variable (as named in ``self.variables``; a
+            trailing ``-<suffix>`` is matched to the sender's variable without it).
+        """
+        self._source_channels = []
+        for v in self.variables:
+            if source_of.get(v) is not None and source_of[v] not in output_variables:
+                raise ValueError(f"Sender {source_of[v]!r} of {v!r} is not among {sorted(output_variables)}")
+            if v not in source_of:
+                raise ValueError(f"No sender given for coupled variable {v!r}")
+            name = v if "-" not in v else "-".join(v.split("-")[:-1])
+            outputs = list(output_variables[source_of[v]])
+            if name not in outputs:
+                raise ValueError(f"Sender {source_of[v]!r} does not output {name!r}")
+            self._source_channels.append((source_of[v], outputs.index(name)))
+        self.coupled_channel_indices = list(range(len(self.variables)))
+
+    def gather_sources(self, fields: Mapping) -> th.Tensor:
+        """
+        Coupled fields from several senders' outputs (see setup_coupling_sources), in
+        ``self.variables`` order: [B, F, T, C, H, W] from {sender name: [B, F, T, C_sender, H, W]},
+        as CPU float32 (the coupler's buffer type) whatever device and dtype each sender uses.
+        """
+        return th.cat(
+            [fields[src][:, :, :, i : i + 1].to("cpu", th.float32) for src, i in self._source_channels], dim=3
+        )
+
     def set_coupled_fields(self, coupled_fields: th.tensor):
         """
         Set the data for the coupled field for the next iteration of the dataloader.
@@ -475,10 +513,18 @@ class ConstantCoupler(BaseCoupler):
 
         Parameters
         ----------
-        coupled_fields: th.tensor
+        coupled_fields: th.tensor or Mapping
             The data to use when the dataloader requests coupled fields. Expected
-            format is [B, F, T, C, H, W]
+            format is [B, F, T, C, H, W], or {sender name: sender outputs} after
+            setup_coupling_sources
         """
+        if isinstance(coupled_fields, Mapping) != (self._source_channels is not None):
+            raise ValueError(
+                "set_coupled_fields takes {sender: outputs} after setup_coupling_sources and a tensor after setup_coupling"
+            )
+        if isinstance(coupled_fields, Mapping):
+            # Several senders; only their first time is used.
+            coupled_fields = self.gather_sources({k: v[:, :, :1] for k, v in coupled_fields.items()})
         # create buffer for coupling
         coupled_fields = coupled_fields[
             :, :, :, self.coupled_channel_indices, :, :
@@ -678,4 +724,184 @@ class TrailingAverageCoupler(BaseCoupler):
         if self.time_first:
             self.preset_coupled_fields = self.preset_coupled_fields.permute(2, 0, 3, 1, 4, 5)
         # flag for construct integrated coupling method to use this array
+        self.coupled_mode = True
+
+
+class WindowMeanCoupler(BaseCoupler):
+    """
+    Coupler that forces each model step with the time mean of the coupled fields over
+    that step's window [t, t + window], t being the step's input time.
+
+    The mean is the trapezoidal average of the stored samples in the window (half
+    weight on the two end samples), so over a 24 h window every hour of the day gets
+    the same weight whatever the start hour. It is computed on the fly from the
+    stored instantaneous fields, read and normalized as the base class reads them, so
+    no pre-averaged variables are needed. The window equals the model step: the
+    prestep sees the window ending at the first step's input time t0, step k the
+    window [t0 + k * step, t0 + (k + 1) * step], and in rollouts the forcing is
+    renewed every window.
+
+    Coupled inference: start_rollout seeds the series with the first window's dataset
+    couplings and the sender's state at t0; set_coupled_fields then averages each
+    window's sender outputs together with the sender's state at the window start, and
+    the prestep slots keep the means of the previous windows.
+    """
+
+    def __init__(
+        self,
+        dataset: xr.Dataset,
+        batch_size: int,
+        variables: Sequence,
+        presteps: int = 0,
+        input_time_dim: int = 1,
+        output_time_dim: int = 1,
+        input_times: Sequence = ("24h",),
+    ):
+        """
+        Parameters
+        ----------
+        dataset: xr.Dataset
+            xarray Dataset or zarr Group that holds the coupled data
+        batch_size: int
+            number of samples per dataset item
+        variables: Sequence
+            coupled variable names in the dataset
+        presteps: int, optional
+            the number of model steps used to initialize the hidden state, default 0
+        input_time_dim: int, optional
+            number of input times per model step; only 1 is supported, default 1
+        output_time_dim: int, optional
+            number of output times per model call, default 1
+        input_times: Sequence, optional
+            one entry: the averaging window, which must equal the model time step,
+            default ("24h",)
+        """
+        if input_time_dim != 1:
+            raise ValueError(f"WindowMeanCoupler needs input_time_dim 1, got {input_time_dim}")
+        if len(input_times) != 1:
+            raise ValueError(f"WindowMeanCoupler takes one input time (the window), got {list(input_times)}")
+        super().__init__(
+            dataset=dataset,
+            batch_size=batch_size,
+            variables=variables,
+            presteps=presteps,
+            input_time_dim=input_time_dim,
+            output_time_dim=output_time_dim,
+            input_times=input_times,
+        )
+        self._weights = None
+        self._frame_offsets = None
+        self._sender_last = None
+        self._previous_means = None
+
+    @staticmethod
+    def _trapezoid_weights(n):
+        """Weights of the n + 1 samples spanning a window of n sample intervals."""
+        w = np.ones(n + 1) / n
+        w[[0, -1]] *= 0.5
+        return w
+
+    def compute_coupled_indices(self, interval, data_time_step):
+        """
+        Called by CoupledDataset to compute static indices for training samples.
+        Offsets count data steps from each sample's first frame, which is the first
+        prestep input; slot i averages the n + 1 frames from its input time on.
+
+        Parameters
+        ----------
+        interval: int
+            ratio of model time step to dataset time step
+        data_time_step:
+            dataset time step
+        """
+        step = self.input_time_dim * interval
+        n = self.input_times[0] / pd.Timedelta(data_time_step)
+        if n != step:
+            raise ValueError(
+                f"WindowMeanCoupler window {self.input_times[0]} must equal the model "
+                f"time step ({step} data steps of {data_time_step})"
+            )
+        n = int(n)
+        t0 = interval * (self.input_time_dim * (1 + self.presteps) - 1)
+        slot_start = t0 + (np.arange(self.coupled_integration_dim) - self.presteps) * step
+        # [B, slots, n + 1]: the frames each slot averages
+        self._frame_offsets = (
+            np.arange(self.batch_size)[:, None, None]
+            + slot_start[None, :, None]
+            + np.arange(n + 1)[None, None, :]
+        ).astype(int)
+        # The base class reads one offset per (sample, slot): give it one slot per frame.
+        self._coupled_offsets = self._frame_offsets.reshape(self.batch_size, -1, 1)
+        self._weights = self._trapezoid_weights(n)
+
+    def construct_integrated_couplings(self, batch=None, bsize=None):
+        """
+        Window means of the coupled fields for every slot of the batch's samples,
+        [slots, B, C, F, H, W].
+        """
+        if self.coupled_mode:
+            return self.preset_coupled_fields
+        # The base class reads, normalizes and casts the coupled data at one offset per
+        # (sample, slot). Read the window frames through it as one slot per frame, then
+        # average each slot's frames.
+        n_slots, n_frames = self._frame_offsets.shape[1:]
+        self.coupled_integration_dim = n_slots * n_frames
+        try:
+            frames = super().construct_integrated_couplings(batch, bsize)  # [slots * frames, B, C, F, H, W]
+        finally:
+            self.coupled_integration_dim = n_slots
+        frames = frames.reshape((n_slots, n_frames) + frames.shape[1:])
+        return np.tensordot(self._weights, frames, axes=(0, 1)).astype(frames.dtype)
+
+    def reset_coupler(self):
+        super().reset_coupler()
+        self._sender_last = None
+        self._previous_means = None
+
+    def start_rollout(self, first_couplings, sender_state):
+        """
+        Seed coupled inference before the first set_coupled_fields.
+
+        Parameters
+        ----------
+        first_couplings: th.tensor
+            The couplings the receiver got for its first window from the dataset,
+            [slots, B, C, F, H, W]; its prestep slots carry over to the next window.
+        sender_state: th.tensor
+            The sender's fields at the first window's start, [B, F, T, C, H, W] in the
+            sender's output channel order (its last time is used).
+        """
+        self._previous_means = th.as_tensor(first_couplings)[: self.presteps].permute(1, 3, 0, 2, 4, 5).float().cpu()
+        self._sender_last = sender_state[:, :, -1:, self.coupled_channel_indices].float().cpu().clone()
+
+    def set_coupled_fields(self, coupled_fields: th.tensor):
+        """
+        Set the coupled forcing of the next window from the sender's outputs over it.
+
+        Parameters
+        ----------
+        coupled_fields: th.tensor
+            The sender's outputs over the window, [B, F, T, C, H, W], at the data's
+            time resolution; the step slots split T evenly, each averaging its outputs
+            with the field just before them.
+        """
+        if self._sender_last is None:
+            raise RuntimeError("WindowMeanCoupler.start_rollout must seed coupled inference first")
+        x = coupled_fields[:, :, :, self.coupled_channel_indices].float().cpu()
+        n_steps = self.coupled_integration_dim - self.presteps
+        n = len(self._weights) - 1
+        if x.shape[2] != n_steps * n:
+            raise ValueError(
+                f"expected {n_steps * n} sender outputs ({n_steps} windows of {n} samples, "
+                f"as in training), got {x.shape[2]}"
+            )
+        w = th.as_tensor(self._weights, dtype=x.dtype).view(1, 1, -1, 1, 1, 1)
+        means = []
+        for s in range(n_steps):
+            frames = th.cat([self._sender_last, x[:, :, s * n : (s + 1) * n]], dim=2)
+            means.append((frames * w).sum(dim=2, keepdim=True))
+            self._sender_last = x[:, :, (s + 1) * n - 1 : (s + 1) * n].clone()
+        slots = th.cat([self._previous_means] + means, dim=2)  # [B, F, slots, C, H, W]
+        self._previous_means = slots[:, :, slots.shape[2] - self.presteps :]
+        self.preset_coupled_fields = slots.permute(2, 0, 3, 1, 4, 5)
         self.coupled_mode = True
