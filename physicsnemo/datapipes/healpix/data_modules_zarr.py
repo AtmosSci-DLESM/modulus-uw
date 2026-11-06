@@ -19,10 +19,12 @@ import copy
 import logging
 import warnings
 from pathlib import Path
+from functools import partial
 from typing import Optional, Sequence, Union
 
 # numpy
 import numpy as np
+import torch
 
 # External modules
 from omegaconf import DictConfig, OmegaConf
@@ -36,6 +38,35 @@ from .multi_store_dataset import MultiStoreDataset
 from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
 
 logger = logging.getLogger(__name__)
+
+
+def concat_samples(items, coupled=False):
+    """Collate dataset items into one batch by concatenating along their batch axis.
+
+    Each item is what a dataset with its own batching returns: ``(inputs, targets)``
+    in training or ``inputs`` in forecast mode, ``inputs`` being [state, insolation,
+    constants, couplings] as present. State, insolation and targets are [B, F, T, C, H, W];
+    constants [F, C, H, W] have no batch axis and are taken from the first item; the
+    couplings (``coupled=True``, the last input) are time-first [T, B, C, F, H, W].
+    """
+
+    def cat(arrays, dim):
+        return torch.cat([torch.as_tensor(a) for a in arrays], dim=dim)
+
+    def inputs(group):
+        n = len(group[0])
+        out = []
+        for i in range(n):
+            arrays = [g[i] for g in group]
+            if np.ndim(arrays[0]) == 4:  # constants
+                out.append(torch.as_tensor(arrays[0]))
+            else:
+                out.append(cat(arrays, 1 if (coupled and i == n - 1) else 0))
+        return out
+
+    if isinstance(items[0], tuple):
+        return inputs([it[0] for it in items]), cat([it[1] for it in items], 0)
+    return inputs(items)
 
 
 class TimeSeriesDataModuleZarr:
@@ -198,7 +229,15 @@ class TimeSeriesDataModuleZarr:
         self.val_dataset = None
         self.test_dataset = None
 
-        self.collate_fn = None
+        # With dataloader_batch_size the DataLoader draws that many dataset items (each of
+        # batch_size consecutive samples) independently, e.g. random start times with
+        # batch_size 1; concat_samples joins them along the batch axis.
+        self.collate_fn = (
+            None
+            if dataloader_batch_size is None
+            # CoupledTimeSeriesDataModuleZarr sets self.couplings before this __init__ runs.
+            else partial(concat_samples, coupled=bool(getattr(self, "couplings", None)))
+        )
 
         self.setup()
 
@@ -389,7 +428,7 @@ class TimeSeriesDataModuleZarr:
         self._create_datasets(common_kwargs, dataset_class, dist)
 
     def _base_dataloader(
-        self, dataset, num_shards=1, shard_id=0, shuffle=False, drop_last=False
+        self, dataset, num_shards=1, shard_id=0, shuffle=False, drop_last=False, item_batches=False
     ) -> DataLoader:
         """Setup a dataloader with common functionality
 
@@ -404,11 +443,15 @@ class TimeSeriesDataModuleZarr:
             The shard number of this instance of the dataloader, default 0
         shuffle: bool, optional
             Whether to shuffle the data, default False
+        item_batches: bool, optional
+            Use each dataset item as a batch even when dataloader_batch_size is set,
+            default False
 
         Returns
         -------
         DataLoader: The configured dataloader
         """
+        batch_size = None if item_batches else self.dataloader_batch_size
         sampler = None
         if num_shards > 1:
             sampler = DistributedSampler(
@@ -423,7 +466,7 @@ class TimeSeriesDataModuleZarr:
         # Dataset-level batching uses dataloader_batch_size=None. PyTorch forbids
         # drop_last=True in that case; the dataset already honors drop_last for
         # incomplete batches. Keep DataLoader drop_last only when it auto-batches.
-        dl_drop_last = drop_last if self.dataloader_batch_size is not None else False
+        dl_drop_last = drop_last if batch_size is not None else False
         dataloader_kwargs = {
             "dataset": dataset,
             "pin_memory": self.pin_memory,
@@ -432,8 +475,8 @@ class TimeSeriesDataModuleZarr:
             "shuffle": shuffle,
             "drop_last": dl_drop_last,
             "sampler": sampler,
-            "collate_fn": self.collate_fn,
-            "batch_size": self.dataloader_batch_size,
+            "collate_fn": None if batch_size is None else self.collate_fn,
+            "batch_size": batch_size,
         }
         if self.prefetch_factor is not None and self.num_workers > 0:
             dataloader_kwargs["prefetch_factor"] = self.prefetch_factor
@@ -510,6 +553,9 @@ class TimeSeriesDataModuleZarr:
             shard_id=shard_id,
             shuffle=False,
             drop_last=False,
+            # Forecast datasets keep per-item rollout state for next_integration, so a
+            # test batch is always one dataset item.
+            item_batches=True,
         )
 
 
