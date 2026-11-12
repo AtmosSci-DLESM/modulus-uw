@@ -475,3 +475,283 @@ def test_HEALPixRecUNet_forward(
 
     del model, inputs
     torch.cuda.empty_cache()
+
+
+RESIDUAL_MODES = ("same-index-add", "last-reference", "chained")
+PRESTEPS = 1
+
+
+@pytest.fixture
+def small_recunet_dicts(
+    conv_next_block_dict,
+    down_sampling_block_dict,
+    up_sampling_block_dict,
+    output_layer_dict,
+    recurrent_block_dict,
+):
+    """Two-level UNet dicts, small enough for the residual tests to run on CPU."""
+    encoder = {
+        "_target_": "physicsnemo.models.dlwp_healpix_layers.UNetEncoder",
+        "conv_block": conv_next_block_dict,
+        "down_sampling_block": down_sampling_block_dict,
+        "recurrent_block": recurrent_block_dict,
+        "_recursive_": False,
+        "n_channels": [16, 8],
+        "dilations": [1, 2],
+    }
+    decoder = omegaconf.DictConfig(
+        {
+            "_target_": "physicsnemo.models.dlwp_healpix_layers.UNetDecoder",
+            "conv_block": conv_next_block_dict,
+            "up_sampling_block": up_sampling_block_dict,
+            "recurrent_block": recurrent_block_dict,
+            "output_layer": output_layer_dict,
+            "_recursive_": False,
+            "n_channels": [8, 16],
+            "dilations": [2, 1],
+        }
+    )
+    return encoder, decoder
+
+
+def _build_residual_recunet(
+    small_recunet_dicts,
+    residual_prediction,
+    in_channels=3,
+    out_channels=5,
+    input_time_dim=2,
+    output_time_dim=4,
+    size=16,
+    device="cpu",
+):
+    """Build the two-level model with karlbauer padding so it runs without CUDA."""
+    encoder, decoder = small_recunet_dicts
+    model = HEALPixRecUNet(
+        encoder=encoder,
+        decoder=decoder,
+        input_channels=in_channels,
+        output_channels=out_channels,
+        n_constants=2,
+        decoder_input_channels=1,
+        input_time_dim=input_time_dim,
+        output_time_dim=output_time_dim,
+        presteps=PRESTEPS,
+        residual_prediction=residual_prediction,
+        hpx_padding_mode="karlbauer",
+        nside=(size, size // 2),
+        delta_time="6h",
+    ).to(device)
+    model.eval()
+    return model
+
+
+def _expected_prognostics(mode, deltas, state):
+    """Documented closed form for each mode, given raw deltas and the input state."""
+    if mode == "same-index-add":
+        return deltas + state
+    if mode == "last-reference":
+        return deltas + state[:, :, -1:]
+    if mode == "chained":
+        return state[:, :, -1:] + torch.cumsum(deltas, dim=2)
+    raise ValueError(f"unhandled residual prediction mode: {mode}")
+
+
+@import_or_fail("omegaconf")
+@pytest.mark.parametrize("out_channels", [3, 5])
+def test_HEALPixRecUNet_residual_prediction_closed_form(
+    out_channels,
+    small_recunet_dicts,
+    test_data,
+    insolation_data,
+    constant_data,
+    pytestconfig,
+):
+    """Each mode must combine the raw deltas with the input state as documented.
+
+    Run with out_channels == input_channels (prognostics only) and with extra
+    diagnostic channels, which must stay absolute in every mode.
+    """
+    in_channels = 3
+    input_time_dim = 2
+    output_time_dim = 4
+    batch_size = 2
+    size = 16
+
+    fix_random_seeds(seed=42)
+    x = test_data(
+        batch_size=batch_size,
+        time_dim=2 * input_time_dim,
+        channels=in_channels,
+        img_size=size,
+    )
+    decoder_inputs = insolation_data(
+        batch_size=batch_size, time_dim=2 * output_time_dim, img_size=size
+    )
+    constants = constant_data(channels=2, img_size=size)
+    inputs = [x, decoder_inputs, constants]
+
+    model = _build_residual_recunet(
+        small_recunet_dicts,
+        "none",
+        in_channels=in_channels,
+        out_channels=out_channels,
+        input_time_dim=input_time_dim,
+        output_time_dim=output_time_dim,
+        size=size,
+    )
+
+    # The presteps prime the recurrent states, so step 0 reads its state from
+    # the presteps-th block of input times rather than the first one.
+    state = x[:, :, PRESTEPS * input_time_dim : (PRESTEPS + 1) * input_time_dim]
+
+    # "none" returns the decoder output untouched, which is the deltas the other
+    # modes build on. Only the first integration step can be compared across
+    # modes, since later steps recycle mode-dependent state.
+    with torch.no_grad():
+        raw = model(inputs)
+    assert raw.shape == (batch_size, 12, output_time_dim, out_channels, size, size)
+
+    first_step = slice(0, input_time_dim)
+    deltas = raw[:, :, first_step, :in_channels]
+    diagnostics = raw[:, :, first_step, in_channels:]
+
+    for mode in RESIDUAL_MODES:
+        model.residual_prediction = mode
+        with torch.no_grad():
+            out = model(inputs)
+
+        assert out.shape == raw.shape, mode
+        assert torch.isfinite(out).all(), mode
+        assert torch.allclose(
+            out[:, :, first_step, :in_channels],
+            _expected_prognostics(mode, deltas, state),
+            atol=1e-6,
+        ), f"prognostics do not match the closed form for {mode}"
+        assert torch.allclose(
+            out[:, :, first_step, in_channels:], diagnostics, atol=1e-6
+        ), f"diagnostics are not absolute for {mode}"
+
+    del inputs, model
+    torch.cuda.empty_cache()
+
+
+@import_or_fail("omegaconf")
+def test_HEALPixRecUNet_residual_prediction_modes_differ(
+    small_recunet_dicts,
+    test_data,
+    insolation_data,
+    constant_data,
+    pytestconfig,
+):
+    """Guard against a mode silently falling through to no residual at all."""
+    in_channels = 3
+    input_time_dim = 2
+    size = 16
+
+    fix_random_seeds(seed=42)
+    x = test_data(
+        batch_size=1, time_dim=2 * input_time_dim, channels=in_channels, img_size=size
+    )
+    decoder_inputs = insolation_data(
+        batch_size=1, time_dim=2 * input_time_dim, img_size=size
+    )
+    constants = constant_data(channels=2, img_size=size)
+    inputs = [x, decoder_inputs, constants]
+
+    model = _build_residual_recunet(
+        small_recunet_dicts,
+        "none",
+        in_channels=in_channels,
+        out_channels=in_channels,
+        input_time_dim=input_time_dim,
+        output_time_dim=input_time_dim,
+        size=size,
+    )
+
+    outputs = {}
+    for mode in ("none",) + RESIDUAL_MODES:
+        model.residual_prediction = mode
+        with torch.no_grad():
+            outputs[mode] = model(inputs)
+
+    for mode in RESIDUAL_MODES:
+        assert not torch.allclose(
+            outputs[mode], outputs["none"]
+        ), f"{mode} left the prediction unchanged"
+
+    # same-index-add and last-reference only agree when input_time_dim == 1
+    assert not torch.allclose(outputs["same-index-add"], outputs["last-reference"])
+    assert not torch.allclose(outputs["chained"], outputs["last-reference"])
+
+    del inputs, model
+    torch.cuda.empty_cache()
+
+
+@import_or_fail("omegaconf")
+@pytest.mark.parametrize("residual_prediction", ("none",) + RESIDUAL_MODES)
+def test_HEALPixRecUNet_residual_prediction_backward(
+    residual_prediction,
+    small_recunet_dicts,
+    test_data,
+    insolation_data,
+    constant_data,
+    pytestconfig,
+):
+    """Every mode must stay differentiable with respect to the input state."""
+    in_channels = 2
+    input_time_dim = 2
+    size = 8
+
+    fix_random_seeds(seed=0)
+    x = test_data(
+        batch_size=1, time_dim=2 * input_time_dim, channels=in_channels, img_size=size
+    ).requires_grad_(True)
+    decoder_inputs = insolation_data(
+        batch_size=1, time_dim=2 * input_time_dim, img_size=size
+    )
+    constants = constant_data(channels=2, img_size=size)
+
+    model = _build_residual_recunet(
+        small_recunet_dicts,
+        residual_prediction,
+        in_channels=in_channels,
+        out_channels=in_channels + 1,
+        input_time_dim=input_time_dim,
+        output_time_dim=input_time_dim,
+        size=size,
+    )
+
+    out = model([x, decoder_inputs, constants])
+    out.sum().backward()
+
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+
+    del model
+    torch.cuda.empty_cache()
+
+
+@import_or_fail("omegaconf")
+def test_HEALPixRecUNet_residual_prediction_validation(
+    small_recunet_dicts, pytestconfig
+):
+    """Unknown modes are rejected and legacy booleans map onto the named modes."""
+    with pytest.raises(ValueError, match="Invalid residual prediction type"):
+        _build_residual_recunet(small_recunet_dicts, "not-a-mode")
+
+    # The UNet spelling for the last-reference mode was never valid here
+    with pytest.raises(ValueError, match="Invalid residual prediction type"):
+        _build_residual_recunet(small_recunet_dicts, "same-reference")
+
+    # True must stay same-index-add: that is what the old boolean flag did here,
+    # unlike HEALPixUNet where it mapped onto last-reference.
+    assert (
+        _build_residual_recunet(small_recunet_dicts, True).residual_prediction
+        == "same-index-add"
+    )
+    assert (
+        _build_residual_recunet(small_recunet_dicts, False).residual_prediction
+        == "none"
+    )
+
+    torch.cuda.empty_cache()

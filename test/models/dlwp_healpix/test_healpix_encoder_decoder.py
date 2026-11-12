@@ -749,6 +749,173 @@ def test_UNetDecoder_per_level_checkpointing_applied_only_at_configured_levels(
 
 @import_or_fail("hydra")
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_UNetEncoder_checkpointing_skipped_without_grad(
+    device, monkeypatch, pytestconfig
+):
+    """checkpoint() with use_reentrant=False still runs its bookkeeping when no
+    graph is being built, so the encoder must bypass it outside of training and
+    under no_grad, while still using it for a normal training step.
+    """
+    from torch.utils.checkpoint import checkpoint as real_checkpoint
+
+    from physicsnemo.models.dlwp_healpix_layers import (
+        AvgPool,
+        ConvNeXtBlock,
+        UNetEncoder,
+    )
+
+    channels = 2
+    hw_size = 16
+    b_size = 12
+    n_channels = (8, 8, 8)
+
+    conv_block = {
+        "_target_": ConvNeXtBlock,
+        "in_channels": channels,
+    }
+    # AvgPool rather than MaxPool: UNetEncoder passes in_channels to the
+    # down-sampling block, which MaxPool's signature does not accept.
+    down_sampling_block = {
+        "_target_": AvgPool,
+        "pooling": 2,
+    }
+
+    call_count = {"n": 0}
+
+    def spy_checkpoint(*args, **kwargs):
+        call_count["n"] += 1
+        return real_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "physicsnemo.models.dlwp_healpix_layers.healpix_encoder.checkpoint",
+        spy_checkpoint,
+    )
+
+    encoder = UNetEncoder(
+        conv_block=conv_block,
+        down_sampling_block=down_sampling_block,
+        n_channels=n_channels,
+        input_channels=channels,
+        hpx_padding_mode="karlbauer",
+        per_level_checkpointing=[True] * len(n_channels),
+    ).to(device)
+
+    invar = torch.rand([b_size, channels, hw_size, hw_size]).to(device)
+
+    encoder.train()
+    encoder(invar)
+    assert call_count["n"] == len(n_channels), (
+        "training with grad enabled should checkpoint every configured level"
+    )
+
+    call_count["n"] = 0
+    with torch.no_grad():
+        outvar = encoder(invar)
+    assert call_count["n"] == 0, "no_grad forward should not checkpoint"
+    assert len(outvar) == len(n_channels)
+
+    call_count["n"] = 0
+    encoder.eval()
+    encoder(invar)
+    assert call_count["n"] == 0, "eval forward should not checkpoint"
+
+    del encoder, invar, outvar
+    torch.cuda.empty_cache()
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_UNetDecoder_checkpointing_skipped_without_grad(
+    device, monkeypatch, pytestconfig
+):
+    """Same guard as the encoder: skip checkpointing in eval and under no_grad."""
+    from torch.utils.checkpoint import checkpoint as real_checkpoint
+
+    from physicsnemo.models.dlwp_healpix_layers import (
+        BasicConvBlock,
+        ConvNeXtBlock,
+        TransposedConvUpsample,
+        UNetDecoder,
+    )
+
+    in_channels = 2
+    out_channels = 1
+    hw_size = 16
+    n_channels = (8, 8, 8)
+
+    conv_block = {
+        "_target_": ConvNeXtBlock,
+        "in_channels": in_channels,
+    }
+    up_sampling_block = {
+        "_target_": TransposedConvUpsample,
+        "in_channels": in_channels,
+        "out_channels": in_channels,
+        "upsampling": 2,
+    }
+    output_layer = {
+        "_target_": BasicConvBlock,
+        "in_channels": in_channels,
+        "out_channels": out_channels,
+        "kernel_size": 1,
+        "dilation": 1,
+        "n_layers": 1,
+    }
+
+    call_count = {"n": 0}
+
+    def spy_checkpoint(*args, **kwargs):
+        call_count["n"] += 1
+        return real_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "physicsnemo.models.dlwp_healpix_layers.healpix_decoder.checkpoint",
+        spy_checkpoint,
+    )
+
+    decoder = UNetDecoder(
+        conv_block=conv_block,
+        up_sampling_block=up_sampling_block,
+        output_layer=output_layer,
+        recurrent_block=None,
+        n_channels=n_channels,
+        hpx_padding_mode="karlbauer",
+        per_level_checkpointing=[True] * len(n_channels),
+    ).to(device)
+
+    invars = []
+    size = hw_size
+    for idx in range(len(n_channels) - 1, -1, -1):
+        invars.append(torch.rand([12, n_channels[idx], size, size]).to(device))
+        size = size // 2
+
+    expected_size = torch.Size([12, out_channels, hw_size, hw_size])
+
+    decoder.train()
+    outvar = decoder(invars)
+    assert call_count["n"] == len(n_channels), (
+        "training with grad enabled should checkpoint every configured level"
+    )
+    assert outvar.shape == expected_size
+
+    call_count["n"] = 0
+    with torch.no_grad():
+        outvar = decoder(invars)
+    assert call_count["n"] == 0, "no_grad forward should not checkpoint"
+    assert outvar.shape == expected_size
+
+    call_count["n"] = 0
+    decoder.eval()
+    outvar = decoder(invars)
+    assert call_count["n"] == 0, "eval forward should not checkpoint"
+    assert outvar.shape == expected_size
+
+    del decoder, invars, outvar
+    torch.cuda.empty_cache()
+
+
+@import_or_fail("hydra")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 def test_UNetDecoder_per_level_checkpointing_matches_no_checkpointing(
     device, pytestconfig
 ):

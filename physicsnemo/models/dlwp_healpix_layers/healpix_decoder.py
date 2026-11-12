@@ -228,7 +228,9 @@ class UNetDecoder(th.nn.Module):
         x = inputs[-1]
         for n, layer in enumerate(self.decoder):
             skip_connection = inputs[-1 - n] if layer["upsamp"] is not None else None
-            if self.per_level_checkpointing[n]:
+            # when use_reentrant=False, checkpoint() will still checkpoint the layer
+            # to disable checkpointing, we manually check if we are in training mode and the gradient is enabled
+            if self.per_level_checkpointing[n] and self.training and th.is_grad_enabled():
                 x = checkpoint(self._forward_layer_pass, layer, x, skip_connection, conditions_cln, use_reentrant=False)
             else:
                 x = self._forward_layer_pass(layer, x, skip_connection, conditions_cln)
