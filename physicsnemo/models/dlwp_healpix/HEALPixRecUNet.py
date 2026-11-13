@@ -554,9 +554,13 @@ class HEALPixRecUNet(Module):
             prognostics = combined[:, :, :, :self.input_channels]
             orig_input = self._reshape_outputs(input_tensor[:, : self.input_channels * self.input_time_dim])
             if self.residual_prediction:
+                # this is a view of combined which already holds [prognostics|diagnostics]
                 prognostics += orig_input
             diagnostics = combined[:, :, :, self.input_channels:]
-            out = th.cat([prognostics, diagnostics], dim=3)
+            # `combined` is exactly cat([combined[..., :in], combined[..., in:]], dim=3),
+            # so rebuilding it with th.cat only allocates and copies the whole output again.
+            # out = th.cat([prognostics, diagnostics], dim=3)
+            out = combined
 
             # Apply constraints
             if self.constraints is not None:
@@ -571,7 +575,20 @@ class HEALPixRecUNet(Module):
 
         return th.cat(outputs, dim=self.channel_dim)
 
-    def reset(self):
-        """Resets the state of the network"""
-        self.encoder.reset()
-        self.decoder.reset()
+    def reset(self, reset_mode: str = None):
+        """
+        Resets the state of the network
+
+        Parameters
+        ----------
+        reset_mode: str, optional
+            The mode to use for the reset. If not provided, the default mode is used.
+            Valid modes depend on the type of recurrent block used in the model.
+        """
+
+        if reset_mode is not None:
+            self.encoder.reset(reset_mode)
+            self.decoder.reset(reset_mode)
+        else:
+            self.encoder.reset()
+            self.decoder.reset()
