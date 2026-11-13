@@ -455,7 +455,7 @@ class HEALPixRecUNet(Module):
             # Forward the data through the model to initialize hidden states
             self.decoder(self.encoder(input_tensor, conditions_cln=conditions_cln), conditions_cln=conditions_cln)
 
-    def forward(self, inputs: Sequence, output_only_last=False, conditions_cln=None) -> th.Tensor:
+    def forward(self, inputs: Sequence, output_only_last=False, conditions_cln=None, spatial_noise=None) -> th.Tensor:
         """
         Forward pass of the HEALPixUnet
 
@@ -541,9 +541,13 @@ class HEALPixRecUNet(Module):
                 kwargs = {"conditions_cln": conditions_cln[step]}
             else:
                 kwargs = {}
+            # Per-step spatial noise feeds the encoder only.
+            encoder_kwargs = dict(kwargs)
+            if spatial_noise is not None:
+                encoder_kwargs["spatial_noise"] = spatial_noise[step]
 
             # th.cuda.nvtx.range_push("Encoder")
-            encodings = self.encoder(input_tensor, **kwargs)
+            encodings = self.encoder(input_tensor, **encoder_kwargs)
             # th.cuda.nvtx.range_pop()
             # th.cuda.nvtx.range_push("Dencoder")
             decodings = self.decoder(encodings, **kwargs)
