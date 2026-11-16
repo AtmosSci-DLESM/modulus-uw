@@ -87,6 +87,8 @@ class HEALPixRecUNet(Module):
         residual_prediction: bool = True,
         fp32_residual_state: bool = False,
         couplings_time_first: bool = True,
+        input_noise: DictConfig | None = None,
+        window_noise: DictConfig | None = None,
         constraints: list[DictConfig] = None,
         hpx_padding_mode: str | None = None,
         compile_padding: bool = False,
@@ -157,6 +159,18 @@ class HEALPixRecUNet(Module):
             Default: False keeps the previous behavior.
         couplings_time_first: bool, optional
             Whether coupled data is in [T, B, C, F, H, W] rather than [B, F, T, C, H, W] format
+        input_noise: DictConfig, optional
+            Hydra instantiable noise layer (e.g. ``SpectralInputNoise``) that perturbs the prognostic
+            state fed to each model step, in training mode only. The first step's initial state is
+            perturbed once (one draw serves the hidden-state warm-up and the current time) and every
+            fed-back prediction gets a fresh draw. Targets and the returned predictions stay clean,
+            so the model learns to remove the perturbation, and the residual connection and any
+            constraints see the perturbed input. Default None adds no noise.
+        window_noise: DictConfig, optional
+            Hydra instantiable layer (``WindowErrorSwap`` or ``WindowSpectralNoise``) that perturbs the
+            state fed to rollout steps >= 1 with the error of the previous step against the truth of
+            the same training window. The trainer supplies that truth through ``bind_train_targets``.
+            In training mode it replaces ``input_noise`` at those steps. Default None.
         constraints: list[DictConfig], optional
             List of hydra instantiable DictConfigs specifying constraints 
             (e.g., nonnegativity) to be applied to the model outputs
@@ -348,6 +362,39 @@ class HEALPixRecUNet(Module):
 
         self.constraints = None
         self.set_constraints(constraints)
+
+        self.input_noise = instantiate(input_noise) if input_noise is not None else None
+        # Noise built from the previous step's error inside the same training window (healpix_window_noise.py). It needs the
+        # truth of the window, which the trainer binds with ``bind_train_targets`` (a static tensor, so a captured graph sees
+        # every batch). It acts at rollout steps >= 1 in training mode; when set, it replaces ``input_noise`` there.
+        self.window_noise = instantiate(window_noise) if window_noise is not None else None
+        self._train_target = None
+
+    def bind_train_targets(self, target: th.Tensor) -> None:
+        """Training truth ``[B, F, T, C, H, W]`` (normalized), read by ``window_noise``; bind a static tensor for graph capture."""
+        self._train_target = target
+
+    def _fed_back_state(self, prev_out: th.Tensor, step: int, level) -> th.Tensor:
+        """Prognostic state fed to rollout step ``step >= 1``, perturbed in training mode."""
+        state = prev_out[:, :, :, : self.input_channels]
+        if self.window_noise is not None and self.training and self._train_target is not None:
+            err = state - self._train_target[:, :, step - 1 : step, : self.input_channels]
+            return self.window_noise(state, err)
+        return self._perturb_state(state, level)
+
+    def _perturb_state(self, state: th.Tensor, level=None) -> th.Tensor:
+        """Apply ``input_noise`` to a prognostic state; identity when absent or not training.
+
+        The hidden-state re-initialization inside ``_initialize_hidden`` reads fed-back
+        predictions directly and is not perturbed: with a finite ``reset_cycle`` that
+        covers the whole training window it only ever uses the (perturbed) initial state.
+        """
+        if self.input_noise is None or not self.training:
+            return state
+        # ``level`` is only set for online noise; a noise layer without that argument is called as before.
+        if level is None:
+            return self.input_noise(state)
+        return self.input_noise(state, level=level)
 
     @property
     def integration_steps(self):
@@ -871,6 +918,12 @@ class HEALPixRecUNet(Module):
             )
             self._reset_cycle_inf_train_warned = True
         outputs = []
+        # One draw on the initial state serves the warm-up and the first step.
+        # Online noise draws its per-sample level once for the whole rollout window (it must know which samples were clean).
+        level = None
+        if self.input_noise is not None and self.training and getattr(self.input_noise, "online", None):
+            level = self.input_noise.draw_level(inputs[0].shape[0], inputs[0].device)
+        inputs = [self._perturb_state(inputs[0], level)] + list(inputs[1:])
         for step in range(self.integration_steps):
             # (Re-)initialize recurrent hidden states
             hours = step * (self.delta_t * self.input_time_dim)
@@ -921,14 +974,14 @@ class HEALPixRecUNet(Module):
             else:
                 if len(self.couplings) > 0:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[-1][:, :, :, :self.input_channels]]
+                        inputs=[self._fed_back_state(outputs[-1], step, level)]
                         + list(inputs[1:3])
                         + [inputs[3][self.presteps + step]],
                         step=step + self.presteps,
                     )
                 else:
                     input_tensor = self._reshape_inputs(
-                        inputs=[outputs[-1][:, :, :, :self.input_channels]] + list(inputs[1:]),
+                        inputs=[self._fed_back_state(outputs[-1], step, level)] + list(inputs[1:]),
                         step=step + self.presteps,
                     )
 
