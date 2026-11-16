@@ -136,3 +136,65 @@ class HEALPixLayer(th.nn.Module):
             Output of the composed ``Sequential`` of shape (B*F, C', H', W').
         """
         return self.layers(x)
+
+
+# Modules whose forward draws from the RNG. Gradient checkpointing recomputes the
+# forward during backward, so anything listed here produces a *different* random
+# number on recompute unless the RNG state is restored.
+_RNG_CONSUMER_TYPES = (
+    th.nn.Dropout,
+    th.nn.Dropout1d,
+    th.nn.Dropout2d,
+    th.nn.Dropout3d,
+    th.nn.AlphaDropout,
+    th.nn.FeatureAlphaDropout,
+)
+
+def check_for_rng_consumers(module: th.nn.Module, where: str) -> bool:
+    """Refuse to checkpoint a module whose forward consumes RNG.
+
+    The checkpoint calls in the encoder and decoder pass ``preserve_rng_state=False``
+    because the default (``True``) calls ``CUDAGeneratorImpl::current_seed``, which is
+    not capturable and either hard-fails under ``graph_mode: train_eval`` or suffers
+    a large performance penalty.
+
+    With no RNG consumer in the region that is exact -- recompute is bitwise identical.
+    With one, the recomputed forward draws a *different* mask than the forward whose
+    output was used, so the gradients are wrong. Measured with
+    ``Dropout2d(p=0.5)``: max relative error 0.909 on the input gradient and 0.843 on
+    the weight gradient, against a bitwise-exact match when the state is preserved.
+
+    This cannot be fixed by saving and restoring the state around the checkpoint call.
+    The cost would be negligible (~3.3 us host-side, ~0.4 us via the graph-safe
+    generator), but every snapshot API is blocked inside a CUDA graph capture:
+    ``get_rng_state()`` raises on ``current_seed`` and ``clone_state()`` raises on
+    ``clone_impl``. ``graphsafe_get_state()`` is capturable but returns a live handle
+    rather than a snapshot, so restoring it is a no-op. CUDA graphs can *advance* RNG
+    across replays, not *rewind* it within a capture, and rewinding is exactly what
+    checkpoint recompute needs.
+
+    So the we check for RNG consumers in the module and enable preserve_rng_state accordingly.
+    We suffer the performance penalty of preserving the RNG state only if there are RNG consumers.
+
+    Parameters
+    ----------
+    module: th.nn.Module
+        The module that would be wrapped in ``checkpoint``.
+    where: str
+        Human-readable location, used in the warning message.
+
+    Returns
+    ------
+    bool
+        True if ``module`` contains any RNG-consuming submodule, False otherwise.
+    """
+    offenders = [
+        f"{name or '<root>'} ({type(m).__name__}, p={getattr(m, 'p', '?')})"
+        for name, m in module.named_modules()
+        if isinstance(m, _RNG_CONSUMER_TYPES) and getattr(m, "p", 0.0) > 0.0
+    ]
+    if offenders:
+        logger.warning(f"Module {module.__class__.__name__} contains RNG-consuming submodules: {offenders} " \
+                        "Enabling preserve_rng_state, this will cause a performance penalty during activation checkpointing.")
+        return True
+    return False
