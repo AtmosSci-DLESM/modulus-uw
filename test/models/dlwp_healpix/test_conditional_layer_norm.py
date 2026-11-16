@@ -263,3 +263,51 @@ def test_load_old_checkpoint():
     assert torch.isfinite(out_new).all()
     assert torch.allclose(out_old, out_new, atol=1e-5, rtol=1e-4), \
         f"Max diff after loading old checkpoint: {(out_old - out_new).abs().max().item()}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_parity_cln_zeros_odd_beta_and_splits_norm():
+    """With n_even set, odd β is unused and LN is applied per even/odd bank."""
+    from physicsnemo.models.dlwp_healpix_layers.reflection_ops import hpx_reflect_typed
+
+    C, H, W = 8, 8, 8
+    n_even = 6
+    n_odd = C - n_even
+    n_cond = 2
+    B_nf = n_cond * 12
+
+    torch.manual_seed(0)
+    cln = ConditionalLayerNorm(
+        condition_shape=16,
+        channel_depth=C,
+        mlp_hidden_dims=[16, 16],
+        scale_center=1.0,
+        init_cln_to_zero=False,
+        n_even=n_even,
+    ).cuda()
+
+    # Force nonzero odd-β MLP output so we can verify it is masked out.
+    with torch.no_grad():
+        cln.gamma_beta_mlp[-1].bias[C + n_even :] = 1.5
+
+    x = torch.randn(B_nf, C, H, W, device="cuda")
+    cond = torch.randn(n_cond, 16, device="cuda")
+
+    with torch.no_grad():
+        out = cln(x, cond)
+        gamma_beta = cln.gamma_beta_mlp(cond)
+        _, beta = gamma_beta.chunk(2, dim=-1)
+        assert (beta[:, n_even:].abs() > 0.5).all(), "test setup: odd β should be nonzero before mask"
+
+    assert torch.isfinite(out).all()
+
+    # ρ-equivariance: CLN(ρ x; c) ≈ ρ CLN(x; c) with typed even/odd banks.
+    x_ref = hpx_reflect_typed(x, n_even)
+    with torch.no_grad():
+        out_ref = cln(x_ref, cond)
+        out_then_ref = hpx_reflect_typed(out, n_even)
+    assert torch.allclose(out_ref, out_then_ref, atol=1e-5, rtol=1e-4), (
+        f"Parity CLN not ρ-equivariant; max diff "
+        f"{(out_ref - out_then_ref).abs().max().item()}"
+    )
+    assert n_odd > 0  # sanity: test exercises odd bank

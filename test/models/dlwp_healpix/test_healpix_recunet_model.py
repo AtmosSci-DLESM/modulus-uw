@@ -16,6 +16,7 @@
 # ruff: noqa: E402
 import os
 import sys
+import warnings
 
 script_path = os.path.abspath(__file__)
 sys.path.append(os.path.join(os.path.dirname(script_path), ".."))
@@ -351,6 +352,180 @@ def test_HEALPixRecUNet_reset(
     assert common.compare_output(out_var, model(inputs))
 
     del model, inputs, out_var
+    torch.cuda.empty_cache()
+
+
+@import_or_fail("omegaconf")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_HEALPixRecUNet_reset_cycle_inf_preserves_hidden_across_forwards(
+    device,
+    encoder_dict,
+    decoder_dict,
+    test_data,
+    insolation_data,
+    constant_data,
+    pytestconfig,
+):
+    """reset_cycle=inf must prime once, then keep GRU state across forward() calls.
+
+    Coupled inference issues one forward per coupler window; wiping at every
+    forward entry (or at step 0 via ``0 % inf == 0``) incorrectly resets state.
+    """
+    in_channels = 2
+    out_channels = 2
+    n_constants = 2
+    decoder_input_channels = 1
+    input_time_dim = 2
+    output_time_dim = 4
+    size = 16
+
+    fix_random_seeds(seed=42)
+    x = test_data(
+        time_dim=2 * input_time_dim, channels=in_channels, img_size=size, device=device
+    )
+    decoder_inputs = insolation_data(
+        time_dim=2 * output_time_dim, img_size=size, device=device
+    )
+    constants = constant_data(channels=n_constants, img_size=size, device=device)
+    inputs = [x, decoder_inputs, constants]
+
+    model = HEALPixRecUNet(
+        encoder=encoder_dict,
+        decoder=decoder_dict,
+        input_channels=in_channels,
+        output_channels=out_channels,
+        n_constants=n_constants,
+        decoder_input_channels=decoder_input_channels,
+        input_time_dim=input_time_dim,
+        output_time_dim=output_time_dim,
+        enable_healpixpad=True,
+        delta_time="6h",
+        reset_cycle=float("inf"),
+    ).to(device)
+
+    reset_calls = {"n": 0}
+    orig_reset = model.reset
+
+    def counting_reset():
+        reset_calls["n"] += 1
+        return orig_reset()
+
+    model.reset = counting_reset
+
+    assert model._recurrent_hidden_primed is False
+    model.eval()
+    model(inputs)
+    assert model._recurrent_hidden_primed is True
+    assert reset_calls["n"] == 1  # only via first _initialize_hidden
+
+    h_after_first = [
+        model.decoder.decoder[n].recurrent.h.detach().clone()
+        for n in range(len(model.decoder.decoder))
+    ]
+
+    model(inputs)
+    assert reset_calls["n"] == 1  # second forward must not re-zero
+    for n, h0 in enumerate(h_after_first):
+        h1 = model.decoder.decoder[n].recurrent.h
+        # Hidden may evolve during the second integration; it must not have been
+        # cleared to the post-reset sentinel before that integration.
+        assert h1.shape == h0.shape
+        assert not (h1.numel() == 1 and tuple(h1.shape) == (1, 1, 1, 1) and h0.numel() > 1)
+
+    model.reset()
+    assert model._recurrent_hidden_primed is False
+    assert reset_calls["n"] == 2
+    model(inputs)
+    assert reset_calls["n"] == 3  # re-prime after explicit reset
+
+    # Finite reset_cycle: each forward re-inits at step 0.
+    model_finite = HEALPixRecUNet(
+        encoder=encoder_dict,
+        decoder=decoder_dict,
+        input_channels=in_channels,
+        output_channels=out_channels,
+        n_constants=n_constants,
+        decoder_input_channels=decoder_input_channels,
+        input_time_dim=input_time_dim,
+        output_time_dim=output_time_dim,
+        enable_healpixpad=True,
+        delta_time="6h",
+        reset_cycle="24h",
+    ).to(device)
+    finite_calls = {"n": 0}
+    orig_finite_reset = model_finite.reset
+
+    def counting_finite_reset():
+        finite_calls["n"] += 1
+        return orig_finite_reset()
+
+    model_finite.reset = counting_finite_reset
+    model_finite(inputs)
+    model_finite(inputs)
+    assert finite_calls["n"] >= 2
+
+    del model, model_finite, inputs
+    torch.cuda.empty_cache()
+
+
+@import_or_fail("omegaconf")
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_HEALPixRecUNet_reset_cycle_inf_warns_in_training(
+    device,
+    encoder_dict,
+    decoder_dict,
+    test_data,
+    insolation_data,
+    constant_data,
+    pytestconfig,
+):
+    """reset_cycle=inf in train() warns once; eval() does not warn."""
+    in_channels = 2
+    out_channels = 2
+    n_constants = 2
+    decoder_input_channels = 1
+    input_time_dim = 2
+    output_time_dim = 4
+    size = 16
+
+    fix_random_seeds(seed=42)
+    x = test_data(
+        time_dim=2 * input_time_dim, channels=in_channels, img_size=size, device=device
+    )
+    decoder_inputs = insolation_data(
+        time_dim=2 * output_time_dim, img_size=size, device=device
+    )
+    constants = constant_data(channels=n_constants, img_size=size, device=device)
+    inputs = [x, decoder_inputs, constants]
+
+    kwargs = dict(
+        encoder=encoder_dict,
+        decoder=decoder_dict,
+        input_channels=in_channels,
+        output_channels=out_channels,
+        n_constants=n_constants,
+        decoder_input_channels=decoder_input_channels,
+        input_time_dim=input_time_dim,
+        output_time_dim=output_time_dim,
+        enable_healpixpad=True,
+        delta_time="6h",
+        reset_cycle=float("inf"),
+    )
+    model = HEALPixRecUNet(**kwargs).to(device)
+    model.train()
+    with pytest.warns(UserWarning, match="reset_cycle=inf during training"):
+        model(inputs)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        model(inputs)
+
+    model_eval = HEALPixRecUNet(**kwargs).to(device)
+    model_eval.eval()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        model_eval(inputs)
+
+    del model, model_eval, inputs
     torch.cuda.empty_cache()
 
 
