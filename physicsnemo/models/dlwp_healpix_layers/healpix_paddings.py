@@ -290,10 +290,8 @@ class HEALPixPaddingv2(th.nn.Module):
 
         x = self.unfold(x)
         xp = self.padding(x)
+        # self.fold already applies channels_last when enable_nhwc is set, so conversion is not needed.
         xp = self.fold(xp)
-
-        if self.enable_nhwc:
-            xp = xp.to(memory_format=th.channels_last)
 
         return xp
 
