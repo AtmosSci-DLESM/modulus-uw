@@ -115,7 +115,6 @@ def make_hpx_padding_layer(
     hpx_padding_mode: str,
     enable_nhwc: bool,
     nside: int | None = None,
-    isolatitude_split_bwd: bool = True,
 ) -> th.nn.Module:
     """
     Construct the HEALPix padding submodule for a given mode.
@@ -131,9 +130,6 @@ def make_hpx_padding_layer(
     nside : int or None, optional
         Native face height/width. Required when ``hpx_padding_mode=="isolatitude"``;
         ignored otherwise.
-    isolatitude_split_bwd : bool, optional
-        Forwarded as ``split_bwd`` to :class:`HEALPixPaddingIsolatitude` (split
-        gather-plus-border-scatter backward). Ignored for other modes.
 
     Returns
     -------
@@ -166,7 +162,6 @@ def make_hpx_padding_layer(
             padding=padding,
             nside=nside,
             enable_nhwc=enable_nhwc,
-            split_bwd=isolatitude_split_bwd,
         )
     raise ValueError(
         f"Unsupported hpx_padding_mode={hpx_padding_mode!r}; "
@@ -757,7 +752,6 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
         padding: int,
         nside: int,
         enable_nhwc: bool = False,
-        split_bwd: bool = True,
     ):
         """
         Parameters
@@ -769,18 +763,16 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             this size at init; ``forward`` rejects other ``H``.
         enable_nhwc : bool, optional
             Channels-last output when True.
-        split_bwd : bool, optional
-            Only affects channels-last input. When True (default) the backward is
-            computed as a gather over the output interior plus a scatter over the
-            border ring only. When False, autograd's generic gradient for
-            ``index_select`` (a scatter-add over every output pixel) is used. The
-            forward output is identical either way; the gradient differs only by
-            floating-point summation order.
+
+        Notes
+        -----
+        For channels-last input the backward is computed as a gather over the
+        output interior plus a scatter over the border ring only, rather than
+        autograd's generic scatter-add over every output pixel.
         """
         super().__init__()
         self.p = padding
         self.enable_nhwc = enable_nhwc
-        self.split_bwd = bool(split_bwd)
         if not isinstance(nside, int) or nside < 1:
             raise ValueError(
                 f"nside must be a positive int, got {nside!r}"
@@ -808,14 +800,13 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             persistent=False,
         )
 
-        if self.split_bwd:
-            ik, bk, bsrc, bw = _build_backward_split(
-                padding, nside, self._index0, self._pos_v1
-            )
-            self.register_buffer("_interior_k", ik, persistent=False)
-            self.register_buffer("_border_k", bk, persistent=False)
-            self.register_buffer("_border_src", bsrc, persistent=False)
-            self.register_buffer("_border_w", bw, persistent=False)
+        ik, bk, bsrc, bw = _build_backward_split(
+            padding, nside, self._index0, self._pos_v1
+        )
+        self.register_buffer("_interior_k", ik, persistent=False)
+        self.register_buffer("_border_k", bk, persistent=False)
+        self.register_buffer("_border_src", bsrc, persistent=False)
+        self.register_buffer("_border_w", bw, persistent=False)
 
     def forward(self, data: th.Tensor) -> th.Tensor:
         """
@@ -845,6 +836,9 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             ``[N * 12, C, H + 2*p, W + 2*p]``; numerically aligned with the reference
             module for the same ``padding`` and ``H``.
         """
+
+        # Index buffers are built on CPU at init; no-op once on the input's device.
+        self.to(device=data.device)
 
         BF, C, H, W = data.shape
         F = 12
@@ -877,7 +871,7 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             )
             axis = 2
 
-        if row_major and self.split_bwd:
+        if row_major:
             out = _IsolatitudeRowGather.apply(
                 src, self._index0, pos_v1, self._index1_pos_v1,
                 self._interior_k, self._border_k, self._border_src, self._border_w,
