@@ -597,15 +597,19 @@ class CoupledTimeSeriesDataModule(TimeSeriesDataModule):
         )
 
     def _get_coupled_vars(self):
-
+        # couplers with their own coupled_dataset_path do not read this dataset
         coupled_variables = []
         for d in self.couplings:
+            if d["params"].get("coupled_dataset_path") is not None:
+                continue
             coupled_variables = coupled_variables + d["params"]["variables"]
         return coupled_variables
 
     def setup(self) -> None:
         """Setup the datasets used for this DataModule"""
+        # coupled variables we fetch from this dataset
         coupled_variables = self._get_coupled_vars()
+
         # make sure distributed manager is initalized
         if not DistributedManager.is_initialized():
             DistributedManager.initialize()

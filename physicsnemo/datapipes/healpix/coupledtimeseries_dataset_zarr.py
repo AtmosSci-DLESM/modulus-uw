@@ -15,12 +15,14 @@
 # limitations under the License.
 
 import logging
+import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import torch
+import xarray as xr
 import zarr
 from omegaconf import DictConfig, OmegaConf
 
@@ -28,10 +30,65 @@ from physicsnemo.datapipes.meta import DatapipeMetaData
 from physicsnemo.utils.insolation import insolation
 
 from . import couplers
-from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
 from .base_timeseries_dataset_zarr import _check_availability
+from .timeseries_dataset_zarr import TimeSeriesDatasetZarr
 
 logger = logging.getLogger(__name__)
+
+
+def _coupled_index_offset(path, coupled_times, main_times, start_date, end_date):
+    """Find how a coupled zarr's sample positions are shifted from the main zarr's.
+
+    Couplers read the coupled zarr by sample position. If both zarrs start on the
+    same date, a position means the same timestamp in each. If the coupled zarr
+    starts on a different date, positions are shifted by a constant ``offset``:
+
+        main position i  <->  coupled position i + offset
+
+    Returns ``offset`` (0 when the axes are aligned). Raises if the two time axes
+    do not agree once shifted, or share no dates. Warns if the coupled zarr is
+    missing some of the dates between ``start_date`` and ``end_date``; the couplers
+    fill those samples with NaN.
+    """
+    # Only main times up to end_date are ever read.
+    if end_date is None or isinstance(end_date, int):
+        n_main = len(main_times)
+    else:
+        n_main = int(np.searchsorted(main_times, np.datetime64(end_date), side="right"))
+    main_times = main_times[:n_main]
+
+    # 1. Find the shift: pick the first main time that also exists in the coupled
+    #    zarr and see where it sits in each.
+    positions_in_coupled = np.searchsorted(coupled_times, main_times)
+    positions_in_coupled = np.minimum(positions_in_coupled, len(coupled_times) - 1)
+    shared = np.flatnonzero(coupled_times[positions_in_coupled] == main_times)
+    if len(shared) == 0:
+        raise ValueError(f"coupled_dataset_path {path} shares no dates with {n_main} main dataset dates")
+    first_shared = shared[0]
+    offset = int(positions_in_coupled[first_shared] - first_shared)
+
+    # 2. Check the shift is consistent: every main position that lands inside the
+    #    coupled zarr must be the same timestamp there.
+    first = max(0, -offset)  # first main position that exists in the coupled zarr
+    last = min(n_main, len(coupled_times) - offset)  # one past the last such position
+    if not np.array_equal(main_times[first:last], coupled_times[first + offset : last + offset]):
+        raise ValueError(
+            f"coupled_dataset_path {path} has a time axis that is not a constant "
+            f"shift of the main dataset's (gaps or a different time step); "
+            "reindexing is not supported for zarr datasets."
+        )
+
+    # 3. Warn if the requested date range is not fully covered by the coupled zarr.
+    if start_date is None or isinstance(start_date, int):
+        first_needed = start_date or 0
+    else:
+        first_needed = int(np.searchsorted(main_times, np.datetime64(start_date), side="left"))
+    if first > first_needed or last < n_main:
+        warnings.warn(
+            f"coupled_dataset_path {path} does not cover all main dataset dates from "
+            f"{start_date} to {end_date}; samples outside its range will be NaN"
+        )
+    return offset
 
 
 @dataclass
@@ -108,13 +165,29 @@ class CoupledTimeSeriesDatasetZarr(TimeSeriesDatasetZarr):
         # and set the scaling
         _check_availability(dataset_path)
         self.ds = zarr.open(dataset_path)
-        self.couplings = [
-            getattr(couplers, c["coupler"])(
-                self.ds,
-                **OmegaConf.to_object(DictConfig(c))["params"],
-            )
-            for c in couplings
-        ]
+
+        # A coupler whose params set ``coupled_dataset_path`` reads that zarr instead.
+        # It may start on a different date; the coupler is given the position shift.
+        self.couplings = []
+        for c in couplings:
+            params = dict(OmegaConf.to_object(DictConfig(c))["params"])
+            path = params.pop("coupled_dataset_path", None)
+            coupled_ds = self.ds
+            if path is not None:
+                _check_availability(path)
+                coupled_ds = zarr.open(path)
+            coupler = getattr(couplers, c["coupler"])(coupled_ds, **params)
+            if path is not None:
+                coupler.set_index_offset(
+                    _coupled_index_offset(
+                        path,
+                        coupled_times=xr.open_zarr(path).time.values,
+                        main_times=xr.open_zarr(dataset_path).time.values,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                )
+            self.couplings.append(coupler)
 
         super().__init__(
             dataset_path=dataset_path,

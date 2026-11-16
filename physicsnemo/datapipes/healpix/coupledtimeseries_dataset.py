@@ -17,6 +17,7 @@
 import gc
 import logging
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 
@@ -134,13 +135,44 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         if self.add_train_noise:
             self.rng = np.random.default_rng(train_noise_seed)
 
-        self.couplings = [
-            getattr(couplers, c["coupler"])(
-                dataset,
-                **OmegaConf.to_object(DictConfig(c))["params"],
-            )
-            for c in couplings
-        ]
+        # A coupler whose params set ``coupled_dataset_path`` reads that zarr instead,
+        # reindexed to this dataset's time axis (NaN outside the zarr's range).
+        self.couplings = []
+        for c in couplings:
+            params = dict(OmegaConf.to_object(DictConfig(c))["params"])
+            path = params.pop("coupled_dataset_path", None)
+            coupled_ds = dataset
+            if path is not None:
+                coupled_ds = xr.open_zarr(path, consolidated=True)
+                if not np.array_equal(coupled_ds.time.values, dataset.time.values):
+                    # ``dataset`` is already restricted to the requested date range
+                    # by the data module, so this is the window that must be covered.
+                    overlap = np.isin(dataset.time.values, coupled_ds.time.values)
+                    if not overlap.any():
+                        raise ValueError(
+                            f"coupled_dataset_path {path} has no times in common "
+                            "with the dataset's time axis"
+                        )
+                    # Reindexing keeps only the coupled samples whose timestamps match
+                    # the dataset's exactly (e.g. a finer time step is subsampled
+                    # silently), so always say that it happened.
+                    n_missing = int((~overlap).sum())
+                    warnings.warn(
+                        f"coupled_dataset_path {path} has a different time axis than the "
+                        f"dataset ({coupled_ds.sizes['time']} times, "
+                        f"{coupled_ds.time.values[0]} to {coupled_ds.time.values[-1]}, vs "
+                        f"{len(overlap)} times, {dataset.time.values[0]} to "
+                        f"{dataset.time.values[-1]}); reindexing it onto the dataset's "
+                        "times."
+                        + (
+                            f" {n_missing} dataset times are missing from it and will be NaN."
+                            if n_missing
+                            else ""
+                        )
+                    )
+                    coupled_ds = coupled_ds.reindex(time=dataset.time.values, fill_value=np.nan)
+            self.couplings.append(getattr(couplers, c["coupler"])(coupled_ds, **params))
+
         super().__init__(
             dataset=dataset,
             scaling=scaling,
@@ -173,6 +205,24 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
         for c in self.couplings:
             c.set_scaling(scaling_da)
         super()._get_scaling_da()
+
+        # __getitem__ loads exactly ``input_variables`` / ``output_variables`` (in that
+        # order), so build their scaling by name. The parent builds it from the dataset's
+        # channel_in / channel_out, which only lines up if the dataset stores the variables
+        # in the same order and has the coupled variables appended at the end of channel_in.
+        # That does not hold when couplers read their own ``coupled_dataset_path``.
+        self.input_scaling = self._scaling_for(scaling_da, self.input_variables)
+        self.target_scaling = self._scaling_for(scaling_da, self.output_variables)
+
+    @staticmethod
+    def _scaling_for(scaling_da, variables):
+        """Mean/std arrays for ``variables`` (in that order), shaped to broadcast
+        against [T, C, F, H, W] data."""
+        selected = scaling_da.sel(index=list(variables))
+        return {
+            "mean": np.expand_dims(selected["mean"].to_numpy(), (0, 2, 3, 4)),
+            "std": np.expand_dims(selected["std"].to_numpy(), (0, 2, 3, 4)),
+        }
 
     def __getitem__(self, item):
         # start range
@@ -207,13 +257,9 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
                 axis=2,
             )
 
-        # for models with extra outputs
-        if len(self.ds["targets"].channel_out) != (len(self.ds["inputs"].channel_in)-len(self.couplings[0].variables)):
-            input_array = (input_array - self.input_scaling["mean"][:,:-len(self.couplings[0].variables)]) \
-                    / self.input_scaling["std"][:,:-len(self.couplings[0].variables)]
-        else:
-            input_array = (input_array - self.input_scaling["mean"]) \
-                    / self.input_scaling["std"]
+        input_array = (input_array - self.input_scaling["mean"]) / self.input_scaling[
+            "std"
+        ]
 
         if not self.forecast_mode:
             # BAD NEWS: Indexing the array as commented out below causes unexpected behavior in target creation.

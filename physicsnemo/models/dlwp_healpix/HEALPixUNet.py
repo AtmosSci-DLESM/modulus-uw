@@ -374,6 +374,15 @@ class HEALPixUNet(Module):
         if constraints is not None:
             self.constraints = [instantiate(constraints[constraint]) for constraint in constraints]
 
+    def _apply_network(self, input_tensor: th.Tensor, **kwargs) -> th.Tensor:
+        """
+        Run the folded input through the network layers (encoder then decoder).
+        Subclasses with a different architecture override this; everything else in
+        ``forward`` (input assembly, autoregressive rollout, residual, constraints)
+        is shared.
+        """
+        return self.decoder(self.encoder(input_tensor, **kwargs), **kwargs)
+
     def forward(self, inputs: Sequence, output_only_last=False, conditions_cln: Sequence=None) -> th.Tensor:
         """
         Forward pass of the HEALPixUnet
@@ -428,8 +437,7 @@ class HEALPixUNet(Module):
             else:
                 kwargs = {}
 
-            encodings = self.encoder(input_tensor, **kwargs)
-            decodings = self.decoder(encodings, **kwargs)
+            decodings = self._apply_network(input_tensor, **kwargs)
 
             # Residual prediction applies only to prognostics; diagnostics are
             # absolute (same split as HEALPixRecUNet).

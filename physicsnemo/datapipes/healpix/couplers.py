@@ -97,6 +97,10 @@ class BaseCoupler(ABC):
         self.integrated_couplings = None
         self.ds_variable_indices = []
         self.time_first = time_first
+        # (zarr only) position in this coupler's dataset minus position in the main
+        # dataset for the same timestamp. Non-zero when the coupled zarr starts on a
+        # different date than the main one. See set_index_offset.
+        self.index_offset = 0
 
         if not prepared_coupled_data:
             raise NotImplementedError("Data preparation not yet implemented")
@@ -124,6 +128,41 @@ class BaseCoupler(ABC):
             raise TypeError(
                 f"Coupler only supports xarray Datasets or zarr Groups, got {type(self.ds)}"
             )
+
+    def set_index_offset(self, offset: int):
+        """
+        Set how far the coupled zarr's sample positions are shifted from the main
+        dataset's (zarr datasets only).
+
+        Samples are requested using positions in the main dataset. A timestamp that
+        is at position ``i`` in the main dataset is at position ``i + offset`` here.
+        Positions that fall outside the coupled zarr are filled with NaN.
+        """
+        self.index_offset = int(offset)
+
+    def _read_zarr_inputs(self, start: int, stop: int):
+        """
+        Read main-dataset sample positions [start, stop) from the coupled zarr,
+        applying ``index_offset`` and filling positions it does not have with NaN.
+        """
+        inputs = self.ds["inputs"]
+        n_samples = stop - start
+        # the same range, expressed in the coupled zarr's own positions
+        lo, hi = start + self.index_offset, stop + self.index_offset
+        # the part of that range the coupled zarr actually has
+        avail_lo, avail_hi = max(lo, 0), min(hi, inputs.shape[0])
+
+        out = np.full(
+            (n_samples, len(self.ds_variable_indices)) + tuple(inputs.shape[2:]),
+            np.nan,
+            dtype=np.result_type(inputs.dtype, np.float32),
+        )
+        if avail_lo < avail_hi:
+            # Loading the contiguous time slice into memory and then pulling out the
+            # semi-random variable indices is quicker than doing this all at once.
+            data = inputs[avail_lo:avail_hi][:, self.ds_variable_indices]
+            out[avail_lo - lo : avail_hi - lo] = data
+        return out
 
     def _compute_coupled_integration_dim(self):
         return self.presteps + max(self.output_time_dim // self.input_time_dim, 1)
@@ -244,10 +283,7 @@ class BaseCoupler(ABC):
 
         # extract coupled variables
         if self.use_zarr:
-            # Loading the contiguous time slice into memory and then pulling out the semi-random
-            # variable indices is quicker than trying to do this all at once.
-            ds_index_range = self.ds["inputs"][index_range]
-            ds_index_range = ds_index_range[:, self.ds_variable_indices]
+            ds_index_range = self._read_zarr_inputs(index_range.start, index_range.stop)
         else:
             ds_index_range = (
                 self.ds["inputs"].sel(channel_in=self.variables)

@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from .HEALPixRecUNet import HEALPixRecUNet
+from .HEALPixResNet import HEALPixResNet
 from .HEALPixUNet import HEALPixUNet
 
-__all__ = ["HEALPixRecUNet", "HEALPixUNet"]
+__all__ = ["HEALPixRecUNet", "HEALPixUNet", "HEALPixResNet"]
