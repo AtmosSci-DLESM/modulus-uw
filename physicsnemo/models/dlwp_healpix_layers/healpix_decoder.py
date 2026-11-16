@@ -22,6 +22,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from torch.utils.checkpoint import checkpoint
 
+from .healpix_layers import check_for_rng_consumers
 from .healpix_paddings import warn_deprecated_enable_healpixpad
 from .reflection_ops import bank_sizes, strip_nested_odd_fraction
 from .reflection_steerable_blocks import parity_skip_concat
@@ -117,6 +118,9 @@ class UNetDecoder(th.nn.Module):
             )
         # Generate the per_level_checkpointing list, simplifies forward logic
         self.per_level_checkpointing = per_level_checkpointing if per_level_checkpointing is not None else [False] * len(n_channels)
+
+        # All layers are identical, so we can just set the flag once
+        self.preserve_rng_state = False
 
         if dilations is None:
             # Defaults to [1, 1, 1...] in accordance with the number of unet levels
@@ -216,6 +220,16 @@ class UNetDecoder(th.nn.Module):
                 )
             )
 
+        # The checkpointed regions use preserve_rng_state=False to avoid a 30% performance penalty
+        # (see the helper's docstring). The forward and backward passes are exact only while the
+        # region draws no RNG, so check if the region draws RNG and if enable preserve_rng_state accordingly.
+        for n, enabled in enumerate(self.per_level_checkpointing):
+            if enabled:
+                # all layers are identical, so we check the result from the last layer for simplicity
+                self.preserve_rng_state = check_for_rng_consumers(
+                    self.decoder[n], f"UNetDecoder level {n}"
+                )
+
         self.decoder = th.nn.ModuleList(self.decoder)
         # (Linear) Output layer
         out_config = strip_nested_odd_fraction(
@@ -294,12 +308,16 @@ class UNetDecoder(th.nn.Module):
             (deepest-first), or a single tensor for all levels.
         """
         x = inputs[-1]
+        emit_nvtx = not th.compiler.is_compiling()
+        if emit_nvtx:
+            th.cuda.nvtx.range_push("dlesym:decoder")
         for n, layer in enumerate(self.decoder):
             skip_connection = inputs[-1 - n] if layer["upsamp"] is not None else None
             gate_n = None
             if sin_lat_gate is not None:
                 gate_n = sin_lat_gate[n] if isinstance(sin_lat_gate, (list, tuple)) else sin_lat_gate
             if self.per_level_checkpointing[n]:
+                # Disable reentrancy and rng preservation conditionally to allow for cuda graph capture with checkpointing
                 x = checkpoint(
                     self._forward_layer_pass,
                     layer,
@@ -308,6 +326,7 @@ class UNetDecoder(th.nn.Module):
                     conditions_cln,
                     gate_n,
                     use_reentrant=False,
+                    preserve_rng_state=self.preserve_rng_state,
                 )
             else:
                 x = self._forward_layer_pass(layer, x, skip_connection, conditions_cln, gate_n)
@@ -320,6 +339,9 @@ class UNetDecoder(th.nn.Module):
                     x = layer["recurrent"](x, sin_lat_gate=gate_n)
                 else:
                     x = layer["recurrent"](x)
+        # Close the decoder range before either output-layer return path.
+        if emit_nvtx:
+            th.cuda.nvtx.range_pop()
 
         if getattr(self.output_layer, "reflection_steerable", False):
             gate_out = None
@@ -328,8 +350,19 @@ class UNetDecoder(th.nn.Module):
             return self.output_layer(x, sin_lat_gate=gate_out)
         return self.output_layer(x)
 
-    def reset(self):
-        """Resets the state of the decoder layers"""
+    def reset(self, reset_mode: str = None):
+        """
+        Resets the state of the decoder layers
+
+        Parameters
+        ----------
+        reset_mode: str, optional
+            The mode to use for the reset. If not provided, the default mode is used.
+            Valid modes depend on the type of recurrent block used in the model.
+        """
         for layer in self.decoder:
             if layer["recurrent"] is not None:
-                layer["recurrent"].reset()
+                if reset_mode is not None:
+                    layer["recurrent"].reset(reset_mode)
+                else:
+                    layer["recurrent"].reset()
