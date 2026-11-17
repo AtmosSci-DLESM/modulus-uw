@@ -17,7 +17,10 @@ and the noise is a re-arranged copy of that very error:
 * ``WindowErrorSwap`` (``alpha``): the previous-step error of another sample of the batch, global mean removed.
 
 Both add to the state and clamp channels with a physical lower bound (specific humidity), return the noisy state, run
-under ``no_grad`` in fp32, and are active in training mode only (the model decides). They hold no state, so a
+under ``no_grad`` in fp32, and are active in training mode only (the model decides). By default
+(``keep_clamped_mean=True``) the clamp is followed by one rescale per bounded channel that restores the clean state's
+global mean (``clamp_keep_mean``): the noise has no degree 0, so this keeps the global mass, water and energy of the noisy
+state equal to the clean state's, which the hard constraints close their budgets against. They hold no state, so a
 CUDA-graph capture sees fresh noise at every replay.
 """
 
@@ -29,7 +32,7 @@ from typing import Mapping, Sequence
 
 import torch
 
-from physicsnemo.models.dlwp_healpix_layers.healpix_input_noise import trim_sht_tables
+from physicsnemo.models.dlwp_healpix_layers.healpix_input_noise import clamp_keep_mean, trim_sht_tables
 
 
 def _lower_table(in_channels, scaling, lower_bounds):
@@ -43,8 +46,9 @@ def _lower_table(in_channels, scaling, lower_bounds):
 
 
 class _WindowNoiseBase(torch.nn.Module):
-    def __init__(self, in_channels, scaling, alpha, lower_bounds):
+    def __init__(self, in_channels, scaling, alpha, lower_bounds, keep_clamped_mean=True):
         super().__init__()
+        self.keep_clamped_mean = bool(keep_clamped_mean)
         self.in_channels = [str(c) for c in in_channels]
         self.n_channels = len(self.in_channels)
         self.alpha = float(alpha)
@@ -73,6 +77,8 @@ class _WindowNoiseBase(torch.nn.Module):
             noise = self._noise(err.detach().float())
         out = state + noise.to(state.dtype)
         if self._lower is not None:
+            if self.keep_clamped_mean:
+                return clamp_keep_mean(out, state, self._lower)
             out = torch.maximum(out, self._lower.to(device=out.device, dtype=out.dtype))
         return out
 
@@ -80,8 +86,16 @@ class _WindowNoiseBase(torch.nn.Module):
 class WindowErrorSwap(_WindowNoiseBase):
     """Noise = ``alpha`` times the previous-step error of another sample of the batch (global mean removed)."""
 
-    def __init__(self, in_channels, scaling, alpha: float = 1.0, lower_bounds: Mapping[str, float] | None = None, **_):
-        super().__init__(in_channels, scaling, alpha, lower_bounds)
+    def __init__(
+        self,
+        in_channels,
+        scaling,
+        alpha: float = 1.0,
+        lower_bounds: Mapping[str, float] | None = None,
+        keep_clamped_mean: bool = True,
+        **_,
+    ):
+        super().__init__(in_channels, scaling, alpha, lower_bounds, keep_clamped_mean)
 
     def _noise(self, err):
         other = torch.roll(err, shifts=1, dims=0)
@@ -104,9 +118,10 @@ class WindowSpectralNoise(_WindowNoiseBase):
         lmax: int | None = None,
         lower_bounds: Mapping[str, float] | None = None,
         alpha_range: Sequence[float] | None = None,
+        keep_clamped_mean: bool = True,
         **_,
     ):
-        super().__init__(in_channels, scaling, alpha, lower_bounds)
+        super().__init__(in_channels, scaling, alpha, lower_bounds, keep_clamped_mean)
         self.alpha_range = None
         if alpha_range is not None:
             lo, hi = (float(v) for v in alpha_range)

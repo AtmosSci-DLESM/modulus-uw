@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from physicsnemo.models.dlwp_healpix import HEALPixRecUNet
-from physicsnemo.models.dlwp_healpix_layers.healpix_window_noise import WindowSpectralNoise
+from physicsnemo.models.dlwp_healpix_layers.healpix_window_noise import WindowErrorSwap, WindowSpectralNoise
 from physicsnemo.models.dlwp_healpix_layers.healpix_input_noise import (
     SpectralInputNoise,
     degree_variance,
@@ -227,7 +227,8 @@ def test_amplitude_scales_standard_deviation(spectrum_path):
 @requires_sht
 def test_lower_bounds_clamp_after_noise(spectrum_path):
     kwargs = {"variance_scale_range": (5.0, 5.0)}
-    clamped = _make(spectrum_path, lower_bounds={"q": 0.0}, **kwargs)
+    # The plain clamp; the mean-keeping rescale (the default) is tested on its own below.
+    clamped = _make(spectrum_path, lower_bounds={"q": 0.0}, keep_clamped_mean=False, **kwargs)
     unclamped = _make(spectrum_path, **kwargs)
     floor = (0.0 - SCALING["q"]["mean"]) / SCALING["q"]["std"]
     state = torch.zeros(8, 12, 1, len(CHANNELS), NSIDE, NSIDE, device="cuda")
@@ -596,3 +597,48 @@ def test_window_noise_level(alpha_range):
 def test_window_noise_alpha_range_rejects_bad_ranges(bad):
     with pytest.raises(ValueError):
         WindowSpectralNoise(CHANNELS, SCALING, nside=NSIDE, alpha_range=bad)
+
+
+def _dry_state_and_error(batch=4, side=8, seed=0):
+    """q sits a little above its physical zero, so much of a unit-variance noise crosses it."""
+    gen = torch.Generator().manual_seed(seed)
+    floor = (0.0 - SCALING["q"]["mean"]) / SCALING["q"]["std"]
+    state = torch.randn(batch, 12, 1, len(CHANNELS), side, side, generator=gen)
+    state[:, :, :, 3] = floor + 0.2 * torch.rand(batch, 12, 1, side, side, generator=gen)
+    return state, torch.randn(state.shape, generator=gen), floor
+
+
+@pytest.mark.parametrize("keep", [True, False])
+def test_window_noise_clamp_keeps_bounded_channel_mean(keep):
+    state, err, floor = _dry_state_and_error()
+    module = WindowErrorSwap(CHANNELS, SCALING, lower_bounds={"q": 0.0}, keep_clamped_mean=keep)
+    plain = WindowErrorSwap(CHANNELS, SCALING, lower_bounds={"q": 0.0}, keep_clamped_mean=False)
+    out, ref = module(state, err), plain(state, err)
+    q, q0 = out[:, :, :, 3], state[:, :, :, 3]
+    assert q.min().item() >= floor - 1e-6
+    assert torch.equal(out[:, :, :, :3], ref[:, :, :, :3])  # unbounded channels: noise only
+    mean, mean0 = q.mean(dim=(1, 3, 4)), q0.mean(dim=(1, 3, 4))  # per sample and time
+    if keep:
+        assert torch.allclose(mean, mean0, atol=1e-5)
+    else:  # the plain clamp adds water: the case the rescale exists for
+        assert (mean > mean0 + 0.05).all()
+    assert module(state.bfloat16(), err.bfloat16()).dtype == torch.bfloat16
+
+
+def test_clamp_keep_mean_gradient_is_finite_and_identity_off_bound():
+    state, err, _ = _dry_state_and_error()
+    state.requires_grad_(True)
+    WindowErrorSwap(CHANNELS, SCALING, lower_bounds={"q": 0.0})(state, err).sum().backward()
+    assert torch.isfinite(state.grad).all()
+    assert torch.equal(state.grad[:, :, :, :3], torch.ones_like(state.grad[:, :, :, :3]))
+
+
+@requires_sht
+def test_spectral_input_noise_keeps_bounded_channel_mean_by_default(spectrum_path):
+    floor = (0.0 - SCALING["q"]["mean"]) / SCALING["q"]["std"]
+    state = torch.zeros(8, 12, 1, len(CHANNELS), NSIDE, NSIDE, device="cuda")
+    state[:, :, :, 3] = floor + 0.05
+    out = _make(spectrum_path, lower_bounds={"q": 0.0}, variance_scale_range=(5.0, 5.0))(state)
+    q = out[:, :, :, 3]
+    assert q.min().item() >= floor - 1e-6
+    assert torch.allclose(q.mean(dim=(1, 3, 4)), state[:, :, :, 3].mean(dim=(1, 3, 4)), atol=1e-5)

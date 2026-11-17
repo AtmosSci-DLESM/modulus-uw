@@ -107,6 +107,30 @@ def spectral_ramp(ell: torch.Tensor, start: int, full: int) -> torch.Tensor:
     return 0.5 * (1.0 - torch.cos(math.pi * t))
 
 
+def clamp_keep_mean(out: torch.Tensor, state: torch.Tensor, lower: torch.Tensor) -> torch.Tensor:
+    """Clamp a noisy state at its lower bounds while keeping each bounded channel's global mean at the clean state's.
+
+    ``out`` (noisy) and ``state`` (clean) are normalized ``[B, F, T, C, H, W]``; ``lower`` is ``[1, 1, 1, C, 1, 1]``
+    with ``-inf`` for unbounded channels, which pass through unchanged. A plain clamp only ever raises values, so for a
+    bounded channel such as specific humidity it adds water that the zero-mean noise did not: the hard constraints then
+    close each step's budget against that wetter state, and the model's removal of the extra water counts as
+    precipitation and latent heating that the training targets do not contain. Scaling the amount above the bound by
+    one factor per sample, time and channel restores the clean state's equal-area (pixel) mean and keeps the field at
+    or above the bound. In normalized units the amount above the bound is proportional to the physical amount, so the
+    scale is the same in physical units.
+    """
+    lower = lower.to(device=out.device, dtype=torch.float32)
+    bounded = torch.isfinite(lower)
+    base = torch.where(bounded, lower, torch.zeros_like(lower))
+    above = torch.maximum(out.float(), lower) - base  # an unbounded channel keeps its values (base 0, scale 1)
+    target = (state.float() - base).mean(dim=(1, 4, 5), keepdim=True)
+    have = above.mean(dim=(1, 4, 5), keepdim=True)
+    # A sanitized denominator keeps the unused branch finite, so gradients through ``state`` stay finite too.
+    scale = target / torch.where(bounded, have.clamp_min(1e-12), torch.ones_like(have))
+    scale = torch.where(bounded, scale, torch.ones_like(scale))
+    return (base + above * scale).to(out.dtype)
+
+
 def save_noise_spectrum(
     path: str,
     channels: Sequence[str],
@@ -173,6 +197,9 @@ class SpectralInputNoise(torch.nn.Module):
     lower_bounds:
         Mapping channel name to a physical lower bound. Those channels are clamped at
         the (normalized) bound after the noise is added, so noisy inputs stay physical.
+    keep_clamped_mean:
+        After the clamp, rescale each bounded channel so its global mean equals the
+        clean state's (``clamp_keep_mean``). Default True: a plain clamp adds water.
     """
 
     def __init__(
@@ -195,8 +222,10 @@ class SpectralInputNoise(torch.nn.Module):
         bank_size: int = 32,
         clean_s: float = 0.3,
         ell_stop: int | None = None,
+        keep_clamped_mean: bool = True,
     ):
         super().__init__()
+        self.keep_clamped_mean = bool(keep_clamped_mean)
         if online not in (None, "model_error", "persistence", "replay"):
             raise ValueError(f"online must be null, model_error, persistence or replay, got {online}")
         if online is None and spectrum_path is None:
@@ -585,5 +614,7 @@ class SpectralInputNoise(torch.nn.Module):
             noise = noise.permute(0, 2, 1, 3, 4).unsqueeze(2)
         out = state + noise.to(state.dtype)
         if self._lower is not None:
+            if self.keep_clamped_mean:
+                return clamp_keep_mean(out, state, self._lower)
             out = torch.maximum(out, self._lower.to(device=out.device, dtype=out.dtype))
         return out
