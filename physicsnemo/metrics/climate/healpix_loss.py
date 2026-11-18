@@ -24,6 +24,7 @@ import earth2grid
 from cuhpx import SHTCUDA, iSHTCUDA
 from earth2grid.healpix import HEALPIX_PAD_XY, PixelOrder
 from physicsnemo.models.dlwp_healpix_layers.healpix_paddings import make_hpx_padding_layer
+
 """
 Custom dlwp compatible loss classes that allow for more sophisticated training optimization.
 
@@ -399,7 +400,8 @@ class WeightedCRPSLoss(th.nn.MSELoss):
     def _2member_crps(self, prediction, target, lsm_tensor):
         diff_target = th.abs(prediction - target.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
         diff_ensemble = th.abs(prediction[0] - prediction[1]) # [B, F, T, C, H, W]
-        crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
+        # n=2 collapsed path; 2 * averaging_coeff matches the pairwise (i≠j) reduction
+        crps = 2 * self.averaging_coeff * (diff_target - self.coeff_eps * diff_ensemble)  # [B, F, T, C, H, W]
         crps *= lsm_tensor
         return crps
 
@@ -768,7 +770,8 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
             # Use faster explicit implementation
             diff_target = th.abs(prediction - target.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
             diff_ensemble = th.abs(prediction[0] - prediction[1]) # [B, F, T, C, H, W]
-            crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
+            # n=2 collapsed path; 2 * averaging_coeff matches the pairwise (i≠j) reduction
+            crps = 2 * self.averaging_coeff * (diff_target - self.coeff_eps * diff_ensemble)  # [B, F, T, C, H, W]
 
             if average_channels:
                 loss = crps.mean()
@@ -795,7 +798,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
                     diff_sht_target = th.abs(sht_pred - sht_tar.unsqueeze(0)).sum(dim=(0, 4, 5)) # [B, T, C]
                     diff_sht_ensemble = th.abs(sht_pred[0] - sht_pred[1]).sum(dim=(-1,-2)) # [B, T, C] 
-                    crps_sht = self.averaging_coeff * (diff_sht_target - self.coeff_eps * diff_sht_ensemble) # [B, T, C]
+                    crps_sht = 2 * self.averaging_coeff * (diff_sht_target - self.coeff_eps * diff_sht_ensemble)  # [B, T, C]
 
                     # Compute spectral afCRPS
                     if average_channels:
@@ -820,7 +823,7 @@ class WeightedCRPSLossSpectral(th.nn.MSELoss):
 
                         diff_target = th.abs(pred_smooth - tar_smooth.unsqueeze(0)).sum(dim=0) # [B, F, T, C, H, W]
                         diff_ensemble = th.abs(pred_smooth[0] - pred_smooth[1]) # [B, F, T, C, H, W]
-                        crps = self.averaging_coeff*(diff_target - self.coeff_eps * diff_ensemble) # [B, F, T, C, H, W]
+                        crps = 2 * self.averaging_coeff * (diff_target - self.coeff_eps * diff_ensemble)  # [B, F, T, C, H, W]
 
                         crps *= self.lsm_tensor
 
@@ -992,6 +995,53 @@ class SpreadSkillRatioLoss(th.nn.MSELoss):
             return ratio_out, spread_out, skill_out
         return ratio_out
 
+
+class _WeightedPatchL2(th.autograd.Function):
+    """
+    Per-location weighted patch L2 on an NCHW residual: ``||r ⊙ √w||₂`` at
+    each output pixel, implemented as ``sqrt(conv2d(r², w))`` so overlapping
+    neighborhoods are never materialized (unlike ``nn.Unfold``).
+
+    Backward is the analytic gradient of that norm, with a finite zero
+    subgradient when a patch residual is identically zero — the same contract
+    as ``torch.linalg.vector_norm`` at the origin.
+    """
+
+    @staticmethod
+    def forward(ctx, residual: th.Tensor, kernel: th.Tensor) -> th.Tensor:
+        residual = residual.contiguous()
+        kernel = kernel.to(dtype=residual.dtype)
+        _, c, _, _ = residual.shape
+        k_h, k_w = kernel.shape[-2], kernel.shape[-1]
+        weight = kernel.expand(c, 1, k_h, k_w)
+        sq = th.nn.functional.conv2d(residual.square(), weight, groups=c)
+        norm = sq.clamp(min=0).sqrt()
+        ctx.save_for_backward(residual, norm, kernel)
+        ctx.c = c
+        return norm
+
+    @staticmethod
+    def backward(ctx, grad_norm: th.Tensor):
+        residual, norm, kernel = ctx.saved_tensors
+        c = ctx.c
+        k_h, k_w = kernel.shape[-2], kernel.shape[-1]
+        # AMP / GradScaler can leave the saved kernel in fp32 while scale is bf16.
+        dtype = grad_norm.dtype
+        kernel = kernel.to(dtype=dtype)
+        residual = residual.to(dtype=dtype)
+        norm = norm.to(dtype=dtype)
+        weight = kernel.expand(c, 1, k_h, k_w)
+        # Graph-safe zero subgradient: no data-dependent masked writes.
+        tiny = th.finfo(dtype).tiny
+        scale = th.where(
+            norm > 0, grad_norm.to(dtype=dtype) / norm.clamp_min(tiny), th.zeros_like(norm)
+        )
+        grad_residual = (
+            th.nn.functional.conv_transpose2d(scale, weight, groups=c) * residual
+        )
+        return grad_residual, None
+
+
 class PatchedEnergyScoreLoss(th.nn.MSELoss):
 
     """
@@ -1000,6 +1050,8 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
     with almost-fair ensemble weighting, optional land–sea masking, and
     channel-wise weights. Optionally weights patch-vector components by
     a Gaussian in distance from the patch center (weights sum to one).
+    Patch L2 is ``sqrt(conv2d(r², w))`` so overlapping neighborhoods are
+    never materialized.
     """
 
     def __init__(
@@ -1015,6 +1067,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         enable_nhwc: bool = True,
         nside: int | None = None,
         patch_weight_sigma: float = None,
+        cast_to_fp32: bool = True,
     ):
         """
         Parameters
@@ -1046,6 +1099,9 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             Patch_weight_sigma is the standard deviation of the Gaussian.
             Patch_weight_sigma = 1 for standard normal distribution.
             If None, no spatial weighting within the patch (default).
+        cast_to_fp32: bool, optional
+            If True (default), cast prediction/target to float32 before scoring.
+            Set False to keep the incoming dtype for native AMP.
         """
         super().__init__()
         if n_members < 2:
@@ -1061,6 +1117,7 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         self.hpx_padding_mode = hpx_padding_mode
         self.enable_nhwc = enable_nhwc
         self.nside = nside
+        self.cast_to_fp32 = cast_to_fp32
 
         # Gaussian weights for patch positions (row-major, center-weighted, sum=1)
         if patch_weight_sigma is not None and patch_weight_sigma > 0:
@@ -1073,6 +1130,11 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
             self.patch_weights = (w / w.sum()).reshape(1, -1)
         else:
             self.patch_weights = None
+        # Conv kernel for spatial patch L2: unweighted ones, or Gaussian / 1/D weights.
+        if self.patch_weights is None:
+            self._patch_kernel = th.ones(1, 1, patch_size, patch_size, dtype=th.float32)
+        else:
+            self._patch_kernel = self.patch_weights.reshape(1, 1, patch_size, patch_size)
 
         # Parameters for almost fair energy score
         self.coeff_eps = 1 - ((1 - alpha) / n_members)
@@ -1107,79 +1169,68 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         self.lsm_tensor = self.lsm_tensor.to(device=trainer.device)
         if self.hpx_pad is not None:
             self.hpx_pad = self.hpx_pad.to(device=trainer.device)
+        self._patch_kernel = self._patch_kernel.to(device=trainer.device)
         if self.patch_weights is not None:
             self.patch_weights = self.patch_weights.to(device=trainer.device)
 
-    def _weighted_patch_norm(self, diff_vec: th.Tensor) -> th.Tensor:
-        """
-        Weighted L2 norm over the patch dimension: sqrt(sum_k w_k * v_k^2).
-        If patch_weights is None, returns the usual vector_norm(diff_vec, dim=-1).
-        """
-        if self.patch_weights is None:
-            return th.linalg.vector_norm(diff_vec, dim=-1)
-        weighted_sq = diff_vec ** 2 * self.patch_weights
-        return th.sqrt((weighted_sq).sum(dim=-1).clamp(min=0.0))
+    def _pad_faces(self, x: th.Tensor) -> th.Tensor:
+        """HEALPix-pad NCHW faces; contiguous so later views are NCHW-safe."""
+        if self.hpx_pad is not None:
+            x = self.hpx_pad(x)
+        return x.contiguous()
 
-    def _extract_patches_prediction(self, prediction: th.Tensor) -> th.Tensor:
-        """
-        Extract N×N patches for predictions.
-        prediction: [Cond, B, F, T, C, H, W]
-        returns: [Cond, B, F, T, C, H, W, D]
-        """
-        n, b, f, t, c, h, w = prediction.shape
+    def _patch_l2(self, residual: th.Tensor) -> th.Tensor:
+        """Weighted patch L2 of an NCHW residual; spatial size is unpadded H×W."""
+        return _WeightedPatchL2.apply(residual, self._patch_kernel)
 
+    def _energy_score_field(
+        self,
+        prediction: th.Tensor,
+        target: th.Tensor,
+        n: int,
+        b: int,
+        f: int,
+        t: int,
+        c: int,
+        h: int,
+        w: int,
+    ) -> th.Tensor:
+        """Per-channel energy score field [B, F, T, C, H, W] for one channel slice."""
         if self.hpx_padding_mode == "isolatitude" and self.nside != h:
             raise ValueError(
                 f"hpx_padding_mode=isolatitude requires nside={self.nside} to match h={h}. "
                 f"Got hpx_padding_mode={self.hpx_padding_mode}, nside={self.nside}, h={h}."
             )
 
-        # Move faces to last spatial block and fold leading dims
-        x = prediction.permute(0, 1, 3, 2, 4, 5, 6)  # [Cond, B, T, F, C, H, W]
-        x = x.reshape(n * b * t * f, c, h, w)  # [Cond*B*T*F, C, H, W]
+        pred_nchw = prediction.permute(0, 1, 3, 2, 4, 5, 6).reshape(n * b * t * f, c, h, w)
+        pred_pad = self._pad_faces(pred_nchw)
+        with th.no_grad():
+            tar_nchw = target.permute(0, 2, 1, 3, 4, 5).reshape(b * t * f, c, h, w)
+            tar_pad = self._pad_faces(tar_nchw)
 
-        # Apply HEALPix padding across faces if requested
-        if self.hpx_pad is not None:
-            x = self.hpx_pad(x)  # [Cond*B*T*F, C, H_pad, W_pad]
-            _, _, h_pad, w_pad = x.shape
-        else:
-            h_pad, w_pad = h, w
+        btf = b * t * f
+        hp, wp = pred_pad.shape[-2], pred_pad.shape[-1]
+        p = pred_pad.view(n, btf, c, hp, wp)
+        skill = self._patch_l2(
+            (p - tar_pad.unsqueeze(0)).reshape(n * btf, c, hp, wp)
+        ).view(n, b, t, f, c, h, w).permute(0, 1, 3, 2, 4, 5, 6)
 
-        # Unfold patches over H/W for each face independently, then stack
-        unfold = th.nn.Unfold(kernel_size=self.patch_size, padding=0, stride=1)
-        # Treat F as extra batch dim: combine Nflat and F, unfold over H/W
-        x_unfold = x.reshape(n * b * t * f * c, 1, h_pad, w_pad)
-        patches = unfold(x_unfold)  # [Cond*B*T*F*C, D, H*W]
+        if n == 2:
+            spread = self._patch_l2(p[0] - p[1]).view(b, t, f, c, h, w).permute(
+                0, 2, 1, 3, 4, 5
+            )
+            return 2 * self.averaging_coeff * (skill.sum(dim=0) - self.coeff_eps * spread)
 
-        d = self.patch_size ** 2
-        patches = patches.reshape(n, b, t, f, c, d, h, w)
-        patches = patches.permute(0, 1, 3, 2, 4, 6, 7, 5)  # [Cond, B, F, T, C, H, W, D]
-        return patches
-
-    def _extract_patches_target(self, target: th.Tensor) -> th.Tensor:
-        """
-        Extract N×N patches for targets.
-        target: [B, F, T, C, H, W]
-        returns: [B, F, T, C, H, W, D]
-        """
-        b, f, t, c, h, w = target.shape
-        x = target.permute(0, 2, 1, 3, 4, 5)  # [B, T, F, C, H, W]
-        x = x.reshape(b * t * f, c, h, w)  # [B*T*F, C, H, W]
-
-        if self.hpx_pad is not None:
-            x = self.hpx_pad(x)  # [B*T*F, C, H_pad, W_pad]
-            _, _, h_pad, w_pad = x.shape
-        else:
-            h_pad, w_pad = h, w
-
-        unfold = th.nn.Unfold(kernel_size=self.patch_size, padding=0, stride=1)
-        x_unfold = x.reshape(b * t * f * c, 1, h_pad, w_pad)
-        patches = unfold(x_unfold)  # [B*T*F*C, D, H*W]
-
-        d = self.patch_size ** 2
-        patches = patches.reshape(b, t, f, c, d, h, w)
-        patches = patches.permute(0, 2, 1, 3, 5, 6, 4)  # [B, F, T, C, H, W, D]
-        return patches
+        r_ij = (p.unsqueeze(1) - p.unsqueeze(0)).reshape(n * n * btf, c, hp, wp)
+        dist = self._patch_l2(r_ij).view(n, n, b, t, f, c, h, w).permute(
+            0, 1, 2, 4, 3, 5, 6, 7
+        )
+        mask = self.diag_mask[:, :, None, None, None, None, None, None]
+        diff_terms = mask * (skill.unsqueeze(0) + skill.unsqueeze(1))
+        dist_terms = mask * dist
+        return self.averaging_coeff * (diff_terms - self.coeff_eps * dist_terms).sum(
+            dim=(0, 1)
+        )
 
     def forward(self, prediction, target, average_channels: bool = True):
         """
@@ -1189,7 +1240,13 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
         target: [B, F, T, C, H, W]
         """
         b, f, t, c, h, w = target.shape
-        prediction = prediction.view(self.n_members, b, f, t, c, h, w)
+        if prediction.shape[0] % b != 0:
+            raise ValueError(
+                f"Leading prediction dimension must be divisible by batch size, "
+                f"got prediction.shape[0]={prediction.shape[0]} and batch={b}"
+            )
+        n = prediction.shape[0] // b
+        prediction = prediction.view(n, b, f, t, c, h, w)
 
         if prediction.shape[1:] != target.shape:
             raise ValueError(
@@ -1197,48 +1254,19 @@ class PatchedEnergyScoreLoss(th.nn.MSELoss):
                 f"got {prediction.shape} and {target.shape}"
             )
 
-        if prediction.shape[0] != self.n_members:
+        if n != self.n_members:
             raise ValueError(
                 f"Shape of prediction should have ensemble dimension of size {self.n_members}, "
-                f"got {prediction.shape[0]}"
+                f"got {n}"
             )
 
         n = self.n_members
 
-        prediction = prediction.to(th.float32)
-        target = target.to(th.float32)
+        if self.cast_to_fp32:
+            prediction = prediction.to(th.float32)
+            target = target.to(th.float32)
 
-        # Extract patches (HEALPix-aware)
-        pred_patches = self._extract_patches_prediction(prediction)  # [Cond,B,F,T,C,H,W,D]
-        tar_patches = self._extract_patches_target(target)  # [B,F,T,C,H,W,D]
-
-        # Compute per-member distances to target (weighted patch norm if enabled)
-        diff_to_target = self._weighted_patch_norm(
-            pred_patches - tar_patches.unsqueeze(0)
-        )  # [Cond,B,F,T,C,H,W]
-
-        if n == 2:
-            diff_target = diff_to_target.sum(dim=0)  # [B,F,T,C,H,W]
-            diff_ensemble = self._weighted_patch_norm(
-                pred_patches[0] - pred_patches[1]
-            )  # [B,F,T,C,H,W]
-            es = self.averaging_coeff * (diff_target - self.coeff_eps * diff_ensemble)
-        else:
-            diff_i = diff_to_target  # [Cond,B,F,T,C,H,W]
-            diff_i_i = diff_i.unsqueeze(0)  # [1,Cond,B,F,T,C,H,W]
-            diff_j_i = diff_i.unsqueeze(1)  # [Cond,1,B,F,T,C,H,W]
-
-            pred_i = pred_patches.unsqueeze(1)  # [Cond,1,B,F,T,C,H,W,D]
-            pred_j = pred_patches.unsqueeze(0)  # [1,Cond,B,F,T,C,H,W,D]
-            dist_ensemble = self._weighted_patch_norm(pred_i - pred_j)  # [Cond,Cond,B,F,T,C,H,W]
-
-            mask = self.diag_mask[:, :, None, None, None, None, None, None]
-            diff_terms = mask * (diff_i_i + diff_j_i)
-            dist_terms = mask * dist_ensemble
-
-            es = self.averaging_coeff * (diff_terms - self.coeff_eps * dist_terms).sum(
-                dim=(0, 1)
-            )  # [B,F,T,C,H,W]
+        es = self._energy_score_field(prediction, target, n, b, f, t, c, h, w)
 
         es *= self.lsm_tensor
 

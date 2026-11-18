@@ -275,6 +275,13 @@ class UNetEncoder(th.nn.Module):
             th.cuda.nvtx.range_pop()
         return outputs
 
-    def reset(self):
-        """Resets the state of the decoder layers"""
+    def reset(self, reset_mode: str = None):
+        """Resets the state of the decoder layers
+           Currently no-op, but required for compatibility with the model interface.
+
+        Parameters
+        ----------
+        reset_mode: str, optional
+            Ignored.
+        """
         pass
