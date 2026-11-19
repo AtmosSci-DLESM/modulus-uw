@@ -30,6 +30,7 @@ from physicsnemo.datapipes.meta import DatapipeMetaData
 from physicsnemo.utils.insolation import insolation
 
 from . import couplers
+from .coupling_ops import concat_integrated_couplings
 from .timeseries_dataset import TimeSeriesDataset
 
 logger = logging.getLogger(__name__)
@@ -365,10 +366,7 @@ class CoupledTimeSeriesDataset(TimeSeriesDataset):
 
         # append couplings inputs
         if len(self.couplings) > 0:
-            integrated_couplings = np.concatenate(
-                [c.construct_integrated_couplings() for c in self.couplings], axis=2
-            )
-            inputs_result.append(torch.tensor(integrated_couplings))
+            inputs_result.append(concat_integrated_couplings(self.couplings))
 
         # gather coupled_inputs
         return inputs_result
