@@ -14,6 +14,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""HEALPix couplers for exchanging fields between Earth-system components.
+
+Overview
+--------
+A coupler takes prognostic outputs from one component (e.g. atmosphere) and
+prepares them as forcing for another (e.g. ocean). Two strategies are provided:
+
+* ``ConstantCoupler`` — broadcast the first available time step across the
+  coupled integration window.
+* ``TrailingAverageCoupler`` — average over trailing windows whose right edges
+  are given by ``input_times`` (e.g. 48 h and 96 h).
+
+Tensor layouts
+--------------
+``set_coupled_fields`` expects::
+
+    [B, F, T, C, H, W]
+
+With default ``time_first=True``, ``construct_integrated_couplings`` returns::
+
+    [I, B, timevar, F, H, W]
+
+where ``timevar = len(variables) * len(input_times)`` in **period-major** order::
+
+    [p0_v0, p0_v1, ..., p1_v0, p1_v1, ...]
+
+Example for ``variables=["z1000", "ws10m"]``, ``input_times=["48h", "96h"]``::
+
+    [z1000@48h, ws10m@48h, z1000@96h, ws10m@96h]
+
+Call ``set_coupled_scaling(incoming)`` after ``set_scaling`` / ``setup_coupling``
+to denorm→operate→renorm (float32 mid-flight); omit it for the legacy path.
+"""
+
 import logging
 from abc import ABC, abstractmethod
 from typing import Sequence
@@ -97,6 +131,12 @@ class BaseCoupler(ABC):
         self.integrated_couplings = None
         self.ds_variable_indices = []
         self.time_first = time_first
+        self.incoming_coupled_scaling = None
+        self.outgoing_coupled_scaling = None
+        # Set by setup_coupling: source-module channel names for denorm lookups,
+        # and sink-side names in the same post-index order for renorm lookups.
+        self.incoming_variables = None
+        self.outgoing_variable_order = None
 
         if not prepared_coupled_data:
             raise NotImplementedError("Data preparation not yet implemented")
@@ -171,6 +211,118 @@ class BaseCoupler(ABC):
             "std": np.expand_dims(coupled_scaling["std"].to_numpy(), (0, 2, 3, 4)),
         }
 
+    def set_coupled_scaling(self, incoming_coupled_scaling):
+        """Set incoming denorm stats; outgoing renorm uses ``coupled_scaling`` tiled.
+
+        Requires :meth:`set_scaling` and :meth:`setup_coupling`. Incoming keys
+        follow ``incoming_variables``; outgoing is reordered to
+        ``outgoing_variable_order`` and tiled across ``input_times``.
+        """
+        if self.coupled_scaling is None or self.incoming_variables is None:
+            raise RuntimeError(
+                "set_scaling and setup_coupling must be called before "
+                "set_coupled_scaling."
+            )
+        self.incoming_coupled_scaling = self._prepare_incoming_coupled_scaling(
+            incoming_coupled_scaling
+        )
+        self.outgoing_coupled_scaling = self._prepare_outgoing_coupled_scaling()
+
+    def _prepare_incoming_coupled_scaling(self, incoming_coupled_scaling):
+        """Parse incoming stats and broadcast to [B, F, T, C, H, W]."""
+        return self._broadcast_stats(
+            *self._coupled_scaling_to_mean_std(
+                incoming_coupled_scaling, self.incoming_variables
+            )
+        )
+
+    def _prepare_outgoing_coupled_scaling(self):
+        """Reorder ``coupled_scaling`` to post-index order and tile across input times."""
+        var_idx = {v: i for i, v in enumerate(self.variables)}
+        order = [var_idx[v] for v in self.outgoing_variable_order]
+        cs_mean = np.asarray(self.coupled_scaling["mean"], dtype=np.float32).ravel()
+        cs_std = np.asarray(self.coupled_scaling["std"], dtype=np.float32).ravel()
+        n = len(self.input_times)
+        return self._broadcast_stats(
+            np.tile(cs_mean[order], n), np.tile(cs_std[order], n)
+        )
+
+    @staticmethod
+    def _coupled_scaling_to_mean_std(scaling, keys: Sequence[str]):
+        if isinstance(scaling, (xr.Dataset, xr.DataArray)):
+            selected = scaling.sel(index=list(keys))
+            return (
+                np.asarray(selected["mean"].to_numpy(), dtype=np.float32).ravel(),
+                np.asarray(selected["std"].to_numpy(), dtype=np.float32).ravel(),
+            )
+        return (
+            np.asarray([scaling[k]["mean"] for k in keys], dtype=np.float32),
+            np.asarray([scaling[k]["std"] for k in keys], dtype=np.float32),
+        )
+
+    @staticmethod
+    def _broadcast_stats(mean, std) -> dict:
+        mean = np.asarray(mean, dtype=np.float32).ravel()
+        std = np.asarray(std, dtype=np.float32).ravel()
+        if np.any(std == 0):
+            raise ValueError("scaling std must be non-zero for all channels")
+        # Broadcast to channel dimension [B, F, T, C, H, W] to match the shape of the coupled fields
+        return {
+            "mean": th.as_tensor(mean).view(1, 1, 1, -1, 1, 1),
+            "std": th.as_tensor(std).view(1, 1, 1, -1, 1, 1),
+        }
+
+    @staticmethod
+    def _denormalize(x: th.Tensor, scaling: dict) -> th.Tensor:
+        mean = scaling["mean"].to(device=x.device, dtype=x.dtype)
+        std = scaling["std"].to(device=x.device, dtype=x.dtype)
+        return x * std + mean
+
+    @staticmethod
+    def _renormalize(x: th.Tensor, scaling: dict) -> th.Tensor:
+        mean = scaling["mean"].to(device=x.device, dtype=x.dtype)
+        std = scaling["std"].to(device=x.device, dtype=x.dtype)
+        return (x - mean) / std
+
+    def rescale_coupled_fields_through_physical(
+        self, coupled_fields: th.Tensor, physical_op
+    ) -> th.Tensor:
+        """
+        Rescale coupled fields through physical space.
+        Fields may overflow when denormalized, so we run in float32 mid-flight.
+        float32 → Denorm → ``physical_op`` → renorm → restore input dtype.
+
+        Parameters
+        ----------
+        coupled_fields: th.Tensor
+            The coupled fields to rescale.
+        physical_op: callable
+            The physical operation to apply to the coupled fields.
+        """
+        orig_dtype = coupled_fields.dtype
+        physical_fields = self._denormalize(
+            coupled_fields.float(), self.incoming_coupled_scaling
+        )
+        transformed_fields = physical_op(physical_fields)
+        normalized_fields = self._renormalize(
+            transformed_fields, self.outgoing_coupled_scaling
+        )
+        return normalized_fields.to(dtype=orig_dtype)
+
+    def _store_preset_coupled_fields(self, coupled_fields: th.Tensor, physical_op):
+        """Index channels, optionally rescale through physical space, then store."""
+        coupled_fields = coupled_fields[:, :, :, self.coupled_channel_indices, :, :]
+        if self.incoming_coupled_scaling is not None:
+            preset = self.rescale_coupled_fields_through_physical(
+                coupled_fields, physical_op
+            )
+        else:
+            preset = physical_op(coupled_fields)
+        if self.time_first:
+            preset = preset.permute(2, 0, 3, 1, 4, 5)
+        self.preset_coupled_fields = preset
+        self.coupled_mode = True
+
     def setup_coupling(self, coupled_module):
         """
         Sets up the coupling between the coupled variables and the provided module
@@ -188,25 +340,25 @@ class BaseCoupler(ABC):
         # with a time increment suach as a trailing average increment e.g. 'z1000-48H'.
         # Some variables may have an additional suffix, e.g. 'z1000-3H-48H'. The final
         # suffix (if it exists) is used to determine the coupling increment.
-        channel_indices = [
-            i
-            for i, oc in enumerate(output_channels)
-            for v in self.variables
-            # extract everthing before the last "-" if there is one in the name
-            if (("-" not in v and oc == v) or (oc == "-".join(v.split("-")[:-1])))
-        ]
-        # check for missing variables
+        # Order follows source output_channels (may differ from self.variables).
+        channel_indices = []
+        incoming_variables = []
+        outgoing_variable_order = []
+        for i, oc in enumerate(output_channels):
+            for v in self.variables:
+                if ("-" not in v and oc == v) or (
+                    oc == "-".join(v.split("-")[:-1])
+                ):
+                    channel_indices.append(i)
+                    incoming_variables.append(oc)
+                    outgoing_variable_order.append(v)
+                    break
         if len(self.variables) != len(channel_indices):
-            found_channels = [
-                oc
-                for oc in output_channels
-                for v in self.variables
-                # extract everthing before the last -
-                if (("-" not in v and oc == v) or (oc == "-".join(v.split("-")[:-1])))
-            ]
-            missing_channels = set(self.variables) - set(found_channels)
+            missing_channels = set(self.variables) - set(outgoing_variable_order)
             raise ValueError(f"Missing variables in coupled module: {missing_channels}")
         self.coupled_channel_indices = channel_indices
+        self.incoming_variables = incoming_variables
+        self.outgoing_variable_order = outgoing_variable_order
 
     def reset_coupler(self):
         self.coupled_mode = False
@@ -334,6 +486,7 @@ class ConstantCoupler(BaseCoupler):
         output_time_dim: int = 2,
         input_times: Sequence = [pd.Timedelta("24h"), pd.Timedelta("48h")],
         prepared_coupled_data=True,
+        **kwargs,
     ):
         """
         Parameters
@@ -371,6 +524,7 @@ class ConstantCoupler(BaseCoupler):
             output_time_dim=output_time_dim,
             input_times=input_times,
             prepared_coupled_data=prepared_coupled_data,
+            **kwargs,
         )
 
     def compute_coupled_indices(self, interval, data_time_step):
@@ -409,22 +563,16 @@ class ConstantCoupler(BaseCoupler):
             The data to use when the dataloader requests coupled fields. Expected
             format is [B, F, T, C, H, W]
         """
-        # create buffer for coupling
-        coupled_fields = coupled_fields[
-            :, :, :, self.coupled_channel_indices, :, :
-        ] 
-        self.preset_coupled_fields = th.empty(
-            [coupled_fields.shape[0], self.spatial_dims[0], self.coupled_integration_dim, self.timevar_dim]
-            + list(self.spatial_dims[1:])
-        )
-        # we use a constant set of values so we just copy time 0
 
-        # broadcast the first time step to the entire coupled integration dimension
-        self.preset_coupled_fields[:, :, :, :, :, :] = coupled_fields[:, :, :1, :, :, :]
-        if self.time_first:
-            self.preset_coupled_fields = self.preset_coupled_fields.permute(2, 0, 3, 1, 4, 5)
-        # flag for construct integrated coupling method to use this array
-        self.coupled_mode = True
+        def _broadcast_first_time(fields: th.Tensor) -> th.Tensor:
+            # Clone so later mutations of coupled_fields cannot alter presets.
+            return (
+                fields[:, :, :1]
+                .expand(-1, -1, self.coupled_integration_dim, -1, -1, -1)
+                .clone()
+            )
+
+        self._store_preset_coupled_fields(coupled_fields, _broadcast_first_time)
 
 
 class TrailingAverageCoupler(BaseCoupler):
@@ -446,6 +594,7 @@ class TrailingAverageCoupler(BaseCoupler):
         averaging_window: str = "24h",
         input_times: Sequence = [pd.Timedelta("24h"), pd.Timedelta("48h")],
         prepared_coupled_data=True,
+        **kwargs,
     ):
         """
         Parameters
@@ -485,6 +634,7 @@ class TrailingAverageCoupler(BaseCoupler):
             output_time_dim=output_time_dim,
             input_times=input_times,
             prepared_coupled_data=prepared_coupled_data,
+            **kwargs,
         )
 
         # TrailingAverageCoupler-specific attributes
@@ -568,25 +718,26 @@ class TrailingAverageCoupler(BaseCoupler):
         Instead of loading data from the dataset the data from coupled_fields will
         be returned instead.
 
+        When :meth:`set_coupled_scaling` has been called, fields are
+        denormalized, averaged in physical space, then renormalized.
+
         Parameters
         ----------
         coupled_fields: th.tensor
             The data to use when the dataloader requests coupled fields. Expected
             format is [B, F, T, C, H, W]
         """
-        coupled_fields = coupled_fields[:, :, :, self.coupled_channel_indices, :, :]
-        # TODO: Now support output_time_dim =/= input_time_dim, but presteps need to be 0, will add support for presteps>0
-        coupled_averaging_periods = []
-        for j in range(self.coupled_integration_dim):
-            averaging_periods = [
-                coupled_fields[:, :, s, :, :, :].mean(dim=2, keepdim=True)
-                for s in self.averaging_slices[j]
-            ]
-            coupled_averaging_periods.append(th.concat(averaging_periods, dim=3))
-        self.preset_coupled_fields = th.concat(
-            coupled_averaging_periods, dim=2
-        )
-        if self.time_first:
-            self.preset_coupled_fields = self.preset_coupled_fields.permute(2, 0, 3, 1, 4, 5)
-        # flag for construct integrated coupling method to use this array
-        self.coupled_mode = True
+
+        def _trailing_average(fields: th.Tensor) -> th.Tensor:
+            # TODO: Now support output_time_dim =/= input_time_dim, but presteps
+            # need to be 0, will add support for presteps>0
+            coupled_averaging_periods = []
+            for j in range(self.coupled_integration_dim):
+                averaging_periods = [
+                    fields[:, :, s, :, :, :].mean(dim=2, keepdim=True)
+                    for s in self.averaging_slices[j]
+                ]
+                coupled_averaging_periods.append(th.concat(averaging_periods, dim=3))
+            return th.concat(coupled_averaging_periods, dim=2)
+
+        self._store_preset_coupled_fields(coupled_fields, _trailing_average)
