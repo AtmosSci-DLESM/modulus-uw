@@ -24,11 +24,12 @@ from typing import List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 import xarray as xr
-import zarr
 from physicsnemo.datapipes.datapipe import Datapipe
 from physicsnemo.datapipes.meta import DatapipeMetaData
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import Dataset
+
+from .zarr_layout import open_healpix_zarr
 
 logger = logging.getLogger(__name__)
 
@@ -177,20 +178,19 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         self.all_variables = list(
             set(self.input_variables).union(self.output_variables)
         )
-        # Channels jointly loaded/scaled from the store. Forecast/inference only
-        # reads ICs, so output-only diagnostics need not exist in the dataset;
-        # training still stages input ∪ output for supervised targets.
+        # Channels that must exist in the store. Forecast/inference only reads
+        # ICs, so output-only diagnostics need not be present; training still
+        # requires input ∪ output for supervised targets.
         self.staging_variables = (
             list(self.input_variables)
             if self.forecast_mode
             else self.all_variables
         )
-        self.all_scaling = None
 
         # Check if for fsspec if necessary and make sure path exist
         _check_availability(dataset_path)
 
-        self.ds = zarr.open(dataset_path)
+        self.ds = open_healpix_zarr(dataset_path)
 
         if (
             start_date is None or end_date is None
@@ -199,8 +199,15 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                 "Either start and end date or forecast_init_times must be provided"
             )
 
-        # Validate channels that will actually be read from the store.
-        missing_channels = set(self.staging_variables) - set(self.ds["channel_in"][:])
+        # Validate requested fields exist in the store: a stacked store lists them
+        # in ``channel_in`` / ``channel_c``, a per-variable store as top-level arrays.
+        from .zarr_layout import available_field_names, is_stacked_layout
+
+        stacked = is_stacked_layout(self.ds)
+        available = (
+            set(self.ds["channel_in"][:]) if stacked else available_field_names(self.ds)
+        )
+        missing_channels = set(self.staging_variables) - available
         if len(missing_channels) > 0:
             raise KeyError(
                 f"Requested Input, coupled, or output variables not found in dataset: {missing_channels}"
@@ -208,39 +215,14 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
 
         self._get_time_da(self.dataset_path, start_date, end_date)
 
-        self.all_variable_indices = [
-            int(np.where(self.ds["channel_in"][:] == ch)[0][0])
-            for ch in self.staging_variables
-        ]
-
-        # Validate constants exist
         if constant_variables:
-            missing_constants = set(constant_variables) - set(self.ds["channel_c"][:])
+            if stacked:
+                available = set(self.ds["channel_c"][:])
+            missing_constants = set(constant_variables) - available
             if len(missing_constants) > 0:
                 raise KeyError(
                     f"Requested constants not found in dataset: {missing_constants}"
                 )
-
-        self.constant_variable_indices = (
-            [
-                int(np.where(self.ds["channel_c"][:] == ch)[0][0])
-                for ch in self.constant_variables
-            ]
-            if self.constant_variables
-            else None
-        )
-        self.input_variable_indices = [
-            self.staging_variables.index(inp_ch) for inp_ch in self.input_variables
-        ]
-        # Output indices are only used when loading supervised targets.
-        self.output_variable_indices = (
-            None
-            if self.forecast_mode
-            else [
-                self.staging_variables.index(out_ch)
-                for out_ch in self.output_variables
-            ]
-        )
 
         # Length of the data window needed for one sample
         if self.forecast_mode:
@@ -273,6 +255,13 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             )
             for n in range(self.batch_size)
         ]
+        # Contiguous intp arrays for windowed loads and insolation gather.
+        self._input_indices_np = np.asarray(self._input_indices, dtype=np.intp)
+        self._output_indices_np = np.asarray(self._output_indices, dtype=np.intp)
+        self._sol_indices_np = np.asarray(
+            [inp + out for inp, out in zip(self._input_indices, self._output_indices)],
+            dtype=np.intp,
+        )
 
         self.spatial_dims = (
             self.ds["face"].shape[0],
@@ -464,17 +453,6 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
                 f"Target channels {missing} not found in the scaling config dict data.scaling ({list(self.scaling.keys())})"
             )
 
-        # Align mean/std with the staged channel axis used in __getitem__.
-        self.all_scaling = scaling_da.sel(index=self.staging_variables).rename(
-            {"index": "channel_in"}
-        )
-        self.all_scaling = {
-            "mean": np.expand_dims(
-                self.all_scaling["mean"].values.copy(), (0, 2, 3, 4)
-            ),
-            "std": np.expand_dims(self.all_scaling["std"].values.copy(), (0, 2, 3, 4)),
-        }
-
         if self.constant_variables:
             # Check that all constant variables are present in scaling data
             missing_constants = [
@@ -525,7 +503,9 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
         if self.constant_variables is None:
             return None
 
-        const = np.asarray(self.ds["constants"][self.constant_variable_indices])
+        from .zarr_layout import load_constant_fields
+
+        const = load_constant_fields(self.ds, self.constant_variables)
 
         if self.constant_scaling:
             const = (const - self.constant_scaling["mean"]) / self.constant_scaling[
@@ -563,6 +543,14 @@ class BaseTimeSeriesDatasetZarr(Dataset, Datapipe, ABC):
             batch_size = self.batch_size - (window_max_index - self.total_samples)
         else:
             batch_size = self.batch_size
+        if batch_size < 0:
+            # Fail loudly: slicing the sample indices with a negative batch size
+            # would silently return mis-sized batches.
+            raise ValueError(
+                f"Index {item} gives a batch of {batch_size} samples (time window "
+                f"[{window_start_index}, {window_max_index}), "
+                f"total_samples={self.total_samples})."
+            )
         return (window_start_index, window_max_index), batch_size
 
     def _get_forecast_sol_times(self, item: int) -> np.ndarray:

@@ -100,12 +100,23 @@ def _load_topography(
     convert_topography_to_meters: bool,
 ) -> torch.Tensor:
     """Load denormalized topography [1, F, 1, H, W] from a constants zarr store."""
-    ds = xr.open_zarr(dataset_path)
-    topography = (
-        surface_geopotential_std
-        * ds["constants"].sel(channel_c=surface_geopotential_name).values
-        + surface_geopotential_mean
+    from physicsnemo.datapipes.healpix.zarr_layout import (
+        constants_are_stacked,
+        load_constant_fields,
     )
+
+    ds = xr.open_zarr(dataset_path)
+    if constants_are_stacked(ds):
+        topography = (
+            surface_geopotential_std
+            * ds["constants"].sel(channel_c=surface_geopotential_name).values
+            + surface_geopotential_mean
+        )
+    else:
+        const = load_constant_fields(ds, [surface_geopotential_name])
+        topography = (
+            surface_geopotential_std * const[0] + surface_geopotential_mean
+        )
     if convert_topography_to_meters:
         topography = topography / g0
 
