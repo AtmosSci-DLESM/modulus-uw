@@ -69,6 +69,7 @@ class TimeSeriesDataModuleZarr:
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
+        return_ic_diagnostics: bool = False,
         max_threads_per_worker: Optional[int] = None,
     ):
         """
@@ -171,6 +172,7 @@ class TimeSeriesDataModuleZarr:
         self.train_noise_params = train_noise_params
         self.train_noise_seed = train_noise_seed
         self.in_order = in_order
+        self.return_ic_diagnostics = return_ic_diagnostics
         self.max_threads_per_worker = max_threads_per_worker
 
         self.train_dataset = None
@@ -212,6 +214,7 @@ class TimeSeriesDataModuleZarr:
             "time_step": self.time_step,
             "gap": self.gap,
             "scaling": self.scaling,
+            "return_ic_diagnostics": self.return_ic_diagnostics,
         }
 
     def _validate_setup_requirements(self) -> None:
@@ -475,6 +478,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
         train_noise_params: Optional[DictConfig] = None,
         train_noise_seed: Optional[int] = 42,
         in_order: Optional[bool] = None,
+        return_ic_diagnostics: bool = False,
         max_threads_per_worker: Optional[int] = None,
     ):
         """
@@ -579,6 +583,7 @@ class CoupledTimeSeriesDataModuleZarr(TimeSeriesDataModuleZarr):
             train_noise_params,
             train_noise_seed,
             in_order,
+            return_ic_diagnostics,
             max_threads_per_worker,
         )
 
