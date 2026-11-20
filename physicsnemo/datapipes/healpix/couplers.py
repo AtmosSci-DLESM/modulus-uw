@@ -415,7 +415,8 @@ class ConstantCoupler(BaseCoupler):
         ] 
         self.preset_coupled_fields = th.empty(
             [coupled_fields.shape[0], self.spatial_dims[0], self.coupled_integration_dim, self.timevar_dim]
-            + list(self.spatial_dims[1:])
+            + list(self.spatial_dims[1:]),
+            device=coupled_fields.device,
         )
         # we use a constant set of values so we just copy time 0
 
