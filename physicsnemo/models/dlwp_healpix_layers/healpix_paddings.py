@@ -835,8 +835,12 @@ class HEALPixPaddingIsolatitude(th.nn.Module):
             module for the same ``padding`` and ``H``.
         """
 
-        # Index buffers are built on CPU at init; no-op once on the input's device.
-        self.to(device=data.device)
+        # Index buffers are built on CPU at init; move them if the module has not
+        # been moved to the input's device. The explicit check keeps the common
+        # (already co-located) case free of a Module.to() call, which causes a
+        # graph break under torch.compile on some torch versions (seen on 2.9.0a0).
+        if self._index0.device != data.device:
+            self.to(device=data.device)
 
         BF, C, H, W = data.shape
         F = 12
