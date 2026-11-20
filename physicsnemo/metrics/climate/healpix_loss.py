@@ -133,6 +133,162 @@ class WeightedMSE(th.nn.MSELoss):
         else:
             return d
 
+class WeightedMSEtp6Exp(th.nn.MSELoss):
+    """
+    Loss object that allows for user defined weighting of variables when calculating MSE.
+    Optionally applies conditional exponential weighting (as in ConditionalWeightLoss)
+    to a single variable, e.g. tp6.
+    """
+
+    def __init__(
+        self,
+        weights: Sequence = [],
+        conditional_var: str = None,      # e.g. "tp6"
+        conditional_weight=(0.15, 1.0),   # (zero-precip weight, nonzero-precip weight)
+        b: float = 0.0,                   # exponential scaling for nonzero precip
+    ):
+        super().__init__()
+        self.loss_weights = th.tensor(weights)
+        self.device = None
+
+        self.conditional_var = conditional_var
+        self.weight_zero = conditional_weight[0]
+        self.weight_nonzero = conditional_weight[1]
+        self.b = b
+        self.cond_idx = None
+
+    def setup(self, trainer):
+        if len(trainer.output_variables) != len(self.loss_weights):
+            raise ValueError("Length of outputs and loss_weights is not the same!")
+
+        self.loss_weights = self.loss_weights.to(device=trainer.device)
+
+        if self.conditional_var is not None:
+            out_vars = list(trainer.output_variables)
+            if self.conditional_var not in out_vars:
+                raise ValueError(
+                    f"{self.conditional_var} not in output variables {out_vars}"
+                )
+            self.cond_idx = out_vars.index(self.conditional_var)
+            self.b = th.tensor(self.b, device=trainer.device)
+
+    def forward(self, prediction, target, average_channels=True):
+        """
+        Tensors are expected to be in the shape [N, B, F, C, H, W]
+        """
+        if not (prediction.ndim == 6 and target.ndim == 6):
+            raise AssertionError("Expected predictions to have 6 dimensions")
+
+        se = (target - prediction) ** 2
+
+        if self.cond_idx is not None:
+            # per-element weights: 1 for all channels except the conditional one
+            w = th.ones_like(target)
+            t = target[:, :, :, self.cond_idx]
+            w[:, :, :, self.cond_idx] = th.where(
+                t > -0.99848,
+                self.weight_nonzero * th.exp(self.b * t),
+                th.full_like(t, self.weight_zero),
+            )
+            se = se * w
+
+        d = se.mean(dim=(0, 1, 2, 4, 5)) * self.loss_weights
+        if average_channels:
+            return th.mean(d)
+        return d
+
+class WeightedMSEtp6Physical(th.nn.MSELoss):
+    """
+    Weighted MSE loss with precipitation loss calculated in physical units.
+
+    For the conditional precipitation variable:
+        1. Undo standardization: P_tran = P_norm * std + mean
+        2. Undo log transform: P = eps * expm1(P_tran)
+        3. Compute MSE in physical precipitation units.
+
+    All other variables retain MSE in normalized space.
+
+    Expected tensor shape: [N, B, F, C, H, W]
+    """
+
+    def __init__(
+        self,
+        weights: Sequence = [],
+        conditional_var: str = "tp6",
+        precip_mean: float = 0.0,
+        precip_std: float = 1.0,
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+
+        self.loss_weights = th.tensor(weights)
+        self.device = None
+
+        self.conditional_var = conditional_var
+        self.cond_idx = None
+
+        self.precip_mean = precip_mean
+        self.precip_std = precip_std
+        self.eps = eps
+
+    def setup(self, trainer):
+        if len(trainer.output_variables) != len(self.loss_weights):
+            raise ValueError(
+                "Length of outputs and loss_weights is not the same!"
+            )
+
+        self.loss_weights = self.loss_weights.to(
+            device=trainer.device
+        )
+
+        out_vars = list(trainer.output_variables)
+
+        if self.conditional_var not in out_vars:
+            raise ValueError(
+                f"{self.conditional_var} not in output variables {out_vars}"
+            )
+
+        self.cond_idx = out_vars.index(self.conditional_var)
+
+    def inverse_precip(self, x):
+        """Convert normalized log precipitation to physical precipitation."""
+        x = x * self.precip_std + self.precip_mean
+        return self.eps * th.expm1(x)
+
+    def forward(self, prediction, target, average_channels=True):
+        """
+        Tensors are expected to have shape [N, B, F, C, H, W].
+        """
+
+        if prediction.ndim != 6 or target.ndim != 6:
+            raise AssertionError("Expected predictions to have 6 dimensions")
+
+        # MSE in normalized space for all variables
+        se = (target - prediction) ** 2
+
+        # Extract precipitation channel
+        p_pred = prediction[:, :, :, self.cond_idx]
+        p_target = target[:, :, :, self.cond_idx]
+
+        # Undo standardization and log transform
+        p_pred_phys = self.inverse_precip(p_pred) * 1000
+        p_target_phys = self.inverse_precip(p_target) * 1000
+
+        # MSE in physical precipitation units
+        se_precip = (p_target_phys - p_pred_phys) ** 2
+
+        # Replace precipitation channel loss
+        se = se.clone()
+        se[:, :, :, self.cond_idx] = se_precip
+
+        # Spatial, batch, and temporal averaging
+        d = se.mean(dim=(0, 1, 2, 4, 5)) * self.loss_weights
+
+        if average_channels:
+            return th.mean(d)
+
+        return d
+
 class ConditionalWeightLoss( th.nn.MSELoss ):
     """
     Conditional loss for precipitation diagnostic model.
