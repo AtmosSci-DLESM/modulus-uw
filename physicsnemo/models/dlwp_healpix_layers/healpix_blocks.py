@@ -120,7 +120,9 @@ class ConvGRUBlock(th.nn.Module):
     def _init_update_gates(self, inputs):
         """ initializes the update gates"""
 
-        if torch.cuda.is_current_stream_capturing():
+        # is_current_stream_capturing() returns a Python bool and breaks the Dynamo graph; the check is only
+        # meaningful in eager mode (compiled graphs are captured by the trainer after warm-up).
+        if not torch.compiler.is_compiling() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Hidden-state storage was not initialized before CUDA Graph capture"
             )
