@@ -77,6 +77,8 @@ class HEALPixRecUNet(Module):
         compile_padding: bool = False,
         nside: Sequence[int] = (64, 32, 16),
         enable_healpixpad: bool | None = None,
+        precip_head: DictConfig | None = None,
+        detach_state_for_precip: bool = False,
     ):
         """
         Parameters
@@ -133,6 +135,10 @@ class HEALPixRecUNet(Module):
         enable_healpixpad: bool, optional
             Deprecated. When ``hpx_padding_mode`` is omitted, ``False`` maps to ``karlbauer``
             and ``True`` to ``earth2grid`` (legacy configs). Prefer ``hpx_padding_mode``.
+        precip_head: DictConfig
+            dictionary of instantiable parameters for the precip head conv blocks.
+        detach_state_for_precip: bool, optional
+            If True, detach precip head gradients.
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
@@ -175,6 +181,9 @@ class HEALPixRecUNet(Module):
         self.hpx_padding_mode = hpx_padding_mode
         self.compile_padding = compile_padding
         self.nside = nside
+        
+        self.use_precip_head = precip_head is not None
+        self.detach_state_for_precip = detach_state_for_precip
 
         if len(encoder["n_channels"]) != len(decoder["n_channels"]):
             raise ValueError(
@@ -208,12 +217,41 @@ class HEALPixRecUNet(Module):
         )
         self.decoder = instantiate(
             config=decoder,
-            output_channels=self._compute_output_channels(),
+            output_channels=(
+                self._compute_decoder_output_channels()
+                if self.use_precip_head
+                else self._compute_output_channels()
+            ),
             enable_nhwc=self.enable_nhwc,
             hpx_padding_mode=self.hpx_padding_mode,
             compile_padding=self.compile_padding,
             nside=self.nside,
         )
+        
+        self.precip_head = None
+
+        if self.use_precip_head:
+            if self.is_diagnostic:
+                raise ValueError(
+                    "The precipitation head currently does not support "
+                    "diagnostic-only models with input_time_dim > 1."
+                )
+
+            if self.output_channels <= self.input_channels:
+                raise ValueError(
+                    "When using a precipitation head, output_channels must "
+                    "be greater than input_channels."
+                )
+
+            self.precip_head = instantiate(
+                config=precip_head,
+                in_channels=2 * self.input_channels * self.input_time_dim,
+                out_channels=self._compute_diagnostic_channels(),
+                enable_nhwc=self.enable_nhwc,
+                hpx_padding_mode=self.hpx_padding_mode,
+                compile_padding=self.compile_padding,
+                nside=self.nside[0],
+            )
 
         self.constraints = None
         self.set_constraints(constraints)
@@ -249,6 +287,20 @@ class HEALPixRecUNet(Module):
     def _compute_output_channels(self) -> int:
         """Compute the total number of output channels in the model"""
         return (1 if self.is_diagnostic else self.input_time_dim) * self.output_channels
+    
+    def _compute_decoder_output_channels(self) -> int:
+        """Number of channels predicted by the prognostic decoder."""
+        return (
+            (1 if self.is_diagnostic else self.input_time_dim)
+            * self.input_channels
+        )
+
+    def _compute_diagnostic_channels(self) -> int:
+        """Number of channels predicted by the diagnostic head."""
+        return (
+            (1 if self.is_diagnostic else self.input_time_dim)
+            * (self.output_channels - self.input_channels)
+        )
 
     def _reshape_inputs(self, inputs: Sequence, step: int = 0) -> th.Tensor:
         """
@@ -557,14 +609,49 @@ class HEALPixRecUNet(Module):
             combined = self._reshape_outputs(decodings)
             prognostics = combined[:, :, :, :self.input_channels]
             orig_input = self._reshape_outputs(input_tensor[:, : self.input_channels * self.input_time_dim])
-            if self.residual_prediction:
-                # this is a view of combined which already holds [prognostics|diagnostics]
-                prognostics += orig_input
-            diagnostics = combined[:, :, :, self.input_channels:]
-            # `combined` is exactly cat([combined[..., :in], combined[..., in:]], dim=3),
-            # so rebuilding it with th.cat only allocates and copies the whole output again.
-            # out = th.cat([prognostics, diagnostics], dim=3)
-            out = combined
+            
+            if self.use_precip_head:
+                # The decoder predicts prognostic variables only.
+                # Use out-of-place addition to avoid modifying decoder outputs.
+                if self.residual_prediction:
+                    prognostics = prognostics + orig_input
+
+                # Prepare original and updated prognostic states for the head.
+                B, F, T, C, H, W = prognostics.shape
+
+                prog_flat = prognostics.reshape(B, F, T * C, H, W)
+                orig_flat = orig_input.reshape(B, F, T * C, H, W)
+
+                if self.detach_state_for_precip:
+                    prog_flat = prog_flat.detach()
+
+                # Concatenate along the channel dimension
+                precip_input = th.cat(
+                    [orig_flat, prog_flat], dim=2
+                )
+                precip_input = self.fold(precip_input)
+
+                if self.enable_nhwc:
+                    precip_input = precip_input.to(
+                        memory_format=th.channels_last
+                    )
+
+                # Predict diagnostic variables.
+                precip_out = self.precip_head(precip_input, **kwargs)
+                diagnostics = self.unfold(precip_out).reshape(
+                    B, F, T, -1, H, W
+                )
+                out = th.cat([prognostics, diagnostics], dim=3)
+                
+            else:
+                if self.residual_prediction:
+                    # this is a view of combined which already holds [prognostics|diagnostics]
+                    prognostics += orig_input
+                diagnostics = combined[:, :, :, self.input_channels:]
+                # `combined` is exactly cat([combined[..., :in], combined[..., in:]], dim=3),
+                # so rebuilding it with th.cat only allocates and copies the whole output again.
+                # out = th.cat([prognostics, diagnostics], dim=3)
+                out = combined
 
             # Apply constraints
             if self.constraints is not None:
