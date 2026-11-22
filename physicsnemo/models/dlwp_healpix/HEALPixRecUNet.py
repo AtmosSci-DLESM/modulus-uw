@@ -108,7 +108,9 @@ class HEALPixRecUNet(Module):
         presteps: int, optional
             number of model steps to initialize recurrent states.
         enable_nhwc: bool, optional
-            Model with [N, H, W, C] instead of [N, C, H, W]
+            If True, use channels-last (NHWC) memory format for folded face
+            tensors and HEALPix conv/padding layers. Logical shape stays
+            ``[N, C, H, W]``.
         couplings: list, optional
             sequence of dictionaries that describe coupling mechanisms
         residual_prediction: bool, optional
@@ -194,7 +196,7 @@ class HEALPixRecUNet(Module):
             )
 
         # Build the model layers
-        self.fold = HEALPixFoldFaces()
+        self.fold = HEALPixFoldFaces(enable_nhwc=self.enable_nhwc)
         self.unfold = HEALPixUnfoldFaces(num_faces=12)
         self.encoder = instantiate(
             config=encoder,
@@ -345,8 +347,6 @@ class HEALPixRecUNet(Module):
 
         # fold faces into batch dim (BF, C, H, W)
         res = self.fold(res)
-        if self.enable_nhwc:
-            res = res.to(memory_format=th.channels_last)
         return res
 
     def _reshape_outputs(self, outputs: th.Tensor) -> th.Tensor:
@@ -455,7 +455,7 @@ class HEALPixRecUNet(Module):
             # Forward the data through the model to initialize hidden states
             self.decoder(self.encoder(input_tensor, conditions_cln=conditions_cln), conditions_cln=conditions_cln)
 
-    def forward(self, inputs: Sequence, output_only_last=False, conditions_cln=None) -> th.Tensor:
+    def forward(self, inputs: Sequence, output_only_last=False, conditions_cln=None, spatial_noise=None) -> th.Tensor:
         """
         Forward pass of the HEALPixUnet
 
@@ -541,9 +541,13 @@ class HEALPixRecUNet(Module):
                 kwargs = {"conditions_cln": conditions_cln[step]}
             else:
                 kwargs = {}
+            # Per-step spatial noise feeds the encoder only.
+            encoder_kwargs = dict(kwargs)
+            if spatial_noise is not None:
+                encoder_kwargs["spatial_noise"] = spatial_noise[step]
 
             # th.cuda.nvtx.range_push("Encoder")
-            encodings = self.encoder(input_tensor, **kwargs)
+            encodings = self.encoder(input_tensor, **encoder_kwargs)
             # th.cuda.nvtx.range_pop()
             # th.cuda.nvtx.range_push("Dencoder")
             decodings = self.decoder(encodings, **kwargs)
@@ -554,9 +558,13 @@ class HEALPixRecUNet(Module):
             prognostics = combined[:, :, :, :self.input_channels]
             orig_input = self._reshape_outputs(input_tensor[:, : self.input_channels * self.input_time_dim])
             if self.residual_prediction:
+                # this is a view of combined which already holds [prognostics|diagnostics]
                 prognostics += orig_input
             diagnostics = combined[:, :, :, self.input_channels:]
-            out = th.cat([prognostics, diagnostics], dim=3)
+            # `combined` is exactly cat([combined[..., :in], combined[..., in:]], dim=3),
+            # so rebuilding it with th.cat only allocates and copies the whole output again.
+            # out = th.cat([prognostics, diagnostics], dim=3)
+            out = combined
 
             # Apply constraints
             if self.constraints is not None:
@@ -571,7 +579,20 @@ class HEALPixRecUNet(Module):
 
         return th.cat(outputs, dim=self.channel_dim)
 
-    def reset(self):
-        """Resets the state of the network"""
-        self.encoder.reset()
-        self.decoder.reset()
+    def reset(self, reset_mode: str = None):
+        """
+        Resets the state of the network
+
+        Parameters
+        ----------
+        reset_mode: str, optional
+            The mode to use for the reset. If not provided, the default mode is used.
+            Valid modes depend on the type of recurrent block used in the model.
+        """
+
+        if reset_mode is not None:
+            self.encoder.reset(reset_mode)
+            self.decoder.reset(reset_mode)
+        else:
+            self.encoder.reset()
+            self.decoder.reset()

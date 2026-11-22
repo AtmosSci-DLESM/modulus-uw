@@ -21,6 +21,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 from torch.utils.checkpoint import checkpoint
 
+from .healpix_layers import check_for_rng_consumers
 from .healpix_paddings import warn_deprecated_enable_healpixpad
 
 
@@ -43,6 +44,8 @@ class UNetEncoder(th.nn.Module):
         per_level_cln: Sequence[bool] = None,
         per_level_checkpointing: Sequence[bool] = None,
         enable_healpixpad: bool | None = None,
+        spatial_noise_dim: int | None = None,
+        spatial_noise_levels: Sequence[int] = None,
     ):
         """
         Parameters
@@ -81,6 +84,10 @@ class UNetEncoder(th.nn.Module):
             If None, the checkpointing will not be applied
         enable_healpixpad: bool, optional
             Deprecated; see ``hpx_padding_mode`` (legacy mapping when mode omitted).
+        spatial_noise_dim: int | None, optional
+            Channels of the spatial noise fed to each injected level; None disables injection.
+        spatial_noise_levels: Sequence[int], optional
+            Encoder levels that receive spatial noise, in the order of ``forward(spatial_noise=...)``.
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
@@ -104,6 +111,9 @@ class UNetEncoder(th.nn.Module):
             )
         # Generate the per_level_checkpointing list, simplifies forward logic
         self.per_level_checkpointing = per_level_checkpointing if per_level_checkpointing is not None else [False] * len(n_channels)
+
+        # All layers are identical, so we can just set the flag once
+        self.preserve_rng_state = False
 
         if dilations is None:
             # Defaults to [1, 1, 1...] in accordance with the number of unet levels
@@ -150,7 +160,33 @@ class UNetEncoder(th.nn.Module):
 
             self.encoder.append(th.nn.Sequential(*modules))
 
+        # The checkpointed regions use preserve_rng_state=False to avoid a 30% performance penalty
+        # (see the helper's docstring). The forward and backward passes are exact only while the
+        # region draws no RNG, so check if the region draws RNG and if enable preserve_rng_state accordingly.
+        for n, enabled in enumerate(self.per_level_checkpointing):
+            if enabled:
+                # all layers are identical, so we check the result from the last layer for simplicity
+                self.preserve_rng_state = check_for_rng_consumers(
+                    self.encoder[n], f"UNetEncoder level {n}"
+                )
+
         self.encoder = th.nn.ModuleList(self.encoder)
+
+        # Zero-initialised 1x1 conv per noise level: adds learned-amplitude spatial noise to that
+        # level's features and is a no-op until trained.
+        self.spatial_noise_dim = spatial_noise_dim
+        self.spatial_noise_levels = list(spatial_noise_levels) if spatial_noise_levels else []
+        if self.spatial_noise_dim is not None and self.spatial_noise_levels:
+            self.spatial_noise_injectors = th.nn.ModuleDict()
+            for lvl in self.spatial_noise_levels:
+                if lvl < 0 or lvl >= len(n_channels):
+                    raise ValueError(f"spatial_noise_levels entry {lvl} out of range [0, {len(n_channels)})")
+                inj = th.nn.Conv2d(self.spatial_noise_dim, n_channels[lvl], kernel_size=1, bias=True)
+                th.nn.init.zeros_(inj.weight)
+                th.nn.init.zeros_(inj.bias)
+                self.spatial_noise_injectors[str(lvl)] = inj
+        else:
+            self.spatial_noise_injectors = None
 
 
     def _forward_layer_pass(self, layer_group: th.nn.Module, inp: th.Tensor, conditions_cln: th.Tensor=None) -> th.Tensor:
@@ -182,7 +218,7 @@ class UNetEncoder(th.nn.Module):
         # Return the outputs of the last layer
         return interim_output
 
-    def forward(self, inputs: Sequence, conditions_cln: th.Tensor=None) -> Sequence:
+    def forward(self, inputs: Sequence, conditions_cln: th.Tensor=None, spatial_noise: Sequence[th.Tensor]=None) -> Sequence:
         """
         Forward pass of the HEALPix Unet encoder
 
@@ -192,23 +228,60 @@ class UNetEncoder(th.nn.Module):
             The inputs to encode
         conditions_cln: th.Tensor: optional
             The conditional inputs for the normalization layers.
+        spatial_noise: Sequence[th.Tensor]: optional
+            One pre-drawn noise tensor per level that has an injector, shape
+            ``(B*n_cond, noise_dim, F, H_level, W_level)``. Positions in the sequence
+            must align with ``spatial_noise_levels`` passed to ``__init__``. Each
+            tensor is folded to ``(B*n_cond*F, noise_dim, H_level, W_level)`` and
+            passed through the per-level 1x1 conv injector, then added to that
+            level's output feature map. None (default) skips injection entirely.
 
         Returns
         -------
         Sequence: The encoded values
         """
+        emit_nvtx = not th.compiler.is_compiling()
+        if emit_nvtx:
+            th.cuda.nvtx.range_push("dlesym_encoder")
         outputs = []
+        noise_pos = {lvl: i for i, lvl in enumerate(self.spatial_noise_levels)} if self.spatial_noise_injectors is not None else {}
         for n, layer_group in enumerate(self.encoder):
+            if emit_nvtx:
+                th.cuda.nvtx.range_push("dlesym_encoder:layer")
             interim_output = inputs
             if self.per_level_checkpointing[n]:
-                interim_output = checkpoint(self._forward_layer_pass, layer_group, interim_output, conditions_cln, use_reentrant=False)
+                # Disable reentrancy and rng preservation conditionally to allow for cuda graph capture with checkpointing
+                interim_output = checkpoint(
+                    self._forward_layer_pass,
+                    layer_group,
+                    interim_output,
+                    conditions_cln,
+                    use_reentrant=False,
+                    preserve_rng_state=self.preserve_rng_state
+                )
             else:
                 interim_output = self._forward_layer_pass(layer_group, interim_output, conditions_cln)
+            if spatial_noise is not None and n in noise_pos:
+                z = spatial_noise[noise_pos[n]]
+                bsz, ndim, F, H, W = z.shape
+                z_folded = z.permute(0, 2, 1, 3, 4).reshape(bsz * F, ndim, H, W).to(interim_output.dtype)
+                interim_output = interim_output + self.spatial_noise_injectors[str(n)](z_folded)
             outputs.append(interim_output)
             inputs = outputs[-1]
+            if emit_nvtx:
+                th.cuda.nvtx.range_pop() # dlesym_encoder:layer
         # Return the outputs of the last layer
+        if emit_nvtx:
+            th.cuda.nvtx.range_pop()
         return outputs
 
-    def reset(self):
-        """Resets the state of the decoder layers"""
+    def reset(self, reset_mode: str = None):
+        """Resets the state of the decoder layers
+           Currently no-op, but required for compatibility with the model interface.
+
+        Parameters
+        ----------
+        reset_mode: str, optional
+            Ignored.
+        """
         pass

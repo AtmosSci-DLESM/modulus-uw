@@ -110,7 +110,27 @@ class ConvGRUBlock(th.nn.Module):
             compile_padding=compile_padding,
             nside=nside,
         )
-        self.h = th.zeros(1, 1, 1, 1)
+        self.register_buffer(
+                "_h0",
+                th.zeros(1, 1, 1, 1),
+                persistent=False,
+        )
+        self.h = self._h0
+
+    def _init_update_gates(self, inputs):
+        """ initializes the update gates"""
+
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Hidden-state storage was not initialized before CUDA Graph capture"
+            )
+
+        self._h0 = torch.zeros_like(
+            inputs,
+            requires_grad=False,
+        )
+
+        self.h = self._h0
 
     def forward(self, inputs: Sequence) -> Sequence:
         """Forward pass of the ConvGRUBlock
@@ -126,7 +146,7 @@ class ConvGRUBlock(th.nn.Module):
             Result of the forward pass
         """
         if inputs.shape != self.h.shape:
-            self.h = th.zeros_like(inputs)
+            self._init_update_gates(inputs)
         combined = th.cat([inputs, self.h], dim=1)
         combined_conv = self.conv_gates(combined)
 
@@ -143,9 +163,29 @@ class ConvGRUBlock(th.nn.Module):
 
         return inputs + h_next
 
-    def reset(self):
-        """Reset the update gates"""
-        self.h = th.zeros_like(self.h)
+    RESET_MODES = ("detach", "zero", "zero_in_place")
+
+    def reset(self, mode: str = "detach"):
+        """Reset the hidden state to zeros.
+
+        Parameters
+        ----------
+        mode: str, optional
+            ``"detach"`` (default): point ``h`` back at the persistent zero buffer ``_h0``. Nothing is
+            written, so it is safe for any number of resets within a backpropagated rollout and keeps a
+            stable address for CUDA graphs. ``_h0`` must never be modified in place.
+            ``"zero"``: replace ``h`` and ``_h0`` with a newly allocated zero tensor.
+            ``"zero_in_place"``: zero the current ``h`` in place; inference only, since under autograd it
+            links the next rollout to the previous (freed) graph.
+        """
+        if mode == "detach":
+            self.h = self._h0
+        elif mode == "zero":
+            self.h = self._h0 = th.zeros_like(self.h)
+        elif mode == "zero_in_place":
+            self.h = self.h.zero_()
+        else:
+            raise ValueError(f"Invalid reset mode: {mode}; expected one of {self.RESET_MODES}")
 
 #
 # CONV BLOCKS
@@ -765,9 +805,14 @@ class Multi_SymmetricConvNeXtBlock(th.nn.Module):
             )
 
     def forward(self, x, conditions_cln=None):
+        emit_nvtx = not torch.compiler.is_compiling()
+        if emit_nvtx:
+            torch.cuda.nvtx.range_push("Multi_SymmetricConvNeXtBlock:forward")
         out = x
         for block in self.blocks:
             out = block(out, conditions_cln=conditions_cln)
+        if emit_nvtx:
+            torch.cuda.nvtx.range_pop() # Multi_SymmetricConvNeXtBlock:forward
         return out
 
 
@@ -1001,21 +1046,35 @@ class SymmetricConvNeXtBlock(th.nn.Module):
         # TODO: performance of skip connectioni hasn't been compared
         # check  cln(x) vs. cln(x1_residual + x) in the future
         # Save residual
+        emit_nvtx = not torch.compiler.is_compiling()
+        if emit_nvtx:
+            torch.cuda.nvtx.range_push("SymmetricConvNextBlock:forward")
         residual = self.skip_module(x) if self.use_block_skip_connection else 0
 
         if self.entry_norm is not None:
+            if emit_nvtx:
+                torch.cuda.nvtx.range_push("SymmetricConvNextBlock:forward:norm")
             if conditions_cln is not None:
                 x = self.entry_norm(x, conditions=conditions_cln)
             else:
                 x = self.entry_norm(x)
+            if emit_nvtx:
+                torch.cuda.nvtx.range_pop() # SymmetricConvNextBlock:forward:norm
 
         for layer in self.convblock:
+            if emit_nvtx:
+                torch.cuda.nvtx.range_push("SymmetricConvNextBlock:forward:conv_block")
             if isinstance(layer, ConditionalLayerNorm):
                 x = layer(x, conditions=conditions_cln)
             else:
                 x = layer(x)
+            if emit_nvtx:
+                torch.cuda.nvtx.range_pop() #SymmetricConvNextBlock:forward:conv_block
 
-        return x + residual
+        x = x + residual
+        if emit_nvtx:
+            torch.cuda.nvtx.range_pop() # SymmetricConvNextBlock:forward
+        return x
 
 #
 # DOWNSAMPLING BLOCKS

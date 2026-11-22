@@ -100,7 +100,9 @@ class HEALPixUNet(Module):
         presteps: int, optional
             number of model steps to initialize recurrent states. default: 0
         enable_nhwc: bool, optional
-            Model with [N, H, W, C] instead of [N, C, H, W]. default: False
+            If True, use channels-last (NHWC) memory format for folded face
+            tensors and HEALPix conv/padding layers. Logical shape stays
+            ``[N, C, H, W]``. default: False
         couplings: list, optional
             sequence of dictionaries that describe coupling mechanisms
         residual_prediction: bool, optional
@@ -175,7 +177,7 @@ class HEALPixUNet(Module):
             )
 
         # Build the model layers
-        self.fold = HEALPixFoldFaces()
+        self.fold = HEALPixFoldFaces(enable_nhwc=self.enable_nhwc)
         self.unfold = HEALPixUnfoldFaces(num_faces=12)
         self.encoder = instantiate(
             config=encoder,
@@ -437,9 +439,13 @@ class HEALPixUNet(Module):
                 input_tensor[:, : self.input_channels * self.input_time_dim]
             )
             if self.residual_prediction:
+                # this is a view of combined which already holds [prognostics|diagnostics]
                 prognostics += orig_input
             diagnostics = combined[:, :, :, self.input_channels :]
-            out = th.cat([prognostics, diagnostics], dim=3)
+            # `out` is exactly cat([prognostics, diagnostics], dim=3),
+            # so rebuilding it with th.cat only allocates and copies the whole output again.
+            # out = th.cat([prognostics, diagnostics], dim=3)
+            out = combined
 
             # Apply constraints
             if self.constraints is not None:
