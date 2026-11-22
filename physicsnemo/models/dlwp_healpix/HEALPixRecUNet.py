@@ -138,7 +138,7 @@ class HEALPixRecUNet(Module):
         precip_head: DictConfig
             dictionary of instantiable parameters for the precip head conv blocks.
         detach_state_for_precip: bool, optional
-            If True, detach precip head gradients.
+            If True, prevents gradients from propagating back into the main model through precip_head.
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
