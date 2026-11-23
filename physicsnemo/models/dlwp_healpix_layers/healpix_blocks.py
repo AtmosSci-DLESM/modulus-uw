@@ -251,33 +251,32 @@ class ConvGRUBlock(th.nn.Module):
 
         return inputs + h_next
 
-    def reset(self, mode: str = "zero_in_place"):
-        """Reset the update gates"""
+    RESET_MODES = ("detach", "zero", "zero_in_place")
+
+    def reset(self, mode: str = "detach"):
+        """Reset the hidden state to zeros.
+
+        Parameters
+        ----------
+        mode: str, optional
+            ``"detach"`` (default): point ``h`` back at the persistent zero buffer ``_h0``. Nothing is
+            written, so it is safe for any number of resets within a backpropagated rollout and keeps a
+            stable address for CUDA graphs. ``_h0`` must never be modified in place.
+            ``"zero"``: replace ``h`` and ``_h0`` with a newly allocated zero tensor.
+            ``"zero_in_place"``: zero the current ``h`` in place; inference only, since under autograd it
+            links the next rollout to the previous (freed) graph.
+        """
         # A static hidden state is the buffer a captured CUDA graph reads and writes, so it is
         # always zeroed in place; ``mode`` (which may replace the tensor) applies otherwise.
         if self.static_hidden_state:
             _zero_hidden(self)
             return
-        
-        # mode can be "zero_new", "zero", "detach"
-        # h and _h0 are the same tensor, _h0 is the original tensor
-        # zero: create a new zero tensor, original behavior
-        # zero_in_place: set the current h tensor to zero
-        # detach: detach the current h tensor, keep the original tensor
-        if mode == "zero":
-            # create a new zero tensor, original behavior
+        if mode == "detach":
+            self.h = self._h0
+        elif mode == "zero":
             self.h = self._h0 = th.zeros_like(self.h)
         elif mode == "zero_in_place":
-            # set the current h tensor to zero
             self.h = self.h.zero_()
-        elif mode == "detach":
-            # _h0 remains alive for the lifetime of this module/CUDA Graph.
-            with torch.no_grad():
-                self._h0.zero_()
-
-            # Severs history between top-level forwards, while retaining
-            # recurrence gradients within one forward.
-            self.h = self._h0
         else:
             raise ValueError(f"Invalid reset mode: {mode}; expected one of {self.RESET_MODES}")
 
