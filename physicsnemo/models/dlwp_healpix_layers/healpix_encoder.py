@@ -47,6 +47,8 @@ class UNetEncoder(th.nn.Module):
         enable_healpixpad: bool | None = None,
         structural_input_even: int | None = None,
         odd_fraction: float = 0.25,
+        spatial_noise_dim: int | None = None,
+        spatial_noise_levels: Sequence[int] = None,
     ):
         """
         Parameters
@@ -88,6 +90,10 @@ class UNetEncoder(th.nn.Module):
         odd_fraction: float, optional
             Global even|odd bank split for ReflectionSteerable blocks. Set on
             ``HEALPixRecUNet`` and propagated here; do not set per conv block.
+        spatial_noise_dim: int | None, optional
+            Channels of the spatial noise fed to each injected level; None disables injection.
+        spatial_noise_levels: Sequence[int], optional
+            Encoder levels that receive spatial noise, in the order of ``forward(spatial_noise=...)``.
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
@@ -187,6 +193,22 @@ class UNetEncoder(th.nn.Module):
 
         self.encoder = th.nn.ModuleList(self.encoder)
 
+        # Zero-initialised 1x1 conv per noise level: adds learned-amplitude spatial noise to that
+        # level's features and is a no-op until trained.
+        self.spatial_noise_dim = spatial_noise_dim
+        self.spatial_noise_levels = list(spatial_noise_levels) if spatial_noise_levels else []
+        if self.spatial_noise_dim is not None and self.spatial_noise_levels:
+            self.spatial_noise_injectors = th.nn.ModuleDict()
+            for lvl in self.spatial_noise_levels:
+                if lvl < 0 or lvl >= len(n_channels):
+                    raise ValueError(f"spatial_noise_levels entry {lvl} out of range [0, {len(n_channels)})")
+                inj = th.nn.Conv2d(self.spatial_noise_dim, n_channels[lvl], kernel_size=1, bias=True)
+                th.nn.init.zeros_(inj.weight)
+                th.nn.init.zeros_(inj.bias)
+                self.spatial_noise_injectors[str(lvl)] = inj
+        else:
+            self.spatial_noise_injectors = None
+
 
     def _forward_layer_pass(self, layer_group: th.nn.Module, inp: th.Tensor, conditions_cln: th.Tensor=None, sin_lat_gate: th.Tensor=None) -> th.Tensor:
         """
@@ -227,7 +249,7 @@ class UNetEncoder(th.nn.Module):
         # Return the outputs of the last layer
         return interim_output
 
-    def forward(self, inputs: Sequence, conditions_cln: th.Tensor=None, sin_lat_gate: th.Tensor=None) -> Sequence:
+    def forward(self, inputs: Sequence, conditions_cln: th.Tensor=None, sin_lat_gate: th.Tensor=None, spatial_noise: Sequence[th.Tensor]=None) -> Sequence:
         """
         Forward pass of the HEALPix Unet encoder
 
@@ -240,6 +262,13 @@ class UNetEncoder(th.nn.Module):
         sin_lat_gate: th.Tensor, optional
             Odd geometric field (``sin(lat)``) at the current encoder resolution.
             If a sequence is provided, ``sin_lat_gate[n]`` is used at level ``n``.
+        spatial_noise: Sequence[th.Tensor]: optional
+            One pre-drawn noise tensor per level that has an injector, shape
+            ``(B*n_cond, noise_dim, F, H_level, W_level)``. Positions in the sequence
+            must align with ``spatial_noise_levels`` passed to ``__init__``. Each
+            tensor is folded to ``(B*n_cond*F, noise_dim, H_level, W_level)`` and
+            passed through the per-level 1x1 conv injector, then added to that
+            level's output feature map. None (default) skips injection entirely.
 
         Returns
         -------
@@ -249,6 +278,7 @@ class UNetEncoder(th.nn.Module):
         if emit_nvtx:
             th.cuda.nvtx.range_push("dlesym_encoder")
         outputs = []
+        noise_pos = {lvl: i for i, lvl in enumerate(self.spatial_noise_levels)} if self.spatial_noise_injectors is not None else {}
         for n, layer_group in enumerate(self.encoder):
             if emit_nvtx:
                 th.cuda.nvtx.range_push("dlesym_encoder:layer")
@@ -271,6 +301,11 @@ class UNetEncoder(th.nn.Module):
                 interim_output = self._forward_layer_pass(
                     layer_group, interim_output, conditions_cln, gate_n
                 )
+            if spatial_noise is not None and n in noise_pos:
+                z = spatial_noise[noise_pos[n]]
+                bsz, ndim, F, H, W = z.shape
+                z_folded = z.permute(0, 2, 1, 3, 4).reshape(bsz * F, ndim, H, W).to(interim_output.dtype)
+                interim_output = interim_output + self.spatial_noise_injectors[str(n)](z_folded)
             outputs.append(interim_output)
             inputs = outputs[-1]
             if emit_nvtx:
