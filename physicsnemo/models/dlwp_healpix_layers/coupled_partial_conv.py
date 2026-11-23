@@ -185,6 +185,8 @@ class PartialHEALPixConv2d(nn.Module):
     (``K = R(K)``) via init/``eval()`` projection and gradient hooks — required
     for both even and odd depthwise channels. Even channels may have a free
     bias; odd channels (see ``channel_is_odd``) force bias to zero.
+    ``reflection_equivariant=False`` leaves the feature kernel unconstrained,
+    for models that drop N-S reflection equivariance.
     """
 
     def __init__(
@@ -199,6 +201,7 @@ class PartialHEALPixConv2d(nn.Module):
         bias: bool = True,
         enable_nhwc: bool = False,
         channel_is_odd: Optional[Union[Sequence[bool], th.Tensor]] = None,
+        reflection_equivariant: bool = True,
     ):
         super().__init__()
         if channels < 1:
@@ -208,6 +211,7 @@ class PartialHEALPixConv2d(nn.Module):
         self.dilation = int(dilation)
         self.eps = float(eps)
         self.kernel_numel = float(self.kernel_size * self.kernel_size)
+        self.reflection_equivariant = bool(reflection_equivariant)
         self.register_buffer(
             "channel_is_odd",
             _normalize_channel_is_odd(channels, channel_is_odd),
@@ -237,10 +241,11 @@ class PartialHEALPixConv2d(nn.Module):
 
         # Even-kernel manifold (depthwise even→even and odd→odd): project init and
         # keep Adam on-manifold via grad hooks (same pattern as ReflectionSteerable).
-        feat_weight = self._conv_weight(self.feature_conv)
-        with th.no_grad():
-            feat_weight.copy_(_project_even_kernel(feat_weight))
-        feat_weight.register_hook(lambda g: _project_even_kernel(g))
+        if self.reflection_equivariant:
+            feat_weight = self._conv_weight(self.feature_conv)
+            with th.no_grad():
+                feat_weight.copy_(_project_even_kernel(feat_weight))
+            feat_weight.register_hook(lambda g: _project_even_kernel(g))
 
         if bias:
             self.bias = nn.Parameter(th.zeros(channels))
@@ -281,6 +286,8 @@ class PartialHEALPixConv2d(nn.Module):
             w.copy_(_project_even_kernel(w))
 
     def _project_parity_params_(self) -> None:
+        if not self.reflection_equivariant:
+            return
         self._project_feature_kernel_()
         if self.bias is not None and bool(self.channel_is_odd.any()):
             with th.no_grad():
@@ -338,6 +345,7 @@ class CoupledPartialConvStem(nn.Module):
         compile_padding: bool = False,
         enable_nhwc: bool = False,
         channel_is_odd: Optional[Union[Sequence[bool], th.Tensor]] = None,
+        reflection_equivariant: bool = True,
     ):
         """
         Parameters
@@ -351,6 +359,8 @@ class CoupledPartialConvStem(nn.Module):
             model builder to match the parent RecUNet/UNet.
         channel_is_odd:
             Per-channel odd/even flags (length ``C``). ``None`` means all even.
+        reflection_equivariant:
+            ``False`` drops the even-kernel constraint (see :class:`PartialHEALPixConv2d`).
         """
         super().__init__()
         if channel_masks.ndim != 4:
@@ -379,6 +389,7 @@ class CoupledPartialConvStem(nn.Module):
             bias=bias,
             enable_nhwc=enable_nhwc,
             channel_is_odd=channel_is_odd,
+            reflection_equivariant=reflection_equivariant,
         )
 
     def forward(self, coupled: th.Tensor) -> th.Tensor:

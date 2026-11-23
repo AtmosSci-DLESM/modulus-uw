@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Sequence
 
 import torch as th
@@ -47,6 +48,7 @@ class UNetEncoder(th.nn.Module):
         enable_healpixpad: bool | None = None,
         structural_input_even: int | None = None,
         odd_fraction: float = 0.25,
+        pos_embed: bool = False,
     ):
         """
         Parameters
@@ -88,6 +90,11 @@ class UNetEncoder(th.nn.Module):
         odd_fraction: float, optional
             Global even|odd bank split for ReflectionSteerable blocks. Set on
             ``HEALPixRecUNet`` and propagated here; do not set per conv block.
+        pos_embed: bool, optional
+            Add a learned positional embedding to the level-0 output (ACE's
+            "direct" ``pos_embed``): one value per face, channel and pixel,
+            ``trunc_normal(std=0.02)`` init. It breaks zonal symmetry and N-S
+            reflection equivariance by design.
         """
         super().__init__()
         hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
@@ -187,6 +194,18 @@ class UNetEncoder(th.nn.Module):
 
         self.encoder = th.nn.ModuleList(self.encoder)
 
+        self.pos_embed = None
+        if pos_embed:
+            # Same as ACE's "direct" embedding (fme conditional_sfno/ankur.py, makani sfnonet.py):
+            # a learned field added after the first block. Level 0 is used because its output is
+            # both the first skip connection and the next level's input, so every RecUNet forward
+            # path (priming, averaged twin pass, rollout) sees it.
+            # Stored flat (1-D) so MuonWithAux routes it to the AdamW aux optimizer, as ACE trains
+            # it; Muon would orthogonalise a (12, C, H, W) tensor as a matrix.
+            self._pos_embed_shape = (12, int(n_channels[0]), int(nside[0]), int(nside[0]))
+            self.pos_embed = th.nn.Parameter(th.empty(math.prod(self._pos_embed_shape)))
+            th.nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
 
     def _forward_layer_pass(self, layer_group: th.nn.Module, inp: th.Tensor, conditions_cln: th.Tensor=None, sin_lat_gate: th.Tensor=None) -> th.Tensor:
         """
@@ -271,6 +290,8 @@ class UNetEncoder(th.nn.Module):
                 interim_output = self._forward_layer_pass(
                     layer_group, interim_output, conditions_cln, gate_n
                 )
+            if n == 0 and self.pos_embed is not None:
+                interim_output = self._add_pos_embed(interim_output)
             outputs.append(interim_output)
             inputs = outputs[-1]
             if emit_nvtx:
@@ -279,6 +300,14 @@ class UNetEncoder(th.nn.Module):
         if emit_nvtx:
             th.cuda.nvtx.range_pop()
         return outputs
+
+    def _add_pos_embed(self, x: th.Tensor) -> th.Tensor:
+        """Add the embedding to folded ``[B*12, C, H, W]``; dtype and memory format follow ``x``."""
+        embed = self.pos_embed.view(self._pos_embed_shape).to(x.dtype)
+        out = (x.unflatten(0, (-1, 12)) + embed).flatten(0, 1)
+        if x.is_contiguous(memory_format=th.channels_last):
+            out = out.contiguous(memory_format=th.channels_last)
+        return out
 
     def reset(self, reset_mode: str = None):
         """Resets the state of the decoder layers
