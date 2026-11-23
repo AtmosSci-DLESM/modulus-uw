@@ -73,3 +73,13 @@ def test_stem_projection_switch():
     torch.testing.assert_close(w, even)
     w, even = _stem_kernel_after_step(False)
     assert (w - even).abs().max() > 1e-3
+
+
+def test_conv_gru_default_reset_detaches_history():
+    from physicsnemo.models.dlwp_healpix_layers.healpix_blocks import ConvGRUBlock
+
+    gru = ConvGRUBlock(in_channels=2, nside=NSIDE)
+    x = torch.randn(12, 2, NSIDE, NSIDE)
+    for _ in range(2):  # the second backward used to walk the first step's freed graph
+        gru.reset()
+        gru(gru(x)).sum().backward()
