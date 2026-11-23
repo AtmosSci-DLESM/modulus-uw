@@ -19,6 +19,7 @@ import earth2grid
 from earth2grid.healpix import HEALPIX_PAD_XY
 
 from physicsnemo.models.layers.activations import Tanh
+from physicsnemo.models.dlwp_healpix_layers.healpix_layers import HEALPixLayer
 
 from .healpix_paddings import warn_deprecated_enable_healpixpad
 from .healpix_polar_cap import POLE_CORRECTION_MODE, PolarCapUpCorrection
@@ -481,3 +482,57 @@ class ReflectionSteerableRingMeanPCHIPConv(nn.Module):
         if self.act is not None:
             fine = self.act(fine)
         return fine
+
+
+class RingMeanPCHIPConv(ReflectionSteerableRingMeanPCHIPConv):
+    """Ring-mean PCHIP upsample, then a plain padded HEALPix conv and activation.
+
+    Non-equivariant twin of :class:`ReflectionSteerableRingMeanPCHIPConv` for
+    models without reflection equivariance (``SmoothedInterpolateConv`` is the
+    same split for nearest upsampling). It subclasses only to reuse the
+    folded-face resample in ``forward``; the conv is an unconstrained
+    ``nn.Conv2d`` and ``activation`` is used as given. The resample has no
+    polar-cap correction.
+    """
+
+    reflection_steerable = False
+
+    def __init__(
+        self,
+        geometry_layer=HEALPixLayer,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        kernel_size: int = 3,
+        dilation: int = 1,
+        scale_factor: int = 2,
+        mode: str = "nearest",
+        activation: nn.Module | None = None,
+        enable_nhwc: bool = False,
+        hpx_padding_mode: str | None = "isolatitude",
+        compile_padding: bool = False,
+        nside: int = 64,
+        enable_healpixpad: bool | None = None,
+        resample_in_fp32: bool = True,
+        **kwargs,
+    ):
+        nn.Module.__init__(self)
+        del mode, kwargs
+        hpx_padding_mode = warn_deprecated_enable_healpixpad(enable_healpixpad, hpx_padding_mode)
+        if dilation > 1:
+            raise ValueError(f"dilation > 1 is not supported for hpx resize convolutions, got {dilation}")
+        self.enable_nhwc = bool(enable_nhwc)
+        self.resample = RingMeanPCHIPUpsample(
+            nside=nside, scale_factor=scale_factor, resample_in_fp32=resample_in_fp32
+        )
+        self.conv = geometry_layer(
+            layer=nn.Conv2d,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            enable_nhwc=enable_nhwc,
+            hpx_padding_mode=hpx_padding_mode,
+            compile_padding=compile_padding,
+            nside=nside * scale_factor,
+        )
+        self.act = activation
