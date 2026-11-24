@@ -143,3 +143,51 @@ def test_train_split_gets_longer_window_couplings():
     assert seen[1]["couplings"][0]["params"]["output_time_dim"] == 4
     dm.train_output_time_dim = 4
     assert dm._train_kwargs(common) is common
+
+
+def _window_values(c, values):
+    """Feed one field per coupling window (window 0 came from the dataset); return the (prestep, step) slot values."""
+    seen = []
+    for v in values:
+        c.set_coupled_fields(torch.full((1, _FACE, 1, 2, _HEIGHT, _WIDTH), float(v)))
+        out = c.preset_coupled_fields  # [T, B, C, F, H, W]
+        assert torch.all(out[0] == out[0, 0, 0, 0, 0, 0]) and torch.all(out[1:] == out[1, 0, 0, 0, 0, 0])
+        seen.append((float(out[0, 0, 0, 0, 0, 0]), float(out[-1, 0, 0, 0, 0, 0])))
+    return seen
+
+
+def test_refresh_longer_than_the_window_holds_the_field_across_windows():
+    # 6 h coupling windows (one step), refresh 24 h: four windows per period, as a 24 h training window sees it.
+    c = _coupler(output_time_dim=1, refresh_period="24h", batch_size=1)
+    start = 10
+    out = c.construct_integrated_couplings(batch={"time": slice(start, start + 6)}, bsize=1)
+    t0 = start + 1
+    np.testing.assert_array_equal(out[:, 0, 0, 0, 0, 0], [t0 - 4, t0])  # window 0: prestep t0 - 24 h, step t0
+    seen = _window_values(c, [100 * k for k in range(1, 10)])
+    # steps: the IC's period field for windows 1-3, renewed at windows 4 and 8 from the field passed there;
+    # prestep: the previous period's field on renewal windows (training's prestep), the held field otherwise
+    assert [s for _, s in seen] == [t0, t0, t0, 400, 400, 400, 400, 800, 800]
+    assert [p for p, _ in seen] == [t0, t0, t0, t0, 400, 400, 400, 400, 800]
+    # a reset (next rollout from the same IC) restarts the count from the IC's period field
+    c.reset_coupler()
+    assert [s for _, s in _window_values(c, [100, 200, 300, 400])] == [t0, t0, t0, 400]
+
+
+def test_refresh_of_two_windows():
+    c = _coupler(output_time_dim=2, refresh_period="24h", batch_size=1)
+    c.construct_integrated_couplings(batch={"time": slice(10, 16)}, bsize=1)
+    assert [s for _, s in _window_values(c, [100, 200, 300, 400])] == [11, 200, 200, 400]
+
+
+def test_refresh_not_a_multiple_of_a_shorter_window_raises():
+    c = _coupler(output_time_dim=4, refresh_period="36h", batch_size=1)  # 24 h window
+    c.construct_integrated_couplings(batch={"time": slice(10, 20)}, bsize=1)
+    with pytest.raises(ValueError, match="multiple of the coupling window"):
+        c.set_coupled_fields(torch.full((1, _FACE, 1, 2, _HEIGHT, _WIDTH), 100.0))
+
+
+def test_refresh_equal_to_a_one_step_window_renews_every_window():
+    # refresh 6 h in 6 h windows: each window's step gets the field passed there, its prestep the previous one
+    c = _coupler(output_time_dim=1, refresh_period="6h", batch_size=1)
+    c.construct_integrated_couplings(batch={"time": slice(10, 16)}, bsize=1)
+    assert _window_values(c, [100, 200, 300]) == [(11, 100), (100, 200), (200, 300)]
