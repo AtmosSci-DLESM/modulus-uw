@@ -876,7 +876,7 @@ class HEALPixRecUNet(Module):
                 for n in range(len(self.decoder.decoder)):
                     self.decoder.decoder[n].recurrent.h = 0.5 * (new_hidden_states[n] + self.hpx_reflect(new_hidden_states_refl[n], latent_tensor=True))
 
-    def forward(self, inputs: Sequence, output_only_last=False, conditions_cln=None) -> th.Tensor:
+    def forward(self, inputs: Sequence, output_only_last=False, conditions_cln=None, spatial_noise=None) -> th.Tensor:
         """
         Forward pass of the HEALPixUnet
 
@@ -996,6 +996,10 @@ class HEALPixRecUNet(Module):
                 kwargs = {"conditions_cln": conditions_cln[step]}
             else:
                 kwargs = {}
+            # Per-step spatial noise feeds the encoder only.
+            encoder_kwargs = dict(kwargs)
+            if spatial_noise is not None:
+                encoder_kwargs["spatial_noise"] = spatial_noise[step]
 
             structural = self.reflection_equivariance_mode == "structural"
             input_for_residual = input_tensor
@@ -1003,11 +1007,11 @@ class HEALPixRecUNet(Module):
                 input_tensor = apply_channel_order(input_tensor, self.structural_in_order)
                 enc_gates = self._sin_lat_gates_for_batch(input_tensor.shape[0])
                 dec_gates = list(reversed(enc_gates)) if enc_gates is not None else None
-                encodings = self.encoder(input_tensor, sin_lat_gate=enc_gates, **kwargs)
+                encodings = self.encoder(input_tensor, sin_lat_gate=enc_gates, **encoder_kwargs)
                 decodings = self.decoder(encodings, sin_lat_gate=dec_gates, **kwargs)
                 decodings = apply_channel_order(decodings, self.structural_out_inverse)
             else:
-                encodings = self.encoder(input_tensor, **kwargs)
+                encodings = self.encoder(input_tensor, **encoder_kwargs)
                 decodings = self.decoder(encodings, **kwargs)
 
             # Forward through model again with reflected input and original hidden states
