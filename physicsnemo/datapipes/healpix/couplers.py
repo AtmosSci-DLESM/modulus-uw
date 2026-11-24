@@ -390,7 +390,9 @@ class ConstantCoupler(BaseCoupler):
             [0, refresh_period) see the field at t0, the next period the field at
             t0 + refresh_period, and so on. Must be a multiple of the model step.
             Default None keeps one field (the window's first input time) for the
-            whole window.
+            whole window. In coupled inference with coupling windows shorter than
+            the period (a multiple of the window), the field is held across windows
+            and renewed every refresh_period / window windows, as in training.
         """
         self.refresh_period = (
             pd.Timedelta(refresh_period) if refresh_period is not None else None
@@ -398,6 +400,9 @@ class ConstantCoupler(BaseCoupler):
         self._slot_periods = None
         self._previous_fields = None
         self._period0_source = None
+        self._window_index = 0
+        self._held_fields = None
+        self._before_fields = None
         super().__init__(
             dataset=dataset,
             batch_size=batch_size,
@@ -440,6 +445,8 @@ class ConstantCoupler(BaseCoupler):
                     f"multiple of the model step ({step} data steps)"
                 )
             refresh = int(refresh)
+            # Kept for inference: whether a period spans several coupling windows.
+            self._step_data_steps, self._refresh_data_steps = step, refresh
             t0 = interval * (self.input_time_dim * (1 + self.presteps) - 1)
             # Slot i feeds model step i - presteps, whose input time is
             # (i - presteps) * step; floor division puts the presteps in period -1.
@@ -464,9 +471,53 @@ class ConstantCoupler(BaseCoupler):
     def reset_coupler(self):
         super().reset_coupler()
         self._previous_fields = None
+        self._window_index = 0
+        self._held_fields = None
+        self._before_fields = None
         # _period0_source is kept: it is the dataset's field for the initial condition, which a
         # reset between rollouts from that IC (e.g. ensemble batches) does not change. Reading
         # the next initial condition replaces it.
+
+    def _period0_field(self):
+        """The initial condition's first-period field, [B, F, 1, C, H, W] in the preset buffer's dtype."""
+        src = th.from_numpy(self._period0_source[:, self.presteps])  # [B, C, F, H, W]
+        # cast: the dataset buffer may be float64 while the preset buffer is float32
+        return src.permute(0, 2, 1, 3, 4)[:, :, None].to(self.preset_coupled_fields.dtype)
+
+    def _windows_per_refresh(self):
+        """Coupling windows per refresh period (1 when a period fits in one window)."""
+        window = (self.coupled_integration_dim - self.presteps) * self._step_data_steps
+        if self._refresh_data_steps <= window:
+            return 1
+        if self._refresh_data_steps % window:
+            raise ValueError(
+                f"refresh_period {self.refresh_period} must be a multiple of the coupling window "
+                f"({window} data steps) when it is longer than the window"
+            )
+        return self._refresh_data_steps // window
+
+    def _hold_across_windows(self, coupled_fields, windows_per_refresh):
+        """
+        Refresh period spanning several coupling windows: every window gets the field of
+        the period it lies in, renewed every ``windows_per_refresh`` windows from the field
+        passed at that window (the field at the period's start, as in training). The
+        prestep slots of a renewal window get the previous period's field, which is what
+        training feeds the prestep. Window 0 came from the dataset, so the first call is
+        window 1 and the held field starts as the initial condition's period field.
+        """
+        self._window_index += 1
+        if self._held_fields is None:
+            self._held_fields = (
+                self._period0_field() if self._period0_source is not None else coupled_fields[:, :, :1].clone()
+            )
+            self._before_fields = self._held_fields
+        renew = self._window_index % windows_per_refresh == 0
+        if renew:
+            self._before_fields, self._held_fields = self._held_fields, coupled_fields[:, :, :1].clone()
+        self.preset_coupled_fields[:] = self._held_fields
+        if renew:
+            prev = np.flatnonzero(self._slot_periods < 0)
+            self.preset_coupled_fields[:, :, th.as_tensor(prev)] = self._before_fields
 
     def set_coupled_fields(self, coupled_fields: th.tensor):
         """
@@ -492,15 +543,14 @@ class ConstantCoupler(BaseCoupler):
 
         # broadcast the first time step to the entire coupled integration dimension
         self.preset_coupled_fields[:, :, :, :, :, :] = coupled_fields[:, :, :1, :, :, :]
-        if self.refresh_period is not None:
+        windows_per_refresh = self._windows_per_refresh() if self.refresh_period is not None else 1
+        if windows_per_refresh > 1:
+            self._hold_across_windows(coupled_fields, windows_per_refresh)
+        elif self.refresh_period is not None:
             # Slots of the previous period (the prestep) keep the field the last
             # window used; later periods cannot be known yet and repeat this one.
             if self._previous_fields is None and self._period0_source is not None:
-                src = th.from_numpy(self._period0_source[:, self.presteps])  # [B, C, F, H, W]
-                # cast: the dataset buffer may be float64 while the preset buffer is float32
-                self._previous_fields = src.permute(0, 2, 1, 3, 4)[:, :, None].to(
-                    self.preset_coupled_fields.dtype
-                )
+                self._previous_fields = self._period0_field()
             if self._previous_fields is not None:
                 prev = np.flatnonzero(self._slot_periods < 0)
                 self.preset_coupled_fields[:, :, th.as_tensor(prev)] = self._previous_fields
